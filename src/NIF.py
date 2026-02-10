@@ -214,9 +214,154 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
     raise ValueError("marker sequence not found")
 
 
-def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", mode: str = "supervised", *, epochs: int = 1, lr: float = 5e-5, input_ids: Tensor | None = None, labels: Tensor | None = None, boost_indices: list[int] | None = None, boost_coef: float = 10.0):
+def _apply_freeze_strategy(model, strategy: str):
+    """
+    Apply parameter freezing strategy before finetuning.
+    
+    Strategies:
+    - 'all': Full finetune, all parameters trainable
+    - 'qk_all': Only Q/K projections in all layers
+    - 'qk_last_quarter': Only Q/K projections in last 1/4 layers
+    - 'qk_last_half': Only Q/K projections in last 1/2 layers
+    - 'qk_last': Only Q/K projections in the last layer
+    - 'attn_all': All attention params (Q/K/V/O) in all layers
+    - 'attn_last_quarter': All attention params in last 1/4 layers
+    """
+    # First, freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    if strategy == 'all':
+        # Full finetune: unfreeze everything
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+    
+    num_layers = len(model.model.layers)
+    
+    if strategy == 'qk_all':
+        # Q/K in all layers
+        for layer in model.model.layers:
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_quarter':
+        # Q/K in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_half':
+        # Q/K in last 1/2 layers
+        start_layer = num_layers // 2
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last':
+        # Q/K in the last layer only
+        layer = model.model.layers[-1]
+        layer.self_attn.q_proj.weight.requires_grad = True
+        layer.self_attn.k_proj.weight.requires_grad = True
+        if layer.self_attn.q_proj.bias is not None:
+            layer.self_attn.q_proj.bias.requires_grad = True
+        if layer.self_attn.k_proj.bias is not None:
+            layer.self_attn.k_proj.bias.requires_grad = True
+            
+    elif strategy == 'attn_all':
+        # All attention params (Q/K/V/O) in all layers
+        for layer in model.model.layers:
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+                    
+    elif strategy == 'attn_last_quarter':
+        # All attention params in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+    else:
+        raise ValueError(f"Unknown freeze strategy: {strategy}. "
+                        f"Choose from: 'all', 'qk_all', 'qk_last_quarter', 'qk_last_half', "
+                        f"'qk_last', 'attn_all', 'attn_last_quarter'")
+    
+    # Count trainable parameters
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Freeze strategy '{strategy}': {trainable:,} / {total:,} params trainable ({100*trainable/total:.2f}%)")
+
+
+def finetune_on_sample(
+    model, 
+    tokenizer, 
+    question: str = "", 
+    answer: str = "", 
+    mode: str = "supervised", 
+    *, 
+    epochs: int = 1, 
+    lr: float = 5e-5, 
+    input_ids: Tensor | None = None, 
+    labels: Tensor | None = None, 
+    boost_indices: list[int] | None = None, 
+    boost_coef: float = 1.0,
+    freeze_strategy: str = "qk_last_quarter",
+    first_gen_pos: int | None = None,
+):
+    """
+    Finetune model on a single sample with attention guidance.
+    
+    Args:
+        model: The model to finetune
+        tokenizer: Tokenizer for encoding
+        question: Question text (used if input_ids not provided)
+        answer: Answer text (used if input_ids not provided)
+        mode: 'supervised' or 'unsupervised'
+        epochs: Number of training epochs
+        lr: Learning rate
+        input_ids: Pre-encoded input IDs
+        labels: Pre-encoded labels
+        boost_indices: Token indices that the first generated token should attend to
+        boost_coef: Coefficient for attention loss (lambda in: loss = base_loss - lambda * L_attn)
+        freeze_strategy: Which parameters to train. Options:
+            - 'all': Full finetune
+            - 'qk_all': Q/K projections in all layers
+            - 'qk_last_quarter': Q/K projections in last 1/4 layers (recommended)
+            - 'qk_last_half': Q/K projections in last 1/2 layers
+            - 'qk_last': Q/K projections in last layer only
+            - 'attn_all': All attention params in all layers
+            - 'attn_last_quarter': All attention params in last 1/4 layers
+        first_gen_pos: Position of the first generated token. If None, auto-detect from marker.
+    """
     device = next(model.parameters()).device
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)       
+    
+    # Apply freeze strategy
+    _apply_freeze_strategy(model, freeze_strategy)
+    
+    # Only optimize trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)       
 
     if mode == "supervised":
         if input_ids is None or labels is None:
@@ -234,6 +379,9 @@ def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", m
         for i in range(input_ids.size(0)):
             start = _find_subseq_start(input_ids[i], marker_ids) + 3
             labels[i, :start] = -100
+            # Auto-detect first_gen_pos if not provided
+            if first_gen_pos is None:
+                first_gen_pos = start
 
     elif mode == "unsupervised":
         if input_ids is None or labels is None:
@@ -250,26 +398,48 @@ def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", m
     input_ids = input_ids.to(device=device)
     labels = labels.to(device=device)
 
-    for _ in tqdm(range(epochs), desc="Finetuning on sample", leave=False):
+    for epoch in tqdm(range(epochs), desc="Finetuning on sample", leave=False):
         out = model(input_ids=input_ids, labels=labels, save_last_attention=True)
 
-        attn_loss = torch.tensor(0, dtype=torch.float32)
-        if boost_indices is not None and len(boost_indices) > 0:
+        attn_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+        
+        if boost_indices is not None and len(boost_indices) > 0 and first_gen_pos is not None:
             attn = out.attentions[-1]   # [batch, head, q, k]
             if not isinstance(attn, Tensor):
                 raise ValueError("Expect attn to be Tensor")
             
             idx = torch.tensor(boost_indices, device=device)
+            
+            # NEW ATTENTION LOSS:
+            # Only look at the first generated token's attention distribution
+            # first_gen_pos is the query position (the first token to generate)
+            # boost_indices are the key positions to attend to
+            #
+            # L_attn = mean( log(attn[first_gen_pos, boost_indices]) )
+            # Total loss = base_loss - lambda * L_attn
+            # (minimizing this maximizes attention on target positions)
+            
+            first_token_attn = attn[:, :, first_gen_pos, :]  # [batch, head, k]
+            
+            # Get attention on target positions and take log
+            attn_on_target = first_token_attn[:, :, idx]  # [batch, head, len(idx)]
+            log_attn = torch.log(attn_on_target + 1e-8)
+            
+            # L_attn = average log-attention on target positions
+            L_attn = log_attn.mean()
+            
+            # We want to MAXIMIZE L_attn, so attn_loss = -L_attn
+            attn_loss = -L_attn
 
-            emphasized_attn = attn.clone()
-            emphasized_attn[:, :, :, idx] = emphasized_attn[:, :, :, idx] * boost_coef
-            attn_loss = (emphasized_attn - attn).mean()
-
-        loss = out.loss + attn_loss
+        # Total loss = base_loss + boost_coef * attn_loss
+        # Since attn_loss = -L_attn, this is equivalent to: base_loss - boost_coef * L_attn
+        loss = out.loss + boost_coef * attn_loss
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        # print(f"loss: {loss.item()}, out_loss: {out.loss.item()}, attn_loss: {attn_loss.item()}")
+        
+        # Debug print (uncomment for debugging)
+        # print(f"Epoch {epoch}: loss={loss.item():.4f}, base_loss={out.loss.item():.4f}, attn_loss={attn_loss.item():.4f}")
 
 
 _TAG_RE = re.compile(r"<ATTN>(.*?)</ATTN>", re.DOTALL)
@@ -1303,5 +1473,207 @@ def main_compute_gradient_related_samples():
     
 
 if __name__ == "__main__":
-    # main_compute_new_inference_function()
     main_compute_gradient_related_samples()
+
+def main_fast_retrieval():
+    '''
+    Fast retrieval workflow using pre-computed gradients.
+    '''
+    accelerator = Accelerator()
+    set_seed(SEED)
+
+    model, tokenizer = load_model_and_tokenizer()
+    convert_to_chatml_with_tokenizer = partial(process_func_chatml, tokenizer=tokenizer)
+    
+    # Load test samples
+    test_samples = load_samples_from_formal_jsonl("sft_test.jsonl")
+    
+    # Check if cache exists
+    cache_path = "train_grads_cache.pt"
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(f"Cache file {cache_path} not found. Run src/precompute.py first.")
+    
+    print(f"Loading pre-computed gradients from {cache_path}...")
+    cache_data = torch.load(cache_path, map_location=accelerator.device)
+    train_grads_matrix = cache_data["projected_grads"].to(accelerator.device) # [N_train, Dim]
+    train_indices = cache_data["indices"].to(accelerator.device)
+    projection_matrix = cache_data["projection_matrix"].to(accelerator.device) 
+    chunk_size = cache_data["chunk_size"]
+    
+    # Normalize train grads for cosine similarity
+    train_norms = train_grads_matrix.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    train_grads_normalized = train_grads_matrix / train_norms
+    
+    base_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100
+    )
+    
+    # Build query batch for the selected test sample
+    print(f"Analyzing Test Sample {SELECTED_TEST_SAMPLE_INDEX}...")
+    temp_ds = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml_with_tokenizer)
+    query_batch = base_collator([temp_ds[0]])
+    
+    for k, v in query_batch.items():
+        query_batch[k] = v.to(accelerator.device)
+
+    inference_function = NewInferenceFunction(
+        model=model,
+        tokenizer=tokenizer,
+        train_loader=None, # Not needed for fast retrieval
+        accelerator=accelerator,
+        param_filter_fn=None,
+        top_k=20,
+    )
+    
+    # 1. Standard Inference to get prediction & saliency
+    result = inference_function.infer(query_batch)
+    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+    # 2. Rebuild batch with prediction (Gradient Target)
+    prompt_len = int(result["target_idx"][0])
+    prompt_ids = query_batch["input_ids"][0, :prompt_len]
+    pred_ids = torch.tensor(result["pred_ids"][0], device=prompt_ids.device, dtype=prompt_ids.dtype)
+    
+    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels = new_input_ids.clone()
+    new_labels[:, :prompt_len] = -100
+    new_labels[:, (TOKEN_INDEX_TO_RETRIEVE+1):] = -100 # Consistent with original logic
+    
+    query_batch = {
+        "input_ids": new_input_ids,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels
+    }
+    
+    # 3. Compute Test Gradient
+    print("Computing gradient for test sample...")
+    query_batch, _ = inference_function._mask_labels_before_target(query_batch, TOKEN_INDEX_TO_RETRIEVE)
+    query_grads = compute_gradients(
+        model, query_batch, None, inference_function.device, inference_function.ignored_token_ids
+    )
+    
+    # 4. Project Test Gradient
+    # Must use same projection logic as precompute.py
+    sketch = torch.zeros(projection_matrix.shape[1], device=accelerator.device)
+    
+    g_flat_all = []
+    for g in query_grads:
+        if g is not None:
+             g_flat_all.append(g.detach().reshape(-1))
+    
+    if len(g_flat_all) == 0:
+        raise RuntimeError("No gradients computed for test sample")
+        
+    g_flat = torch.cat(g_flat_all)
+    n = g_flat.numel()
+    
+    # Chunked Projection
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        length = end - start
+        segment = g_flat[start:end]
+        res = segment @ projection_matrix[:length]
+        sketch += res
+        
+    query_vec = sketch
+    query_norm = query_vec.norm().clamp_min(1e-12)
+    query_vec_normalized = query_vec / query_norm
+    
+    # 5. Fast Similarity Search (Matrix Multiplication)
+    # Cosine Similarity = (A . B) / (|A|*|B|)
+    # We already normalized vectors, so just dot product
+    print("Searching for similar training samples...")
+    scores = torch.mv(train_grads_normalized, query_vec_normalized)
+    
+    # Top-K
+    topk_scores, topk_indices_in_matrix = torch.topk(scores, k=20)
+    
+    # Map back to original dataset indices
+    real_indices = train_indices[topk_indices_in_matrix].cpu().tolist()
+    real_scores = topk_scores.cpu().tolist()
+    
+    print("Top Related Samples:")
+    results = list(zip(real_indices, real_scores))
+    pprint(results)
+    
+    # Save results consistent with original format
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'w', encoding='utf-8') as f:
+        json.dump({"result": results}, f)
+        
+    # Proceed to generate visualization data (reuse logic from original main)
+    # Copied from original main function...
+    
+    # For visualization, we need Saliency on the top related sample
+    dumped_json = {
+        "related_train_samples": [],
+        "target_test_sample": {}
+    }
+    dumped_json["target_test_sample"]["before"] = {
+        "full_tokens": result["full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_original"][0]
+    }
+    dumped_json["target_test_sample"]["after"] = {
+        "full_tokens": result["pred_full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_generation"][0]
+    }
+
+    # Load Train Samples for visualization
+    train_samples = load_samples_from_formal_jsonl("sft_train.jsonl")
+    
+    # Analyze top 10 related samples
+    saliency_analysis_samples = nlargest(10, results, lambda x: x[1]) # or abs(x[1]) logic
+    
+    for idx, score in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+        # Just compute saliency for display
+        temp_ds = build_single_sample_dataset(train_samples[idx], convert_to_chatml_with_tokenizer)
+        query_batch = base_collator([temp_ds[0]])
+        for k, v in query_batch.items():
+            query_batch[k] = v.to(accelerator.device)
+            
+        # Get Saliency BEFORE generation (original context)
+        result_0 = inference_function.infer(query_batch)
+        
+        # We don't have "after_original" (finetuned) unless we actually run finetuning.
+        # Original code puts result_1 (after finetuning loop) here. 
+        # For fast retrieval mode, we might skip the finetuning loop or simulate it?
+        # Let's just output the current state (before == after) for now to visualize correlation.
+        
+        dumped_json["related_train_samples"].append({
+            "target_idx": result_0["target_idx"][0],
+            "before_original": {
+                "full_tokens": result_0["full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_original"][0]
+            },
+            "before_generation": {
+                "full_tokens": result_0["pred_full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_generation"][0]
+            },
+             "after_original": {
+                "full_tokens": result_0["full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_original"][0]
+            },
+            "after_generation": {
+                "full_tokens": result_0["pred_full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_generation"][0]
+            }
+        })
+
+    dumped_json = round_floats(dumped_json, 5)
+    with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
+        json.dump(dumped_json ,f)
+    print("Saved visualization data to ./latest_saliency.json")
+
+if __name__ == "__main__":
+    # main_compute_new_inference_function()
+    # main_compute_gradient_related_samples()
+    main_fast_retrieval()
