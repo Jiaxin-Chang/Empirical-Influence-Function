@@ -182,7 +182,8 @@ def compute_answer_only_saliency_masked_loss(
             step_outputs = model(inputs_embeds=embeddings)
             target_logits = step_outputs.logits[:, -1, :]
 
-            picked = target_logits.gather(1, target_vocab_id[:, None]).sum()
+            target_vocab_id_on_logits_device = target_vocab_id[:, None].to(target_logits.device)
+            picked = target_logits.gather(1, target_vocab_id_on_logits_device).sum()
             # gradients from target logits to input embeddings
             grads = torch.autograd.grad(picked, embeddings, retain_graph=False, create_graph=False)[0]
 
@@ -191,6 +192,9 @@ def compute_answer_only_saliency_masked_loss(
 
         # get top-k saliency token indices
         topk_indices = torch.topk(saliency, k=k, dim=-1).indices
+
+        # ensure same device as mask (model may be split across GPUs with device_map="auto")
+        topk_indices = topk_indices.to(device)
         
         # build masks
         mask = torch.zeros((bsz, k_len), device=device, dtype=torch.bool)

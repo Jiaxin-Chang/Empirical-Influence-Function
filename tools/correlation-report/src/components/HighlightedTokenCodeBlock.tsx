@@ -6,6 +6,8 @@ export interface HighlightedTokenCodeBlockProps {
     saliencies?: { [key: number]: number },
     tokenTypes?: { [key: number]: string },
     colors?: { [key: number]: string },
+    gptAnnotationIndices?: Set<number>,
+    gptOpacity?: number,
     isTokenClickable?: (tokenIndex: number) => boolean,
     onClickToken?: (tokenIndex: number) => void
 }
@@ -52,7 +54,17 @@ export const saliencyToYellowOpacity = (
     return toOkLch({ L, c, h, a });
 };
 
-function renderToken(token: string, key?: string, score?: number, saliency?: number, tokenType?: string, color?: string, onClickToken?: () => void) {
+function renderToken(
+    token: string,
+    key?: string,
+    score?: number,
+    saliency?: number,
+    tokenType?: string,
+    color?: string,
+    isGptMarked?: boolean,
+    gptOpacity?: number,
+    onClickToken?: () => void
+) {
     const baseStyle: React.CSSProperties = {};
     const baseProps: React.HTMLAttributes<HTMLSpanElement> = {};
 
@@ -71,9 +83,21 @@ function renderToken(token: string, key?: string, score?: number, saliency?: num
     } else {
         Object.assign(style, defaultColors['none']);
     }
-    
+
     if (saliency !== undefined) {
         props.title = `(${key}) ${saliency}`;
+    }
+
+    // GPT annotation: indigo bottom border
+    if (isGptMarked) {
+        const opacity = gptOpacity ?? 1;
+        style.borderBottom = `3px solid rgba(79, 70, 229, ${opacity})`;
+        style.borderRadius = '2px 2px 0 0';
+        if (props.title) {
+            props.title += ' | GPT: marked';
+        } else {
+            props.title = `(${key}) GPT: marked`;
+        }
     }
 
     // add event handler
@@ -86,12 +110,14 @@ function renderToken(token: string, key?: string, score?: number, saliency?: num
 }
 
 export function HighlightedTokenCodeBlock(props: HighlightedTokenCodeBlockProps) {
-    const { tokenTypes, colors, isTokenClickable, onClickToken } = props;
+    const { tokenTypes, colors, isTokenClickable, onClickToken, gptAnnotationIndices, gptOpacity } = props;
     const preRef: React.RefObject<HTMLPreElement | null> = useRef(null);
+
+    const gptSet = gptAnnotationIndices ?? new Set<number>();
 
     // normalize saliencies
     let { saliencies } = props;
-    
+
     const scores = { ...saliencies }; // necessary, use a copy
     if (scores !== undefined) {
         const _k: number[] = [];
@@ -131,7 +157,7 @@ export function HighlightedTokenCodeBlock(props: HighlightedTokenCodeBlockProps)
                 {props.tokens.map((v, i) => {
                     const tokenType = targetTokenIndex !== undefined && i > targetTokenIndex ? 'behindTarget' : tokenTypes?.[i];
                     const onClickCurrentToken = isTokenClickable?.(i) ? () => onClickToken?.(i) : undefined;
-                    return renderToken(v, `${i}`, scores?.[i], saliencies?.[i], tokenType, colors?.[i], onClickCurrentToken);
+                    return renderToken(v, `${i}`, scores?.[i], saliencies?.[i], tokenType, colors?.[i], gptSet.has(i), gptOpacity, onClickCurrentToken);
                 })}
             </code>
         </pre>

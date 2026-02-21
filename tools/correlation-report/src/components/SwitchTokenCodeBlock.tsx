@@ -4,11 +4,13 @@ import { HighlightedTokenCodeBlock } from "./HighlightedTokenCodeBlock";
 export interface SwitchTokenCodeBlockProps {
     tokens: string[],
     salienciesByToken: { [key: number]: number[] },
-    answerStartIndex: number
+    answerStartIndex: number,
+    gptAnnotationIndices?: Set<number>,
+    gptOpacity?: number,
 }
 
 export function SwitchTokenCodeBlock(props: SwitchTokenCodeBlockProps) {
-    const { tokens, salienciesByToken, answerStartIndex } = props;
+    const { tokens, salienciesByToken, answerStartIndex, gptAnnotationIndices, gptOpacity } = props;
 
     const [currentIndex, setCurrentIndex] = useState(answerStartIndex);
     const convertedSaliencies = useMemo(() => convertSaliencies(salienciesByToken), [salienciesByToken]);
@@ -20,6 +22,8 @@ export function SwitchTokenCodeBlock(props: SwitchTokenCodeBlockProps) {
             tokenTypes={{
                 [currentIndex]: 'target'   // other token types will be auto set in HighlightedTokenCodeBlock
             }}
+            gptAnnotationIndices={gptAnnotationIndices}
+            gptOpacity={gptOpacity}
             isTokenClickable={(i) => i >= answerStartIndex}
             onClickToken={(i) => setCurrentIndex(i)}
         />

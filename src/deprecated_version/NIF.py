@@ -15,11 +15,10 @@ from transformers.generation.utils import GenerateDecoderOnlyOutput
 from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, GenerationMixin, PreTrainedTokenizer, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
-from .utils import print_query_and_answer, process_func_chatml
-from .sft.sft import finetune_on_sample
-from .attribution import compute_answer_only_saliency_masked_loss, compute_gradients_selected_attention, compute_gradients
-from .loss import compute_loss_per_sample
-from .auto_annotate import annotate_samples
+from src.sft.inference import print_query_and_answer
+
+from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
+from .loss import compute_answer_only_saliency_masked_loss, compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample
 
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -31,6 +30,7 @@ from torch.nn import Parameter
 SEED = 42
 SEQUENCE_LENGTH_LIMIT = 3000
 TRAIN_SAMPLE_RETRIEVE_LIMIT = 100
+PROJECTION_DIM = 262144
 SELECTED_TEST_SAMPLE_INDEX = 34
 TOKEN_INDEX_TO_RETRIEVE = 438
 
@@ -179,7 +179,7 @@ def build_single_sample_dataset(sample, convert_fn):
 
 
 def load_model_and_tokenizer():
-    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/checkpoint-full")
+    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/nif-checkpoints/checkpoint-full")
     print(f"Loading model from {abs_model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
@@ -213,6 +213,105 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
         if int(row[i]) == a and int(row[i + 1]) == b:
             return i
     raise ValueError("marker sequence not found")
+
+
+def _apply_freeze_strategy(model, strategy: str):
+    """
+    Apply parameter freezing strategy before finetuning.
+    
+    Strategies:
+    - 'all': Full finetune, all parameters trainable
+    - 'qk_all': Only Q/K projections in all layers
+    - 'qk_last_quarter': Only Q/K projections in last 1/4 layers
+    - 'qk_last_half': Only Q/K projections in last 1/2 layers
+    - 'qk_last': Only Q/K projections in the last layer
+    - 'attn_all': All attention params (Q/K/V/O) in all layers
+    - 'attn_last_quarter': All attention params in last 1/4 layers
+    """
+    # First, freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    if strategy == 'all':
+        # Full finetune: unfreeze everything
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+    
+    num_layers = len(model.model.layers)
+    
+    if strategy == 'qk_all':
+        # Q/K in all layers
+        for layer in model.model.layers:
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_quarter':
+        # Q/K in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_half':
+        # Q/K in last 1/2 layers
+        start_layer = num_layers // 2
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last':
+        # Q/K in the last layer only
+        layer = model.model.layers[-1]
+        layer.self_attn.q_proj.weight.requires_grad = True
+        layer.self_attn.k_proj.weight.requires_grad = True
+        if layer.self_attn.q_proj.bias is not None:
+            layer.self_attn.q_proj.bias.requires_grad = True
+        if layer.self_attn.k_proj.bias is not None:
+            layer.self_attn.k_proj.bias.requires_grad = True
+            
+    elif strategy == 'attn_all':
+        # All attention params (Q/K/V/O) in all layers
+        for layer in model.model.layers:
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+                    
+    elif strategy == 'attn_last_quarter':
+        # All attention params in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+    else:
+        raise ValueError(f"Unknown freeze strategy: {strategy}. "
+                        f"Choose from: 'all', 'qk_all', 'qk_last_quarter', 'qk_last_half', "
+                        f"'qk_last', 'attn_all', 'attn_last_quarter'")
+    
+    # Count trainable parameters
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Freeze strategy '{strategy}': {trainable:,} / {total:,} params trainable ({100*trainable/total:.2f}%)")
 
 
 def finetune_on_sample(
@@ -458,7 +557,7 @@ class NewInferenceFunction:
         self.ignored_token_ids = torch.tensor(ignored_token_ids, device=self.device)
 
         self.base_train_results: tuple | None = None
-        # BUG FIX: was `self.param_filter_fn: ... = None` which overrode the param passed in __init__
+        self.param_filter_fn: Callable[[str, Parameter], bool] | None = None
         self.param_snapshot_original: list[Parameter] | None = None
         self.param_snapshot_overfit: list[Parameter] | None = None
 
@@ -887,7 +986,12 @@ class NewInferenceFunction:
         dtype: torch.dtype = torch.float32,
     ) -> Tensor:
         # flatten each param grad to 1D then concatenate -> [P]
-        flat = [g.detach().reshape(-1).to(dtype=dtype) for g in grads if g is not None]
+        # move to self.device so cat works when model is split across GPUs (device_map="auto")
+        flat = [
+            g.detach().reshape(-1).to(device=self.device, dtype=dtype)
+            for g in grads
+            if g is not None
+        ]
         if not flat:
             raise RuntimeError("No gradients to flatten.")
         return torch.cat(flat, dim=0)
@@ -1202,7 +1306,6 @@ def main_compute_gradient_related_samples():
 
     dumped_json = {
         "related_train_samples": [],
-        "overfit_test_results": [],
         "target_test_sample": {}
     }
 
@@ -1223,12 +1326,7 @@ def main_compute_gradient_related_samples():
     }
 
     # 2) Rebuild query batch using prediction as new ground truth
-    # 2) Rebuild query batch using prediction as new ground truth
     prompt_len = int(result["target_idx"][0])
-    
-    # Use the manually specified token index
-    target_token_index = TOKEN_INDEX_TO_RETRIEVE
-
     prompt_ids = query_batch["input_ids"][0, :prompt_len]
     pred_ids = torch.tensor(
         result["pred_ids"][0],
@@ -1239,32 +1337,7 @@ def main_compute_gradient_related_samples():
     new_attention_mask = torch.ones_like(new_input_ids)
     new_labels = new_input_ids.clone()
     new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
-    
-    # We only want to calculate loss on the *target_token_index* token.
-    # So we mask everything after it.
-    new_labels[:, (target_token_index+1):] = -100
-    
-    print(f"\n{'='*20} DEBUG INFO {'='*20}")
-    print(f"Manually selected target_token_index: {target_token_index}")
-    print(f"First generated token index (Auto):   {prompt_len}")
-    
-    # Context window to inspect
-    context_start = max(0, target_token_index - 5)
-    context_end = min(new_input_ids.size(1), target_token_index + 6)
-    
-    print(f"Inspecting tokens around target index {target_token_index}:")
-    for idx in range(context_start, context_end):
-        if idx >= new_input_ids.size(1):
-             break
-        token_id = new_input_ids[0, idx].item()
-        token_str = tokenizer.decode([token_id])
-        # Escape newlines for visibility
-        token_repr = token_str.replace('\n', '\\n').replace('\t', '\\t')
-        
-        prefix = "-> " if idx == target_token_index else "   "
-        suffix_auto = " (First generated token)" if idx == prompt_len else ""
-        print(f"{prefix}Index {idx:<4}: ID={token_id:<6} Token='{token_repr}'{suffix_auto}")
-    print(f"{'='*52}\n")
+    new_labels[:, (TOKEN_INDEX_TO_RETRIEVE+1):] = -100
 
     query_batch = {
         "input_ids": new_input_ids,
@@ -1286,14 +1359,14 @@ def main_compute_gradient_related_samples():
     # saved to file, and you can comment this part to prevent retrieving again, because it takes ~1h
     scores, indices = inference_function.influence_gradient_single(
         query_batch=query_batch,
-        target_idx=target_token_index
+        target_idx=TOKEN_INDEX_TO_RETRIEVE
     )
-    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{target_token_index}_result.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'w', encoding='utf-8') as f:
         json.dump({"result": list(zip(indices, scores))}, f)
 
     # read from saved data
     # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
-    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{target_token_index}_result.json'), 'r', encoding='utf-8') as f:
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'r', encoding='utf-8') as f:
         most_related_samples_json = json.load(f)
     most_related_samples = most_related_samples_json['result']
     # pprint(most_related_samples)
@@ -1303,35 +1376,38 @@ def main_compute_gradient_related_samples():
     # lambda x: abs(x[1]) -> top related samples
     saliency_analysis_samples = nlargest(10, most_related_samples, lambda x: -x[1])
 
-    # Get the raw sample texts
-    raw_sample_texts = [convert_sample_to_full_text(train_samples[i]) for i, s in saliency_analysis_samples]
+    # print the top 10 samples as code blocks
+    # output to file, or the \t will be converted to spaces in terminal
+    # copy them to GPT-5.2 manually
 
-    print(f"Calling automated GPT annotation for {len(raw_sample_texts)} samples...")
-    # Annotate samples automatically
-    annotation_results = annotate_samples(raw_sample_texts, tokenizer)
+    samples_text = '```\n' + '\n```\n\n```\n'.join(map(convert_sample_to_full_text, [train_samples[i] for i, s in saliency_analysis_samples])) + '\n```'
+    prompt = '''Above are full training samples of go code completion, please:
+1. The `<|im_start|>user` part is the question part, and the `<|im_start|>assistant` part is the answer part as the correct answer. The `<MID>` is a completion placeholder which you should not modify. Mark 3-10 words in the question part that you think that are most contributive to the correct answer with `<ATTN></ATTN>`, but don't mark the `<MID>`. These words must natively appear in the context, and not in the natural languag text, but code text.
+2. Then output only one code block for each sample containing the marked full training sample again, not just the marked part.'''
+    with open(os.path.join(os.path.dirname(__file__), '../samples_in_code_blocks.md'), 'w', encoding='utf-8') as f:
+        f.write(samples_text)
+        f.write("\n\n")
+        f.write(prompt)
 
-    # Reconstruct marked_code_samples.md for the record and parse token_samples
+    # then the response of GPT-5.2 should be copied to marked_code_samples.md
+
+    # Option 1: train on salient samples marked by GPT-5.2, which is manually collected
+
+    def extract_fenced_code_blocks(text: str) -> list[str]:
+        # 1) Match ```lang?\n ... \n``` with DOTALL to span multiple lines
+        pattern = re.compile(r"```[^\n]*\n(.*?)\n```", re.DOTALL)
+        # 2) Return only the captured code content
+        return pattern.findall(text)
+
+    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples.md'), 'r', encoding='utf-8') as f:
+        file_text = f.read()
+        temp_correlation_train_samples = extract_fenced_code_blocks(file_text)
+
     token_samples = []
-    marked_blocks_str = ""
+    for text in temp_correlation_train_samples:
 
-    for i, res in enumerate(annotation_results):
-        marked_text = res.get("marked_text", "")
-        token_result = res.get("token_result", {})
-
-        if not marked_text or not token_result:
-            print(f"Warning: Annotation failed for sample {i}.")
-            continue
-        
-        # Append to our string to save back to the markdown file
-        marked_blocks_str += f"```go\n{marked_text}\n```\n\n"
-        
-        # Collect token result directly
+        token_result = tokenize_with_marked_tokens(text, tokenizer)
         token_samples.append(token_result)
-
-    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples.md'), 'w', encoding='utf-8') as f:
-        f.write(marked_blocks_str)
-
-    print(f"Written annotated samples to marked_code_samples.md.")
 
     for coef in [1, 10, 100, 1000, 10000]:
         inference_function.save_model_params()
@@ -1352,7 +1428,7 @@ def main_compute_gradient_related_samples():
         print(f"Finetuned on boost_coef = {coef}")
         print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
-        dumped_json["overfit_test_results"].append({
+        dumped_json["related_train_samples"].append({
             "target_idx": result["target_idx"][0],
             "before_original": {
                 "full_tokens": result["pred_full_tokens"][0],
@@ -1370,16 +1446,202 @@ def main_compute_gradient_related_samples():
 
     # Option 2: record training sample saliency
 
-    for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
-        # Build query batch
-        temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
-        query_batch = base_collator([temp_ds[0]])
+    # for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+    #     # Build query batch
+    #     temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    #     query_batch = base_collator([temp_ds[0]])
 
+    #     for k, v in query_batch.items():
+    #         query_batch[k] = v.to(accelerator.device)
+
+    #     result_0 = inference_function.infer(query_batch)
+
+    #     dumped_json["related_train_samples"].append({
+    #         "target_idx": result_0["target_idx"][0],
+    #         "before_original": {
+    #             "full_tokens": result_0["full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_original"][0]
+    #         },
+    #         "before_generation": {
+    #             "full_tokens": result_0["pred_full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_generation"][0]
+    #         }
+    #     })
+    
+    # compress json size
+    dumped_json = round_floats(dumped_json, 5)
+
+    # this file is displayed in tools/correlation-report
+    with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
+        json.dump(dumped_json ,f)
+    
+
+if __name__ == "__main__":
+    main_compute_gradient_related_samples()
+
+def main_fast_retrieval():
+    '''
+    Fast retrieval workflow using pre-computed gradients.
+    '''
+    accelerator = Accelerator()
+    set_seed(SEED)
+
+    model, tokenizer = load_model_and_tokenizer()
+    convert_to_chatml_with_tokenizer = partial(process_func_chatml, tokenizer=tokenizer)
+    
+    # Load test samples
+    test_samples = load_samples_from_formal_jsonl("sft_test.jsonl")
+    
+    # Check if cache exists
+    cache_path = "train_grads_cache.pt"
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(f"Cache file {cache_path} not found. Run src/precompute.py first.")
+    
+    print(f"Loading pre-computed gradients from {cache_path}...")
+    cache_data = torch.load(cache_path, map_location=accelerator.device)
+    train_grads_matrix = cache_data["projected_grads"].to(accelerator.device) # [N_train, Dim]
+    train_indices = cache_data["indices"].to(accelerator.device)
+    projection_matrix = cache_data["projection_matrix"].to(accelerator.device) 
+    chunk_size = cache_data["chunk_size"]
+    
+    # Normalize train grads for cosine similarity
+    train_norms = train_grads_matrix.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    train_grads_normalized = train_grads_matrix / train_norms
+    
+    base_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100
+    )
+    
+    # Build query batch for the selected test sample
+    print(f"Analyzing Test Sample {SELECTED_TEST_SAMPLE_INDEX}...")
+    temp_ds = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml_with_tokenizer)
+    query_batch = base_collator([temp_ds[0]])
+    
+    for k, v in query_batch.items():
+        query_batch[k] = v.to(accelerator.device)
+
+    inference_function = NewInferenceFunction(
+        model=model,
+        tokenizer=tokenizer,
+        train_loader=None, # Not needed for fast retrieval
+        accelerator=accelerator,
+        param_filter_fn=None,
+        top_k=20,
+    )
+    
+    # 1. Standard Inference to get prediction & saliency
+    result = inference_function.infer(query_batch)
+    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+    # 2. Rebuild batch with prediction (Gradient Target)
+    prompt_len = int(result["target_idx"][0])
+    prompt_ids = query_batch["input_ids"][0, :prompt_len]
+    pred_ids = torch.tensor(result["pred_ids"][0], device=prompt_ids.device, dtype=prompt_ids.dtype)
+    
+    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels = new_input_ids.clone()
+    new_labels[:, :prompt_len] = -100
+    new_labels[:, (TOKEN_INDEX_TO_RETRIEVE+1):] = -100 # Consistent with original logic
+    
+    query_batch = {
+        "input_ids": new_input_ids,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels
+    }
+    
+    # 3. Compute Test Gradient
+    print("Computing gradient for test sample...")
+    query_batch, _ = inference_function._mask_labels_before_target(query_batch, TOKEN_INDEX_TO_RETRIEVE)
+    query_grads = compute_gradients(
+        model, query_batch, None, inference_function.device, inference_function.ignored_token_ids
+    )
+    
+    # 4. Project Test Gradient (batched matmul, same as precompute.py)
+    g_parts = []
+    for g in query_grads:
+        if g is not None:
+            g_parts.append(g.detach().reshape(-1).to(device=accelerator.device))
+    g_flat = torch.cat(g_parts)
+    n = g_flat.numel()
+    remainder = n % chunk_size
+    if remainder != 0:
+        g_flat = torch.nn.functional.pad(g_flat, (0, chunk_size - remainder))
+    num_chunks = g_flat.numel() // chunk_size
+    g_matrix = g_flat.reshape(num_chunks, chunk_size)
+    sketches = g_matrix @ projection_matrix.to(dtype=g_matrix.dtype)
+    sketch = sketches.sum(dim=0)
+        
+    query_vec = sketch
+    query_norm = query_vec.norm().clamp_min(1e-12)
+    query_vec_normalized = query_vec / query_norm
+    
+    # 5. Fast Similarity Search (Matrix Multiplication)
+    # Cosine Similarity = (A . B) / (|A|*|B|)
+    # We already normalized vectors, so just dot product
+    print("Searching for similar training samples...")
+    scores = torch.mv(train_grads_normalized, query_vec_normalized)
+    
+    # Top-K
+    topk_scores, topk_indices_in_matrix = torch.topk(scores, k=20)
+    
+    # Map back to original dataset indices
+    real_indices = train_indices[topk_indices_in_matrix].cpu().tolist()
+    real_scores = topk_scores.cpu().tolist()
+    
+    print("Top Related Samples:")
+    results = list(zip(real_indices, real_scores))
+    pprint(results)
+    
+    # Save results consistent with original format
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'w', encoding='utf-8') as f:
+        json.dump({"result": results}, f)
+        
+    # Proceed to generate visualization data (reuse logic from original main)
+    # Copied from original main function...
+    
+    # For visualization, we need Saliency on the top related sample
+    dumped_json = {
+        "related_train_samples": [],
+        "target_test_sample": {}
+    }
+    dumped_json["target_test_sample"]["before"] = {
+        "full_tokens": result["full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_original"][0]
+    }
+    dumped_json["target_test_sample"]["after"] = {
+        "full_tokens": result["pred_full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_generation"][0]
+    }
+
+    # Load Train Samples for visualization
+    train_samples = load_samples_from_formal_jsonl("sft_train.jsonl")
+    
+    # Analyze top 10 related samples
+    saliency_analysis_samples = nlargest(10, results, lambda x: x[1]) # or abs(x[1]) logic
+    
+    for idx, score in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+        # Just compute saliency for display
+        temp_ds = build_single_sample_dataset(train_samples[idx], convert_to_chatml_with_tokenizer)
+        query_batch = base_collator([temp_ds[0]])
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
-
+            
+        # Get Saliency BEFORE generation (original context)
         result_0 = inference_function.infer(query_batch)
-
+        
+        # We don't have "after_original" (finetuned) unless we actually run finetuning.
+        # Original code puts result_1 (after finetuning loop) here. 
+        # For fast retrieval mode, we might skip the finetuning loop or simulate it?
+        # Let's just output the current state (before == after) for now to visualize correlation.
+        
         dumped_json["related_train_samples"].append({
             "target_idx": result_0["target_idx"][0],
             "before_original": {
@@ -1391,17 +1653,25 @@ def main_compute_gradient_related_samples():
                 "full_tokens": result_0["pred_full_tokens"][0],
                 "start_index": result_0["target_idx"][0],
                 "saliency_list": result_0["saliency_generation"][0]
+            },
+             "after_original": {
+                "full_tokens": result_0["full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_original"][0]
+            },
+            "after_generation": {
+                "full_tokens": result_0["pred_full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_generation"][0]
             }
         })
-    
-    # compress json size
-    dumped_json = round_floats(dumped_json, 5)
 
-    # this file is displayed in tools/correlation-report
+    dumped_json = round_floats(dumped_json, 5)
     with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
         json.dump(dumped_json ,f)
-    
+    print("Saved visualization data to ./latest_saliency.json")
 
 if __name__ == "__main__":
     # main_compute_new_inference_function()
-    main_compute_gradient_related_samples()
+    # main_compute_gradient_related_samples()
+    main_fast_retrieval()
