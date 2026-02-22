@@ -22,7 +22,6 @@ from openai import AsyncOpenAI
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
-from .NIF import convert_sample_to_full_text, tokenize_with_marked_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +149,14 @@ def annotate_samples(
 
 def annotate_raw_samples(
     samples: list[dict],
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: "PreTrainedTokenizer | None",
     **kwargs,
 ) -> list[dict]:
     """
     Convenience: takes raw sample dicts (with 'system', 'input', 'output' keys)
     and converts them to full text before annotating.
     """
+    from .NIF import convert_sample_to_full_text
     texts = [convert_sample_to_full_text(s) for s in samples]
     return annotate_samples(texts, tokenizer, **kwargs)
 
@@ -167,7 +167,7 @@ def annotate_raw_samples(
 
 async def _annotate_samples_async(
     sample_texts: list[str],
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: "PreTrainedTokenizer | None",
     *,
     model: str,
     api_key: str | None,
@@ -218,12 +218,16 @@ async def _annotate_samples_async(
 
         # Align to tokenizer using existing infrastructure
         token_result = {}
-        try:
-            token_result = tokenize_with_marked_tokens(marked_text, tokenizer)
-            marked_indices = token_result["marked_indices"]
-        except Exception as e:
-            print(f"[auto_annotate] Sample {i}: alignment failed: {e}")
-            marked_indices = []
+        marked_indices = []
+        if tokenizer is not None:
+            try:
+                from .NIF import tokenize_with_marked_tokens
+                token_result = tokenize_with_marked_tokens(marked_text, tokenizer)
+                marked_indices = token_result["marked_indices"]
+            except Exception as e:
+                print(f"[auto_annotate] Sample {i}: alignment failed: {e}")
+        else:
+            print(f"[auto_annotate] Sample {i}: tokenizer is None, skipping token alignment (local test mode)")
 
         results.append({
             "marked_token_indices": marked_indices,
@@ -237,7 +241,10 @@ async def _annotate_samples_async(
 if __name__ == "__main__":
     import os
     import json
-    from transformers import AutoTokenizer
+    from dotenv import load_dotenv
+
+    # 尝试加载当前目录下的 .env 文件
+    load_dotenv()
 
     print("Running auto_annotate.py test...")
     if not os.environ.get("OPENAI_API_KEY"):
@@ -259,23 +266,14 @@ func main() {
 <|im_start|>assistant
     fmt.Println("End")<|im_end|>"""
 
-    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/checkpoint-full")
-    if os.path.exists(abs_model_path):
-        print(f"Loading tokenizer from {abs_model_path}...")
-        tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
-    else:
-        # Fallback to a common tokenizer from huggingface hub if local doesn't exist just for testing
-        print(f"Model path {abs_model_path} doesn't exist, falling back to Qwen/Qwen2.5-Coder-7B-Instruct tokenizer from hub...")
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
-    
+    # For local API testing, we bypass the HF tokenizer logic
     print("Sending request to GPT...")
     try:
         results = annotate_sample(
             sample_text=sample_text,
-            tokenizer=tokenizer
+            tokenizer=None # Set to None to skip torch/transformers testing
         )
         print("\n--- Test Successful ---")
-        print(f"Marked Indices (Count: {len(results.get('marked_token_indices', []))}):", results.get("marked_token_indices"))
         print("\n--- Marked Text returned from API ---")
         print(results.get("marked_text"))
     except Exception as e:
