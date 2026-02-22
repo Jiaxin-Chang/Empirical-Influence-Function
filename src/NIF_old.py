@@ -15,11 +15,10 @@ from transformers.generation.utils import GenerateDecoderOnlyOutput
 from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, GenerationMixin, PreTrainedTokenizer, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
-from .utils import print_query_and_answer, process_func_chatml
-from .sft.sft import finetune_on_sample
-from .attribution import compute_answer_only_saliency_masked_loss, compute_gradients_selected_attention, compute_gradients
-from .loss import compute_loss_per_sample
-from .auto_annotate import annotate_samples
+from src.sft.inference import print_query_and_answer
+
+from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
+from .loss import compute_answer_only_saliency_masked_loss, compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample
 
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -31,8 +30,8 @@ from torch.nn import Parameter
 SEED = 42
 SEQUENCE_LENGTH_LIMIT = 3000
 TRAIN_SAMPLE_RETRIEVE_LIMIT = 100
-SELECTED_TEST_SAMPLE_INDEX = 34
-TOKEN_INDEX_TO_RETRIEVE = 438
+SELECTED_TEST_SAMPLE_INDEX = 38
+TOKEN_INDEX_TO_RETRIEVE = 334
 
 
 # dev-only patch, to see the shape of tensor when debugging
@@ -179,7 +178,7 @@ def build_single_sample_dataset(sample, convert_fn):
 
 
 def load_model_and_tokenizer():
-    aabs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/nif-checkpoints/checkpoint-full")
+    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/nif-checkpoints/checkpoint-full")
     print(f"Loading model from {abs_model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
@@ -215,55 +214,9 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
     raise ValueError("marker sequence not found")
 
 
-def finetune_on_sample(
-    model, 
-    tokenizer, 
-    question: str = "", 
-    answer: str = "", 
-    mode: str = "supervised", 
-    *, 
-    epochs: int = 1, 
-    lr: float = 5e-5, 
-    input_ids: Tensor | None = None, 
-    labels: Tensor | None = None, 
-    boost_indices: list[int] | None = None, 
-    boost_coef: float = 1.0,
-    freeze_strategy: str = "qk_last_quarter",
-    first_gen_pos: int | None = None,
-):
-    """
-    Finetune model on a single sample with attention guidance.
-    
-    Args:
-        model: The model to finetune
-        tokenizer: Tokenizer for encoding
-        question: Question text (used if input_ids not provided)
-        answer: Answer text (used if input_ids not provided)
-        mode: 'supervised' or 'unsupervised'
-        epochs: Number of training epochs
-        lr: Learning rate
-        input_ids: Pre-encoded input IDs
-        labels: Pre-encoded labels
-        boost_indices: Token indices that the first generated token should attend to
-        boost_coef: Coefficient for attention loss (lambda in: loss = base_loss - lambda * L_attn)
-        freeze_strategy: Which parameters to train. Options:
-            - 'all': Full finetune
-            - 'qk_all': Q/K projections in all layers
-            - 'qk_last_quarter': Q/K projections in last 1/4 layers (recommended)
-            - 'qk_last_half': Q/K projections in last 1/2 layers
-            - 'qk_last': Q/K projections in last layer only
-            - 'attn_all': All attention params in all layers
-            - 'attn_last_quarter': All attention params in last 1/4 layers
-        first_gen_pos: Position of the first generated token. If None, auto-detect from marker.
-    """
+def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", mode: str = "supervised", *, epochs: int = 1, lr: float = 5e-5, input_ids: Tensor | None = None, labels: Tensor | None = None, boost_indices: list[int] | None = None, boost_coef: float = 10.0):
     device = next(model.parameters()).device
-    
-    # Apply freeze strategy
-    _apply_freeze_strategy(model, freeze_strategy)
-    
-    # Only optimize trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr)       
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)       
 
     if mode == "supervised":
         if input_ids is None or labels is None:
@@ -281,9 +234,6 @@ def finetune_on_sample(
         for i in range(input_ids.size(0)):
             start = _find_subseq_start(input_ids[i], marker_ids) + 3
             labels[i, :start] = -100
-            # Auto-detect first_gen_pos if not provided
-            if first_gen_pos is None:
-                first_gen_pos = start
 
     elif mode == "unsupervised":
         if input_ids is None or labels is None:
@@ -300,48 +250,26 @@ def finetune_on_sample(
     input_ids = input_ids.to(device=device)
     labels = labels.to(device=device)
 
-    for epoch in tqdm(range(epochs), desc="Finetuning on sample", leave=False):
+    for _ in tqdm(range(epochs), desc="Finetuning on sample", leave=False):
         out = model(input_ids=input_ids, labels=labels, save_last_attention=True)
 
-        attn_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-        
-        if boost_indices is not None and len(boost_indices) > 0 and first_gen_pos is not None:
+        attn_loss = torch.tensor(0, dtype=torch.float32)
+        if boost_indices is not None and len(boost_indices) > 0:
             attn = out.attentions[-1]   # [batch, head, q, k]
             if not isinstance(attn, Tensor):
                 raise ValueError("Expect attn to be Tensor")
             
             idx = torch.tensor(boost_indices, device=device)
-            
-            # NEW ATTENTION LOSS:
-            # Only look at the first generated token's attention distribution
-            # first_gen_pos is the query position (the first token to generate)
-            # boost_indices are the key positions to attend to
-            #
-            # L_attn = mean( log(attn[first_gen_pos, boost_indices]) )
-            # Total loss = base_loss - lambda * L_attn
-            # (minimizing this maximizes attention on target positions)
-            
-            first_token_attn = attn[:, :, first_gen_pos, :]  # [batch, head, k]
-            
-            # Get attention on target positions and take log
-            attn_on_target = first_token_attn[:, :, idx]  # [batch, head, len(idx)]
-            log_attn = torch.log(attn_on_target + 1e-8)
-            
-            # L_attn = average log-attention on target positions
-            L_attn = log_attn.mean()
-            
-            # We want to MAXIMIZE L_attn, so attn_loss = -L_attn
-            attn_loss = -L_attn
 
-        # Total loss = base_loss + boost_coef * attn_loss
-        # Since attn_loss = -L_attn, this is equivalent to: base_loss - boost_coef * L_attn
-        loss = out.loss + boost_coef * attn_loss
+            emphasized_attn = attn.clone()
+            emphasized_attn[:, :, :, idx] = emphasized_attn[:, :, :, idx] * boost_coef
+            attn_loss = (emphasized_attn - attn).mean()
+
+        loss = out.loss + attn_loss
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        
-        # Debug print (uncomment for debugging)
-        # print(f"Epoch {epoch}: loss={loss.item():.4f}, base_loss={out.loss.item():.4f}, attn_loss={attn_loss.item():.4f}")
+        # print(f"loss: {loss.item()}, out_loss: {out.loss.item()}, attn_loss: {attn_loss.item()}")
 
 
 _TAG_RE = re.compile(r"<ATTN>(.*?)</ATTN>", re.DOTALL)
@@ -458,7 +386,7 @@ class NewInferenceFunction:
         self.ignored_token_ids = torch.tensor(ignored_token_ids, device=self.device)
 
         self.base_train_results: tuple | None = None
-        # BUG FIX: was `self.param_filter_fn: ... = None` which overrode the param passed in __init__
+        self.param_filter_fn: Callable[[str, Parameter], bool] | None = None
         self.param_snapshot_original: list[Parameter] | None = None
         self.param_snapshot_overfit: list[Parameter] | None = None
 
@@ -1206,7 +1134,6 @@ def main_compute_gradient_related_samples():
 
     dumped_json = {
         "related_train_samples": [],
-        "overfit_test_results": [],
         "target_test_sample": {}
     }
 
@@ -1251,7 +1178,6 @@ def main_compute_gradient_related_samples():
     print(f"\n{'='*20} DEBUG INFO {'='*20}")
     print(f"Manually selected target_token_index: {target_token_index}")
     print(f"First generated token index (Auto):   {prompt_len}")
-    
     # Context window to inspect
     context_start = max(0, target_token_index - 5)
     context_end = min(new_input_ids.size(1), target_token_index + 6)
@@ -1307,35 +1233,38 @@ def main_compute_gradient_related_samples():
     # lambda x: abs(x[1]) -> top related samples
     saliency_analysis_samples = nlargest(10, most_related_samples, lambda x: -x[1])
 
-    # Get the raw sample texts
-    raw_sample_texts = [convert_sample_to_full_text(train_samples[i]) for i, s in saliency_analysis_samples]
+    # print the top 10 samples as code blocks
+    # output to file, or the \t will be converted to spaces in terminal
+    # copy them to GPT-5.2 manually
 
-    print(f"Calling automated GPT annotation for {len(raw_sample_texts)} samples...")
-    # Annotate samples automatically
-    annotation_results = annotate_samples(raw_sample_texts, tokenizer)
+    samples_text = '```\n' + '\n```\n\n```\n'.join(map(convert_sample_to_full_text, [train_samples[i] for i, s in saliency_analysis_samples])) + '\n```'
+    prompt = '''Above are full training samples of go code completion, please:
+1. The `<|im_start|>user` part is the question part, and the `<|im_start|>assistant` part is the answer part as the correct answer. The `<MID>` is a completion placeholder which you should not modify. Mark 3-10 words in the question part that you think that are most contributive to the correct answer with `<ATTN></ATTN>`, but don't mark the `<MID>`. These words must natively appear in the context, and not in the natural languag text, but code text.
+2. Then output only one code block for each sample containing the marked full training sample again, not just the marked part.'''
+    with open(os.path.join(os.path.dirname(__file__), '../samples_in_code_blocks.md'), 'w', encoding='utf-8') as f:
+        f.write(samples_text)
+        f.write("\n\n")
+        f.write(prompt)
 
-    # Reconstruct marked_code_samples.md for the record and parse token_samples
+    # then the response of GPT-5.2 should be copied to marked_code_samples.md
+
+    # Option 1: train on salient samples marked by GPT-5.2, which is manually collected
+
+    def extract_fenced_code_blocks(text: str) -> list[str]:
+        # 1) Match ```lang?\n ... \n``` with DOTALL to span multiple lines
+        pattern = re.compile(r"```[^\n]*\n(.*?)\n```", re.DOTALL)
+        # 2) Return only the captured code content
+        return pattern.findall(text)
+
+    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples.md'), 'r', encoding='utf-8') as f:
+        file_text = f.read()
+        temp_correlation_train_samples = extract_fenced_code_blocks(file_text)
+
     token_samples = []
-    marked_blocks_str = ""
+    for text in temp_correlation_train_samples:
 
-    for i, res in enumerate(annotation_results):
-        marked_text = res.get("marked_text", "")
-        token_result = res.get("token_result", {})
-
-        if not marked_text or not token_result:
-            print(f"Warning: Annotation failed for sample {i}.")
-            continue
-        
-        # Append to our string to save back to the markdown file
-        marked_blocks_str += f"```go\n{marked_text}\n```\n\n"
-        
-        # Collect token result directly
+        token_result = tokenize_with_marked_tokens(text, tokenizer)
         token_samples.append(token_result)
-
-    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples.md'), 'w', encoding='utf-8') as f:
-        f.write(marked_blocks_str)
-
-    print(f"Written annotated samples to marked_code_samples.md.")
 
     for coef in [1, 10, 100, 1000, 10000]:
         inference_function.save_model_params()
@@ -1356,7 +1285,7 @@ def main_compute_gradient_related_samples():
         print(f"Finetuned on boost_coef = {coef}")
         print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
-        dumped_json["overfit_test_results"].append({
+        dumped_json["related_train_samples"].append({
             "target_idx": result["target_idx"][0],
             "before_original": {
                 "full_tokens": result["pred_full_tokens"][0],
@@ -1374,29 +1303,29 @@ def main_compute_gradient_related_samples():
 
     # Option 2: record training sample saliency
 
-    for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
-        # Build query batch
-        temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
-        query_batch = base_collator([temp_ds[0]])
+    # for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+    #     # Build query batch
+    #     temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    #     query_batch = base_collator([temp_ds[0]])
 
-        for k, v in query_batch.items():
-            query_batch[k] = v.to(accelerator.device)
+    #     for k, v in query_batch.items():
+    #         query_batch[k] = v.to(accelerator.device)
 
-        result_0 = inference_function.infer(query_batch)
+    #     result_0 = inference_function.infer(query_batch)
 
-        dumped_json["related_train_samples"].append({
-            "target_idx": result_0["target_idx"][0],
-            "before_original": {
-                "full_tokens": result_0["full_tokens"][0],
-                "start_index": result_0["target_idx"][0],
-                "saliency_list": result_0["saliency_original"][0]
-            },
-            "before_generation": {
-                "full_tokens": result_0["pred_full_tokens"][0],
-                "start_index": result_0["target_idx"][0],
-                "saliency_list": result_0["saliency_generation"][0]
-            }
-        })
+    #     dumped_json["related_train_samples"].append({
+    #         "target_idx": result_0["target_idx"][0],
+    #         "before_original": {
+    #             "full_tokens": result_0["full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_original"][0]
+    #         },
+    #         "before_generation": {
+    #             "full_tokens": result_0["pred_full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_generation"][0]
+    #         }
+    #     })
     
     # compress json size
     dumped_json = round_floats(dumped_json, 5)
