@@ -15,10 +15,9 @@ from transformers.generation.utils import GenerateDecoderOnlyOutput
 from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, GenerationMixin, PreTrainedTokenizer, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
-from .utils import print_query_and_answer, process_func_chatml
-from .sft.sft import finetune_on_sample
-from .attribution import compute_answer_only_saliency_masked_loss, compute_gradients_selected_attention, compute_gradients
-from .loss import compute_loss_per_sample
+from src.sft.inference import print_query_and_answer
+from .process_data import process_func_chatml, CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict
+from .loss import compute_answer_only_saliency_masked_loss, compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample
 from .auto_annotate import annotate_samples
 
 from datasets import Dataset
@@ -179,7 +178,7 @@ def build_single_sample_dataset(sample, convert_fn):
 
 
 def load_model_and_tokenizer():
-    aabs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/nif-checkpoints/checkpoint-full")
+    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/nif-checkpoints/checkpoint-full")
     print(f"Loading model from {abs_model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
@@ -213,6 +212,105 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
         if int(row[i]) == a and int(row[i + 1]) == b:
             return i
     raise ValueError("marker sequence not found")
+
+
+def _apply_freeze_strategy(model, strategy: str):
+    """
+    Apply parameter freezing strategy before finetuning.
+    
+    Strategies:
+    - 'all': Full finetune, all parameters trainable
+    - 'qk_all': Only Q/K projections in all layers
+    - 'qk_last_quarter': Only Q/K projections in last 1/4 layers
+    - 'qk_last_half': Only Q/K projections in last 1/2 layers
+    - 'qk_last': Only Q/K projections in the last layer
+    - 'attn_all': All attention params (Q/K/V/O) in all layers
+    - 'attn_last_quarter': All attention params in last 1/4 layers
+    """
+    # First, freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    if strategy == 'all':
+        # Full finetune: unfreeze everything
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+    
+    num_layers = len(model.model.layers)
+    
+    if strategy == 'qk_all':
+        # Q/K in all layers
+        for layer in model.model.layers:
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_quarter':
+        # Q/K in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last_half':
+        # Q/K in last 1/2 layers
+        start_layer = num_layers // 2
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            layer.self_attn.q_proj.weight.requires_grad = True
+            layer.self_attn.k_proj.weight.requires_grad = True
+            if layer.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.requires_grad = True
+            if layer.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.requires_grad = True
+                
+    elif strategy == 'qk_last':
+        # Q/K in the last layer only
+        layer = model.model.layers[-1]
+        layer.self_attn.q_proj.weight.requires_grad = True
+        layer.self_attn.k_proj.weight.requires_grad = True
+        if layer.self_attn.q_proj.bias is not None:
+            layer.self_attn.q_proj.bias.requires_grad = True
+        if layer.self_attn.k_proj.bias is not None:
+            layer.self_attn.k_proj.bias.requires_grad = True
+            
+    elif strategy == 'attn_all':
+        # All attention params (Q/K/V/O) in all layers
+        for layer in model.model.layers:
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+                    
+    elif strategy == 'attn_last_quarter':
+        # All attention params in last 1/4 layers
+        start_layer = num_layers * 3 // 4
+        for i in range(start_layer, num_layers):
+            layer = model.model.layers[i]
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                proj_module = getattr(layer.self_attn, proj)
+                proj_module.weight.requires_grad = True
+                if proj_module.bias is not None:
+                    proj_module.bias.requires_grad = True
+    else:
+        raise ValueError(f"Unknown freeze strategy: {strategy}. "
+                        f"Choose from: 'all', 'qk_all', 'qk_last_quarter', 'qk_last_half', "
+                        f"'qk_last', 'attn_all', 'attn_last_quarter'")
+    
+    # Count trainable parameters
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Freeze strategy '{strategy}': {trainable:,} / {total:,} params trainable ({100*trainable/total:.2f}%)")
 
 
 def finetune_on_sample(
@@ -1186,12 +1284,21 @@ def main_compute_gradient_related_samples():
     # Assume: model, tokenizer already loaded
     # Assume: query_batch already built with input_ids and attention_mask
 
+    def filter_lm_head(name: str, param: torch.nn.Parameter):
+        return "lm_head.weight" in name and param.requires_grad
+        
+    for name, param in model.named_parameters():
+        if "lm_head.weight" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
     inference_function = NewInferenceFunction(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
         accelerator=accelerator,
-        param_filter_fn=None,
+        param_filter_fn=filter_lm_head,
         top_k=20,
     )
 
@@ -1244,10 +1351,6 @@ def main_compute_gradient_related_samples():
     new_labels = new_input_ids.clone()
     new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
     
-    # We only want to calculate loss on the *target_token_index* token.
-    # So we mask everything after it.
-    new_labels[:, (target_token_index+1):] = -100
-    
     print(f"\n{'='*20} DEBUG INFO {'='*20}")
     print(f"Manually selected target_token_index: {target_token_index}")
     print(f"First generated token index (Auto):   {prompt_len}")
@@ -1290,7 +1393,7 @@ def main_compute_gradient_related_samples():
     # saved to file, and you can comment this part to prevent retrieving again, because it takes ~1h
     scores, indices = inference_function.influence_gradient_single(
         query_batch=query_batch,
-        target_idx=target_token_index
+        target_idx=prompt_len  # <-- Use prompt_len to enable all-token loss (instead of just from target_token_index)
     )
     with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{target_token_index}_result.json'), 'w', encoding='utf-8') as f:
         json.dump({"result": list(zip(indices, scores))}, f)

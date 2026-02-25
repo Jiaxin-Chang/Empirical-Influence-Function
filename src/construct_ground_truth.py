@@ -72,6 +72,16 @@ async def generate_variants(client: AsyncOpenAI, user_content: str, assistant_co
         return {}
 
 async def main():
+    # Simple .env parser to avoid requiring `source .env`
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    v = v.strip("'").strip('"')
+                    os.environ[k.strip()] = v
+                    
     # 1. Provide API info (You can set ENV vars OPENAI_API_KEY and OPENAI_BASE_URL)
     api_key = os.environ.get("OPENAI_API_KEY")
     base_url = os.environ.get("OPENAI_BASE_URL") or "https://api.xi-ai.cn/v1"
@@ -141,6 +151,9 @@ async def main():
                         {"role": "user", "content": user_content},
                         {"role": "assistant", "content": assistant_content}
                     ],
+                    "system": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+                    "input": user_content,
+                    "output": assistant_content,
                     "format": "chatml",
                     "metadata": {
                         "target_test_id": target_test_id,
