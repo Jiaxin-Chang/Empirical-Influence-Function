@@ -16,6 +16,11 @@ import asyncio
 import os
 import re
 from typing import TYPE_CHECKING
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from openai import AsyncOpenAI
 
@@ -174,6 +179,21 @@ async def _annotate_samples_async(
     base_url: str | None,
     concurrency: int,
 ) -> list[dict]:
+    # Suppress verbose debug logs from openai and httpx
+    import logging
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
+    # Simple .env parser to avoid requiring `source .env`
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    v = v.strip("'").strip('"')
+                    os.environ[k.strip()] = v
+
     # Default to xi-api format if no base_url is provided
     final_base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.xi-ai.cn/v1"
     
@@ -183,11 +203,21 @@ async def _annotate_samples_async(
     )
     semaphore = asyncio.Semaphore(concurrency)
 
+    total_samples = len(sample_texts)
+    print(f"[auto_annotate] Starting GPT annotation for {total_samples} training samples concurrently...")
+
+    async def _annotate_one_with_progress(idx: int, text: str) -> str:
+        resp = await _annotate_one(client, text, model, semaphore)
+        print(f"[auto_annotate] ✓ Annotated sample {idx+1}/{total_samples}")
+        return resp
+
     tasks = [
-        _annotate_one(client, text, model, semaphore)
-        for text in sample_texts
+        _annotate_one_with_progress(i, text)
+        for i, text in enumerate(sample_texts)
     ]
     raw_responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"[auto_annotate] GPT annotation finished. Parsing and aligning token results...")
 
     results = []
     for i, resp in enumerate(raw_responses):
@@ -241,10 +271,8 @@ async def _annotate_samples_async(
 if __name__ == "__main__":
     import os
     import json
-    from dotenv import load_dotenv
-
-    # 尝试加载当前目录下的 .env 文件
-    load_dotenv()
+    
+    # .env is already loaded at module level now
 
     print("Running auto_annotate.py test...")
     if not os.environ.get("OPENAI_API_KEY"):

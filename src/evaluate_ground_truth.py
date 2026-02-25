@@ -37,10 +37,33 @@ def evaluate_ground_truth_influence():
     gt_file = "ground_truth_demo.jsonl"
     if not os.path.exists(gt_file):
         raise FileNotFoundError(f"{gt_file} not found. Generate GT first.")
-        
+
+    gt_samples = []
     with open(gt_file, "r", encoding="utf-8") as f:
-        gt_samples = [json.loads(line) for line in f]
-        
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            
+            # Robust extraction of system, input, output
+            sys_text = obj.get("system", "")
+            inp_text = obj.get("input", "")
+            outp_text = obj.get("output", "")
+            
+            if not sys_text or not inp_text or not outp_text:
+                if "messages" in obj and len(obj["messages"]) >= 3:
+                    sys_text = obj["messages"][0]["content"]
+                    inp_text = obj["messages"][1]["content"]
+                    outp_text = obj["messages"][2]["content"]
+                    
+            parsed_obj = {
+                'system': sys_text,
+                'input':  inp_text,
+                'output': outp_text,
+                'label': obj.get("label", "unknown")
+            }
+            gt_samples.append(parsed_obj)
+            
     print(f"Loaded {len(real_train_samples)} real training samples for background noise.")
     print(f"Loaded {len(gt_samples)} ground truth variants.")
     
@@ -80,6 +103,8 @@ def evaluate_ground_truth_influence():
     for name, param in model.named_parameters():
         if "lm_head.weight" in name:
             param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     # Initialize the IF engine
     inference_function = NewInferenceFunction(
@@ -110,27 +135,14 @@ def evaluate_ground_truth_influence():
     target_token_index = prompt_len
     print(f"Prompt length: {prompt_len}. Target Token Index for Attribution: {target_token_index}")
     
-    # 5. Rebuild query batch using generation as new ground truth (like NIF DOES)
-    pred_ids = torch.tensor(
-        result["pred_ids"][0],
-        device=query_batch["input_ids"].device,
-        dtype=query_batch["input_ids"].dtype
-    )
-    prompt_ids = query_batch["input_ids"][0, :prompt_len]
-    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
-    new_attention_mask = torch.ones_like(new_input_ids)
+    # 5. Use the *ORIGINAL CORRECT ANSWER* from the test set as the target, NOT the model's wrong prediction.
+    # If the model gets it wrong, its generated sequence gradients will naturally be deeply orthogonal
+    # or strongly negative to the gradients of the training examples that teach the *correct* logic.
+    # We want to measure who supports the *correct* answer.
+    eval_batch = query_batch.copy()
     
-    new_labels = new_input_ids.clone()
-    new_labels[:, :prompt_len] = -100  # ignore prompt context in loss calculation
-    # Only calculate loss on the specific target_token_index we care about
-    # Since we are evaluating the first token generated, target_token_index = prompt_len
-    new_labels[:, (target_token_index + 1):] = -100
-    
-    eval_batch = {
-        "input_ids": new_input_ids,
-        "attention_mask": new_attention_mask,
-        "labels": new_labels
-    }
+    # Calculate loss on the *ENTIRE* correct response!
+    # NIF's influence_gradient_single will automatically mask labels before target_token_index for us.
     
     # 6. Compute Influence Score
     print("\nComputing influence gradient scores over the mixed dataset... (This might take a minute)")

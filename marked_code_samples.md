@@ -1,939 +1,1176 @@
-```text
+```go
 <|im_start|>system
 You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
 <|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/prometheus/Prometheus/util/logging Below is the code repository: github.com/prometheus/Prometheus/ Below is the imported package path "context"; "log/slog"; "sync"; "time" The receiver struct definitions of the function is type Deduper struct {
-	next   *slog.Logger
-	repeat time.Duration
-	<ATTN>quit</ATTN>   chan struct{}
-	<ATTN>mtx</ATTN>    *sync.RWMutex
-	<ATTN>seen</ATTN>   map[string]time.Time
-}
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/influxdata/influxdb/pkg/tracing Below is the code repository: github.com/influxdata/influxdb/ Below is the imported package path "github.com/xlab/treeprint" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is *treeVisitor
 
+// Type treeVisitor definition:
+type treeVisitor struct {
+	root  <ATTN>treeprint.Tree</ATTN>
+	trees []<ATTN>treeprint.Tree</ATTN>
+}
 // Methods:
-- func (d *Deduper) Enabled((ctx context.Context, level slog.Level)) bool
-- func (d *Deduper) Handle((ctx context.Context, r slog.Record)) error
-- func (d *Deduper) WithAttrs(attrs *ast.ArrayType) slog.Handler
-- func (d *Deduper) WithGroup(name string) slog.Handler
-- func (d *Deduper) Stop()
-- func (d *Deduper) run()
- The parameter struct definition or not exist of the function is attrs *ast.ArrayType The return value struct definitions or not exist of the function is slog.Handler The code snippets before the function is func Dedupe(next *slog.Logger, repeat time.Duration) *Deduper {
-	d := &Deduper{
-		next:   next,
-		repeat: repeat,
-		quit:   make(chan struct{}),
-		mtx:    new(sync.RWMutex),
-		seen:   map[string]time.Time{},
+- func (v *treeVisitor) Visit(n *TreeNode) Visitor
+ The code snippets before the function is func (t *TreeNode) String() string {
+	if t == nil {
+		return ""
 	}
-	go d.run()
-	return d
+	tv := <ATTN>newTreeVisitor()</ATTN>
+	Walk(tv, t)
+	return tv.root.String()
 }
 
-func (d *Deduper) Enabled(ctx context.Context, level slog.Level) bool {
-	return d.next.Enabled(ctx, level)
-}
-
-func (d *Deduper) Handle(ctx context.Context, r slog.Record) error {
-	line := r.Message
-	d.mtx.RLock()
-	last, ok := d.seen[line]
-	d.mtx.RUnlock()
-
-	if ok && time.Since(last) < d.repeat {
-		return nil
-	}
-
-	d.mtx.Lock()
-	if len(d.seen) < maxEntries {
-		d.seen[line] = time.Now()
-	}
-	d.mtx.Unlock()
-
-	return d.next.Handler().Handle(ctx, r.Clone())
-} And here is the function you are asked to complete func (d *Deduper) WithAttrs(attrs *ast.ArrayType) slog.Handler
-func (d *Deduper) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &Deduper{
-		next:   slog.New(d.next.Handler().WithAttrs(attrs)),
-		repeat: d.repeat, <MID> 	}
-} Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-		quit:   d.quit,
-		seen:   d.seen,
-		mtx:    d.mtx,<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "container/heap"; "github.com/cockroachdb/cockroach/pkg/util/syncutil"; "github.com/cockroachdb/errors"; "github.com/cockroachdb/redact" The receiver struct definitions of the function is type MultiQueue struct {
-	<ATTN>mu</ATTN>               syncutil.Mutex
-	concurrencyLimit int
-	remainingRuns    int
-	mapping          map[int]int
-	lastQueueIndex   int
-	outstanding      []notifyHeap
-}
-
-// Methods:
-- func (m *MultiQueue) tryRunNextLocked()
-- func (m *MultiQueue) UpdateConcurrencyLimit(newLimit int)
-- func (m *MultiQueue) updateConcurrencyLimitLocked(newLimit int)
-- func (m *MultiQueue) Add((queueType int, priority float64, maxQueueLength int64)) ((*Task, error))
-- func (m *MultiQueue) Cancel(task *Task)
-- func (m *MultiQueue) Release(permit *Permit)
-- func (m *MultiQueue) releaseLocked(permit *Permit)
-- func (m *MultiQueue) AvailableLen() int
-- func (m *MultiQueue) QueueLen() int
-- func (m *MultiQueue) queueLenLocked() int
-- func (m *MultiQueue) MaxConcurrency() int
- The parameter struct definition or not exist of the function is newLimit int The return value struct definitions or not exist of the function is not exist The code snippets before the function is func (h *notifyHeap) Push(x interface{}) {
-	t := x.(*Task)
-	// Set the index to the end, it will be moved later
-	t.heapIdx = h.Len()
-	*h = append(*h, t)
-}
-
-func (h *notifyHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	old[n-1] = nil
-	*h = old[0 : n-1]
-	// No longer in the heap so clear the index
-	x.heapIdx = -1
-
-	return x
-}
-
-func (h *notifyHeap) tryRemove(task *Task) bool {
-	if task.heapIdx < 0 {
-		return false
-	}
-	heap.Remove(h, task.heapIdx)
-	return true
-}
-
-func NewMultiQueue(maxConcurrency int) *MultiQueue {
-	queue := MultiQueue{
-		remainingRuns:    maxConcurrency,
-		concurrencyLimit: maxConcurrency,
-		mapping:          make(map[int]int),
-	}
-	queue.lastQueueIndex = -1
-
-	return &queue
-}
-
-func (m *MultiQueue) tryRunNextLocked() {
-	// If no permits are left, then we can't run anything.
-	if m.remainingRuns <= 0 {
+func Walk(v Visitor, node *TreeNode) {
+	if v = v.Visit(node); v == nil {
 		return
 	}
 
-	for i := 0; i < len(m.outstanding); i++ {
-		// Start with the next queue in order and iterate through all empty queues.
-		// If all queues are empty then return, as there is nothing to run.
-		index := (m.lastQueueIndex + i + 1) % len(m.outstanding)
-		if m.outstanding[index].Len() > 0 {
-			task := heap.Pop(&m.outstanding[index]).(*Task)
-			task.permitC <- &Permit{valid: true}
-			m.remainingRuns--
-			m.lastQueueIndex = index
-			return
-		}
+	for _, c := range node.Children {
+		Walk(v, c)
 	}
-} And here is the function you are asked to complete func (m *MultiQueue) UpdateConcurrencyLimit(newLimit int)
-func (m *MultiQueue) UpdateConcurrencyLimit(newLimit int) { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
+} And here is the function you are asked to complete func newTreeVisitor() *treeVisitor
+func newTreeVisitor() *treeVisitor { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
 <|im_start|>assistant
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.updateConcurrencyLimitLocked(newLimit)<|im_end|>
+	t := treeprint.New()
+	return &treeVisitor{root: t, trees: []treeprint.Tree{t}}<|im_end|>
 ```
 
-```text
+```go
 <|im_start|>system
 You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
 <|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/pkg/scheduler/metrics Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "time"; "k8s.io/component-base/metrics" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is (bufferSize int, interval time.Duration, stopCh *ast.ChanType) The return value struct definitions or not exist of the function is *MetricAsyncRecorder
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/etcd-io/etcd/client/v3/concurrency Below is the code repository: github.com/etcd-io/etcd/ Below is the imported package path "context"; "errors"; "fmt"; "strings"; "sync"; "go.etcd.io/etcd/api/v3/etcdserverpb"; "go.etcd.io/etcd/client/v3" The receiver struct definitions of the function is type Mutex struct {
+	s *Session
 
-// Type MetricAsyncRecorder definition:
-type MetricAsyncRecorder struct {
-	// bufferCh is a channel that serves as a metrics buffer before the metricsRecorder goroutine reports it.
-	<ATTN>bufferCh</ATTN> chan *histogramVecMetric
-	// if bufferSize is reached, incoming metrics will be discarded.
-	bufferSize int
-	// how often the recorder runs to flush the metrics.
-	interval time.Duration
-
-	// aggregatedInflightEventMetric is only to record InFlightEvents metric asynchronously.
-	// It's a map from gaugeVecMetricKey to the aggregated value
-	// and the aggregated value is flushed to Prometheus every time the interval is reached.
-	// Note that we don't lock the map deliberately because we assume the queue takes lock before updating the in-flight events.
-	aggregatedInflightEventMetric              map[gaugeVecMetricKey]int
-	aggregatedInflightEventMetricLastFlushTime time.Time
-	aggregatedInflightEventMetricBufferCh      chan *gaugeVecMetric
-
-	// stopCh is used to stop the goroutine which periodically flushes metrics.
-	<ATTN>stopCh</ATTN> <-chan struct{}
-	// IsStoppedCh indicates whether the goroutine is stopped. It's used in tests only to make sure
-	// the metric flushing goroutine is stopped so that tests can collect metrics for verification.
-	<ATTN>IsStoppedCh</ATTN> chan struct{}
+	pfx   string
+	myKey string
+	myRev int64
+	hdr   *pb.ResponseHeader
 }
+
 // Methods:
-- func (r *MetricAsyncRecorder) ObservePluginDurationAsync((extensionPoint string, pluginName string, status string, value float64))
-- func (r *MetricAsyncRecorder) ObserveQueueingHintDurationAsync((pluginName string, event string, hint string, value float64))
-- func (r *MetricAsyncRecorder) ObserveInFlightEventsAsync((eventLabel string, valueToAdd float64, forceFlush bool))
-- func (r *MetricAsyncRecorder) observeMetricAsync((m *metrics.HistogramVec, value float64, labelsValues *ast.Ellipsis))
-- func (r *MetricAsyncRecorder) run()
-- func (r *MetricAsyncRecorder) FlushMetrics()
- The code snippets before the function is func NewBackoffPodsRecorder() *PendingPodsRecorder {
-	return &PendingPodsRecorder{
-		recorder: BackoffPods(),
+- func (m *Mutex) TryLock(ctx context.Context) error
+- func (m *Mutex) Lock(ctx context.Context) error
+- func (m *Mutex) tryAcquire(ctx context.Context) ((*v3.TxnResponse, error))
+- func (m *Mutex) Unlock(ctx context.Context) error
+- func (m *Mutex) IsOwner() v3.Cmp
+- func (m *Mutex) Key() string
+- func (m *Mutex) Header() *pb.ResponseHeader
+ The parameter struct definition or not exist of the function is ctx context.Context The return value struct definitions or not exist of the function is error The code snippets before the function is func NewMutex(s *Session, pfx string) *Mutex {
+	return &Mutex{s, pfx + "/", "", -1, nil}
+}
+
+func (m *Mutex) TryLock(ctx context.Context) error {
+	resp, err := m.tryAcquire(ctx)
+	if err != nil {
+		return err
 	}
-}
-
-func NewGatedPodsRecorder() *PendingPodsRecorder {
-	return &PendingPodsRecorder{
-		recorder: GatedPods(),
+	// if no key on prefix / the minimum rev is key, already hold the lock
+	ownerKey := resp.Responses[1].GetResponseRange().Kvs
+	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
+		m.hdr = resp.Header
+		return nil
 	}
-}
+	client := m.s.Client()
+	// Cannot lock, so delete the key
+	if _, err := client.Delete(ctx, m.myKey); err != nil {
+		return err
+	}
+	m.myKey = "\x00"
+	m.myRev = -1
+	return ErrLocked
+} And here is the function you are asked to complete func (m *Mutex) Lock(ctx context.Context) error
+func (m *Mutex) Lock(ctx context.Context) error {
+	resp, err := m.tryAcquire(ctx)
+	if err != nil {
+		return err
+	}
+	// if no key on prefix / the minimum rev is key, already hold the lock
+	ownerKey := resp.Responses[1].GetResponseRange().Kvs
+	if len(ownerKey) == 0 || ownerKey[0].CreateRevision == m.myRev {
+		m.hdr = resp.Header
+		return nil
+	}
+	client := m.s.Client()
+	// wait for deletion revisions prior to myKey
+	// TODO: early termination if the session key is deleted before other session keys with smaller revisions.
+	werr := waitDeletes(ctx, client, m.pfx, m.myRev-1)
+	// release lock key if wait failed
+	if werr != nil {
+		m.Unlock(client.Ctx())
+		return werr
+	}
 
-func (r *PendingPodsRecorder) Inc() {
-	r.recorder.Inc()
-}
+	// make sure the session is not expired, and the owner key still exists.
+	gresp, werr := client.Get(ctx, m.myKey)
+	if werr != nil { <MID> 	}
 
-func (r *PendingPodsRecorder) Dec() {
-	r.recorder.Dec()
-}
+	if len(gresp.Kvs) == 0 { // is the session key lost?
+		return ErrSessionExpired
+	}
+	m.hdr = gresp.Header
 
-func (r *PendingPodsRecorder) Clear() {
-	r.recorder.Set(float64(0))
-} And here is the function you are asked to complete func NewMetricsAsyncRecorder((bufferSize int, interval time.Duration, stopCh *ast.ChanType)) *MetricAsyncRecorder
-func NewMetricsAsyncRecorder(bufferSize int, interval time.Duration, stopCh <-chan struct{}) *MetricAsyncRecorder {
-	recorder := &MetricAsyncRecorder{
-		bufferCh:                      make(chan *histogramVecMetric, bufferSize),
-		bufferSize:                    bufferSize,
-		interval:                      interval,
-		stopCh:                        stopCh,
-		aggregatedInflightEventMetric: make(map[gaugeVecMetricKey]int),
-		aggregatedInflightEventMetricLastFlushTime: time.Now(),
-		aggregatedInflightEventMetricBufferCh:      make(chan *gaugeVecMetric, bufferSize),
-		IsStoppedCh:                                make(chan struct{}), <MID> 	return recorder
+	return nil
 } Ensure that only missing codes marked as <MID> are returned<|im_end|>
 <|im_start|>assistant
-	}
-	go recorder.run()<|im_end|>
+		<ATTN>m.Unlock(client.Ctx())</ATTN>
+		<ATTN>return werr</ATTN><|im_end|>
 ```
 
-```text
+```go
 <|im_start|>system
 You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
 <|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/syncthing/syncthing Below is the code repository: github.com/syncthing/syncthing/ Below is the imported package path "archive/tar"; "archive/zip"; "bytes"; "compress/flate"; "compress/gzip"; "encoding/json"; "errors"; "flag"; "fmt"; "io"; "log"; "os"; "os/exec"; "os/user"; "path/filepath"; "regexp"; "runtime"; "strconv"; "strings"; "text/template"; "time"; "github.com/syncthing/syncthing/lib/build"; "github.com/syncthing/syncthing/lib/upgrade"; "sigs.k8s.io/yaml" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is not exist The code snippets before the function is func rebuildAssets() {
-	os.Setenv("SOURCE_DATE_EPOCH", fmt.Sprint(buildStamp()))
-	runPrint(goCmd, "generate", "github.com/syncthing/syncthing/lib/api/auto", "github.com/syncthing/syncthing/cmd/infra/strelaypoolsrv/auto")
-}
-
-func lazyRebuildAssets() {
-	shouldRebuild := shouldRebuildAssets("lib/api/auto/gui.files.go", "gui") ||
-		shouldRebuildAssets("cmd/infra/strelaypoolsrv/auto/gui.files.go", "cmd/infra/strelaypoolsrv/gui")
-
-	if shouldRebuild {
-		rebuildAssets()
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/urfave/cli Below is the code repository: github.com/urfave/cli/ Below is the imported package path "fmt"; "time" The receiver struct definitions of the function is *Command The parameter struct definition or not exist of the function is name string The return value struct definitions or not exist of the function is any The code snippets before the function is func (a *ArgumentBase[T, C, VC]) Get() any {
+	if a.value != nil {
+		return *a.value
 	}
+	return a.Value
 }
 
-func shouldRebuildAssets(target, srcdir string) bool {
-	info, err := os.Stat(target)
+func (a *ArgumentsBase[T, C, VC]) HasName(s string) bool {
+	return s == a.Name
+}
+
+func (a *ArgumentsBase[T, C, VC]) Usage() string {
+	if a.UsageText != "" {
+		return a.UsageText
+	}
+
+	usageFormat := ""
+	if a.Min == 0 {
+		if a.Max == 1 {
+			usageFormat = "[%[1]s]"
+		} else {
+			usageFormat = "[%[1]s ...]"
+		}
+	} else {
+		usageFormat = "%[1]s [%[1]s ...]"
+	}
+	return fmt.Sprintf(usageFormat, a.Name)
+}
+
+func (a *ArgumentsBase[T, C, VC]) Parse(s []string) ([]string, error) {
+	tracef("calling arg%[1] parse with args %[2]", &a.Name, s)
+	if a.Max == 0 {
+		return s, fmt.Errorf("args %s has max 0, not parsing argument", a.Name)
+	}
+	if a.Max != -1 && a.Min > a.Max {
+		return s, fmt.Errorf("args %s has min[%d] > max[%d], not parsing argument", a.Name, a.Min, a.Max)
+	}
+
+	count := 0
+	var vc VC
+	var t T
+	value := vc.Create(a.Value, &t, a.Config)
+	a.values = []T{}
+
+	tracef("attempting arg%[1] parse", &a.Name)
+	for _, arg := range s {
+		if err := value.Set(arg); err != nil {
+			return s, fmt.Errorf("invalid value %q for argument %s: %v", arg, a.Name, err)
+		}
+		tracef("set arg%[1] one value", &a.Name, value.Get().(T))
+		a.values = append(a.values, value.Get().(T))
+		count++
+		if count >= a.Max && a.Max > -1 {
+			break
+		}
+	}
+	if count < a.Min {
+		return s, fmt.Errorf("sufficient count of arg %s not provided, given %d expected %d", a.Name, count, a.Min)
+	}
+
+	if a.Destination != nil {
+		tracef("appending destination")
+		*a.Destination = a.values // append(*a.Destination, a.values...)
+	}
+
+	return s[count:], nil
+}
+
+func (a *ArgumentsBase[T, C, VC]) Get() any {
+	if a.values != nil {
+		return a.values
+	}
+	return []T{}
+} And here is the function you are asked to complete func (c *Command) getArgValue(name string) any
+func (c *Command) getArgValue(name string) any {
+	tracef("command %s looking for args %s", c.Name, name)
+	for _, arg := range <ATTN>c.Arguments</ATTN> { <MID> 	}
+	tracef("command %s did not find args %s", c.Name, name)
+	return nil
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+		if arg.<ATTN>HasName</ATTN>(name) {
+			tracef("command %s found args %s", c.Name, name)
+			return arg.<ATTN>Get</ATTN>()
+		}<|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/staging/src/k8s.io/apiserver/pkg/server Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "context"; "crypto/tls"; "fmt"; "io"; "log"; "net"; "net/http"; "os"; "strings"; "time"; "golang.org/x/net/http2"; "k8s.io/component-base/cli/flag"; "k8s.io/klog/v2"; "k8s.io/apimachinery/pkg/util/runtime"; "k8s.io/apiserver/pkg/endpoints/metrics"; "k8s.io/apiserver/pkg/server/dynamiccertificates" The receiver struct definitions of the function is type tlsHandshakeErrorWriter struct {
+	out io.Writer
+}
+
+// Methods:
+- func (w *tlsHandshakeErrorWriter) Write(p *ast.ArrayType) ((int, error))
+ The parameter struct definition or not exist of the function is p *ast.ArrayType The return value struct definitions or not exist of the function is (int, error) The code snippets before the function is func (s *SecureServingInfo) tlsConfig(stopCh <-chan struct{}) (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		// Can't use SSLv3 because of POODLE and BEAST
+		// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
+		// Can't use TLSv1.1 because of RC4 cipher usage
+		MinVersion: tls.VersionTLS12,
+		// enable HTTP2 for go's 1.7 HTTP Server
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+
+	// these are static aspects of the tls.Config
+	if s.DisableHTTP2 {
+		klog.Info("Forcing use of http/1.1 only")
+		tlsConfig.NextProtos = []string{"http/1.1"}
+	}
+	if s.MinTLSVersion > 0 {
+		tlsConfig.MinVersion = s.MinTLSVersion
+	}
+	if len(s.CipherSuites) > 0 {
+		tlsConfig.CipherSuites = s.CipherSuites
+		insecureCiphers := flag.InsecureTLSCiphers()
+		for i := 0; i < len(s.CipherSuites); i++ {
+			for cipherName, cipherID := range insecureCiphers {
+				if s.CipherSuites[i] == cipherID {
+					klog.Warningf("Use of insecure cipher '%s' detected.", cipherName)
+				}
+			}
+		}
+	}
+
+	if s.ClientCA != nil {
+		// Populate PeerCertificates in requests, but don't reject connections without certificates
+		// This allows certificates to be validated by authenticators, while still allowing other auth types
+		tlsConfig.ClientAuth = tls.RequestClientCert
+	}
+
+	if s.ClientCA != nil || s.Cert != nil || len(s.SNICerts) > 0 {
+		dynamicCertificateController := dynamiccertificates.NewDynamicServingCertificateController(
+			tlsConfig,
+			s.ClientCA,
+			s.Cert,
+			s.SNICerts,
+			nil, // TODO see how to plumb an event recorder down in here. For now this results in simply klog messages.
+		)
+
+		if s.ClientCA != nil {
+			s.ClientCA.AddListener(dynamicCertificateController)
+		}
+		if s.Cert != nil {
+			s.Cert.AddListener(dynamicCertificateController)
+		}
+		// generate a context from stopCh. This is to avoid modifying files which are relying on apiserver
+		// TODO: See if we can pass ctx to the current method
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-stopCh:
+				cancel() // stopCh closed, so cancel our context
+			case <-ctx.Done():
+			}
+		}()
+		// start controllers if possible
+		if controller, ok := s.ClientCA.(dynamiccertificates.ControllerRunner); ok {
+			// runonce to try to prime data.  If this fails, it's ok because we fail closed.
+			// Files are required to be populated already, so this is for convenience.
+			if err := controller.RunOnce(ctx); err != nil {
+				klog.Warningf("Initial population of client CA failed: %v", err)
+			}
+
+			go controller.Run(ctx, 1)
+		}
+		if controller, ok := s.Cert.(dynamiccertificates.ControllerRunner); ok {
+			// runonce to try to prime data.  If this fails, it's ok because we fail closed.
+			// Files are required to be populated already, so this is for convenience.
+			if err := controller.RunOnce(ctx); err != nil {
+				klog.Warningf("Initial population of default serving certificate failed: %v", err)
+			}
+
+			go controller.Run(ctx, 1)
+		}
+		for _, sniCert := range s.SNICerts {
+			sniCert.AddListener(dynamicCertificateController)
+			if controller, ok := sniCert.(dynamiccertificates.ControllerRunner); ok {
+				// runonce to try to prime data.  If this fails, it's ok because we fail closed.
+				// Files are required to be populated already, so this is for convenience.
+				if err := controller.RunOnce(ctx); err != nil {
+					klog.Warningf("Initial population of SNI serving certificate failed: %v", err)
+				}
+
+				go controller.Run(ctx, 1)
+			}
+		}
+
+		// runonce to try to prime data.  If this fails, it's ok because we fail closed.
+		// Files are required to be populated already, so this is for convenience.
+		if err := dynamicCertificateController.RunOnce(); err != nil {
+			klog.Warningf("Initial population of dynamic certificates failed: %v", err)
+		}
+		go dynamicCertificateController.Run(1, stopCh)
+
+		tlsConfig.GetConfigForClient = dynamicCertificateController.GetConfigForClient
+	}
+
+	return tlsConfig, nil
+}
+
+func (s *SecureServingInfo) Serve(handler http.Handler, shutdownTimeout time.Duration, stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
+	if s.Listener == nil {
+		return nil, nil, fmt.Errorf("listener must not be nil")
+	}
+
+	tlsConfig, err := s.tlsConfig(stopCh)
 	if err != nil {
-		// If the file doesn't exist, we must rebuild it
-		return true
+		return nil, nil, err
 	}
 
-	// Check if any of the files in gui/ are newer than the asset file. If
-	// so we should rebuild it.
-	currentBuild := info.ModTime()
-	assetsAreNewer := false
-	stop := errors.New("no need to iterate further")
-	filepath.Walk(srcdir, func(path string, info os.FileInfo, err error) error {
+	secureServer := &http.Server{
+		Addr:           s.Listener.Addr().String(),
+		Handler:        handler,
+		MaxHeaderBytes: 1 << 20,
+		TLSConfig:      tlsConfig,
+
+		IdleTimeout:       90 * time.Second, // matches http.DefaultTransport keep-alive timeout
+		ReadHeaderTimeout: 32 * time.Second, // just shy of requestTimeoutUpperBound
+	}
+
+	if !s.DisableHTTP2 {
+		// At least 99% of serialized resources in surveyed clusters were smaller than 256kb.
+		// This should be big enough to accommodate most API POST requests in a single frame,
+		// and small enough to allow a per connection buffer of this size multiplied by `MaxConcurrentStreams`.
+		const resourceBody99Percentile = 256 * 1024
+
+		http2Options := &http2.Server{
+			IdleTimeout: 90 * time.Second, // matches http.DefaultTransport keep-alive timeout
+			// shrink the per-stream buffer and max framesize from the 1MB default while still accommodating most API POST requests in a single frame
+			MaxUploadBufferPerStream: resourceBody99Percentile,
+			MaxReadFrameSize:         resourceBody99Percentile,
+		}
+
+		// use the overridden concurrent streams setting or make the default of 250 explicit so we can size MaxUploadBufferPerConnection appropriately
+		if s.HTTP2MaxStreamsPerConnection > 0 {
+			http2Options.MaxConcurrentStreams = uint32(s.HTTP2MaxStreamsPerConnection)
+		} else {
+			// match http2.initialMaxConcurrentStreams used by clients
+			// this makes it so that a malicious client can only open 400 streams before we forcibly close the connection
+			// https://github.com/golang/net/commit/b225e7ca6dde1ef5a5ae5ce922861bda011cfabd
+			http2Options.MaxConcurrentStreams = 100
+		}
+
+		// increase the connection buffer size from the 1MB default to handle the specified number of concurrent streams
+		http2Options.MaxUploadBufferPerConnection = http2Options.MaxUploadBufferPerStream * int32(http2Options.MaxConcurrentStreams)
+		// apply settings to the server
+		if err := http2.ConfigureServer(secureServer, http2Options); err != nil {
+			return nil, nil, fmt.Errorf("error configuring http2: %v", err)
+		}
+	}
+
+	// use tlsHandshakeErrorWriter to handle messages of tls handshake error
+	tlsErrorWriter := &tlsHandshakeErrorWriter{os.Stderr}
+	tlsErrorLogger := log.New(tlsErrorWriter, "", 0)
+	secureServer.ErrorLog = tlsErrorLogger
+
+	klog.Infof("Serving securely on %s", secureServer.Addr)
+	return RunServer(secureServer, s.Listener, shutdownTimeout, stopCh)
+}
+
+) (<-chan struct{}, <-chan struct{}, error) {
+	if ln == nil {
+		return nil, nil, fmt.Errorf("listener must not be nil")
+	}
+
+	// Shutdown server gracefully.
+	serverShutdownCh, listenerStoppedCh := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(serverShutdownCh)
+		<-stopCh
+		ctx, cancel := context.WithTimeout(context.Background(), shutDownTimeout)
+		defer cancel()
+		err := server.Shutdown(ctx)
+		if err != nil {
+			klog.Errorf("Failed to shutdown server: %v", err)
+		}
+	}()
+
+	go func() {
+		defer utilruntime.HandleCrash()
+		defer close(listenerStoppedCh)
+
+		var listener net.Listener
+		listener = tcpKeepAliveListener{ln}
+		if server.TLSConfig != nil {
+			listener = tls.NewListener(listener, server.TLSConfig)
+		}
+
+		err := server.Serve(listener)
+
+		msg := fmt.Sprintf("Stopped listening on %s", ln.Addr().String())
+		select {
+		case <-stopCh:
+			klog.Info(msg)
+		default:
+			panic(fmt.Sprintf("%s due to error: %v", msg, err))
+		}
+	}()
+
+	return serverShutdownCh, listenerStoppedCh, nil
+}
+
+func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
+	c, err := ln.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(defaultKeepAlivePeriod)
+	}
+	return c, nil
+} And here is the function you are asked to complete func (w *tlsHandshakeErrorWriter) Write(p *ast.ArrayType) ((int, error))
+func (w *tlsHandshakeErrorWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), tlsHandshakeErrorPrefix) { <MID> 	}
+
+	// for non tls handshake error, log it as usual
+	return w.out.Write(p)
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+		<ATTN>klog.V(5).Info</ATTN>(string(p))
+		<ATTN>metrics.TLSHandshakeErrors.Inc()</ATTN>
+		<ATTN>return len(p), nil</ATTN><|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/cli Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "context"; "flag"; "os"; "path/filepath"; "strconv"; "strings"; "github.com/cockroachdb/cockroach/pkg/base"; "github.com/cockroachdb/cockroach/pkg/cli/cliflags"; "github.com/cockroachdb/cockroach/pkg/storage/fs"; "github.com/cockroachdb/cockroach/pkg/util/envutil"; "github.com/cockroachdb/cockroach/pkg/util/humanizeutil"; "github.com/cockroachdb/cockroach/pkg/util/log"; "github.com/cockroachdb/cockroach/pkg/util/log/channel"; "github.com/cockroachdb/cockroach/pkg/util/log/logconfig"; "github.com/cockroachdb/cockroach/pkg/util/log/logcrash"; "github.com/cockroachdb/cockroach/pkg/util/log/severity"; "github.com/cockroachdb/errors"; "github.com/spf13/cobra" The receiver struct definitions of the function is type stringValue struct {
+	*<ATTN>settableString</ATTN>
+}
+
+// Methods:
+- func (l *stringValue) Set(s string) error
+- func (l stringValue) Type() string
+- func (l stringValue) String() string
+ The parameter struct definition or not exist of the function is <ATTN>s string</ATTN> The return value struct definitions or not exist of the function is <ATTN>error</ATTN> The code snippets before the function is func getDefaultLogDirFromStores() (dir *string, ambiguousLogDirs bool) {
+	// Default the log directory to the "logs" subdirectory of the first
+	// non-memory store.
+	for _, spec := range serverCfg.Stores.Specs {
+		if spec.InMemory {
+			continue
+		}
+		if dir != nil {
+			ambiguousLogDirs = true
+			break
+		}
+		s := filepath.Join(spec.Path, "logs")
+		dir = &s
+	}
+
+	return
+}
+
+func newLogConfigOverrides() *logConfigFlags {
+	l := &logConfigFlags{}
+	l.fileMaxSizeVal = humanizeutil.NewBytesValue(&l.fileMaxSize)
+	l.maxGroupSizeVal = humanizeutil.NewBytesValue(&l.maxGroupSize)
+	l.reset()
+	return l
+}
+
+func (l *logConfigFlags) reset() {
+	d := logconfig.DefaultConfig()
+
+	l.logDir = settableString{}
+	l.sqlAuditLogDir = settableString{}
+	*l.fileMaxSizeVal = *humanizeutil.NewBytesValue(&l.fileMaxSize)
+	*l.maxGroupSizeVal = *humanizeutil.NewBytesValue(&l.maxGroupSize)
+	l.fileMaxSize = int64(*d.FileDefaults.MaxFileSize)
+	l.maxGroupSize = int64(*d.FileDefaults.MaxGroupSize)
+	l.fileThreshold = severity.UNKNOWN
+	l.stderrThreshold = severity.UNKNOWN
+	l.stderrNoColor = settableBool{}
+	l.redactableLogs = settableBool{}
+}
+
+func (l *logConfigFlags) anySet() bool {
+	return l.logDir.isSet ||
+		l.sqlAuditLogDir.isSet ||
+		l.fileMaxSizeVal.IsSet() ||
+		l.maxGroupSizeVal.IsSet() ||
+		l.fileThreshold.IsSet() ||
+		l.stderrThreshold.IsSet() ||
+		l.stderrNoColor.isSet ||
+		l.redactableLogs.isSet
+}
+
+) {
+	if l.logDir.isSet && l.logDir.s != "" {
+		// Note: the case where .s == "" is handled in setupLogging()
+		// above.
+		c.FileDefaults.Dir = &l.logDir.s
+	}
+	if l.fileMaxSizeVal.IsSet() {
+		s := logconfig.ByteSize(l.fileMaxSize)
+		c.FileDefaults.MaxFileSize = &s
+	}
+	if l.maxGroupSizeVal.IsSet() {
+		s := logconfig.ByteSize(l.maxGroupSize)
+		c.FileDefaults.MaxGroupSize = &s
+	}
+	if l.fileThreshold.IsSet() {
+		c.FileDefaults.Filter = l.fileThreshold
+	}
+	if l.stderrThreshold.IsSet() {
+		if l.stderrThreshold == severity.DEFAULT {
+			c.Sinks.Stderr.Filter = commandSpecificDefaultLegacyStderrOverride
+		} else {
+			c.Sinks.Stderr.Filter = l.stderrThreshold
+		}
+	}
+	if l.stderrNoColor.isSet {
+		c.Sinks.Stderr.NoColor = l.stderrNoColor.val
+	}
+	if l.redactableLogs.isSet {
+		c.FileDefaults.Redactable = &l.redactableLogs.val
+		c.Sinks.Stderr.Redactable = &l.redactableLogs.val
+	}
+} And here is the function you are asked to complete func (l *stringValue) Set(s string) error
+func (l *stringValue) Set(s string) error { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+	l.<ATTN>s</ATTN> = s
+	l.<ATTN>isSet</ATTN> = true
+	return <ATTN>nil</ATTN><|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/util/admission Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "time"; "github.com/cockroachdb/cockroach/pkg/roachpb"; "github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"; "github.com/cockroachdb/cockroach/pkg/util/metric"; "github.com/cockroachdb/cockroach/pkg/util/syncutil"; "github.com/cockroachdb/cockroach/pkg/util/timeutil"; "github.com/cockroachdb/errors"; "github.com/cockroachdb/pebble" The receiver struct definitions of the function is type kvStoreTokenGranter struct {
+	knobs             *TestingKnobs
+	regularRequester  requester
+	elasticRequester  requester
+	snapshotRequester requester
+
+	mu struct {
+		syncutil.Mutex
+		// There is no rate limiting in granting these tokens. That is, they are
+		// all burst tokens.
+
+		// The "IO" tokens represent flush/compaction capacity into/out of L0. All
+		// work deducts from both availableIOTokens and availableElasticIOTokens.
+		// Regular work blocks if availableIOTokens is <= 0 and elastic work
+		// blocks if availableElasticIOTokens <= 0.
+		availableIOTokens            [admissionpb.NumWorkClasses]int64
+		elasticIOTokensUsedByElastic int64
+		// TODO(aaditya): add support for read/IOPS tokens.
+		// Disk bandwidth tokens.
+		diskTokensAvailable diskTokens
+		diskTokensError     struct {
+			// prevObserved{Writes,Reads} is the observed disk metrics in the last
+			// call to adjustDiskTokenErrorLocked. These are used to compute the
+			// delta.
+			prevObservedWrites             uint64
+			prevObservedReads              uint64
+			diskWriteTokensAlreadyDeducted int64
+			diskReadTokensAlreadyDeducted  int64
+		}
+		diskTokensUsed [admissionpb.NumStoreWorkTypes]diskTokens
+		// exhaustedStart is the time when the corresponding availableIOTokens
+		// became <= 0. Ignored when the corresponding availableIOTokens is > 0.
+		exhaustedStart [admissionpb.NumWorkClasses]time.Time
+		// startingIOTokens is the number of tokens set by setAvailableTokens for
+		// regular work. It is used to compute the tokens used, by computing
+		// startingIOTokens-availableIOTokens[RegularWorkClass].
+		startingIOTokens int64
+
+		// Estimation models.
+		l0WriteLM, l0IngestLM, ingestLM, writeAmpLM tokensLinearModel
+	}
+
+	ioTokensExhaustedDurationMetric [admissionpb.NumWorkClasses]*metric.Counter
+	availableTokensMetric           [admissionpb.NumWorkClasses]*metric.Gauge
+	tokensReturnedMetric            *metric.Counter
+	tokensTakenMetric               *metric.Counter
+}
+
+// Methods:
+- func (sg *kvStoreTokenGranter) tryGet((workType admissionpb.StoreWorkType, count int64)) bool
+- func (sg *kvStoreTokenGranter) tryGetLocked((count int64, wt admissionpb.StoreWorkType)) bool
+- func (sg *kvStoreTokenGranter) returnGrant((workType admissionpb.StoreWorkType, count int64))
+- func (sg *kvStoreTokenGranter) returnGrantLocked((count int64, wt admissionpb.StoreWorkType))
+- func (sg *kvStoreTokenGranter) subtractTokensForStoreWorkTypeLocked((wt admissionpb.StoreWorkType, count int64))
+- func (sg *kvStoreTokenGranter) adjustDiskTokenError(m StoreMetrics)
+- func (sg *kvStoreTokenGranter) adjustDiskTokenErrorLocked((readBytes uint64, writeBytes uint64))
+- func (sg *kvStoreTokenGranter) tookWithoutPermission((workType admissionpb.StoreWorkType, count int64))
+- func (sg *kvStoreTokenGranter) tookWithoutPermissionLocked((count int64, wt admissionpb.StoreWorkType))
+- func (sg *kvStoreTokenGranter) subtractIOTokensLocked((count int64, elasticCount int64, settingAvailableTokens bool))
+- func (sg *kvStoreTokenGranter) subtractTokensLockedForWorkClass((wc admissionpb.WorkClass, count int64, settingAvailableTokens bool))
+- func (sg *kvStoreTokenGranter) tryGrant()
+- func (sg *kvStoreTokenGranter) tryGrantLocked()
+- func (sg *kvStoreTokenGranter) tryGrantLockedOne() bool
+- func (sg *kvStoreTokenGranter) setAvailableTokens((ioTokens int64, elasticIOTokens int64, diskWriteTokens int64, diskReadTokens int64, ioTokenCapacity int64, elasticIOTokenCapacity int64, diskWriteTokensCapacity int64, lastTick bool)) ((ioTokensUsed int64, ioTokensUsedByElasticWork int64))
+- func (sg *kvStoreTokenGranter) getDiskTokensUsedAndReset() usedTokens *ast.ArrayType
+- func (sg *kvStoreTokenGranter) setLinearModels((l0WriteLM tokensLinearModel, l0IngestLM tokensLinearModel, ingestLM tokensLinearModel, writeAmpLM tokensLinearModel))
+- func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmitted((wt admissionpb.StoreWorkType, originalTokens int64, admittedInfo storeReplicatedWorkAdmittedInfo, canGrantAnother bool)) additionalTokens int64
+- func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked((wt admissionpb.StoreWorkType, originalTokens int64, admittedInfo storeReplicatedWorkAdmittedInfo, canGrantAnother bool)) additionalTokens int64
+ The parameter struct definition or not exist of the function is (count int64, wt admissionpb.StoreWorkType) The return value struct definitions or not exist of the function is bool The code snippets before the function is func (cg *kvStoreTokenChildGranter) tookWithoutPermission(count int64) {
+	cg.parent.tookWithoutPermission(cg.workType, count)
+}
+
+func (cg *kvStoreTokenChildGranter) continueGrantChain(grantChainID grantChainID) {
+	// Ignore since grant chains are not used for store tokens.
+}
+
+) (additionalTokens int64) {
+	// NB: the token/metric adjustments we want to make here are the same as we
+	// want to make through the storeReplicatedWorkAdmittedLocked, so we (ab)use
+	// it. The one difference is that post token adjustments, if we observe the
+	// granter was previously exhausted but is no longer so, we're allowed to
+	// admit other waiting requests.
+	return cg.parent.storeReplicatedWorkAdmitted(
+		cg.workType, originalTokens, storeReplicatedWorkAdmittedInfo(doneInfo), true /* canGrantAnother */)
+}
+
+) (additionalTokens int64) {
+	return cg.parent.storeReplicatedWorkAdmittedLocked(cg.workType, originalTokens, admittedInfo, false /* canGrantAnother */)
+}
+
+func (sg *kvStoreTokenGranter) tryGet(workType admissionpb.StoreWorkType, count int64) bool {
+	sg.mu.Lock()
+	defer sg.mu.Unlock()
+	return sg.tryGetLocked(count, workType)
+} And here is the function you are asked to complete func (sg *kvStoreTokenGranter) tryGetLocked((count int64, wt admissionpb.StoreWorkType)) bool
+func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWorkType) bool {
+	// NB: ideally if regularRequester.hasWaitingRequests() returns true and
+	// wc==elasticWorkClass we should reject this request, since it means that
+	// more important regular work is waiting. However, we rely on the
+	// assumption that elasticWorkClass, once throttled, will have a non-empty
+	// queue, and since the only case where tryGetLocked is called for
+	// elasticWorkClass is when the queue is empty, this case should be rare
+	// (and not cause a performance isolation failure).
+
+	// NB: For disk write tokens, we apply `writeAmpLM` to account for write
+	// amplification. This model is used again later in
+	// `storeReplicatedWorkAdmittedLocked()`. There is an obvious gap in
+	// accounting here, since the model could change between the two calls for the
+	// same request. For example:
+	// (1) We have a request that requests 50 tokens, and write-amp LM is
+	//     currently 10.0x + 1. We will deduct 501 tokens for disk writes.
+	// (2) Before we adjust the actual write bytes used by the write request, the
+	//     write-amp model is updated to 5.0x + 1.
+	// (3) In `storeReplicatedWorkAdmittedLocked()`, we learn that the request
+	//     used 200 actual bytes. Now we will apply the new LM to get 251 tokens
+	//     initially deducted, and apply the LM for 1001 actual bytes used. We
+	//     will now deduct 750 additional tokens from the bucket. Now we have
+	//     deducted 1251 tokens rather than 1001.
+	// This can also go the other way, where we deduct fewer tokens than actually
+	// needed. We are generally okay with this since the model changes
+	// infrequently (every 15s), and the disk bandwidth limiter is designed to
+	// generally under admit and only pace elastic work.
+	diskWriteTokens := count
+	if wt != admissionpb.SnapshotIngestStoreWorkType {
+		// Snapshot ingests do not incur the write amplification described above, so
+		// we skip applying the model for those writes.
+		diskWriteTokens = sg.mu.writeAmpLM.applyLinearModel(count)
+	}
+	switch wt {
+	case admissionpb.RegularStoreWorkType:
+		if <ATTN></ATTN>sg.mu.availableIOTokens[admissionpb.RegularWorkClass]<ATTN></ATTN> > 0 { <MID> 		}
+	case admissionpb.ElasticStoreWorkType:
+		if sg.mu.diskTokensAvailable.writeByteTokens > 0 &&
+			<ATTN></ATTN>sg.mu.availableIOTokens[admissionpb.RegularWorkClass]<ATTN></ATTN> > 0 &&
+			<ATTN></ATTN>sg.mu.availableIOTokens[admissionpb.ElasticWorkClass]<ATTN></ATTN> > 0 {
+			<ATTN></ATTN>sg.subtractIOTokensLocked(count, count, false)<ATTN></ATTN>
+			sg.mu.elasticIOTokensUsedByElastic += count
+			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
+			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
+			return true
+		}
+	case admissionpb.SnapshotIngestStoreWorkType:
+		// Snapshot ingests do not go into L0, so we only subject them to
+		// writeByteTokens.
+		if sg.mu.diskTokensAvailable.writeByteTokens > 0 {
+			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
+			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
+			return true
+		}
+	}
+	return false
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+			sg.subtractIOTokensLocked(count, count, false)
+			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
+			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
+			return true<|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/google.golang.org/grpc Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "context"; "errors"; "fmt"; "io"; "math"; "net"; "net/http"; "reflect"; "runtime"; "strings"; "sync"; "sync/atomic"; "time"; "google.golang.org/grpc/codes"; "google.golang.org/grpc/credentials"; "google.golang.org/grpc/encoding"; "google.golang.org/grpc/encoding/proto"; "google.golang.org/grpc/experimental/stats"; "google.golang.org/grpc/grpclog"; "google.golang.org/grpc/internal"; "google.golang.org/grpc/internal/binarylog"; "google.golang.org/grpc/internal/channelz"; "google.golang.org/grpc/internal/grpcsync"; "google.golang.org/grpc/internal/grpcutil"; "google.golang.org/grpc/internal/stats"; "google.golang.org/grpc/internal/transport"; "google.golang.org/grpc/keepalive"; "google.golang.org/grpc/mem"; "google.golang.org/grpc/metadata"; "google.golang.org/grpc/peer"; "google.golang.org/grpc/stats"; "google.golang.org/grpc/status"; "google.golang.org/grpc/tap" The receiver struct definitions of the function is type listenSocket struct {
+	net.Listener
+	channelz *channelz.Socket
+}
+
+// Methods:
+- func (l *listenSocket) <ATTN>Close</ATTN>() error
+ The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is error The code snippets before the function is func (s *Server) printf(format string, a ...any) {
+	if s.events != nil {
+		s.events.Printf(format, a...)
+	}
+}
+
+func (s *Server) errorf(format string, a ...any) {
+	if s.events != nil {
+		s.events.Errorf(format, a...)
+	}
+}
+
+func (s *Server) RegisterService(sd *ServiceDesc, ss any) {
+	if ss != nil {
+		ht := reflect.TypeOf(sd.HandlerType).Elem()
+		st := reflect.TypeOf(ss)
+		if !st.Implements(ht) {
+			logger.Fatalf("grpc: Server.RegisterService found the handler of type %v that does not satisfy %v", st, ht)
+		}
+	}
+	s.register(sd, ss)
+}
+
+func (s *Server) register(sd *ServiceDesc, ss any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.printf("RegisterService(%q)", sd.ServiceName)
+	if s.serve {
+		logger.Fatalf("grpc: Server.RegisterService after Server.Serve for %q", sd.ServiceName)
+	}
+	if _, ok := s.services[sd.ServiceName]; ok {
+		logger.Fatalf("grpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
+	}
+	info := &serviceInfo{
+		serviceImpl: ss,
+		methods:     make(map[string]*MethodDesc),
+		streams:     make(map[string]*StreamDesc),
+		mdata:       sd.Metadata,
+	}
+	for i := range sd.Methods {
+		d := &sd.Methods[i]
+		info.methods[d.MethodName] = d
+	}
+	for i := range sd.Streams {
+		d := &sd.Streams[i]
+		info.streams[d.StreamName] = d
+	}
+	s.services[sd.ServiceName] = info
+}
+
+func (s *Server) GetServiceInfo() map[string]ServiceInfo {
+	ret := make(map[string]ServiceInfo)
+	for n, srv := range s.services {
+		methods := make([]MethodInfo, 0, len(srv.methods)+len(srv.streams))
+		for m := range srv.methods {
+			methods = append(methods, MethodInfo{
+				Name:           m,
+				IsClientStream: false,
+				IsServerStream: false,
+			})
+		}
+		for m, d := range srv.streams {
+			methods = append(methods, MethodInfo{
+				Name:           m,
+				IsClientStream: d.ClientStreams,
+				IsServerStream: d.ServerStreams,
+			})
+		}
+
+		ret[n] = ServiceInfo{
+			Methods:  methods,
+			Metadata: srv.mdata,
+		}
+	}
+	return ret
+} And here is the function you are asked to complete func (l *listenSocket) Close() error
+func (l *listenSocket) Close() error { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+	err := l.<ATTN>Listener</ATTN>.<ATTN>Close</ATTN>()
+	<ATTN>channelz.RemoveEntry</ATTN>(l.<ATTN>channelz.ID</ATTN>)
+	<ATTN>channelz.Info</ATTN>(logger, l.channelz, "ListenSocket deleted")
+	return err<|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/cmd/cloud-controller-manager Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "context"; "errors"; "fmt"; "net"; "strings"; "k8s.io/cloud-provider"; "k8s.io/cloud-provider/app"; "k8s.io/cloud-provider/app/config"; "k8s.io/controller-manager/app"; "k8s.io/controller-manager/controller"; "k8s.io/klog/v2"; "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"; "k8s.io/kubernetes/pkg/controller/nodeipam"; "k8s.io/kubernetes/pkg/controller/nodeipam/config"; "k8s.io/kubernetes/pkg/controller/nodeipam/ipam"; "k8s.io/utils/net" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is (ctx context.Context, initContext app.ControllerInitContext, ccmConfig *cloudcontrollerconfig.CompletedConfig, nodeIPAMConfig nodeipamconfig.NodeIPAMControllerConfiguration, controllerCtx genericcontrollermanager.ControllerContext, cloud cloudprovider.Interface) The return value struct definitions or not exist of the function is (controller.Interface, bool, error) The code snippets before the function is func (nodeIpamController *nodeIPAMController) StartNodeIpamControllerWrapper(initContext app.ControllerInitContext, completedConfig *cloudcontrollerconfig.CompletedConfig, cloud cloudprovider.Interface) app.InitFunc {
+	allErrors := nodeIpamController.nodeIPAMControllerOptions.Validate()
+	if len(allErrors) > 0 {
+		klog.Fatal("NodeIPAM controller values are not properly set.")
+	}
+	nodeIpamController.nodeIPAMControllerOptions.ApplyTo(&nodeIpamController.nodeIPAMControllerConfiguration)
+
+	return func(ctx context.Context, controllerContext genericcontrollermanager.ControllerContext) (controller.Interface, bool, error) {
+		return startNodeIpamController(ctx, initContext, completedConfig, nodeIpamController.nodeIPAMControllerConfiguration, controllerContext, cloud)
+	}
+} And here is the function you are asked to complete func startNodeIpamController((ctx context.Context, initContext app.ControllerInitContext, ccmConfig *cloudcontrollerconfig.CompletedConfig, nodeIPAMConfig nodeipamconfig.NodeIPAMControllerConfiguration, controllerCtx genericcontrollermanager.ControllerContext, cloud cloudprovider.Interface)) ((controller.Interface, bool, error))
+func startNodeIpamController(ctx context.Context, initContext app.ControllerInitContext, ccmConfig *cloudcontrollerconfig.CompletedConfig, nodeIPAMConfig nodeipamconfig.NodeIPAMControllerConfiguration, controllerCtx genericcontrollermanager.ControllerContext, cloud cloudprovider.Interface) (controller.Interface, bool, error) {
+	var serviceCIDR *net.IPNet
+	var secondaryServiceCIDR *net.IPNet
+
+	// should we start nodeIPAM
+	if !ccmConfig.ComponentConfig.KubeCloudShared.AllocateNodeCIDRs {
+		return nil, false, nil
+	}
+
+	// Cannot run cloud ipam controller if cloud provider is nil (--cloud-provider not set or set to 'external')
+	if cloud == nil && ccmConfig.ComponentConfig.KubeCloudShared.CIDRAllocatorType == string(ipam.CloudAllocatorType) {
+		return nil, false, errors.New("--cidr-allocator-type is set to 'CloudAllocator' but cloud provider is not configured")
+	}
+
+	// failure: bad cidrs in config
+	clusterCIDRs, dualStack, err := processCIDRs(ccmConfig.ComponentConfig.KubeCloudShared.ClusterCIDR)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// failure: more than one cidr but they are not configured as dual stack
+	if len(clusterCIDRs) > 1 && !dualStack {
+		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and they are not configured as dual stack (at least one from each IPFamily", len(clusterCIDRs))
+	}
+
+	// failure: more than cidrs is not allowed even with dual stack
+	if len(clusterCIDRs) > 2 {
+		return nil, false, fmt.Errorf("len of clusters is:%v > more than max allowed of 2", len(clusterCIDRs))
+	}
+
+	// service cidr processing
+	if len(strings.TrimSpace(nodeIPAMConfig.ServiceCIDR)) != 0 { <MID> 	}
+
+	if len(strings.TrimSpace(nodeIPAMConfig.SecondaryServiceCIDR)) != 0 {
+		_, secondaryServiceCIDR, err = netutils.ParseCIDRSloppy(nodeIPAMConfig.SecondaryServiceCIDR)
+		if err != nil {
+			klog.ErrorS(err, "Unsuccessful parsing of service CIDR", "CIDR", nodeIPAMConfig.SecondaryServiceCIDR)
+		}
+	}
+
+	// the following checks are triggered if both serviceCIDR and secondaryServiceCIDR are provided
+	if serviceCIDR != nil && secondaryServiceCIDR != nil {
+		// should be dual stack (from different IPFamilies)
+		dualstackServiceCIDR, err := netutils.IsDualStackCIDRs([]*net.IPNet{serviceCIDR, secondaryServiceCIDR})
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to perform dualstack check on serviceCIDR and secondaryServiceCIDR error:%v", err)
+		}
+		if !dualstackServiceCIDR {
+			return nil, false, fmt.Errorf("serviceCIDR and secondaryServiceCIDR are not dualstack (from different IPfamiles)")
+		}
+	}
+
+	nodeCIDRMaskSizes, err := setNodeCIDRMaskSizes(nodeIPAMConfig, clusterCIDRs)
+	if err != nil {
+		return nil, false, err
+	}
+
+	nodeIpamController, err := nodeipamcontroller.NewNodeIpamController(
+		ctx,
+		controllerCtx.InformerFactory.Core().V1().Nodes(),
+		cloud,
+		controllerCtx.ClientBuilder.ClientOrDie(initContext.ClientName),
+		clusterCIDRs,
+		serviceCIDR,
+		secondaryServiceCIDR,
+		nodeCIDRMaskSizes,
+		ipam.CIDRAllocatorType(ccmConfig.ComponentConfig.KubeCloudShared.CIDRAllocatorType),
+	)
+	if err != nil {
+		return nil, true, err
+	}
+	go nodeIpamController.Run(ctx)
+	return nil, true, nil
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+		_, <ATTN>serviceCIDR</ATTN>, err = <ATTN>netutils.ParseCIDRSloppy</ATTN>(<ATTN>nodeIPAMConfig.ServiceCIDR</ATTN>)
+		if err != nil {
+			<ATTN>klog.ErrorS</ATTN>(err, "Unsuccessful parsing of service CIDR", "CIDR", <ATTN>nodeIPAMConfig.ServiceCIDR</ATTN>)
+		}<|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/github.com/gogo/protobuf/proto Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "errors"; "fmt"; "math"; "reflect"; "sort"; "strconv"; "strings"; "sync"; "sync/atomic"; "unicode/utf8" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is pb Message The return value struct definitions or not exist of the function is (*ast.ArrayType, error) The code snippets before the function is func (u *marshalInfo) sizeMessageSet(ext *XXX_InternalExtensions) int {
+	m, mu := ext.extensionsRead()
+	if m == nil {
+		return 0
+	}
+	mu.Lock()
+
+	n := 0
+	for id, e := range m {
+		n += 2                          // start group, end group. tag = 1 (size=1)
+		n += SizeVarint(uint64(id)) + 1 // type_id, tag = 2 (size=1)
+
+		if e.value == nil || e.desc == nil {
+			// Extension is only in its encoded form.
+			msgWithLen := skipVarint(e.enc) // skip old tag, but leave the length varint
+			siz := len(msgWithLen)
+			n += siz + 1 // message, tag = 3 (size=1)
+			continue
+		}
+
+		// We don't skip extensions that have an encoded form set,
+		// because the extension value may have been mutated after
+		// the last time this function was called.
+
+		ei := u.getExtElemInfo(e.desc)
+		v := e.value
+		p := toAddrPointer(&v, ei.isptr)
+		n += ei.sizer(p, 1) // message, tag = 3 (size=1)
+	}
+	mu.Unlock()
+	return n
+}
+
+func (u *marshalInfo) appendMessageSet(b []byte, ext *XXX_InternalExtensions, deterministic bool) ([]byte, error) {
+	m, mu := ext.extensionsRead()
+	if m == nil {
+		return b, nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+
+	var err error
+	var nerr nonFatal
+
+	// Fast-path for common cases: zero or one extensions.
+	// Don't bother sorting the keys.
+	if len(m) <= 1 {
+		for id, e := range m {
+			b = append(b, 1<<3|WireStartGroup)
+			b = append(b, 2<<3|WireVarint)
+			b = appendVarint(b, uint64(id))
+
+			if e.value == nil || e.desc == nil {
+				// Extension is only in its encoded form.
+				msgWithLen := skipVarint(e.enc) // skip old tag, but leave the length varint
+				b = append(b, 3<<3|WireBytes)
+				b = append(b, msgWithLen...)
+				b = append(b, 1<<3|WireEndGroup)
+				continue
+			}
+
+			// We don't skip extensions that have an encoded form set,
+			// because the extension value may have been mutated after
+			// the last time this function was called.
+
+			ei := u.getExtElemInfo(e.desc)
+			v := e.value
+			p := toAddrPointer(&v, ei.isptr)
+			b, err = ei.marshaler(b, p, 3<<3|WireBytes, deterministic)
+			if !nerr.Merge(err) {
+				return b, err
+			}
+			b = append(b, 1<<3|WireEndGroup)
+		}
+		return b, nerr.E
+	}
+
+	// Sort the keys to provide a deterministic encoding.
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, int(k))
+	}
+	sort.Ints(keys)
+
+	for _, id := range keys {
+		e := m[int32(id)]
+		b = append(b, 1<<3|WireStartGroup)
+		b = append(b, 2<<3|WireVarint)
+		b = appendVarint(b, uint64(id))
+
+		if e.value == nil || e.desc == nil {
+			// Extension is only in its encoded form.
+			msgWithLen := skipVarint(e.enc) // skip old tag, but leave the length varint
+			b = append(b, 3<<3|WireBytes)
+			b = append(b, msgWithLen...)
+			b = append(b, 1<<3|WireEndGroup)
+			continue
+		}
+
+		// We don't skip extensions that have an encoded form set,
+		// because the extension value may have been mutated after
+		// the last time this function was called.
+
+		ei := u.getExtElemInfo(e.desc)
+		v := e.value
+		p := toAddrPointer(&v, ei.isptr)
+		b, err = ei.marshaler(b, p, 3<<3|WireBytes, deterministic)
+		b = append(b, 1<<3|WireEndGroup)
+		if !nerr.Merge(err) {
+			return b, err
+		}
+	}
+	return b, nerr.E
+}
+
+func (u *marshalInfo) sizeV1Extensions(m map[int32]Extension) int {
+	if m == nil {
+		return 0
+	}
+
+	n := 0
+	for _, e := range m {
+		if e.value == nil || e.desc == nil {
+			// Extension is only in its encoded form.
+			n += len(e.enc)
+			continue
+		}
+
+		// We don't skip extensions that have an encoded form set,
+		// because the extension value may have been mutated after
+		// the last time this function was called.
+
+		ei := u.getExtElemInfo(e.desc)
+		v := e.value
+		p := toAddrPointer(&v, ei.isptr)
+		n += ei.sizer(p, ei.tagsize)
+	}
+	return n
+}
+
+func (u *marshalInfo) appendV1Extensions(b []byte, m map[int32]Extension, deterministic bool) ([]byte, error) {
+	if m == nil {
+		return b, nil
+	}
+
+	// Sort the keys to provide a deterministic encoding.
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, int(k))
+	}
+	sort.Ints(keys)
+
+	var err error
+	var nerr nonFatal
+	for _, k := range keys {
+		e := m[int32(k)]
+		if e.value == nil || e.desc == nil {
+			// Extension is only in its encoded form.
+			b = append(b, e.enc...)
+			continue
+		}
+
+		// We don't skip extensions that have an encoded form set,
+		// because the extension value may have been mutated after
+		// the last time this function was called.
+
+		ei := u.getExtElemInfo(e.desc)
+		v := e.value
+		p := toAddrPointer(&v, ei.isptr)
+		b, err = ei.marshaler(b, p, ei.wiretag, deterministic)
+		if !nerr.Merge(err) {
+			return b, err
+		}
+	}
+	return b, nerr.E
+}
+
+func Size(pb Message) int {
+	if m, ok := pb.(newMarshaler); ok {
+		return m.XXX_Size()
+	}
+	if m, ok := pb.(Marshaler); ok {
+		// If the message can marshal itself, let it do it, for compatibility.
+		// NOTE: This is not efficient.
+		b, _ := m.Marshal()
+		return len(b)
+	}
+	// in case somehow we didn't generate the wrapper
+	if pb == nil {
+		return 0
+	}
+	var info InternalMessageInfo
+	return info.Size(pb)
+} And here is the function you are asked to complete func Marshal(pb Message) ((*ast.ArrayType, error))
+func Marshal(pb Message) ([]byte, error) {
+	if m, ok := pb.(newMarshaler); ok { <MID> 	}
+	if m, ok := pb.(Marshaler); ok {
+		// If the message can marshal itself, let it do it, for compatibility.
+		// NOTE: This is not efficient.
+		return m.Marshal()
+	}
+	// in case somehow we didn't generate the wrapper
+	if pb == nil {
+		return nil, ErrNil
+	}
+	var info InternalMessageInfo
+	siz := info.Size(pb)
+	b := make([]byte, 0, siz)
+	return info.Marshal(b, pb, false)
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant
+		siz := <ATTN>m.XXX_Size()</ATTN>
+		b := make([]byte, 0, siz)
+		return <ATTN>m.XXX_Marshal(b, false)</ATTN><|im_end|>
+```
+
+```go
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/go.etcd.io/etcd/server/v3/internal/clientv2 Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "bytes"; "context"; "encoding/json"; "net/http"; "net/url"; "path" The receiver struct definitions of the function is type authUserAPIList struct{}
+
+// Methods:
+- func (list *authUserAPIList) HTTPRequest(ep url.URL) *http.Request
+ The parameter struct definition or not exist of the function is ep url.URL The return value struct definitions or not exist of the function is *http.Request The code snippets before the function is func (s *httpAuthAPI) Disable(ctx context.Context) error {
+	return s.enableDisable(ctx, &authAPIAction{http.MethodDelete})
+}
+
+func (s *httpAuthAPI) enableDisable(ctx context.Context, req httpAction) error {
+	resp, body, err := s.client.Do(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err = assertStatusCode(resp.StatusCode, http.StatusOK, http.StatusCreated); err != nil {
+		var sec authError
+		err = json.Unmarshal(body, &sec)
 		if err != nil {
 			return err
 		}
-		if info.ModTime().After(currentBuild) {
-			assetsAreNewer = true
-			return stop
-		}
-		return nil
-	})
-
-	return assetsAreNewer
+		return sec
+	}
+	return nil
 }
 
-func updateDependencies() {
-	// Figure out desired Go version
-	bs, err := os.ReadFile("go.mod")
-	if err != nil {
-		log.Fatal(err)
-	}
-	re := regexp.MustCompile(`(?m)^go\s+([0-9.]+)`)
-	matches := re.FindSubmatch(bs)
-	if len(matches) != 2 {
-		log.Fatal("failed to parse go.mod")
-	}
-	goVersion := string(matches[1])
-
-	runPrint(goCmd, "get", "-u", "./...")
-	runPrint(goCmd, "mod", "tidy", "-go="+goVersion, "-compat="+goVersion)
-
-	// We might have updated the protobuf package and should regenerate to match.
-	proto()
+func (e authError) Error() string {
+	return e.Message
 }
 
-func proto() {
-	// buf needs to be installed
-	// https://buf.build/docs/installation/
-	runPrint("buf", "generate")
-} And here is the function you are asked to complete func testmocks()
-func <ATTN>testmocks</ATTN>() {
-	<ATTN>args</ATTN> := <ATTN>[]string</ATTN>{
-		"generate",
-		"github.com/syncthing/syncthing/lib/config",
-		"github.com/syncthing/syncthing/lib/connections",
-		"github.com/syncthing/syncthing/lib/discover",
-		"github.com/syncthing/syncthing/lib/events",
-		"github.com/syncthing/syncthing/lib/model",
-		"github.com/syncthing/syncthing/lib/protocol", <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
+func NewAuthUserAPI(c Client) AuthUserAPI {
+	return &httpAuthUserAPI{
+		client: c,
+	}
+} And here is the function you are asked to complete func (list *authUserAPIList) HTTPRequest(ep url.URL) *http.Request
+func (list *authUserAPIList) HTTPRequest(ep url.URL) *http.Request { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
 <|im_start|>assistant
-	}
-	runPrint(goCmd, args...)<|im_end|>
+	u := <ATTN>v2AuthURL</ATTN>(ep, <ATTN>"users"</ATTN>, <ATTN>""</ATTN>)
+	req, _ := http.<ATTN>NewRequest</ATTN>(<ATTN>http.MethodGet</ATTN>, u.<ATTN>String</ATTN>(), nil)
+	req.Header.Set(<ATTN>"Content-Type"</ATTN>, <ATTN>"application/json"</ATTN>)
+	return req<|im_end|>
 ```
 
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/util/mon Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "context"; "fmt"; "io"; "math"; "strconv"; "strings"; "unsafe"; "github.com/cockroachdb/cockroach/pkg/settings"; "github.com/cockroachdb/cockroach/pkg/settings/cluster"; "github.com/cockroachdb/cockroach/pkg/util"; "github.com/cockroachdb/cockroach/pkg/util/buildutil"; "github.com/cockroachdb/cockroach/pkg/util/envutil"; "github.com/cockroachdb/cockroach/pkg/util/humanizeutil"; "github.com/cockroachdb/cockroach/pkg/util/ioctx"; "github.com/cockroachdb/cockroach/pkg/util/log"; "github.com/cockroachdb/cockroach/pkg/util/log/logcrash"; "github.com/cockroachdb/cockroach/pkg/util/metric"; "github.com/cockroachdb/cockroach/pkg/util/syncutil"; "github.com/cockroachdb/cockroach/pkg/util/uuid"; "github.com/cockroachdb/errors"; "github.com/cockroachdb/redact"; "github.com/dustin/go-humanize" The receiver struct definitions of the function is type BytesMonitor struct {
-	mu struct {
-		syncutil.Mutex
-
-		// curAllocated tracks the current amount of bytes allocated at this
-		// monitor by its client components.
-		curAllocated int64
-
-		// maxAllocated tracks the high water mark of allocations. Used for
-		// monitoring.
-		maxAllocated int64
-
-		// curBudget represents the budget allocated at the pool on behalf of
-		// this monitor.
-		curBudget BoundAccount
-
-		//  Both fields below are protected by the mutex because they might be
-		//  updated after the monitor has been instantiated.
-
-		// curBytesCount is the metric object used to track number of bytes
-		// reserved by the monitor during its lifetime.
-		curBytesCount *metric.Gauge
-
-		// maxBytesHist is the metric object used to track the high watermark of bytes
-		// allocated by the monitor during its lifetime.
-		maxBytesHist metric.IHistogram
-
-		// head is the head of the doubly-linked list of children of this
-		// monitor.
-		// NOTE: a child's mutex **cannot** be acquired while holding this
-		// monitor's lock since it could lead to deadlocks. The main allocation
-		// code path (reserveBytes() and releaseBytes()) might acquire the
-		// parent's lock, so only locking "upwards" is allowed while keeping the
-		// current monitor's lock.
-		head *BytesMonitor
-
-		// stopped indicates whether this monitor has been stopped.
-		stopped bool
-
-		// relinquishAllOnReleaseBytes, if true, indicates that the monitor should
-		// relinquish all bytes on releaseBytes() call.
-		// NB: this field doesn't need mutex protection but is inside of mu
-		// struct in order to reduce the struct size.
-		relinquishAllOnReleaseBytes bool
-
-		// tracksDisk indicates whether this monitor is for tracking disk
-		// resources.
-		// NB: this field doesn't need mutex protection but is inside of mu
-		// struct in order to reduce the struct size.
-		tracksDisk bool
-
-		// rootSQLMonitor indicates whether this monitor is the root SQL memory
-		// monitor (in which case, memory budget exceeded errors should have a
-		// hint to increase --max-sql-memory parameter).
-		// NB: this field doesn't need mutex protection but is inside of mu
-		// struct in order to reduce the struct size.
-		rootSQLMonitor bool
-
-		// longLiving indicates whether lifetime of this monitor matches the
-		// server's life, and as such, this monitor is exempted from having to
-		// be stopped when its ancestor monitor is stopped.
-		// NB: this field doesn't need mutex protection but is inside of mu
-		// struct in order to reduce the struct size.
-		<ATTN>longLiving</ATTN> bool
-	}
-
-	// parentMu encompasses the fields that must be accessed while holding the
-	// mutex of the parent monitor.
-	parentMu struct {
-		// prevSibling and nextSibling are references to the previous and the
-		// next siblings of this monitor (i.e. the previous and the next nodes
-		// in the doubly-linked list of children of the parent monitor).
-		prevSibling, nextSibling *BytesMonitor
-	}
-
-	// name identifies this monitor in logging messages.
-	name Name
-
-	// reserved indicates how many bytes were already reserved for this
-	// monitor before it was instantiated. Allocations registered to
-	// this monitor are first deducted from this budget. If there is no
-	// pool, reserved determines the maximum allocation capacity of this
-	// monitor. The reserved bytes are released to their owner monitor
-	// upon Stop.
-	reserved *BoundAccount
-
-	// limit specifies a hard limit on the number of bytes a monitor allows to
-	// be allocated. Note that this limit will not be observed if allocations
-	// hit constraints on the owner monitor. This is useful to limit allocations
-	// when an owner monitor has a larger capacity than wanted but should still
-	// keep track of allocations made through this monitor. Note that child
-	// monitors are affected by this limit.
-	//
-	// limit is computed from configLimit, the parent monitor and the
-	// reserved budget during Start().
-	limit int64
-
-	// configLimit is the limit configured when the monitor is created.
-	configLimit int64
-
-	// poolAllocationSize specifies the allocation unit for requests to the
-	// pool.
-	poolAllocationSize int64
-
-	settings *cluster.Settings
-}
-
-// Methods:
-- func (mm *BytesMonitor) TraverseTree(monitorStateCb *ast.FuncType) error
-- func (mm *BytesMonitor) traverseTree((level int, monitorStateCb *ast.FuncType)) error
-- func (mm *BytesMonitor) MarkAsRootSQLMonitor()
-- func (mm *BytesMonitor) StartNoReserved((ctx context.Context, pool *BytesMonitor))
-- func (mm *BytesMonitor) Start((ctx context.Context, pool *BytesMonitor, reserved *BoundAccount))
-- func (mm *BytesMonitor) EmergencyStop(ctx context.Context)
-- func (mm *BytesMonitor) Stop(ctx context.Context)
-- func (mm *BytesMonitor) Name() Name
-- func (mm *BytesMonitor) Limit() int64
-- func (mm *BytesMonitor) MarkLongLiving()
-- func (mm *BytesMonitor) doStop((ctx context.Context, check bool))
-- func (mm *BytesMonitor) MaximumBytes() int64
-- func (mm *BytesMonitor) AllocBytes() int64
-- func (mm *BytesMonitor) SetMetrics((curCount *metric.Gauge, maxHist metric.IHistogram))
-- func (mm *BytesMonitor) Resource() Resource
-- func (mm *BytesMonitor) MakeBoundAccount() BoundAccount
-- func (mm *BytesMonitor) MakeEarmarkedBoundAccount() EarmarkedBoundAccount
-- func (mm *BytesMonitor) MakeConcurrentBoundAccount() *ConcurrentBoundAccount
-- func (mm *BytesMonitor) TransferAccount((ctx context.Context, origAccount *BoundAccount)) ((newAccount BoundAccount, err error))
-- func (mm *BytesMonitor) makeBudgetExceededError(minExtra int64) error
-- func (mm *BytesMonitor) reserveBytes((ctx context.Context, x int64)) error
-- func (mm *BytesMonitor) releaseBytes((ctx context.Context, sz int64))
-- func (mm *BytesMonitor) releaseBytesLocked((ctx context.Context, sz int64))
-- func (mm *BytesMonitor) increaseBudget((ctx context.Context, minExtra int64)) error
-- func (mm *BytesMonitor) roundSize(sz int64) int64
-- func (mm *BytesMonitor) releaseBudget(ctx context.Context)
-- func (mm *BytesMonitor) RelinquishAllOnReleaseBytes()
-- func (mm *BytesMonitor) adjustBudget(ctx context.Context)
- The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is not exist The code snippets before the function is func NewUnlimitedMonitor(ctx context.Context, args Options) *BytesMonitor {
-	if log.V(2) {
-		log.Dev.InfofDepth(ctx, 1, "%s: starting unlimited monitor", args.Name)
-	}
-	// The limit is expected to not be set, but let's be conservative.
-	args.Limit = math.MaxInt64
-	m := NewMonitor(args)
-	m.reserved = NewStandaloneBudget(math.MaxInt64)
-	return m
-}
-
-func (mm *BytesMonitor) EmergencyStop(ctx context.Context) {
-	mm.doStop(ctx, false)
-}
-
-func (mm *BytesMonitor) Stop(ctx context.Context) {
-	mm.doStop(ctx, true)
-}
-
-func (mm *BytesMonitor) Name() Name {
-	return mm.name
-}
-
-func (mm *BytesMonitor) Limit() int64 {
-	return mm.limit
-} And here is the function you are asked to complete func (mm *BytesMonitor) MarkLongLiving()
-func (mm *BytesMonitor) MarkLongLiving() { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-	mm.mu.longLiving = true<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/influxdata/influxdb/influxql/query Below is the code repository: github.com/influxdata/influxdb/ Below is the imported package path "container/heap"; "context"; "io"; "sort"; "sync"; "time"; "github.com/influxdata/influxql"; "google.golang.org/protobuf/proto" The receiver struct definitions of the function is type integerIteratorScanner struct {
-	input        *bufIntegerIterator
-	err          error
-	keys         []influxql.VarRef
-	defaultValue interface{}
-}
-
-// Methods:
-- func (s *integerIteratorScanner) Peek() ((int64, string, Tags))
-- func (s *integerIteratorScanner) ScanAt((ts int64, name string, tags Tags, m *ast.MapType))
-- func (s *integerIteratorScanner) useDefaults(m *ast.MapType)
-- func (s *integerIteratorScanner) Stats() IteratorStats
-- func (s *integerIteratorScanner) Err() error
-- func (s *integerIteratorScanner) Close() error
- The parameter struct definition or not exist of the function is (ts int64, name string, tags Tags, m *ast.MapType) The return value struct definitions or not exist of the function is not exist The code snippets before the function is func (h *integerSortedMergeHeap) Less(i, j int) bool {
-	x, y := h.items[i].point, h.items[j].point
-
-	if h.opt.Ascending {
-		if x.Name != y.Name {
-			return x.Name < y.Name
-		} else if xTags, yTags := x.Tags.Subset(h.opt.Dimensions), y.Tags.Subset(h.opt.Dimensions); !xTags.Equals(&yTags) {
-			return xTags.ID() < yTags.ID()
-		}
-
-		if x.Time != y.Time {
-			return x.Time < y.Time
-		}
-
-		if len(x.Aux) > 0 && len(x.Aux) == len(y.Aux) {
-			for i := 0; i < len(x.Aux); i++ {
-				v1, ok1 := x.Aux[i].(string)
-				v2, ok2 := y.Aux[i].(string)
-				if !ok1 || !ok2 {
-					// Unsupported types used in Aux fields. Maybe they
-					// need to be added here?
-					return false
-				} else if v1 == v2 {
-					continue
-				}
-				return v1 < v2
-			}
-		}
-		return false // Times and/or Aux fields are equal.
-	}
-
-	if x.Name != y.Name {
-		return x.Name > y.Name
-	} else if xTags, yTags := x.Tags.Subset(h.opt.Dimensions), y.Tags.Subset(h.opt.Dimensions); !xTags.Equals(&yTags) {
-		return xTags.ID() > yTags.ID()
-	}
-
-	if x.Time != y.Time {
-		return x.Time > y.Time
-	}
-
-	if len(x.Aux) > 0 && len(x.Aux) == len(y.Aux) {
-		for i := 0; i < len(x.Aux); i++ {
-			v1, ok1 := x.Aux[i].(string)
-			v2, ok2 := y.Aux[i].(string)
-			if !ok1 || !ok2 {
-				// Unsupported types used in Aux fields. Maybe they
-				// need to be added here?
-				return false
-			} else if v1 == v2 {
-				continue
-			}
-			return v1 > v2
-		}
-	}
-	return false // Times and/or Aux fields are equal.
-}
-
-func (h *integerSortedMergeHeap) Push(x interface{}) {
-	h.items = append(h.items, x.(*integerSortedMergeHeapItem))
-}
-
-func (h *integerSortedMergeHeap) Pop() interface{} {
-	old := h.items
-	n := len(old)
-	item := old[n-1]
-	h.items = old[0 : n-1]
-	return item
-}
-
-func newIntegerIteratorScanner(input IntegerIterator, keys []influxql.VarRef, defaultValue interface{}) *integerIteratorScanner {
-	return &integerIteratorScanner{
-		input:        newBufIntegerIterator(input),
-		keys:         keys,
-		defaultValue: defaultValue,
-	}
-}
-
-func (s *integerIteratorScanner) Peek() (int64, string, Tags) {
-	if s.err != nil {
-		return ZeroTime, "", Tags{}
-	}
-
-	p, err := s.input.peek()
-	if err != nil {
-		s.err = err
-		return ZeroTime, "", Tags{}
-	} else if p == nil {
-		return ZeroTime, "", Tags{}
-	}
-	return p.Time, p.Name, p.Tags
-} And here is the function you are asked to complete func (s *integerIteratorScanner) ScanAt((ts int64, name string, tags Tags, m *ast.MapType))
-func (s *integerIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[string]interface{}) {
-	if s.err != nil {
-		return
-	}
-
-	p, err := s.input.Next()
-	if err != nil {
-		s.err = err
-		return
-	} else if p == nil {
-		s.useDefaults(m)
-		return
-	} else if p.Time != ts || p.Name != name || !p.Tags.Equals(&tags) {
-		s.useDefaults(m)
-		s.input.unread(p)
-		return
-	}
-
-	if k := s.keys[0]; k.Val != "" {
-		if <ATTN>p.Nil</ATTN> { <MID> 		}
-	}
-	for i, v := range p.Aux {
-		k := s.keys[i+1]
-		switch v.(type) {
-		case float64, int64, uint64, string, bool:
-			m[k.Val] = v
-		default:
-			// Insert the fill value if one was specified.
-			if s.<ATTN>defaultValue</ATTN> != <ATTN>SkipDefault</ATTN> {
-				m[k.Val] = <ATTN>castToType</ATTN>(s.defaultValue, k.Type)
-			}
-		}
-	}
-} Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-			if s.defaultValue != SkipDefault {
-				m[k.Val] = castToType(s.defaultValue, k.Type)
-			}
-		} else {
-			m[k.Val] = p.Value<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/olivere/elastic Below is the code repository: github.com/olivere/elastic/ Below is the imported package path not exist The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is FuzzyLikeThisQuery
-
-// Type FuzzyLikeThisQuery definition:
-type FuzzyLikeThisQuery struct {
-	Query
-
-	<ATTN>fields</ATTN>                 []string
-	boost                  *float32
-	likeText               *string
-	fuzziness              interface{}
-	prefixLength           *int
-	maxQueryTerms          *int
-	ignoreTF               *bool
-	analyzer               string
-	failOnUnsupportedField *bool
-	queryName              string
-}
-// Methods:
-- func (q FuzzyLikeThisQuery) Field(field string) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) Fields(fields *ast.Ellipsis) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) LikeText(likeText string) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) Fuzziness(fuzziness *ast.InterfaceType) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) PrefixLength(prefixLength int) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) MaxQueryTerms(maxQueryTerms int) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) IgnoreTF(ignoreTF bool) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) Analyzer(analyzer string) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) Boost(boost float32) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) FailOnUnsupportedField(fail bool) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) QueryName(queryName string) FuzzyLikeThisQuery
-- func (q FuzzyLikeThisQuery) Source() *ast.InterfaceType
- The code snippets before the function is not exist And here is the function you are asked to complete func NewFuzzyLikeThisQuery() FuzzyLikeThisQuery
-func <ATTN>NewFuzzyLikeThisQuery</ATTN>() FuzzyLikeThisQuery { <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-	q := FuzzyLikeThisQuery{
-		fields: make([]string, 0),
-	}
-	return q<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/olivere/elastic Below is the code repository: github.com/olivere/elastic/ Below is the imported package path not exist The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is parentType string The return value struct definitions or not exist of the function is HasParentFilter
-
-// Type HasParentFilter definition:
-type HasParentFilter struct {
-	filter     Filter
-	query      Query
-	parentType string
-	filterName string
-	cache      *bool
-	cacheKey   string
-	innerHit   *InnerHit
-}
-// Methods:
-- func (f HasParentFilter) Query(query Query) HasParentFilter
-- func (f HasParentFilter) Filter(filter Filter) HasParentFilter
-- func (f HasParentFilter) FilterName(filterName string) HasParentFilter
-- func (f HasParentFilter) Cache(cache bool) HasParentFilter
-- func (f HasParentFilter) CacheKey(cacheKey string) HasParentFilter
-- func (f HasParentFilter) InnerHit(innerHit *InnerHit) HasParentFilter
-- func (f HasParentFilter) Source() *ast.InterfaceType
- The code snippets before the function is not exist And here is the function you are asked to complete func NewHasParentFilter(parentType string) HasParentFilter
-func NewHasParentFilter(parentType string) HasParentFilter {
-	f := HasParentFilter{
-		<ATTN>parentType</ATTN>: parentType, <MID> } Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-	}
-	return f<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/github.com/soheilhy/cmux Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "errors"; "fmt"; "io"; "net"; "sync"; "time" The receiver struct definitions of the function is not exist The parameter struct definition or not exist of the function is matchers *ast.ArrayType The return value struct definitions or not exist of the function is *ast.ArrayType The code snippets before the function is func (e ErrNotMatched) Timeout() bool { return false }
-
-func (e errListenerClosed) Error() string   { return string(e) }
-
-func (e errListenerClosed) Temporary() bool { return false }
-
-func (e errListenerClosed) Timeout() bool   { return false }
-
-func New(l net.Listener) CMux {
-	return &cMux{
-		root:        l,
-		bufLen:      1024,
-		errh:        func(_ error) bool { return true },
-		donec:       make(chan struct{}),
-		readTimeout: noTimeout,
-	}
-} And here is the function you are asked to complete func matchersToMatchWriters(matchers *ast.ArrayType) *ast.ArrayType
-func matchersToMatchWriters(matchers []<ATTN>Matcher</ATTN>) []MatchWriter {
-	mws := make([]MatchWriter, 0, len(matchers))
-	<ATTN>for</ATTN> _, m := range <ATTN>matchers</ATTN> { <MID> 	}
-	return mws
-} Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-		cm := m
-		mws = append(mws, func(w io.Writer, r io.Reader) bool {
-			return cm(r)
-		})<|im_end|>
-```
-
-```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/sql/opt/xform Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "bytes"; "fmt"; "sort"; "github.com/cockroachdb/cockroach/pkg/sql/opt"; "github.com/cockroachdb/cockroach/pkg/sql/opt/cycle"; "github.com/cockroachdb/cockroach/pkg/sql/opt/memo"; "github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"; "github.com/cockroachdb/cockroach/pkg/util/treeprinter"; "github.com/cockroachdb/errors"; "github.com/cockroachdb/redact" The receiver struct definitions of the function is type memoFormatter struct {
-	buf              *bytes.Buffer
-	flags            FmtFlags
-	redactableValues bool
-
-	o *Optimizer
-
-	// groups reachable from the root, generated in breadth-first order.
-	groups []group
-
-	// groupIdx remembers the group index (in the groups slice) for the first
-	// expression in each group.
-	groupIdx map[opt.Expr]int
-}
-
-// Methods:
-- func (mf *memoFormatter) format() string
-- func (mf *memoFormatter) group(expr opt.Expr) int
-- func (mf *memoFormatter) numberMemo(root opt.Expr)
-- func (mf *memoFormatter) numberExpr(expr opt.Expr)
-- func (mf *memoFormatter) populateStates()
-- func (mf *memoFormatter) formatGroup(first memo.RelExpr)
-- func (mf *memoFormatter) formatExpr(e opt.Expr)
-- func (mf *memoFormatter) formatBest((best memo.RelExpr, required *physical.Required))
-- func (mf *memoFormatter) formatPrivate((e opt.Expr, physProps *physical.Required))
-- func (mf *memoFormatter) formatCycles() string
- The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is string The code snippets before the function is func (mf *memoFormatter) formatGroup(first memo.RelExpr) {
-	for member := first; member != nil; member = member.NextExpr() {
-		if member != first {
-			mf.buf.WriteByte(' ')
-		}
-		mf.formatExpr(member)
-	}
-}
-
-func (mf *memoFormatter) formatExpr(e opt.Expr) {
-	if mf.redactableValues && opt.IsConstValueOp(e) && e.Private() == nil {
-		// This marks FalseOp and TrueOp as redactable, e.g. instead of (true) we
-		// print (‹true›).
-		redact.Fprintf(mf.buf, "(%s", e.Op())
-	} else {
-		fmt.Fprintf(mf.buf, "(%s", e.Op())
-	}
-	for i := 0; i < e.ChildCount(); i++ {
-		child := e.Child(i)
-		if opt.IsListItemOp(child) {
-			child = child.Child(0)
-		}
-		fmt.Fprintf(mf.buf, " G%d", mf.group(child)+1)
-	}
-	mf.formatPrivate(e, &physical.Required{})
-	mf.buf.WriteString(")")
-}
-
-func (mf *memoFormatter) formatBest(best memo.RelExpr, required *physical.Required) {
-	fmt.Fprintf(mf.buf, "(%s", best.Op())
-
-	for i := 0; i < best.ChildCount(); i++ {
-		fmt.Fprintf(mf.buf, " G%d", mf.group(best.Child(i))+1)
-
-		// Print properties required of the child if they are interesting.
-		childReq := BuildChildPhysicalProps(mf.o.mem, best, i, required)
-		if childReq.Defined() {
-			fmt.Fprintf(mf.buf, "=\"%s\"", childReq)
-		}
-	}
-
-	mf.formatPrivate(best, required)
-	mf.buf.WriteString(")")
-}
-
-func (mf *memoFormatter) formatPrivate(e opt.Expr, physProps *physical.Required) {
-	private := e.Private()
-	if private == nil {
-		return
-	}
-
-	// Remap special-case privates.
-	switch t := e.(type) {
-	case *memo.CastExpr:
-		private = t.Typ.SQLString()
-	}
-
-	// Start by using private expression formatting.
-	m := mf.o.mem
-	nf := memo.MakeExprFmtCtxBuffer(
-		mf.o.ctx, mf.buf, memo.ExprFmtHideAll, mf.redactableValues, m, nil, /* catalog */
-	)
-	memo.FormatPrivate(&nf, private, physProps)
-
-	// Now append additional information that's useful in the memo case.
-	switch t := e.(type) {
-	case *memo.ScanExpr:
-		tab := m.Metadata().Table(t.Table)
-		if tab.ColumnCount() != t.Cols.Len() {
-			fmt.Fprintf(mf.buf, ",cols=%s", t.Cols)
-		}
-		if t.Constraint != nil {
-			fmt.Fprintf(mf.buf, ",constrained")
-		}
-		if t.InvertedConstraint != nil {
-			fmt.Fprintf(mf.buf, ",constrained inverted")
-		}
-		if t.HardLimit.IsSet() {
-			fmt.Fprintf(mf.buf, ",lim=%s", t.HardLimit)
-		}
-
-	case *memo.IndexJoinExpr:
-		fmt.Fprintf(mf.buf, ",cols=%s", t.Cols)
-
-	case *memo.LookupJoinExpr:
-		if len(t.KeyCols) > 0 {
-			fmt.Fprintf(mf.buf, ",keyCols=%v,outCols=%s", t.KeyCols, t.Cols)
-		} else {
-			fmt.Fprintf(mf.buf, ",outCols=%s", t.Cols)
-		}
-
-	case *memo.ExplainExpr:
-		propsStr := t.Props.String()
-		if propsStr != "" {
-			fmt.Fprintf(mf.buf, " %s", propsStr)
-		}
-
-	case *memo.ProjectExpr:
-		t.Passthrough.ForEach(func(i opt.ColumnID) {
-			fmt.Fprintf(mf.buf, " %s", m.Metadata().ColumnMeta(i).Alias)
-		})
-	}
-}
-
-func firstExpr(expr opt.Expr) opt.Expr {
-	if rel, ok := expr.(memo.RelExpr); ok {
-		return rel.FirstExpr()
-	}
-	return expr
-} And here is the function you are asked to complete func (mf *memoFormatter) formatCycles() string
-func (mf *memoFormatter) formatCycles() string {
-	m := mf.o.mem
-	var cd cycle.Detector
-
-	if mf.flags != FmtCycle {
-		return ""
-	}
-
-	addExpr := func(from cycle.Vertex, e opt.Expr) {
-		for i := 0; i < e.ChildCount(); i++ {
-			child := e.Child(i)
-			if opt.IsListItemOp(child) {
-				child = child.Child(0)
-			}
-			to := cycle.Vertex(mf.group(child))
-			cd.AddEdge(from, to)
-		}
-	}
-
-	addGroup := func(from cycle.Vertex, first memo.RelExpr) {
-		for member := first; member != nil; member = member.NextExpr() {
-			addExpr(from, member)
-		}
-	}
-
-	// Add an edge to the cycle detector from a group to each of the groups it
-	// references.
-	for i, e := range mf.groups {
-		from := cycle.Vertex(i)
-		rel, ok := e.first.(memo.RelExpr)
-		if !ok {
-			addExpr(from, e.first)
-			continue
-		}
-		addGroup(from, rel)
-	}
-
-	// Search for a cycle from the root expression group.
-	root := cycle.Vertex(mf.group(m.RootExpr()))
-	if <ATTN>cyclePath</ATTN>, ok := cd.FindCycleStartingAtVertex(root); ok {
-		mf.buf.Reset()
-		mf.buf.WriteString(", cycle=[")
-		for i, group := range <ATTN>cyclePath</ATTN> { <MID> 		}
-		mf.buf.WriteString("]")
-		return mf.buf.String()
-	}
-	return ""
-} Ensure that only missing codes marked as <MID> are returned<|im_end|>
-<|im_start|>assistant
-			if i > 0 {
-				mf.buf.WriteString("->")
-			}
-			fmt.Fprintf(mf.buf, "G%d", group+1)<|im_end|>
-```
