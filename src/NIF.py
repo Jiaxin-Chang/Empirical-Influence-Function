@@ -1351,6 +1351,10 @@ def main_compute_gradient_related_samples():
     new_labels = new_input_ids.clone()
     new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
     
+    # We only want to calculate loss on the *target_token_index* token.
+    # So we mask everything after it.
+    new_labels[:, (target_token_index+1):] = -100
+    
     print(f"\n{'='*20} DEBUG INFO {'='*20}")
     print(f"Manually selected target_token_index: {target_token_index}")
     print(f"First generated token index (Auto):   {prompt_len}")
@@ -1393,7 +1397,7 @@ def main_compute_gradient_related_samples():
     # saved to file, and you can comment this part to prevent retrieving again, because it takes ~1h
     scores, indices = inference_function.influence_gradient_single(
         query_batch=query_batch,
-        target_idx=prompt_len  # <-- Use prompt_len to enable all-token loss (instead of just from target_token_index)
+        target_idx=target_token_index
     )
     with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{target_token_index}_result.json'), 'w', encoding='utf-8') as f:
         json.dump({"result": list(zip(indices, scores))}, f)
