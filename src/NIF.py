@@ -30,8 +30,8 @@ from torch.nn import Parameter
 SEED = 42
 SEQUENCE_LENGTH_LIMIT = 3000
 TRAIN_SAMPLE_RETRIEVE_LIMIT = 100
-SELECTED_TEST_SAMPLE_INDEX = 34
-TOKEN_INDEX_TO_RETRIEVE = 438
+SELECTED_TEST_SAMPLE_INDEX = 58
+TOKEN_INDEX_TO_RETRIEVE = 703
 
 
 # dev-only patch, to see the shape of tensor when debugging
