@@ -16,7 +16,8 @@ from src.NIF import (
     finetune_on_sample,
     CustomCollator,
     round_floats,
-    _find_subseq_start
+    _find_subseq_start,
+    _apply_freeze_strategy,
 )
 from src.process_data import process_func_chatml
 from transformers import DataCollatorForSeq2Seq, set_seed
@@ -28,7 +29,7 @@ TOKEN_INDEX_TO_RETRIEVE = 703  # This is the "first wrong token" we are investig
 INTERVENTION_EPOCHS = 3        # Low epochs for mild intervention
 BOOST_COEF = 10.0              # To manually amplify the correlation
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples to evaluate
-TOP_K_PROMPT_TOKENS = 5        # How many correlation tokens to extract/compare
+TOP_K_PROMPT_TOKENS = 8         # How many correlation tokens to extract/compare
 
 def get_gradient_related_samples(test_idx, target_tok_idx):
     """
@@ -99,23 +100,12 @@ def run_causal_intervention_experiment():
     )
     train_loader = accelerator.prepare(train_loader)
 
-    # Filter function: we intervene on same mechanism we attribute
-    def filter_lm_head(name: str, param: torch.nn.Parameter):
-        return "lm_head.weight" in name and param.requires_grad
-
-    # We ensure gradient required layers are correct
-    for name, param in model.named_parameters():
-        if "lm_head.weight" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
     infer_fw = NewInferenceFunction(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
         accelerator=accelerator,
-        param_filter_fn=filter_lm_head,
+        param_filter_fn=None,
         top_k=20,
     )
 
@@ -137,7 +127,9 @@ def run_causal_intervention_experiment():
     target_tok_id = test_batch["input_ids"][0, TOKEN_INDEX_TO_RETRIEVE].item()
     target_tok_prob_baseline = baseline_probs[target_tok_id].item()
     
-    baseline_saliency = baseline_res["saliency_original"][0]
+    # saliency_original[batch][target_token] = {"index": t, "saliency": [float per prompt token]}
+    # We want saliency scores over prompt tokens for the single target token we're probing.
+    baseline_saliency = baseline_res["saliency_original"][0][0]["saliency"]
     
     # Top correlation prompt tokens for the test sample
     top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(baseline_saliency), key=lambda x: x[1])
@@ -172,11 +164,11 @@ def run_causal_intervention_experiment():
     # The highest positive score indicates the strongest positive correlation
     related_samples = nlargest(TOP_K_TRAIN_SAMPLES, grad_results, key=lambda x: x[1])
 
-    marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\\n", add_special_tokens=False))
+    marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
     # 3. INTERVENTION LOOP
     for rank, (train_idx, score) in enumerate(related_samples):
-        print(f"\\n--- Processing Interventions: Top {rank+1} Train Sample (ID {train_idx}, Score {score:.4f}) ---")
+        print(f"\n--- Processing Interventions: Top {rank+1} Train Sample (ID {train_idx}, Score {score:.4f}) ---")
         
         # Build Train Sample
         tr_ds = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
@@ -202,7 +194,7 @@ def run_causal_intervention_experiment():
         # Get Train Sample Saliency
         infer_fw.model.eval()
         tr_res = infer_fw.infer(tr_batch, target_idx=torch.tensor([valid_tok_idx], device=accelerator.device))
-        train_saliency = tr_res["saliency_original"][0]
+        train_saliency = tr_res["saliency_original"][0][0]["saliency"]
         
         top_train_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(train_saliency), key=lambda x: x[1])
         boost_indices = [idx for idx, _ in top_train_corr]
@@ -212,7 +204,9 @@ def run_causal_intervention_experiment():
         print(f"Found Train Correlated Prompt Tokens: {boost_tokens_text}")
         
         # --- CAUSAL INTERVENTION ---
-        # 1. Save original weights
+        # 1. Apply the same freeze strategy that finetune_on_sample will use,
+        #    so save/restore operate on the exact same set of parameters.
+        _apply_freeze_strategy(infer_fw.model, "qk_last_quarter")
         infer_fw.save_model_params(to="original")
         
         # 2. Overfit with Attention Boost (Force correlation)
@@ -239,7 +233,7 @@ def run_causal_intervention_experiment():
         after_probs = torch.softmax(after_logits[TOKEN_INDEX_TO_RETRIEVE - 1], dim=-1)
         target_tok_prob_after = after_probs[target_tok_id].item()
         
-        after_saliency = after_res["saliency_original"][0]
+        after_saliency = after_res["saliency_original"][0][0]["saliency"]
         
         correlation_shifts = []
         is_positive_correlated = False
