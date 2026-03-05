@@ -256,8 +256,9 @@ def run_causal_intervention_experiment():
                 "delta": float(delta)
             })
             
-        # 4. Restore original weights
+        # 4. Restore original weights and free GPU memory
         infer_fw.restore_model_params()
+        torch.cuda.empty_cache()
         
         # Record everything
         conclusion = "POSITIVE_CORRELATION" if is_positive_correlated else "NEGATIVE_OR_UNRELATED"
