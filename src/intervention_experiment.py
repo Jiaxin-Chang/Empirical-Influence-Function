@@ -283,8 +283,10 @@ def run_causal_intervention_experiment():
         if prob_diff > 0.001 or sum_delta > 0.01:
             is_positive_correlated = True
             
-        # 4. Restore original weights and free GPU memory
+        # 4. Restore original weights, zero grad, and free GPU memory
         infer_fw.restore_model_params()
+        infer_fw.model.zero_grad(set_to_none=True)
+        del after_res, after_logits, after_probs, tr_res, tr_batch, train_labels
         torch.cuda.empty_cache()
         
         # Record everything
