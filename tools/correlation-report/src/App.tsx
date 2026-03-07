@@ -1,6 +1,11 @@
 import { useMemo, useState } from 'react';
-import latestSaliencyJSONText from '../../../latest_saliency.json?raw';
-import markedCodeSamplesText from '../../../marked_code_samples.md?raw';
+// Use import.meta.glob to gracefully handle missing files without crashing Vite
+const saliencyFiles = import.meta.glob('../../../latest_saliency.json', { query: '?raw', eager: true }) as Record<string, any>;
+const latestSaliencyJSONText = saliencyFiles['../../../latest_saliency.json']?.default || "{}";
+
+const markedCodeFiles = import.meta.glob('../../../marked_code_samples.md', { query: '?raw', eager: true }) as Record<string, any>;
+const markedCodeSamplesText = markedCodeFiles['../../../marked_code_samples.md']?.default || "";
+
 import './App.css';
 import { SwitchTokenCodeBlock } from './components/SwitchTokenCodeBlock';
 
@@ -8,9 +13,12 @@ import { SwitchTokenCodeBlock } from './components/SwitchTokenCodeBlock';
 /* Data loading                                                       */
 /* ------------------------------------------------------------------ */
 
-const allSaliencies = JSON.parse(latestSaliencyJSONText);
-
-// Section 1: overfit experiment
+let allSaliencies: any = {};
+try {
+    allSaliencies = JSON.parse(latestSaliencyJSONText);
+} catch (e) {
+    allSaliencies = {};
+}
 // New format has 'overfit_test_results'; old format stores overfit data under 'related_train_samples'
 const hasNewFormat = 'overfit_test_results' in allSaliencies;
 const overfitResults = hasNewFormat
@@ -72,6 +80,18 @@ function convertTokens(tokens: string[]) {
 /* App                                                                */
 /* ------------------------------------------------------------------ */
 
+// (Optional) load the causal interventions JSON if available
+const interventionFiles = import.meta.glob('../../../intervention_results.json', { query: '?raw', eager: true }) as Record<string, any>;
+const causalInterventionJSONText = interventionFiles['../../../intervention_results.json']?.default || "";
+import { CausalInterventionSection } from './components/CausalIntervention';
+
+let causalInterventionData: any = null;
+try {
+    causalInterventionData = JSON.parse(causalInterventionJSONText);
+} catch (e) {
+    console.log("No intervention results available or JSON parse failed.");
+}
+
 function App() {
     return (
         <div className="app-root">
@@ -80,6 +100,9 @@ function App() {
             </header>
             <OverfitSection />
             <TrainSampleSection />
+
+            {/* Third Section: New Causal Verification results */}
+            {causalInterventionData && <CausalInterventionSection reportData={causalInterventionData} />}
         </div>
     );
 }
@@ -93,6 +116,21 @@ function OverfitSection() {
     const coef = BOOST_COEFS[coefIndex] ?? '?';
 
     const testSample = allSaliencies['target_test_sample'];
+
+    // Safety check if JSON was missing or malformed
+    if (!testSample || !testSample['before']) {
+        return (
+            <section className="analysis-section">
+                <div className="section-header">
+                    <h2>Section 1: Overfit Experiment</h2>
+                    <p className="no-data" style={{ marginTop: '16px' }}>
+                        No `latest_saliency.json` found. Please run Option 1 in `NIF.py`.
+                    </p>
+                </div>
+            </section>
+        );
+    }
+
     const testTokensBefore = useMemo(() => convertTokens(testSample['before']['full_tokens']), []);
     const testTokensAfter = useMemo(() => convertTokens(testSample['after']['full_tokens']), []);
     const testSalBefore = useMemo(() => convertRawSaliencyToObject(testSample['before']['saliency_list']), []);
@@ -171,7 +209,18 @@ function TrainSampleSection() {
 
     // Determine max count: max of train samples from JSON and GPT blocks
     const maxCount = Math.max(trainSamples.length, gptBlocks.length);
-    if (maxCount === 0) return null;
+    if (maxCount === 0) {
+        return (
+            <section className="analysis-section">
+                <div className="section-header">
+                    <h2>Section 2: Related Train Samples</h2>
+                    <p className="no-data" style={{ marginTop: '16px' }}>
+                        No train samples or GPT annotations (`marked_code_samples.md`) found. Please run Option 2 in `NIF.py`.
+                    </p>
+                </div>
+            </section>
+        );
+    }
 
     const goPrev = () => setSampleIndex(((sampleIndex - 1) + maxCount) % maxCount);
     const goNext = () => setSampleIndex((sampleIndex + 1) % maxCount);
