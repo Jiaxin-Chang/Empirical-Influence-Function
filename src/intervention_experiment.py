@@ -111,8 +111,30 @@ def run_causal_intervention_experiment():
 
     # 1. SETUP TEST SAMPLE & GET BASELINE
     test_ds = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml)
-    test_batch = base_collator([test_ds[0]])
-    test_batch = {k: v.to(accelerator.device) for k, v in test_batch.items()}
+    raw_test_batch = base_collator([test_ds[0]])
+    raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
+    
+    # We must evaluate the target token from the model's PREDICTION, not the ground truth label!
+    # So we execute inference once to get its prediction, then bind prompt & prediction together as our test benchmark.
+    infer_fw.model.eval()
+    gen_result = infer_fw.infer(raw_test_batch)
+    prompt_len = int(gen_result["target_idx"][0])
+    prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
+    pred_ids = torch.tensor(
+        gen_result["pred_ids"][0],
+        device=prompt_ids.device,
+        dtype=prompt_ids.dtype
+    )
+    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels = new_input_ids.clone()
+    new_labels[:, :prompt_len] = -100
+    
+    test_batch = {
+        "input_ids": new_input_ids,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels
+    }
     
     target_idx_tensor = torch.tensor([TOKEN_INDEX_TO_RETRIEVE], device=accelerator.device)
     
@@ -152,6 +174,7 @@ def run_causal_intervention_experiment():
         "test_sample_baseline": {
             "target_token": tokenizer.decode([target_tok_id]),
             "target_token_prob": target_tok_prob_baseline,
+            "full_tokens": baseline_res["full_tokens"][0],
             "saliency_list": baseline_saliency,
             "top_correlated_prompt_tokens": top_test_prompt_tokens
         },
@@ -272,6 +295,7 @@ def run_causal_intervention_experiment():
                 "first_valid_token": first_valid_token_text,
                 "boost_indices": boost_indices,
                 "boost_tokens_text": boost_tokens_text,
+                "full_tokens": tr_res["full_tokens"][0],
                 "saliency_list": train_saliency
             },
             "test_after_intervention": {

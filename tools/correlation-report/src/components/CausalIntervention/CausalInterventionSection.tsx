@@ -26,6 +26,9 @@ export function CausalInterventionSection({ reportData }: CausalInterventionSect
     // Train data
     const trainContext = intervention.train_context;
 
+    const testTokens = useMemo(() => convertTokens(testBaseline.full_tokens || []), [testBaseline]);
+    const trainTokens = useMemo(() => convertTokens(trainContext.full_tokens || []), [trainContext]);
+
     // Test context
     const testAfter = intervention.test_after_intervention;
     const isPositive = testAfter.conclusion === "POSITIVE_CORRELATION";
@@ -75,7 +78,7 @@ export function CausalInterventionSection({ reportData }: CausalInterventionSect
                         <div className="panel-col">
                             <div className="col-label">Target Token: [{trainContext.first_valid_token_index}] '{trainContext.first_valid_token}'</div>
                             <SwitchTokenCodeBlock
-                                tokens={trainContext.full_tokens || []}
+                                tokens={trainTokens}
                                 salienciesByToken={convertRawSaliencyToObject(trainContext.saliency_list)}
                                 answerStartIndex={trainContext.first_valid_token_index}
                                 // Highlight the boost indices as pseudo-GPT marks so they show up clearly
@@ -136,7 +139,7 @@ export function CausalInterventionSection({ reportData }: CausalInterventionSect
                         <div className="panel-col">
                             <div className="col-label">Test Saliency After Intervention</div>
                             <SwitchTokenCodeBlock
-                                tokens={testBaseline.full_tokens || []}
+                                tokens={testTokens}
                                 salienciesByToken={testSalAfter}
                                 answerStartIndex={meta.target_token_index}
                             />
@@ -163,4 +166,8 @@ function convertRawSaliencyToObject(saliencyList: any[]): { [key: number]: numbe
     const converted: { [key: number]: number[] } = {};
     saliencyList.forEach((x: any) => { converted[x.index] = x.saliency; });
     return converted;
+}
+
+function convertTokens(tokens: string[]) {
+    return tokens.map(t => t.replaceAll('Ċ', '\n').replaceAll('Ġ', ' ').replaceAll('ĉ', '  '));
 }
