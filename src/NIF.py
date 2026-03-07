@@ -436,10 +436,16 @@ def finetune_on_sample(
         loss = out.loss + boost_coef * attn_loss
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         # Debug print (uncomment for debugging)
         # print(f"Epoch {epoch}: loss={loss.item():.4f}, base_loss={out.loss.item():.4f}, attn_loss={attn_loss.item():.4f}")
+
+        # Explicitly delete variables holding computation graph to prevent OOM
+        del loss, out, attn_loss
+        if boost_indices is not None and len(boost_indices) > 0 and first_gen_pos is not None:
+            del attn, first_token_attn, attn_on_target, log_attn
+        torch.cuda.empty_cache()
 
 
 _TAG_RE = re.compile(r"<ATTN>(.*?)</ATTN>", re.DOTALL)
