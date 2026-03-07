@@ -286,6 +286,8 @@ def run_causal_intervention_experiment():
         # 4. Restore original weights, zero grad, and free GPU memory
         infer_fw.restore_model_params()
         infer_fw.model.zero_grad(set_to_none=True)
+        # Store full tokens strings before deleting tr_res
+        train_full_tokens = tr_res["full_tokens"][0]
         del after_res, after_logits, after_probs, tr_res, tr_batch, train_labels
         torch.cuda.empty_cache()
         
@@ -301,7 +303,7 @@ def run_causal_intervention_experiment():
                 "first_valid_token": first_valid_token_text,
                 "boost_indices": boost_indices,
                 "boost_tokens_text": boost_tokens_text,
-                "full_tokens": tr_res["full_tokens"][0],
+                "full_tokens": train_full_tokens,
                 "saliency_list": train_saliency
             },
             "test_after_intervention": {
