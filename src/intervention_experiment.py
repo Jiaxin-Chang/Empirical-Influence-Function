@@ -259,18 +259,15 @@ def run_causal_intervention_experiment():
         after_saliency = after_res["saliency_original"][0][0]["saliency"]
         
         correlation_shifts = []
-        is_positive_correlated = False
         
+        sum_delta = 0.0
         for baseline_item in top_test_prompt_tokens:
             p_idx = baseline_item["index"]
             b_score = baseline_item["saliency_score"]
             a_score = after_saliency[p_idx]
             delta = a_score - b_score
+            sum_delta += delta
             
-            # If the probability increased OR the primary saliency significantly increased
-            if target_tok_prob_after > target_tok_prob_baseline or delta > 0.05:
-                is_positive_correlated = True
-                
             correlation_shifts.append({
                 "prompt_token_index": p_idx,
                 "prompt_token": baseline_item["token"],
@@ -278,6 +275,13 @@ def run_causal_intervention_experiment():
                 "saliency_after": float(a_score),
                 "delta": float(delta)
             })
+            
+        # We classify as positive if the overall attention to the key tokens increased 
+        # (aggregate delta > 0) OR if the probability of the wrong token increased.
+        is_positive_correlated = False
+        prob_diff = target_tok_prob_after - target_tok_prob_baseline
+        if prob_diff > 0.001 or sum_delta > 0.01:
+            is_positive_correlated = True
             
         # 4. Restore original weights and free GPU memory
         infer_fw.restore_model_params()
