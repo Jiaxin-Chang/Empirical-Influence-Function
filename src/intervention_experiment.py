@@ -276,11 +276,14 @@ def run_causal_intervention_experiment():
                 "delta": float(delta)
             })
             
-        # We classify as positive if the overall attention to the key tokens increased 
-        # (aggregate delta > 0) OR if the probability of the wrong token increased.
+        # We classify as positive if the intervention actually AMPLIFIES the wrong prediction.
+        # So prob_diff MUST be notably positive. If probability drops violently, it's not positive.
         is_positive_correlated = False
         prob_diff = target_tok_prob_after - target_tok_prob_baseline
-        if prob_diff > 0.001 or sum_delta > 0.01:
+        
+        # Only log as Positive Correlation if the intervention directly amplified
+        # the model's confidence in outputting the wrong target prediction.
+        if prob_diff > 0.001:
             is_positive_correlated = True
             
         # 4. Restore original weights, zero grad, and free GPU memory
