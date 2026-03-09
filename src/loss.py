@@ -405,3 +405,82 @@ def get_first_response_token(
     # 响应的有效长度
     query_response_len = total_shifted_len - response_start_idx_in_shifted_labels
     return response_start_idx_in_shifted_labels, query_response_len
+
+
+def compute_correlation_second_order_gradient(
+    model, 
+    batch, 
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+    param_filter_fn
+):
+    """
+    计算二阶导特征: 抽取 source Token 导致 target Token 产生的 Saliency 背后的参数梯度特征
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    
+    # 1. 过滤我们需要微调的参数 (比如 qk_last_quarter)
+    target_params = []
+    for name, param in model.named_parameters():
+        if param_filter_fn(name, param):
+            param.requires_grad = True
+            target_params.append(param)
+        else:
+            param.requires_grad = False
+
+    device = model.device
+    input_ids = batch["input_ids"].to(device)
+    target_vocab_id = input_ids[0, target_idx_in_seq]
+    
+    # 2. 截断输入，只计算到 target 送入前的那一刀
+    curr_input_ids = input_ids[:, :target_idx_in_seq]
+    
+    # 获取 Embeddings，并使其成为一阶导的“叶子结点”
+    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
+    embeddings = get_embeds_fn()(curr_input_ids).detach()
+    embeddings.requires_grad_(True)
+    
+    with torch.enable_grad():
+        # 3. 第一次前向传播（获取 Logit）
+        outputs = model(inputs_embeds=embeddings, use_cache=False)
+        # 取对 Target token 的预测 logits
+        target_logits = outputs.logits[0, -1, target_vocab_id] 
+        
+        # 4. 第一次反向传播（向 embeddings 求导，计算 Saliency的基础）
+        grad_embeds = torch.autograd.grad(
+            target_logits, 
+            embeddings, 
+            retain_graph=False,
+            create_graph=True
+        )[0]
+        
+        # 5. 计算特定的 Correlation Saliency
+        saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
+        target_saliency = saliency_scores[0, source_idx_in_seq]
+        
+        # Saliency 越大越好，等效于 Saliency_Loss (负的 Saliency) 越小越好
+        saliency_loss = - target_saliency
+        
+        # 6. 第二次反向传播（计算 Saliency_Loss 分配在模型特定参数上的方向）
+        final_grads = torch.autograd.grad(
+            saliency_loss, 
+            target_params, 
+            create_graph=False,
+            allow_unused=True
+        )
+        
+    # 7. 铺平并组装特征向量
+    flat_grad = torch.cat([
+        g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1) 
+        for g, p in zip(final_grads, target_params)
+    ])
+    
+    # 恢复 param
+    for param in target_params:
+         param.requires_grad = False
+            
+    return flat_grad.detach()
