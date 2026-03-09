@@ -454,7 +454,7 @@ def compute_correlation_second_order_gradient(
         grad_embeds = torch.autograd.grad(
             target_logits, 
             embeddings, 
-            retain_graph=False,
+            retain_graph=True,
             create_graph=True
         )[0]
         
