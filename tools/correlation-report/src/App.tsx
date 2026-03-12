@@ -80,16 +80,16 @@ function convertTokens(tokens: string[]) {
 /* App                                                                */
 /* ------------------------------------------------------------------ */
 
-// (Optional) load the causal interventions JSON if available
-const interventionFiles = import.meta.glob('../../../intervention_results.json', { query: '?raw', eager: true }) as Record<string, any>;
-const causalInterventionJSONText = interventionFiles['../../../intervention_results.json']?.default || "";
+// (Optional) load the correlation matching JSON if available
+const interventionFiles = import.meta.glob('../../../correlation_matching_results.json', { query: '?raw', eager: true }) as Record<string, any>;
+const causalInterventionJSONText = interventionFiles['../../../correlation_matching_results.json']?.default || "";
 import { CausalInterventionSection } from './components/CausalIntervention';
 
 let causalInterventionData: any = null;
 try {
     causalInterventionData = JSON.parse(causalInterventionJSONText);
 } catch (e) {
-    console.log("No intervention results available or JSON parse failed.");
+    console.log("No correlation matching results available or JSON parse failed.");
 }
 
 function App() {

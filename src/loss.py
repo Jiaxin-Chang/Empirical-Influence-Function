@@ -445,30 +445,42 @@ def compute_correlation_second_order_gradient(
     embeddings.requires_grad_(True)
     
     with torch.enable_grad():
+        # 为了解决 PyTorch "Trying to backward a second time" 问题
+        # 我们需要：
+        # 1. 临时强制关掉某些可能释放中间激活值的内存优化 (如 gradient checkpointing / flash attention 内部机制)
+        # 2. 如果模型在之前的代码中(如 outside)调用过 forward 并发生了 backward，那些图可能残破。
+        # 我们用干净的 forward。
+        
         # 3. 第一次前向传播（获取 Logit）
         outputs = model(inputs_embeds=embeddings, use_cache=False)
-        # 取对 Target token 的预测 logits
         target_logits = outputs.logits[0, -1, target_vocab_id] 
         
-        # 4. 第一次反向传播（向 embeddings 求导，计算 Saliency的基础）
+        # 4. 第一次反向传播
+        # 注意 retain_graph=True 和 create_graph=True
+        # 对 embeddings 取偏导数
         grad_embeds = torch.autograd.grad(
             target_logits, 
             embeddings, 
             retain_graph=True,
-            create_graph=True
+            create_graph=True,
+            allow_unused=False
         )[0]
         
         # 5. 计算特定的 Correlation Saliency
         saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
+        # 如果 source_idx_in_seq 这个值依赖计算图，它提取的元素标量也继续附带计算图
         target_saliency = saliency_scores[0, source_idx_in_seq]
         
         # Saliency 越大越好，等效于 Saliency_Loss (负的 Saliency) 越小越好
         saliency_loss = - target_saliency
         
-        # 6. 第二次反向传播（计算 Saliency_Loss 分配在模型特定参数上的方向）
+        # 6. 第二次反向传播
+        # 这时求 saliency_loss 关于我们想要提取特征的 target_params 的导数。
+        # 因为我们上面使用了 retain_graph=True，计算 target_logits 经历的从 params -> logits 的整条图都被保留了
         final_grads = torch.autograd.grad(
             saliency_loss, 
             target_params, 
+            retain_graph=False,   # 最后一次求导了，把图释放掉
             create_graph=False,
             allow_unused=True
         )
