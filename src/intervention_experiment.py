@@ -30,8 +30,6 @@ TOP_K_TRAIN_SAMPLES = 10       # How many top train samples to evaluate
 TOP_K_PROMPT_TOKENS = 4        # How many correlation tokens to extract/compare
 
 def qk_last_quarter_filter(name, param, num_layers=28):
-    if not param.requires_grad:
-        return False
     import re
     match = re.search(r'layers\.(\d+)\.', name)
     if match:
@@ -40,23 +38,6 @@ def qk_last_quarter_filter(name, param, num_layers=28):
             if 'q_proj' in name or 'k_proj' in name:
                 return True
     return False
-
-def get_gradient_related_samples(test_idx, target_tok_idx):
-    """
-    Loads the cached gradient similarity results.
-    We assume main_compute_gradient_related_samples in NIF.py has already 
-    saved this JSON.
-    """
-    grad_file = f'test_{test_idx}_{target_tok_idx}_result.json'
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    grad_path = os.path.join(base_dir, grad_file)
-    
-    if os.path.exists(grad_path):
-        with open(grad_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data["result"]
-    else:
-        raise FileNotFoundError(f"Gradient cached file not found at {grad_path}. Please run gradient influence first!")
 
 def find_first_valid_token_index(tokenizer, input_ids_tensor, start_idx):
     """
@@ -101,12 +82,20 @@ def run_causal_intervention_experiment():
     )
     collator = CustomCollator(base_collator)
 
+    # Create full train loader for our 30-min scan!
+    train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    train_loader = torch.utils.data.DataLoader(
+        DatasetWrapper(train_ds), 
+        batch_size=1, collate_fn=collator
+    )
+    train_loader = accelerator.prepare(train_loader)
+
     infer_fw = NewInferenceFunction(
         model=model,
         tokenizer=tokenizer,
-        train_loader=None,
+        train_loader=train_loader,
         accelerator=accelerator,
-        param_filter_fn=None,
+        param_filter_fn=param_filter,
         top_k=20,
     )
 
@@ -144,12 +133,15 @@ def run_causal_intervention_experiment():
     target_tok_id = test_batch["input_ids"][0, TOKEN_INDEX_TO_RETRIEVE].item()
     baseline_saliency = baseline_res["saliency_original"][0][0]["saliency"]
     
-    # Top correlation prompt tokens for the test sample
+    # Top correlation pairs for test sample: each is a full (source -> target) pair
+    target_tok_text = tokenizer.decode([target_tok_id])
     top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(baseline_saliency), key=lambda x: x[1])
-    top_test_prompt_tokens = [
+    top_test_correlations = [
         {
-            "index": idx,
-            "token": tokenizer.decode([test_batch["input_ids"][0, idx].item()]),
+            "source_token_index": idx,
+            "source_token": tokenizer.decode([test_batch["input_ids"][0, idx].item()]),
+            "target_token_index": TOKEN_INDEX_TO_RETRIEVE,
+            "target_token": target_tok_text,
             "saliency_score": float(score)
         }
         for idx, score in top_test_corr
@@ -161,21 +153,22 @@ def run_causal_intervention_experiment():
             "target_token_index": TOKEN_INDEX_TO_RETRIEVE
         },
         "test_sample_baseline": {
-            "target_token": tokenizer.decode([target_tok_id]),
-            "top_correlated_prompt_tokens": top_test_prompt_tokens
+            "target_token": target_tok_text,
+            "target_token_index": TOKEN_INDEX_TO_RETRIEVE,
+            "full_tokens": baseline_res["full_tokens"][0],
+            "top_correlations": top_test_correlations
         },
         "interventions": []
     }
 
     # Extract Correlation Gradient Features for TEST SAMPLE
     print("Extracting test correlation features...")
+    # test_corr_features: { source_token_index -> (feat_tensor, source_token_text) }
     test_corr_features = {}
-    
     with torch.inference_mode(False):
-        for item in top_test_prompt_tokens:
-            p_idx = item["index"]
-            print(f"  -> test source token: '{item['token']}'")
-            # Disable inference mode so we can compute graph!
+        for item in top_test_correlations:
+            p_idx = item["source_token_index"]
+            print(f"  -> test correlation: '{item['source_token']}' -> '{item['target_token']}'")
             feat = compute_correlation_second_order_gradient(
                 model=model, 
                 batch=test_batch, 
@@ -183,12 +176,46 @@ def run_causal_intervention_experiment():
                 source_idx_in_seq=p_idx,
                 param_filter_fn=param_filter
             )
-            test_corr_features[p_idx] = feat
+            test_corr_features[p_idx] = (feat, item["source_token"])
 
-    # 2. IDENTIFY TOP CORRELATED TRAIN SAMPLES 
-    print("Loading cached gradient similarities...")
-    grad_results = get_gradient_related_samples(SELECTED_TEST_SAMPLE_INDEX, TOKEN_INDEX_TO_RETRIEVE)
-    related_samples = nlargest(TOP_K_TRAIN_SAMPLES, grad_results, key=lambda x: x[1])
+    # 2. IDENTIFY TOP CORRELATED TRAIN SAMPLES (Coarse-Grained Screening)
+    print("\nStage 2: Scanning full training set CE Gradients against Test Saliency Query (est. 30 mins) ...")
+    
+    from src.loss import compute_gradients
+    
+    # Use the highest-saliency test correlation as primary query for coarse screening
+    primary_test_query = list(test_corr_features.values())[0][0]
+    
+    sample_scores = []
+    
+    with torch.inference_mode(False):
+        for batch in tqdm(train_loader, desc="Scanning Train Samples"):
+            batch_device = {k: v.to(accelerator.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            train_idx = int(batch_device["sample_index"].item())
+            
+            # Extract CE gradient signature for this train sample
+            train_ce_grads = compute_gradients(
+                model=model,
+                batch=batch_device,
+                param_filter_fn=param_filter,
+                device=accelerator.device,
+                ignored_token_ids=infer_fw.ignored_token_ids
+            )
+            
+            # Flatten to 1D vector and compute cosine similarity
+            flat_train_ce = torch.cat([
+                g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1) 
+                for g, p in zip(train_ce_grads, [p for n,p in model.named_parameters() if param_filter(n,p)])
+            ])
+            
+            # Score how well this train sample's CE gradient aligns with our microscopic Query!
+            cos_sim = F.cosine_similarity(primary_test_query, flat_train_ce, dim=0).item()
+            sample_scores.append((train_idx, cos_sim))
+            
+            # Prevent OOM during loop
+            del train_ce_grads, flat_train_ce, batch_device
+            
+    related_samples = nlargest(TOP_K_TRAIN_SAMPLES, sample_scores, key=lambda x: x[1])
 
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
@@ -215,54 +242,73 @@ def run_causal_intervention_experiment():
         first_valid_token_text = tokenizer.decode([valid_tok_id])
         
         # Get Train Sample Saliency
-        with torch.inference_mode():
+        with torch.inference_mode(False):
             infer_fw.model.eval()
             tr_res = infer_fw.infer(tr_batch, target_idx=torch.tensor([valid_tok_idx], device=accelerator.device))
             train_saliency = tr_res["saliency_original"][0][0]["saliency"]
             train_full_tokens = tr_res["full_tokens"][0]
         
         top_train_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(train_saliency), key=lambda x: x[1])
-        
-        best_match_score = -1.0
-        best_match_record = None
-        
+
+        # For each train's top source token, find its best match against EACH test correlation
+        # Store correlation_matches: list of per-test-correlation match results
+        correlation_matches = []  # one entry per test correlation
+
         with torch.inference_mode(False):
-            for p_idx, p_score in top_train_corr:
-                train_source_text = tokenizer.decode([tr_batch["input_ids"][0, p_idx].item()])
-                print(f"  -> Checking train pair: '{train_source_text}' => '{first_valid_token_text}'")
-                
-                train_feat = compute_correlation_second_order_gradient(
-                    model, tr_batch, valid_tok_idx, p_idx, param_filter
-                )
-                
-                # Compare with all test features
-                for test_p_idx, test_feat in test_corr_features.items():
+            for test_p_idx, (test_feat, test_src_text) in test_corr_features.items():
+                # Find which train source token best matches this particular test correlation
+                best_train_cos = -1.0
+                best_train_src_text = ""
+                best_train_src_idx = -1
+
+                for p_idx, p_score in top_train_corr:
+                    train_source_text = tokenizer.decode([tr_batch["input_ids"][0, p_idx].item()])
+                    print(f"  -> [{test_src_text} -> {target_tok_text}] vs [{train_source_text} -> {first_valid_token_text}]")
+
+                    train_feat = compute_correlation_second_order_gradient(
+                        model, tr_batch, valid_tok_idx, p_idx, param_filter
+                    )
                     cos_sim = F.cosine_similarity(test_feat, train_feat, dim=0).item()
-                    
-                    # Check if it's the best local match
-                    if cos_sim > best_match_score:
-                        best_match_score = cos_sim
-                        best_test_token_text = tokenizer.decode([test_batch["input_ids"][0, test_p_idx].item()])
-                        best_match_record = {
-                            "train_source_token": train_source_text,
-                            "test_source_token": best_test_token_text,
-                            "cos_sim": float(cos_sim)
-                        }
+
+                    if cos_sim > best_train_cos:
+                        best_train_cos = cos_sim
+                        best_train_src_text = train_source_text
+                        best_train_src_idx = p_idx
+
+                correlation_matches.append({
+                    "test_correlation": {
+                        "source_token": test_src_text,
+                        "source_token_index": test_p_idx,
+                        "target_token": target_tok_text,
+                        "target_token_index": TOKEN_INDEX_TO_RETRIEVE
+                    },
+                    "train_correlation": {
+                        "source_token": best_train_src_text,
+                        "source_token_index": best_train_src_idx,
+                        "target_token": first_valid_token_text,
+                        "target_token_index": valid_tok_idx
+                    },
+                    "cos_sim": float(best_train_cos)
+                })
 
         torch.cuda.empty_cache()
         
-        print(f"Best Match for Train Sample {train_idx}: {best_match_record}")
+        print(f"Correlation matches for Train Sample {train_idx}:")
+        for m in correlation_matches:
+            print(f"  [{m['test_correlation']['source_token']} -> {m['test_correlation']['target_token']}]"
+                  f" matched [{m['train_correlation']['source_token']} -> {m['train_correlation']['target_token']}]"
+                  f" cos_sim={m['cos_sim']:.4f}")
         
         intervention_record = {
             "train_sample_id": train_idx,
-            "gradient_influence_score": float(score),
+            "coarse_cos_sim": float(score),  # Stage 2 coarse screening score
             "train_context": {
-                "first_valid_token_index": valid_tok_idx,
-                "first_valid_token": first_valid_token_text,
+                "target_token": first_valid_token_text,
+                "target_token_index": valid_tok_idx,
                 "full_tokens": train_full_tokens,
                 "saliency_list": train_saliency
             },
-            "best_correlation_match": best_match_record
+            "correlation_matches": correlation_matches
         }
         
         report_json["interventions"].append(intervention_record)
