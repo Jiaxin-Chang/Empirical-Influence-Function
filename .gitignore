@@ -223,4 +223,5 @@ nif-checkpoints/
 node_modules/
 test*.json
 samples*.md
+*.json
 .vite/

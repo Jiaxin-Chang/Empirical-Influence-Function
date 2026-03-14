@@ -259,20 +259,34 @@ def compute_gradients(
 ):
     model.eval()
     model.zero_grad(set_to_none=True)
-    with torch.set_grad_enabled(True):
-        #     # 使用原始 Loss
-        mean_loss,_   = compute_loss_per_sample(model, batch, device, ignored_token_ids)
+
+    # Explicitly re-enable requires_grad for filtered params.
+    # compute_correlation_second_order_gradient may have frozen all non-Q/K params,
+    # so we need to ensure the target params are trainable before the forward pass.
+    params = []
+    for name, param in model.named_parameters():
+        if param_filter_fn is None or param_filter_fn(name, param):
+            param.requires_grad_(True)
+            params.append(param)
+
+    if not params:
+        raise RuntimeError(
+            "compute_gradients: no parameters matched param_filter_fn. "
+            "Check that the filter is correct and the model has matching layers."
+        )
+
+    # Use torch.enable_grad() rather than torch.set_grad_enabled(True):
+    # enable_grad() works even when called from inside a torch.no_grad() scope,
+    # guaranteeing the forward pass builds a computation graph.
+    with torch.enable_grad():
+        mean_loss, _ = compute_loss_per_sample(model, batch, device, ignored_token_ids)
         loss = mean_loss.mean()
-
-        # 核心优化：只提取需要更新的参数（如 lm_head）
-        params = [p for n, p in model.named_parameters() if
-                  p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
-
-        # 确保 loss 是标量
         if loss.numel() > 1:
             loss = loss.mean()
 
-        grads = torch.autograd.grad(loss, params, create_graph=False)
+        # allow_unused=True: if a param doesn't appear in the graph (e.g. a Q/K
+        # whose layer is never reached), autograd returns None instead of raising.
+        grads = torch.autograd.grad(loss, params, create_graph=False, allow_unused=True)
     return list(grads)
 
 
