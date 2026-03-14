@@ -187,34 +187,35 @@ def run_causal_intervention_experiment():
     primary_test_query = list(test_corr_features.values())[0][0]
     
     sample_scores = []
-    
-    with torch.inference_mode(False):
-        for batch in tqdm(train_loader, desc="Scanning Train Samples"):
-            batch_device = {k: v.to(accelerator.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            train_idx = int(batch_device["sample_index"].item())
-            
-            # Extract CE gradient signature for this train sample
-            train_ce_grads = compute_gradients(
-                model=model,
-                batch=batch_device,
-                param_filter_fn=param_filter,
-                device=accelerator.device,
-                ignored_token_ids=infer_fw.ignored_token_ids
-            )
-            
-            # Flatten to 1D vector and compute cosine similarity
-            flat_train_ce = torch.cat([
-                g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1) 
-                for g, p in zip(train_ce_grads, [p for n,p in model.named_parameters() if param_filter(n,p)])
-            ])
-            
-            # Score how well this train sample's CE gradient aligns with our microscopic Query!
-            cos_sim = F.cosine_similarity(primary_test_query, flat_train_ce, dim=0).item()
-            sample_scores.append((train_idx, cos_sim))
-            
-            # Prevent OOM during loop
-            del train_ce_grads, flat_train_ce, batch_device
-            
+    # Collect filtered param references once — must match the order returned by compute_gradients.
+    filtered_params = [p for n, p in model.named_parameters() if param_filter(n, p)]
+
+    for batch in tqdm(train_loader, desc="Scanning Train Samples"):
+        batch_device = {k: v.to(accelerator.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        train_idx = int(batch_device["sample_index"].item())
+
+        # Extract CE gradient signature for this train sample
+        train_ce_grads = compute_gradients(
+            model=model,
+            batch=batch_device,
+            param_filter_fn=param_filter,
+            device=accelerator.device,
+            ignored_token_ids=infer_fw.ignored_token_ids
+        )
+
+        # Flatten to 1D vector and compute cosine similarity
+        flat_train_ce = torch.cat([
+            g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1)
+            for g, p in zip(train_ce_grads, filtered_params)
+        ])
+
+        # Score how well this train sample's CE gradient aligns with our microscopic Query!
+        cos_sim = F.cosine_similarity(primary_test_query, flat_train_ce, dim=0).item()
+        sample_scores.append((train_idx, cos_sim))
+
+        # Prevent OOM during loop
+        del train_ce_grads, flat_train_ce, batch_device
+
     related_samples = nlargest(TOP_K_TRAIN_SAMPLES, sample_scores, key=lambda x: x[1])
 
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
