@@ -510,3 +510,145 @@ def compute_correlation_second_order_gradient(
          param.requires_grad = False
             
     return flat_grad.detach()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Causal Intervention Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_full_saliency_vector(
+    model,
+    batch,
+    target_idx_in_seq: int,
+) -> list[float]:
+    """
+    用一次前向 + 一次反向计算 [source_0 … source_{target_idx-1}] 对
+    target_idx 处 token 的完整 saliency 向量。
+
+    比 compute_answer_only_saliency_masked_loss 快得多：
+      - 只需一次 forward，不迭代所有 response token
+      - 不需要对 model params 求导（纯 embeddings 梯度）
+
+    Returns:
+        list[float], 长度为 target_idx_in_seq。
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+
+    model.eval()
+    # 确保 model params 不参与梯度图（只对 embeddings 求导）
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    device = model.device
+    input_ids = batch["input_ids"].to(device)
+    target_vocab_id = input_ids[0, target_idx_in_seq]
+    curr_input_ids = input_ids[:, :target_idx_in_seq]
+
+    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
+    embeddings = get_embeds_fn()(curr_input_ids).detach()
+    embeddings.requires_grad_(True)
+
+    with torch.enable_grad():
+        outputs = model(inputs_embeds=embeddings, use_cache=False)
+        target_logit = outputs.logits[0, -1, target_vocab_id]
+        grad_embeds = torch.autograd.grad(target_logit, embeddings)[0]  # [1, seq, dim]
+
+    saliency = (embeddings.detach() * grad_embeds.detach()).abs().sum(dim=-1)  # [1, seq]
+    result = saliency[0].tolist()
+
+    del outputs, embeddings, grad_embeds, saliency
+    torch.cuda.empty_cache()
+
+    return result
+
+
+def compute_saliency_score_only(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+) -> float:
+    """
+    compute_full_saliency_vector 的单值版本。
+    仅返回 source_idx → target_idx 的 saliency 标量，用于干预前后的快速测量。
+    """
+    vec = compute_full_saliency_vector(model, batch, target_idx_in_seq)
+    return vec[source_idx_in_seq]
+
+
+def do_saliency_loss_step(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+    param_filter_fn,
+    optimizer: torch.optim.Optimizer,
+) -> float:
+    """
+    对 saliency(source_idx → target_idx) 做一步最大化梯度更新。
+
+    Loss = -saliency(source_idx → target_idx)
+    使用二阶导路径（retain_graph + create_graph），与
+    compute_correlation_second_order_gradient 的前向计算完全一致。
+
+    调用者负责：
+      1. 在调用前通过 optimizer 绑定好 filtered params（requires_grad=True）
+      2. 在所有步骤完成后恢复权重快照
+
+    Returns:
+        float  saliency_loss 的值（负的 saliency score）
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+
+    model.eval()
+    model.zero_grad(set_to_none=True)
+
+    # 开放 filtered params 的梯度，屏蔽其余参数
+    for name, param in model.named_parameters():
+        param.requires_grad_(param_filter_fn(name, param))
+
+    device = model.device
+    input_ids = batch["input_ids"].to(device)
+    target_vocab_id = input_ids[0, target_idx_in_seq]
+    curr_input_ids = input_ids[:, :target_idx_in_seq]
+
+    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
+    embeddings = get_embeds_fn()(curr_input_ids).detach()
+    embeddings.requires_grad_(True)
+
+    with torch.enable_grad():
+        # 第一次前向
+        outputs = model(inputs_embeds=embeddings, use_cache=False)
+        target_logit = outputs.logits[0, -1, target_vocab_id]
+
+        # 第一次反向（对 embeddings；retain_graph + create_graph 保留计算图）
+        grad_embeds = torch.autograd.grad(
+            target_logit, embeddings,
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=False,
+        )[0]
+
+        # saliency score（标量，仍挂载计算图）
+        saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
+        target_saliency = saliency_scores[0, source_idx_in_seq]
+        saliency_loss = -target_saliency  # 最大化 saliency ⇔ 最小化 -saliency
+
+        # 第二次反向（对 model params）
+        saliency_loss.backward()
+
+    loss_val = saliency_loss.item()
+
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    # 恢复所有 param 的 requires_grad = False（保持 model 的干净状态）
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    del outputs, embeddings, grad_embeds, saliency_scores, target_saliency, saliency_loss
+    torch.cuda.empty_cache()
+
+    return loss_val
