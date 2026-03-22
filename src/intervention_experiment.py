@@ -204,13 +204,15 @@ def run_causal_intervention_experiment():
         )
 
         # Flatten to 1D vector and compute cosine similarity
+        # device_map="auto" 时各层参数分布在不同 GPU，统一搬到 CPU 再 cat
         flat_train_ce = torch.cat([
-            g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1)
+            g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
             for g, p in zip(train_ce_grads, filtered_params)
         ])
 
         # Score how well this train sample's CE gradient aligns with our microscopic Query!
-        cos_sim = F.cosine_similarity(primary_test_query, flat_train_ce, dim=0).item()
+        # primary_test_query 已经在 CPU（来自 loss.py 的修复），flat_train_ce 也在 CPU，直接比较
+        cos_sim = F.cosine_similarity(primary_test_query.cpu(), flat_train_ce, dim=0).item()
         sample_scores.append((train_idx, cos_sim))
 
         # Prevent OOM during loop

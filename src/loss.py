@@ -500,8 +500,10 @@ def compute_correlation_second_order_gradient(
         )
         
     # 7. 铺平并组装特征向量
+    # 注意：device_map="auto" 时参数分布在多 GPU 上，各张量设备不同。
+    # 统一搬到 CPU 再 cat，避免 "Expected all tensors on same device" 报错。
     flat_grad = torch.cat([
-        g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1) 
+        g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
         for g, p in zip(final_grads, target_params)
     ])
     
