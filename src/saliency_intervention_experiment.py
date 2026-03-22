@@ -1,28 +1,28 @@
 """
-Causal Intervention Experiment
-================================
+Causal Intervention Experiment (1-to-1 Design)
+===============================================
 验证假设：在 correlation_matching_results.json 中找到的 train-test correlation 配对，
          是否真的共享同一组模型参数回路（knowledge circuit）。
 
-方法：
-  - 对找到的相关 train sample 的 correlation [A→B] 做 saliency_loss 梯度更新
-  - 观察 test sample 上全部 4 个 top-correlation 的 saliency 变化（delta_S）
-  - 对照组：选取与 test 无关的 train sample，做同样操作，delta_S 应接近 0
+实验单元：每个 test correlation 独立
+  - 为每个 test correlation 找到全局 cos_sim 最高的 (train_sample, train_correlation)
+  - 对该 train_correlation 做 saliency_loss 干预
+  - 观察这个 test correlation 自己的 delta_S（primary metric）
+  - 同时记录其他 3 个 test correlation 的 delta_S（cross-effect，作为参考）
+  - 对照组：用 cos_sim 接近 0 的 train_correlation 做同样操作，delta_S 应接近 0
 
-Phase 1: 在 cos_sim 最高的 train sample 上扫描 (lr × steps) 超参组合
-Phase 2: 固定超参，对全部实验组 + 对照组样本完整跑
+Phase 1: 在全局 cos_sim 最高的那对 (test_corr, train_corr) 上扫描 (lr × steps)
+Phase 2: 固定超参，对全部 4 个 test correlation 各自独立跑实验组 + 对照组
 """
 
-import copy
 import json
 import os
+import random
 import re
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from functools import partial
-from heapq import nlargest
 from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq, set_seed
 
@@ -50,13 +50,13 @@ from src.process_data import process_func_chatml
 
 SEED = 42
 SELECTED_TEST_SAMPLE_INDEX = 58
-TOKEN_INDEX_TO_RETRIEVE = 703   # 我们研究的"第一个预测错误的 token"
-TOP_K_PROMPT_TOKENS = 4         # 监测的 test correlation 数量（全部）
+TOKEN_INDEX_TO_RETRIEVE = 703   # 我们研究的第一个预测错误的 token
+TOP_K_PROMPT_TOKENS = 4         # 监测的 test correlation 数量
 SEQUENCE_LENGTH_LIMIT = 3000
 
 # ── Phase 控制 ────────────────────────────────────────────────────────────────
-# "phase1" : 超参扫描（在 cos_sim 最高的 train sample 上跑 LR × STEPS 组合）
-# "phase2" : 全量实验（固定超参，跑所有实验组 + 对照组）
+# "phase1" : 超参扫描（在全局 cos_sim 最高的那对上跑 LR × STEPS 组合）
+# "phase2" : 全量实验（固定超参，对每个 test correlation 独立跑 1-to-1 实验）
 PHASE: str = "phase1"
 
 # Phase 1 sweep 参数
@@ -65,13 +65,12 @@ STEPS_SWEEP = [1, 3, 5]
 
 # Phase 2 固定参数（从 Phase 1 结果中选）
 PHASE2_LR    = 1e-4
-PHASE2_STEPS = 3
+PHASE2_STEPS = 1
 
-# ── 对照组 ────────────────────────────────────────────────────────────────────
-# 手动指定 or 自动选取不在实验组中的前 N 个样本
-# 若为 None，则自动选取 NUM_CONTROL_SAMPLES 个（跳过实验组 ID）
-NUM_CONTROL_SAMPLES: int = 5
-MANUAL_CONTROL_IDS: list[int] | None = None   # e.g. [2, 7, 15, 23, 41]
+# 对照组 A（低 cos_sim）：从 interventions 里取 cos_sim 最低的 N 个
+NUM_CONTROL_PER_TC: int = 2
+# 对照组 B（真随机）：从完全不在 interventions 里的训练样本中随机选 N 个
+NUM_RANDOM_CONTROL_PER_TC: int = 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -90,10 +89,7 @@ def qk_last_quarter_filter(name: str, param, num_layers: int = 28) -> bool:
 
 
 def find_first_valid_token_index(tokenizer, input_ids_tensor, start_idx: int) -> int:
-    """
-    跳过格式字符（\\n, \\t, 空格, {, } 等），找到第一个有语义意义的 token。
-    与 intervention_experiment.py 保持一致。
-    """
+    """跳过格式字符，找到第一个有语义意义的 token。"""
     idx = start_idx
     seq_len = input_ids_tensor.size(1)
     while idx < seq_len:
@@ -116,7 +112,7 @@ def save_param_snapshot(model, param_filter_fn) -> dict[str, torch.Tensor]:
 def restore_param_snapshot(
     model, snapshot: dict[str, torch.Tensor], param_filter_fn
 ) -> None:
-    """从快照恢复 filtered params，并确保它们的 requires_grad = False。"""
+    """从快照恢复 filtered params。"""
     with torch.no_grad():
         for name, param in model.named_parameters():
             if name in snapshot:
@@ -132,8 +128,7 @@ def measure_all_test_saliencies(
     target_token_idx: int,
 ) -> list[float]:
     """
-    一次性计算 test_batch 中所有 4 个 top-correlation 的 saliency score。
-    利用 compute_full_saliency_vector 只做一次 forward+backward。
+    一次 forward+backward 得到所有 test correlation 的 saliency score。
     """
     full_vec = compute_full_saliency_vector(model, test_batch, target_token_idx)
     return [full_vec[tc["source_token_index"]] for tc in test_correlations]
@@ -153,31 +148,29 @@ def run_single_intervention(
 ) -> tuple[list[float], list[float], list[float]]:
     """
     完整的一次干预周期：
-      1. 测量 S_before（所有 4 个 test correlations）
+      1. 测量 S_before（所有 test correlations）
       2. 保存权重快照
       3. num_steps 步 saliency_loss 梯度更新（在 train correlation 上）
       4. 测量 S_after
       5. 恢复权重快照
-    
+
     Returns:
-        s_before  list[float] 长度 4
-        s_after   list[float] 长度 4
-        step_losses  list[float] 每步的 saliency_loss 值
+        s_before     list[float]  长度 = len(test_correlations)
+        s_after      list[float]  长度 = len(test_correlations)
+        step_losses  list[float]  每步的 saliency_loss 值
     """
-    # ── Step 1: S_before ──────────────────────────────────────────────────────
+    # Step 1: S_before
     s_before = measure_all_test_saliencies(
         model, test_batch, test_correlations, TOKEN_INDEX_TO_RETRIEVE
     )
 
-    # ── Step 2: 快照 ──────────────────────────────────────────────────────────
+    # Step 2: 快照
     snapshot = save_param_snapshot(model, param_filter_fn)
 
-    # ── Step 3: 梯度更新 ──────────────────────────────────────────────────────
-    # 绑定 optimizer（SGD，与理论推导一致，无动量/decay 干扰）
+    # Step 3: 梯度更新
     target_params = [
         p for n, p in model.named_parameters() if param_filter_fn(n, p)
     ]
-    # 先全部 freeze，do_saliency_loss_step 内部会按需 unfreeze
     for p in target_params:
         p.requires_grad_(False)
 
@@ -199,36 +192,97 @@ def run_single_intervention(
             f"(train src={train_source_idx} → tgt={train_target_idx})"
         )
 
-    # ── Step 4: S_after ───────────────────────────────────────────────────────
+    # Step 4: S_after
     s_after = measure_all_test_saliencies(
         model, test_batch, test_correlations, TOKEN_INDEX_TO_RETRIEVE
     )
 
-    # ── Step 5: 恢复 ──────────────────────────────────────────────────────────
+    # Step 5: 恢复
     restore_param_snapshot(model, snapshot, param_filter_fn)
     del snapshot
 
     return s_before, s_after, step_losses
 
 
-def select_control_ids(
-    all_train_ids: set[int],
-    treated_ids: set[int],
-    n: int,
-    manual: list[int] | None,
-) -> list[int]:
+def find_best_match_for_test_corr(
+    interventions: list[dict],
+    test_corr_source_idx: int,
+) -> dict | None:
     """
-    选取对照组 train sample IDs。
-    优先使用 MANUAL_CONTROL_IDS；否则自动选取不在实验组中的前 n 个。
-    """
-    if manual is not None:
-        bad = set(manual) & treated_ids
-        if bad:
-            raise ValueError(f"MANUAL_CONTROL_IDS 中有 ID 与实验组重叠：{bad}")
-        return manual[:n]
+    在 correlation_matching_results.json 的 interventions 列表中，
+    为指定的 test correlation（by source_token_index）找到全局 cos_sim 最高的
+    (train_sample_id, train_correlation, cos_sim) 三元组。
 
-    candidates = sorted(all_train_ids - treated_ids)
+    Returns:
+        dict with keys: train_sample_id, train_correlation, cos_sim
+        or None if not found
+    """
+    best = None
+    best_cos = -1.0
+    for item in interventions:
+        for m in item["correlation_matches"]:
+            if m["test_correlation"]["source_token_index"] == test_corr_source_idx:
+                if m["cos_sim"] > best_cos:
+                    best_cos = m["cos_sim"]
+                    best = {
+                        "train_sample_id":   item["train_sample_id"],
+                        "train_correlation": m["train_correlation"],
+                        "cos_sim":           m["cos_sim"],
+                    }
+    return best
+
+
+def find_control_matches_for_test_corr(
+    interventions: list[dict],
+    test_corr_source_idx: int,
+    treated_train_id: int,
+    n: int,
+) -> list[dict]:
+    """
+    为指定 test correlation 找 n 个对照 train sample：
+    - 不是 treat 样本（排除 treated_train_id）
+    - 按 cos_sim 从低到高（取 cos_sim 接近 0 的，代表无相关）
+    """
+    candidates = []
+    for item in interventions:
+        if item["train_sample_id"] == treated_train_id:
+            continue
+        for m in item["correlation_matches"]:
+            if m["test_correlation"]["source_token_index"] == test_corr_source_idx:
+                candidates.append({
+                    "train_sample_id":   item["train_sample_id"],
+                    "train_correlation": m["train_correlation"],
+                    "cos_sim":           m["cos_sim"],
+                })
+    # 取 cos_sim 最低的 n 个（接近 0 的为对照）
+    candidates.sort(key=lambda x: x["cos_sim"])
     return candidates[:n]
+
+
+def build_delta_result(
+    test_correlations: list[dict],
+    primary_tc_idx: int,
+    s_before: list[float],
+    s_after: list[float],
+) -> dict:
+    """
+    构建标准化的 delta 结果，区分 primary（当前目标 test corr）和 cross-effect（其他）。
+    primary_tc_idx: test_correlations 列表中当前被干预对应的那个的下标
+    """
+    entries = []
+    for i, tc in enumerate(test_correlations):
+        ds = s_after[i] - s_before[i]
+        entries.append({
+            "source_token":       tc["source_token"],
+            "source_token_index": tc["source_token_index"],
+            "role":               "primary" if i == primary_tc_idx else "cross_effect",
+            "S_before":           s_before[i],
+            "S_after":            s_after[i],
+            "delta_S":            ds,
+            "relative_delta":     ds / (s_before[i] + 1e-12),
+            "direction_correct":  ds > 0,
+        })
+    return entries
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,7 +320,9 @@ def run_saliency_intervention_experiment():
     with open(results_path, "r", encoding="utf-8") as f:
         corr_results = json.load(f)
 
-    # ── 重建 test_batch（与 intervention_experiment.py 完全相同的逻辑）────────
+    interventions = corr_results["interventions"]
+
+    # ── 重建 test_batch ────────────────────────────────────────────────────────
     print("\n[Setup] 重建 test_batch for sample 58（需要重新 generate）...")
     infer_fw = NewInferenceFunction(
         model=model,
@@ -289,9 +345,9 @@ def run_saliency_intervention_experiment():
         device=prompt_ids.device,
         dtype=prompt_ids.dtype,
     )
-    new_input_ids       = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
-    new_attention_mask  = torch.ones_like(new_input_ids)
-    new_labels          = new_input_ids.clone()
+    new_input_ids      = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels         = new_input_ids.clone()
     new_labels[:, :prompt_len] = -100
 
     test_batch = {
@@ -310,34 +366,41 @@ def run_saliency_intervention_experiment():
             f"saliency={tc['saliency_score']:.5f}"
         )
 
-    interventions = corr_results["interventions"]
-    treated_ids   = {item["train_sample_id"] for item in interventions}
-
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 1: 超参扫描
+    # PHASE 1: 超参扫描（在全局 cos_sim 最高的那对上）
     # ══════════════════════════════════════════════════════════════════════════
     if PHASE == "phase1":
         print("\n" + "═" * 70)
-        print("PHASE 1: 超参扫描")
+        print("PHASE 1: 超参扫描（1-to-1）")
         print("═" * 70)
 
-        # 选取实验组中 cos_sim 最高的 train sample 作为扫描对象
-        best_item = max(
-            interventions,
-            key=lambda item: max(m["cos_sim"] for m in item["correlation_matches"]),
-        )
-        best_match = max(best_item["correlation_matches"], key=lambda m: m["cos_sim"])
+        # 找全局 cos_sim 最高的那对 (test_corr, train_corr)
+        best_global_cos = -1.0
+        best_tc_idx     = -1
+        best_match      = None
 
-        train_idx        = best_item["train_sample_id"]
-        train_source_idx = best_match["train_correlation"]["source_token_index"]
-        train_target_idx = best_match["train_correlation"]["target_token_index"]
-        best_cos_sim     = best_match["cos_sim"]
+        for tc_i, tc in enumerate(test_correlations):
+            m = find_best_match_for_test_corr(interventions, tc["source_token_index"])
+            if m and m["cos_sim"] > best_global_cos:
+                best_global_cos = m["cos_sim"]
+                best_tc_idx     = tc_i
+                best_match      = m
+
+        if best_match is None:
+            raise RuntimeError("找不到任何有效的 correlation match，请检查 correlation_matching_results.json")
+
+        target_tc         = test_correlations[best_tc_idx]
+        train_idx         = best_match["train_sample_id"]
+        train_source_idx  = best_match["train_correlation"]["source_token_index"]
+        train_target_idx  = best_match["train_correlation"]["target_token_index"]
 
         print(
-            f"  选定 train sample ID={train_idx}，cos_sim={best_cos_sim:.5f}\n"
-            f"  train correlation:  src='{best_match['train_correlation']['source_token']}' "
-            f"(idx={train_source_idx}) → tgt='{best_match['train_correlation']['target_token']}' "
-            f"(idx={train_target_idx})"
+            f"  全局最优 pair：\n"
+            f"    test_corr : '{target_tc['source_token']}'(idx={target_tc['source_token_index']}) "
+            f"→ '{target_tc['target_token']}'(idx={target_tc['target_token_index']})\n"
+            f"    train_corr: '{best_match['train_correlation']['source_token']}'(idx={train_source_idx}) "
+            f"→ '{best_match['train_correlation']['target_token']}'(idx={train_target_idx})\n"
+            f"    cos_sim   : {best_global_cos:.5f}  (train_sample_id={train_idx})"
         )
 
         tr_ds    = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
@@ -360,48 +423,56 @@ def run_saliency_intervention_experiment():
                     num_steps=steps,
                     device=accelerator.device,
                 )
-                delta_S = [a - b for a, b in zip(s_after, s_before)]
 
-                # 理论预测的方向：lr × cos_sim（仅用于验证线性近似）
-                # 真实 predicted_delta = lr * cos_sim * ‖test_feat‖ * ‖train_feat‖
-                # 这里只记 cos_sim 供后续分析
-                per_tc = [
-                    {
-                        "source_token":       tc["source_token"],
-                        "source_token_index": tc["source_token_index"],
-                        "S_before":           sb,
-                        "S_after":            sa,
-                        "delta_S":            ds,
-                        "direction_correct":  ds > 0,  # 预期 delta_S > 0 when cos_sim > 0
-                    }
-                    for tc, sb, sa, ds in zip(test_correlations, s_before, s_after, delta_S)
-                ]
+                # Primary：目标 test correlation 的 delta_S
+                primary_delta_S = s_after[best_tc_idx] - s_before[best_tc_idx]
+                all_delta_S     = [a - b for a, b in zip(s_after, s_before)]
 
-                print(f"    delta_S = {[f'{d:.6f}' for d in delta_S]}")
-                print(f"    step_losses = {[f'{l:.6f}' for l in step_losses]}")
+                print(f"    primary delta_S          = {primary_delta_S:.6f}  (target: '{target_tc['source_token']}')")
+                print(f"    all delta_S              = {[f'{d:.6f}' for d in all_delta_S]}")
+                print(f"    step_losses              = {[f'{l:.6f}' for l in step_losses]}")
 
                 sweep_results.append({
-                    "lr":             lr,
-                    "num_steps":      steps,
-                    "train_sample_id": train_idx,
-                    "cos_sim":         best_cos_sim,
-                    "step_losses":     step_losses,
-                    "per_test_correlation": per_tc,
+                    "lr":               lr,
+                    "num_steps":        steps,
+                    "train_sample_id":  train_idx,
+                    "cos_sim":          best_global_cos,
+                    "step_losses":      step_losses,
+                    "primary_delta_S":  primary_delta_S,
+                    "direction_correct": primary_delta_S > 0,
+                    "all_delta_S": [
+                        {
+                            "source_token":       tc["source_token"],
+                            "source_token_index": tc["source_token_index"],
+                            "role":               "primary" if i == best_tc_idx else "cross_effect",
+                            "S_before":           s_before[i],
+                            "S_after":            s_after[i],
+                            "delta_S":            all_delta_S[i],
+                        }
+                        for i, tc in enumerate(test_correlations)
+                    ],
                 })
 
         output = {
             "phase": "phase1",
             "config": {
-                "tested_train_sample_id": train_idx,
-                "best_cos_sim":           best_cos_sim,
-                "train_correlation": {
-                    "source_token":       best_match["train_correlation"]["source_token"],
-                    "source_token_index": train_source_idx,
-                    "target_token":       best_match["train_correlation"]["target_token"],
-                    "target_token_index": train_target_idx,
+                "primary_test_correlation": {
+                    "source_token":       target_tc["source_token"],
+                    "source_token_index": target_tc["source_token_index"],
+                    "target_token":       target_tc["target_token"],
+                    "target_token_index": target_tc["target_token_index"],
+                    "tc_list_index":      best_tc_idx,
                 },
-                "param_filter": "qk_last_quarter",
-                "test_sample_index":      SELECTED_TEST_SAMPLE_INDEX,
+                "best_train_correlation": {
+                    "train_sample_id":   train_idx,
+                    "source_token":      best_match["train_correlation"]["source_token"],
+                    "source_token_index": train_source_idx,
+                    "target_token":      best_match["train_correlation"]["target_token"],
+                    "target_token_index": train_target_idx,
+                    "cos_sim":           best_global_cos,
+                },
+                "param_filter":            "qk_last_quarter",
+                "test_sample_index":       SELECTED_TEST_SAMPLE_INDEX,
                 "test_target_token_index": TOKEN_INDEX_TO_RETRIEVE,
             },
             "sweep_results": sweep_results,
@@ -413,195 +484,216 @@ def run_saliency_intervention_experiment():
         print(f"\n[Phase 1] 结果已写入 {out_path}")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 2: 全量实验（实验组 + 对照组）
+    # PHASE 2: 全量实验（每个 test correlation 独立 1-to-1）
     # ══════════════════════════════════════════════════════════════════════════
     elif PHASE == "phase2":
         print("\n" + "═" * 70)
-        print(f"PHASE 2: 全量实验  lr={PHASE2_LR:.0e}  steps={PHASE2_STEPS}")
+        print(f"PHASE 2: 全量实验（1-to-1）  lr={PHASE2_LR:.0e}  steps={PHASE2_STEPS}")
         print("═" * 70)
 
-        marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
+        per_tc_results = []
 
-        # ── 构建实验组样本列表 ───────────────────────────────────────────────
-        treated_group = []
-        for item in interventions:
-            best_match = max(item["correlation_matches"], key=lambda m: m["cos_sim"])
-            treated_group.append({
-                "group":           "treated",
-                "train_sample_id": item["train_sample_id"],
-                "rank":            interventions.index(item) + 1,
-                "coarse_cos_sim":  item["coarse_cos_sim"],
-                "cos_sim":         best_match["cos_sim"],
-                "train_correlation": best_match["train_correlation"],
-                "test_correlation":  best_match["test_correlation"],
-            })
+        for tc_i, tc in enumerate(test_correlations):
+            tc_src_idx = tc["source_token_index"]
+            print(f"\n{'─' * 60}")
+            print(f"[TC {tc_i}] test correlation: '{tc['source_token']}'(idx={tc_src_idx}) "
+                  f"→ '{tc['target_token']}'(idx={tc['target_token_index']})")
+            print(f"{'─' * 60}")
 
-        # ── 构建对照组样本列表 ───────────────────────────────────────────────
-        control_ids = select_control_ids(
-            all_train_ids=set(range(len(train_samples))),
-            treated_ids=treated_ids,
-            n=NUM_CONTROL_SAMPLES,
-            manual=MANUAL_CONTROL_IDS,
-        )
-        print(f"[Phase 2] 对照组 IDs: {control_ids}")
+            # ── 实验组：找该 test corr 全局最优的 train_corr ─────────────────
+            treated = find_best_match_for_test_corr(interventions, tc_src_idx)
+            if treated is None:
+                print(f"  ⚠ 找不到 match，跳过 TC {tc_i}")
+                continue
 
-        # 为对照组样本找各自的 top-1 saliency correlation（train's own primary attention）
-        control_group = []
-        for tid in control_ids:
-            tr_ds    = build_single_sample_dataset(train_samples[tid], convert_to_chatml)
+            treated_train_id = treated["train_sample_id"]
+            print(
+                f"  [TREATED] train_id={treated_train_id}  cos_sim={treated['cos_sim']:.5f}\n"
+                f"    train_corr: '{treated['train_correlation']['source_token']}'(idx={treated['train_correlation']['source_token_index']}) "
+                f"→ '{treated['train_correlation']['target_token']}'(idx={treated['train_correlation']['target_token_index']})"
+            )
+
+            tr_ds    = build_single_sample_dataset(train_samples[treated_train_id], convert_to_chatml)
             tr_batch = base_collator([tr_ds[0]])
             tr_batch = {k: v.to(accelerator.device) for k, v in tr_batch.items()}
-
-            if tr_batch["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
-                print(f"  Control sample {tid} 太长，跳过。")
-                continue
-
-            try:
-                start_sys = _find_subseq_start(tr_batch["input_ids"][0], marker_ids) + 3
-            except ValueError:
-                print(f"  Control sample {tid} 找不到 marker，跳过。")
-                continue
-
-            valid_tok_idx = find_first_valid_token_index(
-                tokenizer, tr_batch["input_ids"], start_sys
-            )
-
-            # 用一次 forward 得到完整 saliency 向量，选 top-1 source
-            sal_vec      = compute_full_saliency_vector(model, tr_batch, valid_tok_idx)
-            top1_src_idx = int(max(range(len(sal_vec)), key=lambda i: sal_vec[i]))
-
-            control_group.append({
-                "group":           "control",
-                "train_sample_id": tid,
-                "cos_sim":         0.0,   # 对照组不计算 cos_sim
-                "train_correlation": {
-                    "source_token":       tokenizer.decode(
-                        [tr_batch["input_ids"][0, top1_src_idx].item()]
-                    ),
-                    "source_token_index": top1_src_idx,
-                    "target_token":       tokenizer.decode(
-                        [tr_batch["input_ids"][0, valid_tok_idx].item()]
-                    ),
-                    "target_token_index": valid_tok_idx,
-                },
-                "test_correlation": None,
-                "_tr_batch":         tr_batch,   # 临时缓存，最后删掉
-            })
-
-        # ── 全量运行 ─────────────────────────────────────────────────────────
-        all_groups = treated_group + control_group
-        results    = []
-
-        for entry in tqdm(all_groups, desc="Running interventions"):
-            train_idx  = entry["train_sample_id"]
-            group      = entry["group"]
-            cos_sim    = entry["cos_sim"]
-            train_corr = entry["train_correlation"]
-
-            print(f"\n[{group.upper()} | rank={entry.get('rank','—')}]  "
-                  f"train_id={train_idx}  cos_sim={cos_sim:.5f}")
-
-            # 构建 train_batch（对照组已缓存，实验组现在构建）
-            if group == "treated":
-                tr_ds    = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
-                tr_batch = base_collator([tr_ds[0]])
-                tr_batch = {k: v.to(accelerator.device) for k, v in tr_batch.items()}
-
-                if tr_batch["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
-                    print(f"  样本 {train_idx} 太长，跳过。")
-                    continue
-            else:
-                tr_batch = entry.pop("_tr_batch")   # 用完即弃
-
-            train_source_idx = train_corr["source_token_index"]
-            train_target_idx = train_corr["target_token_index"]
-
-            print(
-                f"  干预 train correlation: "
-                f"'{train_corr.get('source_token','')}' (idx={train_source_idx}) "
-                f"→ '{train_corr.get('target_token','')}' (idx={train_target_idx})"
-            )
 
             s_before, s_after, step_losses = run_single_intervention(
                 model,
                 tr_batch,
                 test_batch,
-                train_source_idx,
-                train_target_idx,
+                treated["train_correlation"]["source_token_index"],
+                treated["train_correlation"]["target_token_index"],
                 test_correlations,
                 param_filter,
                 lr=PHASE2_LR,
                 num_steps=PHASE2_STEPS,
                 device=accelerator.device,
             )
+            treated_entries = build_delta_result(test_correlations, tc_i, s_before, s_after)
+            primary_delta   = treated_entries[tc_i]["delta_S"]
+            print(f"  TREATED  primary delta_S = {primary_delta:+.6f}  direction_correct={primary_delta > 0}")
 
-            delta_S = [a - b for a, b in zip(s_after, s_before)]
-
-            per_tc = [
-                {
-                    "source_token":          tc["source_token"],
-                    "source_token_index":    tc["source_token_index"],
-                    "matched_cos_sim":       (
-                        # 若实验组，找对应 correlation_match 里该 test corr 的 cos_sim
-                        next(
-                            (
-                                m["cos_sim"]
-                                for item in interventions
-                                if item["train_sample_id"] == train_idx
-                                for m in item["correlation_matches"]
-                                if m["test_correlation"]["source_token_index"]
-                                == tc["source_token_index"]
-                            ),
-                            None,
-                        )
-                        if group == "treated"
-                        else None
-                    ),
-                    "S_before":              sb,
-                    "S_after":               sa,
-                    "delta_S":               ds,
-                    "relative_delta":        ds / (sb + 1e-12),
-                    "direction_correct":     ds > 0,
-                }
-                for tc, sb, sa, ds in zip(test_correlations, s_before, s_after, delta_S)
-            ]
-
-            print(
-                f"  delta_S = {[f'{d:.6f}' for d in delta_S]}  "
-                f"step_losses={[f'{l:.6f}' for l in step_losses]}"
-            )
-
-            results.append({
-                "train_sample_id":   train_idx,
-                "group":             group,
-                "rank":              entry.get("rank"),
-                "coarse_cos_sim":    entry.get("coarse_cos_sim"),
-                "cos_sim":           cos_sim,
-                "train_correlation": train_corr,
+            treated_result = {
+                "train_sample_id":   treated_train_id,
+                "train_correlation": treated["train_correlation"],
+                "cos_sim":           treated["cos_sim"],
                 "step_losses":       step_losses,
-                "per_test_correlation": per_tc,
+                "per_correlation":   treated_entries,
+            }
+
+            # ── 对照组 A：interventions 内 cos_sim 最低的 N 个 ──────────────
+            controls_raw = find_control_matches_for_test_corr(
+                interventions, tc_src_idx, treated_train_id, NUM_CONTROL_PER_TC
+            )
+            control_results = []
+            for ctrl in controls_raw:
+                ctrl_train_id = ctrl["train_sample_id"]
+                print(
+                    f"\n  [CTRL-A | low cos_sim] train_id={ctrl_train_id}  cos_sim={ctrl['cos_sim']:.5f}\n"
+                    f"    train_corr: '{ctrl['train_correlation']['source_token']}'(idx={ctrl['train_correlation']['source_token_index']}) "
+                    f"-> '{ctrl['train_correlation']['target_token']}'(idx={ctrl['train_correlation']['target_token_index']})"
+                )
+                c_ds    = build_single_sample_dataset(train_samples[ctrl_train_id], convert_to_chatml)
+                c_batch = base_collator([c_ds[0]])
+                c_batch = {k: v.to(accelerator.device) for k, v in c_batch.items()}
+
+                cs_before, cs_after, c_losses = run_single_intervention(
+                    model,
+                    c_batch,
+                    test_batch,
+                    ctrl["train_correlation"]["source_token_index"],
+                    ctrl["train_correlation"]["target_token_index"],
+                    test_correlations,
+                    param_filter,
+                    lr=PHASE2_LR,
+                    num_steps=PHASE2_STEPS,
+                    device=accelerator.device,
+                )
+                c_entries = build_delta_result(test_correlations, tc_i, cs_before, cs_after)
+                c_primary = c_entries[tc_i]["delta_S"]
+                print(f"  CTRL-A   primary delta_S = {c_primary:+.6f}  direction_correct={c_primary > 0}")
+
+                control_results.append({
+                    "train_sample_id":   ctrl_train_id,
+                    "train_correlation": ctrl["train_correlation"],
+                    "cos_sim":           ctrl["cos_sim"],
+                    "step_losses":       c_losses,
+                    "per_correlation":   c_entries,
+                })
+
+            # ── 对照组 B：真随机样本（完全不在 interventions 里）─────────────
+            treated_id_set = {item["train_sample_id"] for item in interventions}
+            rand_candidates = [i for i in range(len(train_samples)) if i not in treated_id_set]
+            rng = random.Random(SEED + tc_i)
+            rng.shuffle(rand_candidates)
+
+            marker_ids_b = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
+            random_control_results = []
+            for rand_id in rand_candidates:
+                if len(random_control_results) >= NUM_RANDOM_CONTROL_PER_TC:
+                    break
+
+                rc_ds    = build_single_sample_dataset(train_samples[rand_id], convert_to_chatml)
+                rc_batch = base_collator([rc_ds[0]])
+                rc_batch = {k: v.to(accelerator.device) for k, v in rc_batch.items()}
+
+                if rc_batch["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
+                    continue
+                try:
+                    start_sys = _find_subseq_start(rc_batch["input_ids"][0], marker_ids_b) + 3
+                except ValueError:
+                    continue
+
+                valid_tok_rc = find_first_valid_token_index(tokenizer, rc_batch["input_ids"], start_sys)
+                sal_vec_rc   = compute_full_saliency_vector(model, rc_batch, valid_tok_rc)
+                top1_src_rc  = int(max(range(len(sal_vec_rc)), key=lambda ii: sal_vec_rc[ii]))
+                src_tok_rc   = tokenizer.decode([rc_batch["input_ids"][0, top1_src_rc].item()])
+                tgt_tok_rc   = tokenizer.decode([rc_batch["input_ids"][0, valid_tok_rc].item()])
+
+                print(
+                    f"\n  [CTRL-B | random] train_id={rand_id}  cos_sim~0\n"
+                    f"    train_corr (own top-1 saliency): '{src_tok_rc}'(idx={top1_src_rc}) "
+                    f"-> '{tgt_tok_rc}'(idx={valid_tok_rc})"
+                )
+
+                rc_before, rc_after, rc_losses = run_single_intervention(
+                    model, rc_batch, test_batch,
+                    top1_src_rc, valid_tok_rc,
+                    test_correlations, param_filter,
+                    lr=PHASE2_LR, num_steps=PHASE2_STEPS, device=accelerator.device,
+                )
+                rc_entries = build_delta_result(test_correlations, tc_i, rc_before, rc_after)
+                rc_primary = rc_entries[tc_i]["delta_S"]
+                print(f"  CTRL-B   primary delta_S = {rc_primary:+.6f}  direction_correct={rc_primary > 0}")
+
+                random_control_results.append({
+                    "train_sample_id":   rand_id,
+                    "train_correlation": {
+                        "source_token":       src_tok_rc,
+                        "source_token_index": top1_src_rc,
+                        "target_token":       tgt_tok_rc,
+                        "target_token_index": valid_tok_rc,
+                    },
+                    "cos_sim":         None,
+                    "step_losses":     rc_losses,
+                    "per_correlation": rc_entries,
+                })
+
+            per_tc_results.append({
+                "tc_index":          tc_i,
+                "test_correlation":  tc,
+                "treated":           treated_result,
+                "controls_low_cos":  control_results,
+                "controls_random":   random_control_results,
             })
 
         # ── 写出结果 ─────────────────────────────────────────────────────────
         output = {
             "phase": "phase2",
             "config": {
-                "lr":                     PHASE2_LR,
-                "num_steps":              PHASE2_STEPS,
-                "param_filter":           "qk_last_quarter",
-                "test_sample_index":      SELECTED_TEST_SAMPLE_INDEX,
+                "lr":                      PHASE2_LR,
+                "num_steps":               PHASE2_STEPS,
+                "param_filter":            "qk_last_quarter",
+                "test_sample_index":       SELECTED_TEST_SAMPLE_INDEX,
                 "test_target_token_index": TOKEN_INDEX_TO_RETRIEVE,
-                "num_treated":            len(treated_group),
-                "num_control":            len(control_group),
+                "num_control_low_cos_per_tc":  NUM_CONTROL_PER_TC,
+                "num_control_random_per_tc":   NUM_RANDOM_CONTROL_PER_TC,
             },
-            "test_correlations": test_correlations,
-            "results": results,
+            "test_correlations":   test_correlations,
+            "per_tc_results":      per_tc_results,
         }
 
         out_path = os.path.join(base_dir, "causal_intervention_results_phase2.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(round_floats(output, 7), f, indent=2, ensure_ascii=False)
         print(f"\n[Phase 2] 结果已写入 {out_path}")
+
+        # ── 控制台摘要 ───────────────────────────────────────────────────────
+        print("\n" + "═" * 88)
+        print("SUMMARY  (treated vs CTRL-A low-cos vs CTRL-B random)")
+        print("═" * 88)
+        print(f"{'TC':>4}  {'token':>10}  {'cos_sim':>8}  "
+              f"{'treated':>9}  {'A-0':>7}  {'A-1':>7}  {'B-0':>7}  {'B-1':>7}  {'B-2':>7}  ok")
+        print("─" * 88)
+        for r in per_tc_results:
+            tc_r    = r["test_correlation"]
+            treated = r["treated"]
+            ca      = r["controls_low_cos"]
+            cb      = r["controls_random"]
+            idx     = r["tc_index"]
+            t_d  = treated["per_correlation"][idx]["delta_S"]
+            ca0  = ca[0]["per_correlation"][idx]["delta_S"] if len(ca) > 0 else float("nan")
+            ca1  = ca[1]["per_correlation"][idx]["delta_S"] if len(ca) > 1 else float("nan")
+            cb0  = cb[0]["per_correlation"][idx]["delta_S"] if len(cb) > 0 else float("nan")
+            cb1  = cb[1]["per_correlation"][idx]["delta_S"] if len(cb) > 1 else float("nan")
+            cb2  = cb[2]["per_correlation"][idx]["delta_S"] if len(cb) > 2 else float("nan")
+            print(
+                f"[{idx}]  {tc_r['source_token']:>10}  "
+                f"{treated['cos_sim']:>8.5f}  "
+                f"{t_d:>+9.4f}  {ca0:>+7.4f}  {ca1:>+7.4f}  "
+                f"{cb0:>+7.4f}  {cb1:>+7.4f}  {cb2:>+7.4f}  "
+                f"{'✅' if t_d > 0 else '❌'}"
+            )
 
     else:
         raise ValueError(f"PHASE 必须是 'phase1' 或 'phase2'，得到：{PHASE!r}")
