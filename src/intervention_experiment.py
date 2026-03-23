@@ -266,6 +266,7 @@ def run_causal_intervention_experiment():
 
     all_pair_records = []
     pair_id_counter = 0
+    train_sample_details = {}  # str(train_idx) -> full token + saliency data for display
 
     for rank, (train_idx, coarse_score) in enumerate(related_samples):
         print(f"\n--- Train Sample {train_idx}  (rank={rank+1}, coarse_score={coarse_score:.4f}) ---")
@@ -287,6 +288,10 @@ def run_causal_intervention_experiment():
         response_start = find_first_valid_token_index(tokenizer, tr_batch["input_ids"], start_sys)
         seq_len = tr_batch["input_ids"].size(1)
 
+        # Full token list in vocab-level encoding (Ġ=space, Ċ=newline) for SwitchTokenCodeBlock
+        full_tokens = tokenizer.convert_ids_to_tokens(tr_batch["input_ids"][0].tolist())
+        target_saliencies: dict[int, list[float]] = {}  # target_token_idx -> saliency_list
+
         # ── Step A: Cheap saliency scan ────────────────────────────────────────
         # For each of the first TOP_TARGETS response tokens, compute full saliency
         # vector and select the top TOP_K_SOURCE_PER_TARGET source tokens.
@@ -301,6 +306,7 @@ def run_causal_intervention_experiment():
                     break
 
                 saliency_vec = compute_full_saliency_vector(model, tr_batch, t)
+                target_saliencies[t] = [round(float(s), 6) for s in saliency_vec]
 
                 # nlargest over all preceding tokens (0..t-1)
                 top_sources = nlargest(
@@ -313,6 +319,14 @@ def run_causal_intervention_experiment():
 
         print(f"  Step A: {len(candidate_pairs)} candidate (target, source) pairs found "
               f"({TOP_TARGETS} targets × {TOP_K_SOURCE_PER_TARGET} sources each)")
+
+        # Save full token + saliency data for this train sample (used by frontend visualization)
+        train_sample_details[str(train_idx)] = {
+            "full_tokens": full_tokens,
+            "answer_start_index": response_start,
+            "coarse_cos_sim": float(coarse_score),
+            "saliencies_by_token": {str(k): v for k, v in target_saliencies.items()},
+        }
 
         # ── Step B: Full second-order gradient matching ────────────────────────
         # Compute one second-order gradient feature per candidate pair, then
@@ -386,6 +400,7 @@ def run_causal_intervention_experiment():
     # Sort all records by cos_sim descending — ready for threshold-based annotation
     all_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
     report_json["correlation_pairs"] = all_pair_records
+    report_json["train_sample_details"] = train_sample_details
 
     # Quick summary
     total = len(all_pair_records)
