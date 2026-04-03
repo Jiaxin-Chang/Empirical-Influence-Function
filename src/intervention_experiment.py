@@ -22,6 +22,7 @@ from src.process_data import process_func_chatml
 from src.loss import (
     compute_correlation_second_order_gradient,
     compute_full_saliency_vector,
+    compute_gradients,
 )
 from transformers import DataCollatorForSeq2Seq, set_seed
 
@@ -37,15 +38,12 @@ TOP_K_SOURCE_PER_TARGET = 4    # Top source tokens per target (includes response
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 
 
-def qk_last_quarter_filter(name, param, num_layers=28):
-    import re
-    match = re.search(r'layers\.(\d+)\.', name)
-    if match:
-        layer_idx = int(match.group(1))
-        if layer_idx >= num_layers * 3 // 4:
-            if 'q_proj' in name or 'k_proj' in name:
-                return True
-    return False
+def lm_head_filter(name, param):
+    """Only select the LM head weight — a single dense matrix that
+    projects the last hidden state to vocabulary logits.
+    This gives a compact, task-agnostic feature for every token prediction.
+    """
+    return name == "lm_head.weight"
 
 
 def find_first_valid_token_index(tokenizer, input_ids_tensor, start_idx):
@@ -82,8 +80,7 @@ def run_causal_intervention_experiment():
     set_seed(SEED)
 
     model, tokenizer = load_model_and_tokenizer()
-    num_layers = len(model.model.layers)
-    param_filter = partial(qk_last_quarter_filter, num_layers=num_layers)
+    param_filter = lm_head_filter
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
@@ -208,18 +205,48 @@ def run_causal_intervention_experiment():
             )
             test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
-    # Pre-materialise test query vectors for Stage 2
-    test_query_vectors = [feat for (feat, _, _) in test_corr_features.values()]
+    # ── Compute test-side CE gradient at token 703 (for Stage 2 coarse screening) ──
+    # This is the token-targeted influence function query vector:
+    #   g_test = ∂CE(test, token_703) / ∂lm_head
+    # Semantics: "what gradient direction at lm_head would have corrected this specific token?"
+    # Training samples whose CE gradient aligns with this are the most influential for token 703.
+    print("Computing token-targeted CE gradient for coarse screening (token 703)...")
+    filtered_params = [p for n, p in model.named_parameters() if param_filter(n, p)]
+
+    # Build a single-token label batch: only token 703 has a valid label, rest are masked
+    ce_labels = torch.full_like(test_batch["input_ids"], -100)
+    ce_labels[0, TOKEN_INDEX_TO_RETRIEVE] = test_batch["input_ids"][0, TOKEN_INDEX_TO_RETRIEVE]
+    single_token_batch = {
+        "input_ids": test_batch["input_ids"],
+        "attention_mask": test_batch["attention_mask"],
+        "labels": ce_labels,
+    }
+    test_ce_grads = compute_gradients(
+        model=model,
+        batch=single_token_batch,
+        param_filter_fn=param_filter,
+        device=accelerator.device,
+        ignored_token_ids=infer_fw.ignored_token_ids,
+    )
+    test_ce_grad = torch.cat([
+        g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
+        for g, p in zip(test_ce_grads, filtered_params)
+    ]).detach()
+    del test_ce_grads
+    print(f"  test_ce_grad shape: {test_ce_grad.shape}, norm: {test_ce_grad.norm().item():.4f}")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # STAGE 2: Coarse Screening — max cosine sim over ALL test correlation features
+    # STAGE 2: Coarse Screening — token-targeted CE gradient cosine similarity
+    #   Both sides use first-order CE gradients w.r.t. lm_head — consistent types.
+    #   Test : g_test = ∂CE(test, token_703) / ∂lm_head
+    #   Train: g_train = ∂CE(train, full_response) / ∂lm_head
+    #   Score = cosine_sim(g_test, g_train)  [standard TracIn coarse screening]
     # ═══════════════════════════════════════════════════════════════════════════
     print("\n=== Stage 2: Coarse screening over full training set ===")
-    print(f"  Using max cosine sim over {len(test_query_vectors)} test correlation features as proxy score")
+    print("  Method: token-targeted CE gradient cosine similarity (TracIn variant)")
+    print(f"  Test query: ∂CE(token_{TOKEN_INDEX_TO_RETRIEVE})/∂lm_head  "
+          f"vs  Train: ∂CE(full_response)/∂lm_head")
 
-    from src.loss import compute_gradients
-
-    filtered_params = [p for n, p in model.named_parameters() if param_filter(n, p)]
     sample_scores = []
 
     for batch in tqdm(train_loader, desc="Scanning Train Samples"):
@@ -239,13 +266,9 @@ def run_causal_intervention_experiment():
             for g, p in zip(train_ce_grads, filtered_params)
         ])
 
-        # Improved: score = max cosine similarity over all TOP_K test correlation features
-        # Avoids missing samples that align with only secondary test correlations
-        cos_sims = [
-            F.cosine_similarity(q_vec.cpu(), flat_train_ce, dim=0).item()
-            for q_vec in test_query_vectors
-        ]
-        score = max(cos_sims)
+        # Token-targeted TracIn: cosine similarity between test token-703 CE gradient
+        # and this training sample's full-response CE gradient.
+        score = F.cosine_similarity(test_ce_grad, flat_train_ce, dim=0).item()
         sample_scores.append((train_idx, score))
 
         del train_ce_grads, flat_train_ce, batch_device
