@@ -1523,5 +1523,27 @@ def main_compute_gradient_related_samples():
     
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Compute gradient-based influence and saliency for a single test sample."
+    )
+    parser.add_argument(
+        "--test-index", type=int, default=None,
+        help="Index of the test sample to analyse (overrides SELECTED_TEST_SAMPLE_INDEX)."
+    )
+    parser.add_argument(
+        "--token-index", type=int, default=None,
+        help="Token position to retrieve saliency for (overrides TOKEN_INDEX_TO_RETRIEVE)."
+    )
+    args = parser.parse_args()
+
+    # Override module-level globals when CLI args are provided
+    if args.test_index is not None:
+        SELECTED_TEST_SAMPLE_INDEX = args.test_index
+    if args.token_index is not None:
+        TOKEN_INDEX_TO_RETRIEVE = args.token_index
+
+    print(f"[NIF] test_index={SELECTED_TEST_SAMPLE_INDEX}  token_index={TOKEN_INDEX_TO_RETRIEVE}")
     # main_compute_new_inference_function()
     main_compute_gradient_related_samples()
