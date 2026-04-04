@@ -455,4 +455,26 @@ def run_causal_intervention_experiment():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run causal intervention experiment for a single test sample + token."
+    )
+    parser.add_argument(
+        "--test-index", type=int, default=None,
+        help="Index of the test sample to analyse (overrides SELECTED_TEST_SAMPLE_INDEX)."
+    )
+    parser.add_argument(
+        "--token-index", type=int, default=None,
+        help="Token position to investigate (overrides TOKEN_INDEX_TO_RETRIEVE)."
+    )
+    args = parser.parse_args()
+
+    if args.test_index is not None:
+        SELECTED_TEST_SAMPLE_INDEX = args.test_index
+    if args.token_index is not None:
+        TOKEN_INDEX_TO_RETRIEVE = args.token_index
+
+    print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  token_index={TOKEN_INDEX_TO_RETRIEVE}")
     run_causal_intervention_experiment()
+
