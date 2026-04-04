@@ -1515,8 +1515,11 @@ def main_compute_gradient_related_samples():
     dumped_json = round_floats(dumped_json, 5)
 
     # this file is displayed in tools/correlation-report
-    with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
-        json.dump(dumped_json ,f)
+    # filename encodes the experiment parameters so multiple runs don't overwrite each other
+    saliency_filename = f'./saliency_test{SELECTED_TEST_SAMPLE_INDEX}_tok{TOKEN_INDEX_TO_RETRIEVE}.json'
+    with open(saliency_filename, 'w', encoding = 'utf-8') as f:
+        json.dump(dumped_json, f)
+    print(f"\nSaliency results → {saliency_filename}")
     
 
 if __name__ == "__main__":

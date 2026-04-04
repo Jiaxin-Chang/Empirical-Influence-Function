@@ -444,7 +444,10 @@ def run_causal_intervention_experiment():
     report_json = round_floats(report_json, 5)
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    report_path = os.path.join(base_dir, 'correlation_matching_results.json')
+    # filename encodes the experiment parameters so multiple runs don't overwrite each other
+    # this mirrors the saliency_test{N}_tok{tok}.json naming convention
+    report_filename = f'correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_tok{TOKEN_INDEX_TO_RETRIEVE}.json'
+    report_path = os.path.join(base_dir, report_filename)
     with open(report_path, 'w', encoding='utf-8') as f:
         json.dump(report_json, f, indent=2, ensure_ascii=False)
 
