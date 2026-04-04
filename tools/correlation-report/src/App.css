@@ -264,3 +264,68 @@
   border-radius: 2px 2px 0 0;
   padding: 0 1px;
 }
+
+/* ================================================================== */
+/* Experiment Selector                                                */
+/* ================================================================== */
+
+.experiment-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+  padding: 0.6rem 0.9rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.exp-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+  margin-right: 0.15rem;
+}
+
+.exp-pill {
+  display: inline-block;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid #d1d5db;
+  border-radius: 20px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  color: #374151;
+  background: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.exp-pill:hover {
+  border-color: #2563eb;
+  color: #2563eb;
+  background: #eff6ff;
+}
+
+.exp-pill.active {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #2563eb;
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.3);
+}
+
+/* single experiment — show as static pill, no cursor */
+.experiment-selector.single .exp-pill {
+  cursor: default;
+  background: #f1f5f9;
+  color: #475569;
+  border-color: #cbd5e1;
+}
+.experiment-selector.single .exp-pill:hover {
+  background: #f1f5f9;
+  color: #475569;
+  border-color: #cbd5e1;
+}
