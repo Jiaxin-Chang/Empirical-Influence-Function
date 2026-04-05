@@ -361,8 +361,8 @@ export function CausalInterventionSection({ reportData }: Props) {
     // ── Stats ─────────────────────────────────────────────────────────────────
     const stats = useMemo(() => {
         const above = allPairs.filter(p => p.cos_sim >= threshold).length;
-        const cnt = { correct: 0, incorrect: 0, ambiguous: 0, total: 0 };
-        allPairs.forEach(p => { const a = effectiveAnn(p); if (a) { cnt[a]++; cnt.total++; } });
+        const cnt = { correct: 0, incorrect: 0, ambiguous: 0 };
+        allPairs.forEach(p => { const a = effectiveAnn(p); if (a) { cnt[a]++; } });
         return { total: allPairs.length, above, ...cnt };
     }, [allPairs, threshold, annotations]);
 
