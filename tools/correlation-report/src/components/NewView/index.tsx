@@ -348,6 +348,8 @@ export function NewView({ metas }: Props) {
     const [tracing, setTracing] = useState(false);
     // cos_sim filter threshold
     const [threshold, setThreshold] = useState(0.0);
+    // Whether to hide pairs with cos_sim exactly 0
+    const [hideZero, setHideZero] = useState(false);
 
     // Load report when meta selection changes
     useEffect(() => {
@@ -394,17 +396,20 @@ export function NewView({ metas }: Props) {
 
     // Pairs to show in the bottom panel
     const allDisplayPairs = useMemo(() => {
+        const keep = (p: CorrelationPair) =>
+            p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
+
         if (tracing && selectedResult) {
-            return selectedResult.correlation_pairs.filter(p => p.cos_sim >= threshold);
+            return selectedResult.correlation_pairs.filter(keep);
         }
         // Show all pairs across all analyzed tokens
         const all: CorrelationPair[] = [];
         report?.per_token_results.forEach(r => {
-            r.correlation_pairs.forEach(p => { if (p.cos_sim >= threshold) all.push(p); });
+            r.correlation_pairs.forEach(p => { if (keep(p)) all.push(p); });
         });
         all.sort((a, b) => b.cos_sim - a.cos_sim);
         return all;
-    }, [tracing, selectedResult, report, threshold]);
+    }, [tracing, selectedResult, report, threshold, hideZero]);
 
     // Group pairs by train_sample_id
     const trainGroups = useMemo(() => {
@@ -527,6 +532,23 @@ export function NewView({ metas }: Props) {
                             className={styles.thresholdSlider}
                         />
                         <span className={styles.thresholdVal}>{threshold.toFixed(3)}</span>
+                        <button
+                            onClick={() => setHideZero(v => !v)}
+                            style={{
+                                marginLeft: '12px',
+                                padding: '3px 10px',
+                                borderRadius: '6px',
+                                fontSize: '11px',
+                                cursor: 'pointer',
+                                border: `1px solid ${hideZero ? '#ef4444' : '#d1d5db'}`,
+                                background: hideZero ? '#fef2f2' : '#fff',
+                                color: hideZero ? '#b91c1c' : '#6b7280',
+                                fontWeight: hideZero ? 700 : 500,
+                                transition: 'all 0.12s',
+                            }}
+                        >
+                            {hideZero ? '✗ 已隐藏 cos=0' : '隐藏 cos_sim=0'}
+                        </button>
                     </div>
                 </div>
 
