@@ -627,6 +627,10 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             for k, v in train_sample_cache.items()
         }
 
+        correct_full_tokens = tokenizer.convert_ids_to_tokens(
+            raw_test_batch["input_ids"][0].tolist()
+        )
+
         report_json = {
             "experiment_meta": {
                 "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
@@ -643,8 +647,9 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 },
             },
             "test_sample_baseline": {
-                "full_tokens": gen_result["full_tokens"][0],
-                "prompt_len":  prompt_len,
+                "full_tokens":         gen_result["full_tokens"][0],
+                "correct_full_tokens": correct_full_tokens,
+                "prompt_len":          prompt_len,
             },
             "per_token_results":    per_token_results,
             "train_sample_details": train_sample_details,

@@ -1,0 +1,389 @@
+/* ── Root ── */
+.root {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 0 0 60px;
+    font-family: system-ui, -apple-system, sans-serif;
+}
+
+/* ── Experiment selector ── */
+.metaSelector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 12px 20px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+}
+.metaSelectorLabel {
+    font-size: 12px;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.metaBtn {
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1.5px solid #cbd5e1;
+    background: #fff;
+    color: #475569;
+    transition: all 0.12s;
+}
+.metaBtn:hover { border-color: #6366f1; color: #4338ca; }
+.metaBtnActive { background: #6366f1 !important; color: #fff !important; border-color: #6366f1 !important; }
+
+/* ── Two-panel top section ── */
+.topPanels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+@media (max-width: 900px) {
+    .topPanels { grid-template-columns: 1fr; }
+}
+
+/* ── Code Panel ── */
+.codePanel {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.codePanelHeader {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+.badge {
+    font-size: 10px;
+    font-weight: 800;
+    color: #fff;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.05em;
+}
+.codePanelLabel {
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
+}
+.codeBlock {
+    margin: 0;
+    padding: 14px;
+    background: #1e1e2e;
+    color: #cdd6f4;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    max-height: 420px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* ── Token states ── */
+.token { border-radius: 3px; transition: background 0.1s; }
+
+.token-normal   { color: #cdd6f4; }
+.token-response { color: #a6e3a1; }
+
+.token-analyzed {
+    color: #a6e3a1;
+    border-bottom: 1.5px dashed #89b4fa;
+    cursor: pointer;
+}
+.token-analyzed:hover { background: rgba(137,180,250,0.2); }
+
+.token-selected {
+    background: #fab387;
+    color: #1e1e2e;
+    font-weight: 700;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.token-source-highlight {
+    background: #f9e2af;
+    color: #1e1e2e;
+    font-weight: 600;
+    border-radius: 3px;
+}
+
+/* ── Selected token bar ── */
+.selectedBar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
+    border-radius: 10px;
+    border: 1px solid #45475a;
+}
+.selectedBarLeft {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: 1;
+}
+.selectedBarRight { flex-shrink: 0; }
+
+.selectedLabel { font-size: 11px; color: #a6adc8; font-weight: 700; text-transform: uppercase; }
+.selectedToken {
+    background: #fab387;
+    color: #1e1e2e;
+    font-family: monospace;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 5px;
+}
+.selectedIdx { font-size: 11px; color: #585b70; font-family: monospace; }
+.selectedSources { font-size: 11px; color: #89b4fa; font-weight: 600; }
+
+.sourceChip {
+    display: inline-flex;
+    align-items: center;
+    background: #313244;
+    border: 1px solid #89b4fa;
+    color: #89b4fa;
+    font-family: monospace;
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 12px;
+    gap: 3px;
+}
+.sourceChipSal { color: #a6adc8; font-size: 10px; }
+
+.traceBtn {
+    padding: 7px 18px;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(99,102,241,0.4);
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+.traceBtn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(99,102,241,0.5); }
+
+.traceBtnActive {
+    padding: 7px 18px;
+    background: #313244;
+    color: #a6e3a1;
+    border: 1.5px solid #a6e3a1;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+}
+.traceBtnActive:hover { background: rgba(166,227,161,0.1); }
+
+/* ── Bottom panel ── */
+.bottomPanel {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+}
+.bottomPanelHeader {
+    padding: 14px 18px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.bottomPanelTitle {
+    font-size: 14px;
+    font-weight: 700;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.pairCount {
+    font-size: 11px;
+    font-weight: 500;
+    color: #94a3b8;
+}
+.filterRow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.filterLabel { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
+.thresholdSlider { width: 140px; accent-color: #6366f1; }
+.thresholdVal { font-size: 13px; font-weight: 700; color: #4338ca; min-width: 40px; }
+
+.trainGroupList {
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* ── Train group ── */
+.trainGroup {
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    overflow: hidden;
+}
+.trainGroupHeader {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: #f8fafc;
+    cursor: pointer;
+    flex-wrap: wrap;
+    border-bottom: 1px solid transparent;
+    transition: background 0.1s;
+}
+.trainGroupHeader:hover { background: #f1f5f9; }
+.trainGroupId   { font-size: 11px; color: #818cf8; font-weight: 700; font-family: monospace; }
+.trainGroupCoarse { font-size: 11px; color: #94a3b8; }
+.trainGroupCount  { font-size: 11px; color: #94a3b8; }
+
+.trainGroupBody {
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.trainFullView { }
+.subLabel {
+    font-size: 10px;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+}
+.pairList {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* ── Train sample viewer ── */
+.trainSampleViewer {
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #313244;
+}
+
+/* ── Pair card ── */
+.pairCard {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #fff;
+    transition: border-color 0.15s;
+}
+.pairCardHeader {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    flex-wrap: wrap;
+    background: #fafafa;
+    transition: background 0.1s;
+}
+.pairCardHeader:hover { background: #f1f5f9; }
+
+.pairId    { font-size: 10px; font-family: monospace; color: #c4b5fd; }
+.cosSim    { font-weight: 700; font-size: 12px; padding: 2px 9px; border-radius: 10px; flex-shrink: 0; }
+.corrTag   { border: 1px solid; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-family: monospace; flex-shrink: 0; }
+.corrLabel { opacity: 0.65; }
+.arrow     { opacity: 0.55; }
+.offset    { opacity: 0.5; font-size: 10px; margin-left: 3px; }
+.corrArrow { color: #c4b5fd; font-size: 14px; }
+.trainBadge { font-size: 10px; background: #ede9fe; color: #5b21b6; padding: 2px 7px; border-radius: 4px; font-weight: 700; }
+.expandIcon { color: #94a3b8; font-size: 12px; margin-left: auto; }
+
+.pairCardBody {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border-top: 1px solid #f1f5f9;
+}
+
+/* ── Context row ── */
+.contextRow {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    background: #f8fafc;
+    border-radius: 6px;
+    padding: 7px 10px;
+    border: 1px solid #f1f5f9;
+}
+.contextRowLabel {
+    font-size: 10px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+.contextDivider { width: 1px; background: #e2e8f0; }
+
+/* ── Context chip ── */
+.contextChip {
+    font-family: monospace;
+    font-size: 12px;
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 2px;
+}
+.contextToken {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #f1f5f9;
+    color: #475569;
+    border: 1px solid transparent;
+}
+.contextTokenMarked {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #fde68a;
+    color: #78350f;
+    font-weight: 700;
+    border: 1.5px solid #f59e0b;
+}
+
+/* ── Misc ── */
+.emptyState {
+    padding: 40px 20px;
+    text-align: center;
+    color: #94a3b8;
+    font-size: 14px;
+    line-height: 1.6;
+}
+.emptyState code {
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #475569;
+}

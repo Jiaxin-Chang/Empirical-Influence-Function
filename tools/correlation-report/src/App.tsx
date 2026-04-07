@@ -1,40 +1,31 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import './App.css';
 import { SwitchTokenCodeBlock } from './components/SwitchTokenCodeBlock';
 import { CausalInterventionSection } from './components/CausalIntervention';
+import { NewView } from './components/NewView';
 
 /* ------------------------------------------------------------------ */
-/* Multi-experiment discovery via import.meta.glob                    */
+/* Manifest types (matches vite.config.ts plugin output)              */
 /* ------------------------------------------------------------------ */
 
-// Discover all saliency experiment files: saliency_test{N}_tok{tok}.json
-const allSaliencyFiles = import.meta.glob('../../../saliency_test*_tok*.json', {
-    query: '?raw',
-    eager: true,
-}) as Record<string, { default: string }>;
+interface ExperimentMeta {
+    testIdx: number;
+    tokIdx: number;
+    hasSaliency: boolean;
+    hasCorrelation: boolean;
+}
 
-// Discover all correlation matching result files
-const allCorrelationFiles = import.meta.glob(
-    '../../../correlation_matching_results_test*_tok*.json',
-    { query: '?raw', eager: true }
-) as Record<string, { default: string }>;
+interface AllTokensMeta {
+    testIdx: number;
+}
 
-// Legacy filenames — backwards compatibility
-const legacySaliencyFiles = import.meta.glob('../../../latest_saliency.json', {
-    query: '?raw',
-    eager: true,
-}) as Record<string, { default: string }>;
-const legacyCorrelationFiles = import.meta.glob('../../../correlation_matching_results.json', {
-    query: '?raw',
-    eager: true,
-}) as Record<string, { default: string }>;
-
-const markedCodeFiles = import.meta.glob('../../../marked_code_samples.md', {
-    query: '?raw',
-    eager: true,
-}) as Record<string, any>;
-const markedCodeSamplesText: string =
-    markedCodeFiles['../../../marked_code_samples.md']?.default ?? '';
+interface Manifest {
+    experiments: ExperimentMeta[];
+    allTokensExperiments: AllTokensMeta[];
+    hasLegacySaliency: boolean;
+    hasLegacyCorrelation: boolean;
+    hasMarkedCode: boolean;
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -81,10 +72,18 @@ function extractAttnSpans(text: string): { cleanedText: string; spans: [number, 
     return { cleanedText: parts.join(''), spans };
 }
 
-const gptBlocks = extractFencedCodeBlocks(markedCodeSamplesText).map(b => extractAttnSpans(b));
+async function fetchText(url: string): Promise<string | null> {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        return res.text();
+    } catch {
+        return null;
+    }
+}
 
 /* ------------------------------------------------------------------ */
-/* Experiment registry                                                */
+/* Experiment entry & data types                                      */
 /* ------------------------------------------------------------------ */
 
 interface ExperimentEntry {
@@ -94,55 +93,6 @@ interface ExperimentEntry {
     saliencyText: string;
     correlationText: string | null;
 }
-
-function parseSaliencyKey(path: string): { testIdx: number; tokIdx: number } | null {
-    const m = path.match(/saliency_test(\d+)_tok(\d+)\.json/);
-    if (!m) return null;
-    return { testIdx: parseInt(m[1], 10), tokIdx: parseInt(m[2], 10) };
-}
-
-function buildExperiments(): ExperimentEntry[] {
-    const entries: ExperimentEntry[] = [];
-
-    for (const [path, mod] of Object.entries(allSaliencyFiles)) {
-        const parsed = parseSaliencyKey(path);
-        if (!parsed) continue;
-        const { testIdx, tokIdx } = parsed;
-        const corrKey = `../../../correlation_matching_results_test${testIdx}_tok${tokIdx}.json`;
-        entries.push({
-            label: `test=${testIdx}  tok=${tokIdx}`,
-            testIdx,
-            tokIdx,
-            saliencyText: mod.default,
-            correlationText: allCorrelationFiles[corrKey]?.default ?? null,
-        });
-    }
-
-    entries.sort((a, b) => a.testIdx - b.testIdx || a.tokIdx - b.tokIdx);
-
-    // Fallback: legacy files
-    if (entries.length === 0) {
-        const legSal = legacySaliencyFiles['../../../latest_saliency.json']?.default;
-        const legCorr = legacyCorrelationFiles['../../../correlation_matching_results.json']?.default ?? null;
-        if (legSal) {
-            entries.push({
-                label: 'legacy (latest_saliency)',
-                testIdx: -1,
-                tokIdx: -1,
-                saliencyText: legSal,
-                correlationText: legCorr,
-            });
-        }
-    }
-
-    return entries;
-}
-
-const ALL_EXPERIMENTS = buildExperiments();
-
-/* ------------------------------------------------------------------ */
-/* Per-experiment data parsing                                        */
-/* ------------------------------------------------------------------ */
 
 interface ExperimentData {
     saliency: any;
@@ -174,35 +124,40 @@ function parseExperimentData(entry: ExperimentEntry): ExperimentData {
 /* ------------------------------------------------------------------ */
 
 function ExperimentSelector({
-    experiments,
+    metas,
     currentIndex,
+    loading,
     onChange,
 }: {
-    experiments: ExperimentEntry[];
+    metas: ExperimentMeta[];
     currentIndex: number;
+    loading: boolean;
     onChange: (idx: number) => void;
 }) {
-    if (experiments.length === 0) return null;
-    if (experiments.length === 1) {
+    if (metas.length === 0) return null;
+    if (metas.length === 1) {
+        const m = metas[0];
         return (
             <div className="experiment-selector single">
                 <span className="exp-label">Experiment:</span>
-                <span className="exp-pill active">{experiments[0].label}</span>
+                <span className="exp-pill active">test={m.testIdx} tok={m.tokIdx}</span>
             </div>
         );
     }
     return (
         <div className="experiment-selector">
             <span className="exp-label">Experiment:</span>
-            {experiments.map((exp, i) => (
+            {metas.map((m, i) => (
                 <button
                     key={i}
                     className={`exp-pill${i === currentIndex ? ' active' : ''}`}
                     onClick={() => onChange(i)}
+                    disabled={loading}
                 >
-                    {exp.label}
+                    test={m.testIdx} tok={m.tokIdx}
                 </button>
             ))}
+            {loading && <span className="exp-loading">Loading…</span>}
         </div>
     );
 }
@@ -211,10 +166,125 @@ function ExperimentSelector({
 /* App                                                                */
 /* ------------------------------------------------------------------ */
 
-function App() {
-    const [experimentIndex, setExperimentIndex] = useState(0);
+type ViewMode = 'new' | 'legacy';
 
-    if (ALL_EXPERIMENTS.length === 0) {
+function App() {
+    const [viewMode, setViewMode] = useState<ViewMode>('new');
+
+    const [manifest, setManifest] = useState<Manifest | null>(null);
+    const [manifestError, setManifestError] = useState(false);
+
+    const [experimentIndex, setExperimentIndex] = useState(0);
+    const [experimentEntry, setExperimentEntry] = useState<ExperimentEntry | null>(null);
+    const [loadingExp, setLoadingExp] = useState(false);
+
+    const [markedCodeSamplesText, setMarkedCodeSamplesText] = useState('');
+
+    // 1) Fetch the manifest on mount — tiny JSON, instant
+    useEffect(() => {
+        fetch('/data/index.json')
+            .then(r => {
+                if (!r.ok) throw new Error('manifest not found');
+                return r.json();
+            })
+            .then((m: Manifest) => {
+                setManifest(m);
+                if (m.hasMarkedCode) {
+                    fetchText('/data/marked_code_samples.md').then(t => {
+                        if (t) setMarkedCodeSamplesText(t);
+                    });
+                }
+            })
+            .catch(() => setManifestError(true));
+    }, []);
+
+    // 2) Fetch only the selected experiment's data when the user picks one
+    useEffect(() => {
+        if (!manifest) return;
+
+        const snap = manifest;
+        const metas = snap.experiments;
+
+        async function load() {
+            setLoadingExp(true);
+            setExperimentEntry(null);
+
+            if (metas.length > 0) {
+                const m = metas[experimentIndex] ?? metas[0];
+                const salUrl  = `/data/saliency_test${m.testIdx}_tok${m.tokIdx}.json`;
+                const corrUrl = `/data/correlation_matching_results_test${m.testIdx}_tok${m.tokIdx}.json`;
+
+                const [salText, corrText] = await Promise.all([
+                    fetchText(salUrl),
+                    m.hasCorrelation ? fetchText(corrUrl) : Promise.resolve(null),
+                ]);
+
+                if (salText) {
+                    setExperimentEntry({
+                        label: `test=${m.testIdx}  tok=${m.tokIdx}`,
+                        testIdx: m.testIdx,
+                        tokIdx: m.tokIdx,
+                        saliencyText: salText,
+                        correlationText: corrText,
+                    });
+                }
+            } else if (snap.hasLegacySaliency) {
+                const [salText, corrText] = await Promise.all([
+                    fetchText('/data/latest_saliency.json'),
+                    snap.hasLegacyCorrelation
+                        ? fetchText('/data/correlation_matching_results.json')
+                        : Promise.resolve(null),
+                ]);
+                if (salText) {
+                    setExperimentEntry({
+                        label: 'legacy (latest_saliency)',
+                        testIdx: -1,
+                        tokIdx: -1,
+                        saliencyText: salText,
+                        correlationText: corrText,
+                    });
+                }
+            }
+
+            setLoadingExp(false);
+        }
+
+        load();
+    }, [manifest, experimentIndex]);
+
+    const gptBlocks = useMemo(
+        () => extractFencedCodeBlocks(markedCodeSamplesText).map(b => extractAttnSpans(b)),
+        [markedCodeSamplesText]
+    );
+
+    // ── Render states ──────────────────────────────────────────────────────────
+
+    if (manifestError) {
+        return (
+            <div className="app-root">
+                <header className="app-header"><h1>Attribution Analysis</h1></header>
+                <section className="analysis-section">
+                    <p className="no-data" style={{ marginTop: '16px' }}>
+                        Failed to load <code>/data/index.json</code>. Make sure the Vite dev server is running
+                        (<code>pnpm dev</code>) or run <code>pnpm preview</code> after building.
+                    </p>
+                </section>
+            </div>
+        );
+    }
+
+    if (!manifest) {
+        return (
+            <div className="app-root">
+                <header className="app-header"><h1>Attribution Analysis</h1></header>
+                <section className="analysis-section">
+                    <p className="no-data" style={{ marginTop: '16px' }}>Loading experiment list…</p>
+                </section>
+            </div>
+        );
+    }
+
+    if (manifest.experiments.length === 0 && !manifest.hasLegacySaliency) {
         return (
             <div className="app-root">
                 <header className="app-header"><h1>Attribution Analysis</h1></header>
@@ -230,28 +300,66 @@ function App() {
         );
     }
 
-    const currentExp = ALL_EXPERIMENTS[experimentIndex];
-    const expData = parseExperimentData(currentExp);
+    const allTokensMetas = manifest.allTokensExperiments ?? [];
 
     return (
         <div className="app-root">
             <header className="app-header">
                 <h1>Attribution Analysis</h1>
+                <div className="view-toggle">
+                    <button
+                        className={`view-toggle-btn${viewMode === 'new' ? ' active' : ''}`}
+                        onClick={() => setViewMode('new')}
+                    >
+                        New View
+                    </button>
+                    <button
+                        className={`view-toggle-btn${viewMode === 'legacy' ? ' active' : ''}`}
+                        onClick={() => setViewMode('legacy')}
+                    >
+                        Legacy View
+                    </button>
+                </div>
             </header>
 
-            {/* Experiment switcher — drives all three sections simultaneously */}
-            <ExperimentSelector
-                experiments={ALL_EXPERIMENTS}
-                currentIndex={experimentIndex}
-                onChange={idx => setExperimentIndex(idx)}
-            />
+            {/* ── New View ── */}
+            {viewMode === 'new' && (
+                <NewView metas={allTokensMetas} />
+            )}
 
-            <OverfitSection key={`overfit-${experimentIndex}`} expData={expData} />
-            <TrainSampleSection key={`train-${experimentIndex}`} expData={expData} />
+            {/* ── Legacy View ── */}
+            {viewMode === 'legacy' && (
+                <>
+                    <ExperimentSelector
+                        metas={manifest.experiments}
+                        currentIndex={experimentIndex}
+                        loading={loadingExp}
+                        onChange={idx => setExperimentIndex(idx)}
+                    />
 
-            {/* Section 3: Causal Intervention — auto-linked to the same experiment */}
-            {expData.correlationData && (
-                <CausalInterventionSection reportData={expData.correlationData} />
+                    {loadingExp && (
+                        <section className="analysis-section">
+                            <p className="no-data" style={{ marginTop: '16px' }}>Loading experiment data…</p>
+                        </section>
+                    )}
+
+                    {!loadingExp && experimentEntry && (() => {
+                        const expData = parseExperimentData(experimentEntry);
+                        return (
+                            <>
+                                <OverfitSection key={`overfit-${experimentIndex}`} expData={expData} />
+                                <TrainSampleSection
+                                    key={`train-${experimentIndex}`}
+                                    expData={expData}
+                                    gptBlocks={gptBlocks}
+                                />
+                                {expData.correlationData && (
+                                    <CausalInterventionSection reportData={expData.correlationData} />
+                                )}
+                            </>
+                        );
+                    })()}
+                </>
             )}
         </div>
     );
@@ -372,7 +480,13 @@ function OverfitSection({ expData }: { expData: ExperimentData }) {
 
 type LayerMode = 'both' | 'saliency' | 'gpt';
 
-function TrainSampleSection({ expData }: { expData: ExperimentData }) {
+function TrainSampleSection({
+    expData,
+    gptBlocks,
+}: {
+    expData: ExperimentData;
+    gptBlocks: { cleanedText: string; spans: [number, number][] }[];
+}) {
     const [sampleIndex, setSampleIndex] = useState(0);
     const [layerMode, setLayerMode] = useState<LayerMode>('both');
 
@@ -418,9 +532,9 @@ function TrainSampleSection({ expData }: { expData: ExperimentData }) {
                     <button onClick={goNext}>next →</button>
                 </span>
                 <span className="layer-toggle">
-                    <button className={layerMode === 'both'    ? 'active' : ''} onClick={() => setLayerMode('both')}>Both</button>
-                    <button className={layerMode === 'saliency'? 'active' : ''} onClick={() => setLayerMode('saliency')}>Saliency</button>
-                    <button className={layerMode === 'gpt'     ? 'active' : ''} onClick={() => setLayerMode('gpt')}>GPT</button>
+                    <button className={layerMode === 'both'     ? 'active' : ''} onClick={() => setLayerMode('both')}>Both</button>
+                    <button className={layerMode === 'saliency' ? 'active' : ''} onClick={() => setLayerMode('saliency')}>Saliency</button>
+                    <button className={layerMode === 'gpt'      ? 'active' : ''} onClick={() => setLayerMode('gpt')}>GPT</button>
                 </span>
             </div>
 
@@ -457,9 +571,9 @@ function TrainSampleView({
     const showGpt      = layerMode === 'both' || layerMode === 'gpt';
 
     if (hasSaliency && trainSample) {
-        const tokens    = convertTokens(trainSample['before_original']['full_tokens']);
-        const sal       = convertRawSaliencyToObject(trainSample['before_original']['saliency_list']);
-        const startIdx  = trainSample['before_original']['start_index'];
+        const tokens     = convertTokens(trainSample['before_original']['full_tokens']);
+        const sal        = convertRawSaliencyToObject(trainSample['before_original']['saliency_list']);
+        const startIdx   = trainSample['before_original']['start_index'];
         const gptIndices = (showGpt && hasGpt && gptBlock)
             ? computeGptTokenIndices(tokens, gptBlock)
             : undefined;
@@ -468,7 +582,7 @@ function TrainSampleView({
             <div className="train-panel-columns">
                 <div className="panel-col">
                     <div className="col-label">
-                        {layerMode === 'both'     ? 'Model Saliency + GPT Annotation'
+                        {layerMode === 'both'      ? 'Model Saliency + GPT Annotation'
                          : layerMode === 'saliency' ? 'Model Saliency'
                          : 'GPT Annotation Only'}
                     </div>
@@ -512,14 +626,13 @@ function computeGptTokenIndices(
 ): Set<number> {
     const indices  = new Set<number>();
     const fullText = tokens.join('');
-    const gptText  = gptBlock.cleanedText;
 
     const tokenStarts: number[] = [];
     let offset = 0;
     for (const t of tokens) { tokenStarts.push(offset); offset += t.length; }
 
     for (const [spanStart, spanEnd] of gptBlock.spans) {
-        const spanText = gptText.slice(spanStart, spanEnd);
+        const spanText = gptBlock.cleanedText.slice(spanStart, spanEnd);
         const matchIdx = fullText.indexOf(spanText);
         if (matchIdx >= 0) {
             const matchEnd = matchIdx + spanText.length;
