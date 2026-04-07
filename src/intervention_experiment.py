@@ -514,35 +514,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
               f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        # ── Global pre-screening: full response CE grad → top-COARSE_POOL_SIZE pool ──
-        print("\n=== Global pre-screening (full response CE gradient) ===")
-        full_resp_grads  = compute_gradients(
-            model=model, batch=test_batch, param_filter_fn=param_filter,
-            device=accelerator.device,
-            ignored_token_ids=torch.tensor([], device=accelerator.device),
-        )
-        global_test_grad = _flat_grad_on_device(full_resp_grads, filtered_params, lm_head_device).detach()
-        del full_resp_grads
-
-        global_local   = _screen_training_set(
-            model, global_test_grad, filtered_params, train_loader,
-            accelerator.device, lm_head_device, desc="Global pre-screen",
-        )
-        global_scores  = _gather_scores(accelerator, global_local, accelerator.device)
-        pool_indices   = {idx for idx, _ in nlargest(COARSE_POOL_SIZE, global_scores, key=lambda x: x[1])}
-        del global_test_grad
-        print(f"  Pool: top-{COARSE_POOL_SIZE} train samples selected from {len(global_scores)} total.")
-
-        # Build a DataLoader that only iterates over the pool (avoids full-set scan per token)
-        idx_to_row = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
-        pool_rows  = sorted(idx_to_row[idx] for idx in pool_indices if idx in idx_to_row)
-        pool_ds    = train_ds.select(pool_rows)
-        pool_loader = torch.utils.data.DataLoader(
-            DatasetWrapper(pool_ds), batch_size=1, collate_fn=collator,
-        )
-        pool_loader = accelerator.prepare(pool_loader)
-
-        # ── Per-token loop ────────────────────────────────────────────────────
+        # ── Per-token loop: each token screens the FULL training set directly ──
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
@@ -581,17 +553,17 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Stage 2: per-token CE grad → re-rank within pool only
+            # Stage 2: per-token CE grad → screen FULL training set
             token_ce_grad  = _test_ce_grad_for_token(t)
-            pool_local     = _screen_training_set(
-                model, token_ce_grad, filtered_params, pool_loader,
+            local_scores   = _screen_training_set(
+                model, token_ce_grad, filtered_params, train_loader,
                 accelerator.device, lm_head_device,
-                desc=f"Re-rank pool t={t}",
+                desc=f"Stage2 t={t}",
             )
-            pool_scores    = _gather_scores(accelerator, pool_local, accelerator.device)
-            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, pool_scores, key=lambda x: x[1])
+            all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
+            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
             del token_ce_grad
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
+            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from full set: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples
@@ -627,17 +599,13 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             for k, v in train_sample_cache.items()
         }
 
-        correct_full_tokens = tokenizer.convert_ids_to_tokens(
-            raw_test_batch["input_ids"][0].tolist()
-        )
-
         report_json = {
             "experiment_meta": {
                 "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
                 "mode":               "all_tokens",
                 "max_output_tokens":  MAX_OUTPUT_TOKENS,
                 "tokens_analyzed":    len(per_token_results),
-                "coarse_pool_size":   COARSE_POOL_SIZE,
+                "screening":          "full_set_per_token",
                 "config": {
                     "TOP_K_PROMPT_TOKENS":    TOP_K_PROMPT_TOKENS,
                     "TOP_K_TRAIN_SAMPLES":    TOP_K_TRAIN_SAMPLES,
@@ -647,9 +615,8 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 },
             },
             "test_sample_baseline": {
-                "full_tokens":         gen_result["full_tokens"][0],
-                "correct_full_tokens": correct_full_tokens,
-                "prompt_len":          prompt_len,
+                "full_tokens": gen_result["full_tokens"][0],
+                "prompt_len":  prompt_len,
             },
             "per_token_results":    per_token_results,
             "train_sample_details": train_sample_details,
