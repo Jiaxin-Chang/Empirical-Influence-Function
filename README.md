@@ -162,6 +162,73 @@ for test_sample in testloader:
     print(IF_scores)
 ```
 
+## 🖥️ Attribution Analysis Visualization Tool
+
+An interactive frontend for visualizing token-level attribution and training correlation results.
+
+### Prerequisites
+
+```bash
+cd tools/correlation-report
+pnpm install
+```
+
+### Generate Experiment Data (Python)
+
+```bash
+# Single-token mode (analyze one specific output token)
+python -m src.intervention_experiment --test-index 58 --token-index 703
+
+# All-tokens mode (analyze all semantic output tokens — required for New View)
+python -m src.intervention_experiment --test-index 58 --all-tokens
+```
+
+Output files are written to the repo root:
+- `saliency_test{N}_tok{T}.json` — used by Legacy View
+- `correlation_matching_results_test{N}_tok{T}.json` — used by Legacy View
+- `correlation_matching_results_test{N}_all_tokens.json` — used by New View
+
+### Start the Visualization Server
+
+```bash
+# Step 1: ensure you're in the repo root, fix any filename issues if needed
+cd ~/Documents/GitHub/Empirical-Influence-Function
+
+# Step 2: build the frontend (picks up all data files automatically)
+cd tools/correlation-report
+pnpm run build
+
+# Step 3: kill anything already on port 5173
+lsof -ti:5173 | xargs kill -9
+
+# Step 4: serve from the dist folder
+cd dist
+nohup python3 -m http.server 5173 --bind 0.0.0.0 > server.log 2>&1 &
+```
+
+Then open **http://localhost:5173** in your browser.
+
+> **Note:** The app must be served via HTTP — opening `dist/index.html` directly in a browser will not work because `fetch()` requires a server.
+
+### Development Mode (hot reload)
+
+```bash
+cd tools/correlation-report
+pnpm dev
+```
+
+Open **http://localhost:5173**.  
+Data files are served live from the repo root — no rebuild needed when JSON files change, just refresh the page.
+
+### View Modes
+
+| Mode | Data Source | Description |
+|------|------------|-------------|
+| **New View** (default) | `*_all_tokens.json` | Full token attribution explorer: click any output token to trace its source attributions and matching training correlations |
+| **Legacy View** | `saliency_test*.json` + `correlation_matching_results_test*_tok*.json` | Original three-section view: Overfit Experiment, Related Train Samples, Correlation Pair Annotation |
+
+---
+
 ## If you Find our Repo Useful, Please Consider Cite our Paper 
 
 ```bibex
