@@ -33,8 +33,8 @@ TOKEN_INDEX_TO_RETRIEVE = 703  # The "first wrong token" we are investigating (s
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
-TOP_TARGETS = 5                # How many response tokens to scan per train sample
-TOP_K_SOURCE_PER_TARGET = 4    # Top source tokens per target (includes response-internal tokens)
+TOP_TARGETS = 3                # How many response tokens to scan per train sample
+TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 
 # All-tokens mode parameters
