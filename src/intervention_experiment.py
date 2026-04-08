@@ -478,10 +478,11 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 },
             },
             "test_sample_baseline": {
-                "target_token":       target_tok_text,
-                "target_token_index": TOKEN_INDEX_TO_RETRIEVE,
-                "full_tokens":        baseline_res["full_tokens"][0],
-                "top_correlations":   top_test_correlations,
+                "target_token":        target_tok_text,
+                "target_token_index":  TOKEN_INDEX_TO_RETRIEVE,
+                "full_tokens":         baseline_res["full_tokens"][0],  # prompt + model output (test_batch input)
+                "correct_full_tokens": gen_result["full_tokens"][0],    # prompt + ground truth answer
+                "top_correlations":    top_test_correlations,
             },
             "correlation_pairs": all_pair_records,
             "train_sample_details": {
@@ -615,8 +616,9 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 },
             },
             "test_sample_baseline": {
-                "full_tokens": gen_result["full_tokens"][0],
-                "prompt_len":  prompt_len,
+                "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output (clickable)
+                "correct_full_tokens": gen_result["full_tokens"][0],       # prompt + ground truth answer
+                "prompt_len":          prompt_len,
             },
             "per_token_results":    per_token_results,
             "train_sample_details": train_sample_details,
