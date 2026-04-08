@@ -20,7 +20,7 @@ from src.NIF import (
 )
 from src.process_data import process_func_chatml
 from src.loss import (
-    compute_correlation_second_order_gradient,
+    compute_gradcam_feature,
     compute_full_saliency_vector,
     compute_gradients,
 )
@@ -32,7 +32,7 @@ SELECTED_TEST_SAMPLE_INDEX = 58
 TOKEN_INDEX_TO_RETRIEVE = 703  # The "first wrong token" we are investigating (single-token mode)
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
-TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
+TOP_K_TRAIN_SAMPLES = 20       # How many top train samples from coarse screening
 TOP_TARGETS = 3                # How many response tokens to scan per train sample
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
@@ -331,10 +331,11 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 print(f"  Step B: '{train_source_tok}' -> '{train_target_tok}' "
                       f"(offset={response_tok_offset}, sal={saliency_score:.4f})")
 
-                train_feat = compute_correlation_second_order_gradient(
-                    model, tr_batch_gpu,
-                    target_idx_in_seq=t_tr, source_idx_in_seq=s_idx,
-                    param_filter_fn=param_filter,
+                train_feat = compute_gradcam_feature(
+                    model,
+                    tr_batch_gpu,
+                    target_idx_in_seq=t_tr,
+                    source_idx_in_seq=s_idx,
                 )
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
@@ -428,10 +429,11 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             for item in top_test_correlations:
                 p_idx = item["source_token_index"]
                 print(f"  '{item['source_token']}' -> '{item['target_token']}' (sal={item['saliency_score']:.4f})")
-                feat = compute_correlation_second_order_gradient(
-                    model=model, batch=test_batch,
-                    target_idx_in_seq=TOKEN_INDEX_TO_RETRIEVE, source_idx_in_seq=p_idx,
-                    param_filter_fn=param_filter,
+                feat = compute_gradcam_feature(
+                    model=model,
+                    batch=test_batch,
+                    target_idx_in_seq=TOKEN_INDEX_TO_RETRIEVE,
+                    source_idx_in_seq=p_idx,
                 )
                 test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
@@ -515,7 +517,26 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
               f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        # ── Per-token loop: each token screens the FULL training set directly ──
+        # ── Stage 2: one-time coarse screening with full-response CE grad ──────
+        print("\n=== Stage 2: Coarse screening (full response CE, computed once) ===")
+        grads = compute_gradients(
+            model=model, batch=test_batch,
+            param_filter_fn=param_filter, device=accelerator.device,
+            ignored_token_ids=torch.tensor([], device=accelerator.device),
+        )
+        test_response_ce_grad = _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+        del grads
+
+        local_scores = _screen_training_set(
+            model, test_response_ce_grad, filtered_params, train_loader,
+            accelerator.device, lm_head_device, desc="Stage 2",
+        )
+        all_scores = _gather_scores(accelerator, local_scores, accelerator.device)
+        related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
+        del test_response_ce_grad
+        print(f"  Top-{TOP_K_TRAIN_SAMPLES} selected: {[(i, round(s,4)) for i,s in related_samples]}")
+
+        # ── Per-token loop: reuse the coarse-screened top-K for all tokens ───
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
@@ -541,30 +562,21 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 for idx, score in top_test_corr
             ]
 
-            # Stage 1b: 2nd-order test features (kept on lm_head_device, freed after this token)
-            print(f"  Computing {len(top_test_correlations)} test 2nd-order features...")
+            # Stage 1b: GradCAM test features (kept on lm_head_device, freed after this token)
+            print(f"  Computing {len(top_test_correlations)} test GradCAM features...")
             test_corr_features: dict = {}
             with torch.inference_mode(False):
                 for item in top_test_correlations:
                     p_idx = item["source_token_index"]
-                    feat  = compute_correlation_second_order_gradient(
-                        model=model, batch=test_batch,
-                        target_idx_in_seq=t, source_idx_in_seq=p_idx,
-                        param_filter_fn=param_filter,
+                    feat = compute_gradcam_feature(
+                        model=model,
+                        batch=test_batch,
+                        target_idx_in_seq=t,
+                        source_idx_in_seq=p_idx,
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Stage 2: per-token CE grad → screen FULL training set
-            token_ce_grad  = _test_ce_grad_for_token(t)
-            local_scores   = _screen_training_set(
-                model, token_ce_grad, filtered_params, train_loader,
-                accelerator.device, lm_head_device,
-                desc=f"Stage2 t={t}",
-            )
-            all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
-            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
-            del token_ce_grad
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from full set: "
+            print(f"  Reusing Stage 2 top-{TOP_K_TRAIN_SAMPLES}: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples
