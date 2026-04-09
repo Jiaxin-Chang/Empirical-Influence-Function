@@ -337,7 +337,7 @@ interface Props {
 }
 
 export function NewView({ metas }: Props) {
-    const [selectedMetaIdx, setSelectedMetaIdx] = useState(0);
+    const [selectedMetaIdx, setSelectedMetaIdx] = useState<number | null>(null);
     const [report, setReport]     = useState<AllTokensReport | null>(null);
     const [loading, setLoading]   = useState(false);
     const [loadError, setLoadError] = useState(false);
@@ -353,8 +353,9 @@ export function NewView({ metas }: Props) {
 
     // Load report when meta selection changes
     useEffect(() => {
-        if (metas.length === 0) return;
-        const meta = metas[selectedMetaIdx] ?? metas[0];
+        if (metas.length === 0 || selectedMetaIdx === null) return;
+        const meta = metas[selectedMetaIdx];
+        if (!meta) return;
         const url  = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
 
         setLoading(true);
@@ -442,19 +443,15 @@ export function NewView({ metas }: Props) {
         );
     }
 
-    if (loading) return <div className={styles.emptyState}>Loading experiment data…</div>;
-    if (loadError) return <div className={styles.emptyState}>Failed to load experiment data.</div>;
-    if (!report)   return null;
-
-    // ── Render ────────────────────────────────────────────────────────────────
+    // ── Render ──
 
     return (
         <div className={styles.root}>
 
             {/* ── Experiment selector ── */}
-            {metas.length > 1 && (
+            {metas.length > 0 && (
                 <div className={styles.metaSelector}>
-                    <span className={styles.metaSelectorLabel}>Test Sample:</span>
+                    <span className={styles.metaSelectorLabel}>Select Test Sample:</span>
                     {metas.map((m, i) => (
                         <button
                             key={i}
@@ -467,7 +464,18 @@ export function NewView({ metas }: Props) {
                 </div>
             )}
 
-            {/* ── Top: Ground Truth (Full width, scrolls normally) ── */}
+            {selectedMetaIdx === null && (
+                <div className={styles.emptyState}>
+                    Please select an experiment from the top to load the data.
+                </div>
+            )}
+
+            {loading && <div className={styles.emptyState}>Loading experiment data…</div>}
+            {loadError && <div className={styles.emptyState}>Failed to load experiment data.</div>}
+            
+            {!loading && !loadError && report && (
+                <>
+                    {/* ── Top: Ground Truth (Full width, scrolls normally) ── */}
             <div className={styles.topPanel}>
                 <CodePanel
                     label="Correct Output (Ground Truth)"
@@ -584,6 +592,8 @@ export function NewView({ metas }: Props) {
                     </div>
                 </div>
             </div>
+            </>
+            )}
         </div>
     );
 }
