@@ -344,8 +344,8 @@ export function NewView({ metas }: Props) {
 
     // Selected output token (by absolute sequence index)
     const [selectedTokIdx, setSelectedTokIdx] = useState<number | null>(null);
-    // Whether user has clicked "Trace Training Samples" for the selected token
-    const [tracing, setTracing] = useState(false);
+    // Selected test correlation (source_token_index)
+    const [selectedTestCorrIdx, setSelectedTestCorrIdx] = useState<number | null>(null);
     // cos_sim filter threshold
     const [threshold, setThreshold] = useState(0.0);
     // Whether to hide pairs with cos_sim exactly 0
@@ -361,7 +361,7 @@ export function NewView({ metas }: Props) {
         setLoadError(false);
         setReport(null);
         setSelectedTokIdx(null);
-        setTracing(false);
+        setSelectedTestCorrIdx(null);
 
         fetch(url)
             .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json(); })
@@ -369,8 +369,8 @@ export function NewView({ metas }: Props) {
             .catch(() => { setLoadError(true); setLoading(false); });
     }, [metas, selectedMetaIdx]);
 
-    // Reset trace state when selected token changes
-    useEffect(() => { setTracing(false); }, [selectedTokIdx]);
+    // Reset test correlation state when selected token changes
+    useEffect(() => { setSelectedTestCorrIdx(null); }, [selectedTokIdx]);
 
     const modelTokens   = useMemo(() => report ? decodeTokens(report.test_sample_baseline.full_tokens) : [], [report]);
     const correctTokens = useMemo(() => report ? decodeTokens(report.test_sample_baseline.correct_full_tokens ?? []) : [], [report]);
@@ -391,25 +391,32 @@ export function NewView({ metas }: Props) {
     // Source token highlights for the selected token
     const sourceHighlightIndices = useMemo(() => {
         if (!selectedResult) return new Set<number>();
+        if (selectedTestCorrIdx !== null) return new Set([selectedTestCorrIdx]);
         return new Set(selectedResult.top_correlations.map(c => c.source_token_index));
-    }, [selectedResult]);
+    }, [selectedResult, selectedTestCorrIdx]);
 
-    // Pairs to show in the bottom panel
+    // Pairs to show in the right panel
     const allDisplayPairs = useMemo(() => {
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
 
-        if (tracing && selectedResult) {
+        if (selectedResult) {
+            if (selectedTestCorrIdx !== null) {
+                return selectedResult.correlation_pairs.filter(p => 
+                    keep(p) && p.test_correlation.source_token_index === selectedTestCorrIdx
+                );
+            }
             return selectedResult.correlation_pairs.filter(keep);
         }
-        // Show all pairs across all analyzed tokens
+        
+        // Show all pairs across all analyzed tokens if no token is selected
         const all: CorrelationPair[] = [];
         report?.per_token_results.forEach(r => {
             r.correlation_pairs.forEach(p => { if (keep(p)) all.push(p); });
         });
         all.sort((a, b) => b.cos_sim - a.cos_sim);
         return all;
-    }, [tracing, selectedResult, report, threshold, hideZero]);
+    }, [selectedResult, selectedTestCorrIdx, report, threshold, hideZero]);
 
     // Group pairs by train_sample_id
     const trainGroups = useMemo(() => {
@@ -460,8 +467,8 @@ export function NewView({ metas }: Props) {
                 </div>
             )}
 
-            {/* ── Top two-panel: correct vs model output ── */}
-            <div className={styles.topPanels}>
+            {/* ── Top: Ground Truth (Full width, scrolls normally) ── */}
+            <div className={styles.topPanel}>
                 <CodePanel
                     label="Correct Output (Ground Truth)"
                     badge="GT"
@@ -469,105 +476,113 @@ export function NewView({ metas }: Props) {
                     tokens={correctTokens}
                     promptLen={promptLen}
                 />
-                <CodePanel
-                    label="Model Output (Incorrect)"
-                    badge="MODEL"
-                    badgeColor="#dc2626"
-                    tokens={modelTokens}
-                    promptLen={promptLen}
-                    highlightSourceIndices={sourceHighlightIndices}
-                    selectedTargetIndex={selectedTokIdx ?? undefined}
-                    analyzedIndices={analyzedIndices}
-                    onTokenClick={idx => setSelectedTokIdx(prev => prev === idx ? null : idx)}
-                />
             </div>
 
-            {/* ── Selected token info bar ── */}
-            {selectedResult && (
-                <div className={styles.selectedBar}>
-                    <div className={styles.selectedBarLeft}>
-                        <span className={styles.selectedLabel}>Selected token:</span>
-                        <span className={styles.selectedToken}>{decodeToken(selectedResult.target_token).trim() || '·'}</span>
-                        <span className={styles.selectedIdx}>@ idx {selectedResult.target_token_index}</span>
-                        <span className={styles.selectedSources}>
-                            {selectedResult.top_correlations.length} source tokens →
-                        </span>
-                        {selectedResult.top_correlations.map(c => (
-                            <span key={c.source_token_index} className={styles.sourceChip}>
-                                {c.source_token.trim() || '·'}
-                                <span className={styles.sourceChipSal}> {c.saliency_score.toFixed(3)}</span>
-                            </span>
-                        ))}
-                    </div>
-                    <div className={styles.selectedBarRight}>
-                        {!tracing ? (
-                            <button className={styles.traceBtn} onClick={() => setTracing(true)}>
-                                Trace Training Samples →
-                            </button>
+            {/* ── Bottom Section: Left Sticky, Right Scroll ── */}
+            <div className={styles.bottomSection}>
+                {/* ── Left Column: Model Output & Correlations ── */}
+                <div className={styles.bottomLeft}>
+                    <CodePanel
+                        label="Model Output (Incorrect)"
+                        badge="MODEL"
+                        badgeColor="#dc2626"
+                        tokens={modelTokens}
+                        promptLen={promptLen}
+                        highlightSourceIndices={sourceHighlightIndices}
+                        selectedTargetIndex={selectedTokIdx ?? undefined}
+                        analyzedIndices={analyzedIndices}
+                        onTokenClick={idx => setSelectedTokIdx(prev => prev === idx ? null : idx)}
+                    />
+
+                    {selectedResult && (
+                        <div className={styles.correlationList}>
+                            <div className={styles.correlationListTitle}>
+                                Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
+                            </div>
+                            <div className={styles.correlationListItems}>
+                                {selectedResult.top_correlations.slice(0, 4).map(c => (
+                                    <button
+                                        key={c.source_token_index}
+                                        className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
+                                        onClick={() => setSelectedTestCorrIdx(
+                                            prev => prev === c.source_token_index ? null : c.source_token_index
+                                        )}
+                                    >
+                                        <div className={styles.corrBtnLeft}>
+                                            <span className={styles.corrLabel}>source token</span>
+                                            <span className={styles.corrSourceTok}>{c.source_token.trim() || '·'}</span>
+                                        </div>
+                                        <div className={styles.corrBtnRight}>
+                                            <span className={styles.corrScoreLabel}>saliency</span>
+                                            <span className={styles.sourceChipSal}>{c.saliency_score.toFixed(3)}</span>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* ── Right Column: Training pairs ── */}
+                <div className={styles.bottomRight}>
+                    <div className={styles.bottomPanel}>
+                        <div className={styles.bottomPanelHeader}>
+                            <div className={styles.bottomPanelTitle}>
+                                {selectedResult 
+                                    ? (selectedTestCorrIdx !== null 
+                                        ? `Training Correlations for Selected Source Token`
+                                        : `Training Correlations for Target Token`)
+                                    : 'All Training Correlations'}
+                                <span className={styles.pairCount}>
+                                    {trainGroups.length} groups · {allDisplayPairs.length} pairs
+                                </span>
+                            </div>
+                            <div className={styles.filterRow}>
+                                <span className={styles.filterLabel}>cos_sim ≥</span>
+                                <input
+                                    type="range" min={0} max={0.2} step={0.001} value={threshold}
+                                    onChange={e => setThreshold(parseFloat(e.target.value))}
+                                    className={styles.thresholdSlider}
+                                />
+                                <span className={styles.thresholdVal}>{threshold.toFixed(3)}</span>
+                                <button
+                                    onClick={() => setHideZero(v => !v)}
+                                    style={{
+                                        marginLeft: '12px',
+                                        padding: '3px 10px',
+                                        borderRadius: '6px',
+                                        fontSize: '11px',
+                                        cursor: 'pointer',
+                                        border: `1px solid ${hideZero ? '#ef4444' : '#d1d5db'}`,
+                                        background: hideZero ? '#fef2f2' : '#fff',
+                                        color: hideZero ? '#b91c1c' : '#6b7280',
+                                        fontWeight: hideZero ? 700 : 500,
+                                        transition: 'all 0.12s',
+                                    }}
+                                >
+                                    {hideZero ? '✗ 已隐藏 cos=0' : '隐藏 cos_sim=0'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {trainGroups.length === 0 ? (
+                            <div className={styles.emptyState} style={{ padding: '32px 0' }}>
+                                No matching pairs. Try lowering the threshold.
+                            </div>
                         ) : (
-                            <button className={styles.traceBtnActive} onClick={() => setTracing(false)}>
-                                ✓ Tracing — Show All
-                            </button>
+                            <div className={styles.trainGroupList}>
+                                {trainGroups.map(({ id, pairs }) => (
+                                    <TrainSampleGroup
+                                        key={id}
+                                        trainIdx={id}
+                                        pairs={pairs}
+                                        detail={report.train_sample_details[String(id)]}
+                                    />
+                                ))}
+                            </div>
                         )}
                     </div>
                 </div>
-            )}
-
-            {/* ── Bottom panel: training correlations ── */}
-            <div className={styles.bottomPanel}>
-                <div className={styles.bottomPanelHeader}>
-                    <div className={styles.bottomPanelTitle}>
-                        {tracing && selectedResult
-                            ? <>Training Correlations for <strong>{decodeToken(selectedResult.target_token).trim()}</strong></>
-                            : 'All Training Correlations'}
-                        <span className={styles.pairCount}>
-                            {trainGroups.length} groups · {allDisplayPairs.length} pairs
-                        </span>
-                    </div>
-                    <div className={styles.filterRow}>
-                        <span className={styles.filterLabel}>cos_sim ≥</span>
-                        <input
-                            type="range" min={0} max={0.2} step={0.001} value={threshold}
-                            onChange={e => setThreshold(parseFloat(e.target.value))}
-                            className={styles.thresholdSlider}
-                        />
-                        <span className={styles.thresholdVal}>{threshold.toFixed(3)}</span>
-                        <button
-                            onClick={() => setHideZero(v => !v)}
-                            style={{
-                                marginLeft: '12px',
-                                padding: '3px 10px',
-                                borderRadius: '6px',
-                                fontSize: '11px',
-                                cursor: 'pointer',
-                                border: `1px solid ${hideZero ? '#ef4444' : '#d1d5db'}`,
-                                background: hideZero ? '#fef2f2' : '#fff',
-                                color: hideZero ? '#b91c1c' : '#6b7280',
-                                fontWeight: hideZero ? 700 : 500,
-                                transition: 'all 0.12s',
-                            }}
-                        >
-                            {hideZero ? '✗ 已隐藏 cos=0' : '隐藏 cos_sim=0'}
-                        </button>
-                    </div>
-                </div>
-
-                {trainGroups.length === 0 ? (
-                    <div className={styles.emptyState} style={{ padding: '32px 0' }}>
-                        No matching pairs. Try lowering the threshold.
-                    </div>
-                ) : (
-                    <div className={styles.trainGroupList}>
-                        {trainGroups.map(({ id, pairs }) => (
-                            <TrainSampleGroup
-                                key={id}
-                                trainIdx={id}
-                                pairs={pairs}
-                                detail={report.train_sample_details[String(id)]}
-                            />
-                        ))}
-                    </div>
-                )}
             </div>
         </div>
     );
