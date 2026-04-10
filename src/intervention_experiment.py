@@ -512,16 +512,74 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             t for t in range(prompt_len, max_end)
             if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
         ]
-        print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
+        n_test_toks = len(valid_test_tokens)
+        print(f"\nAll-tokens mode: {n_test_toks} semantic tokens "
               f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        # ── Per-token loop: each token screens the FULL training set directly ──
+        # ── Phase 0: Pre-compute one CE grad per test token (stored on CPU) ──────
+        # Cost: n_test_toks × 1 forward — trivial compared to the training scan.
+        print(f"\nPre-computing {n_test_toks} test-token CE gradients...")
+        test_ce_grads_cpu: list[tuple[int, torch.Tensor]] = []  # [(tok_idx, flat_cpu_tensor)]
+        for t in valid_test_tokens:
+            g = _test_ce_grad_for_token(t).cpu()   # detach + move to CPU to save GPU memory
+            test_ce_grads_cpu.append((t, g))
+
+        # Stack into a matrix on lm_head_device for batched cosine similarity: [N_tok, D]
+        test_ce_grad_matrix = torch.stack(
+            [g for _, g in test_ce_grads_cpu], dim=0
+        ).to(lm_head_device)
+
+        # ── Phase 1: Single-pass scan of ALL training samples ────────────────────
+        # Each training sample's gradient is computed ONCE and scored against all
+        # N_tok test-token gradients in one batched cosine_similarity call.
+        # Total training-side forwards: N_train  (was N_tok × N_train before).
+        print(f"\n=== Stage 2: Single-pass coarse screening for all {n_test_toks} tokens ===")
+        # per_token_local_scores[i] = list of (train_idx, cos_sim) for valid_test_tokens[i]
+        per_token_local_scores: list[list[tuple[int, float]]] = [[] for _ in range(n_test_toks)]
+        empty_ignored = torch.tensor([], device=accelerator.device)
+
+        for batch in tqdm(train_loader, desc="Stage 2 (single pass)", leave=False):
+            batch_device = {k: v.to(accelerator.device) for k, v in batch.items()
+                            if isinstance(v, torch.Tensor)}
+            train_idx = int(batch_device["sample_index"].item())
+
+            train_ce_grads = compute_gradients(
+                model=model, batch=batch_device,
+                param_filter_fn=lm_head_filter, device=accelerator.device,
+                ignored_token_ids=empty_ignored,
+            )
+            flat_train = _flat_grad_on_device(
+                train_ce_grads, filtered_params, lm_head_device
+            )  # [D]
+
+            # Batched cosine: test_ce_grad_matrix [N_tok, D] vs flat_train [D] → [N_tok]
+            cos_sims = F.cosine_similarity(
+                test_ce_grad_matrix,        # [N_tok, D]
+                flat_train.unsqueeze(0),    # [1, D]
+                dim=1,
+            )  # [N_tok]
+
+            for i, cos_sim in enumerate(cos_sims.tolist()):
+                per_token_local_scores[i].append((train_idx, float(cos_sim)))
+
+            del train_ce_grads, flat_train, batch_device
+
+        del test_ce_grad_matrix, test_ce_grads_cpu
+
+        # Gather across GPUs (no-op in single-process mode) and select top-K per token
+        per_token_related: list[list[tuple[int, float]]] = []
+        for i, local_scores in enumerate(per_token_local_scores):
+            all_s = _gather_scores(accelerator, local_scores, accelerator.device)
+            per_token_related.append(nlargest(TOP_K_TRAIN_SAMPLES, all_s, key=lambda x: x[1]))
+        del per_token_local_scores
+
+        # ── Phase 2: Per-token Stage 1 (saliency + 2nd-order) + Stage 3 ─────────
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
 
-        for t in tqdm(valid_test_tokens, desc="Test tokens",
-                      disable=not accelerator.is_local_main_process):
+        for tok_loop_i, t in enumerate(tqdm(valid_test_tokens, desc="Test tokens",
+                                            disable=not accelerator.is_local_main_process)):
             target_tok_id   = int(test_batch["input_ids"][0, t].item())
             target_tok_text = tokenizer.decode([target_tok_id])
             print(f"\n=== Token {t}: '{target_tok_text}' ===")
@@ -554,17 +612,9 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Stage 2: per-token CE grad → screen FULL training set
-            token_ce_grad  = _test_ce_grad_for_token(t)
-            local_scores   = _screen_training_set(
-                model, token_ce_grad, filtered_params, train_loader,
-                accelerator.device, lm_head_device,
-                desc=f"Stage2 t={t}",
-            )
-            all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
-            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
-            del token_ce_grad
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from full set: "
+            # Use pre-computed Stage 2 results — no additional training-set scan needed
+            related_samples = per_token_related[tok_loop_i]
+            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from Stage 2: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples
@@ -606,7 +656,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 "mode":               "all_tokens",
                 "max_output_tokens":  MAX_OUTPUT_TOKENS,
                 "tokens_analyzed":    len(per_token_results),
-                "screening":          "full_set_per_token",
+                "screening":          "single_pass_all_tokens",
                 "config": {
                     "TOP_K_PROMPT_TOKENS":    TOP_K_PROMPT_TOKENS,
                     "TOP_K_TRAIN_SAMPLES":    TOP_K_TRAIN_SAMPLES,
