@@ -421,137 +421,97 @@ def get_first_response_token(
     return response_start_idx_in_shifted_labels, query_response_len
 
 
-def compute_gradcam_feature(
-    model,
-    batch,
+def compute_correlation_second_order_gradient(
+    model, 
+    batch, 
     target_idx_in_seq: int,
     source_idx_in_seq: int,
-) -> torch.Tensor:
+    param_filter_fn
+):
     """
-    一阶 GradCAM 特征向量（不 sum d 维度），用于跨样本 cosine sim。
-    Returns: (d,) tensor on CPU.
+    计算二阶导特征: 抽取 source Token 导致 target Token 产生的 Saliency 背后的参数梯度特征
     """
     if torch.is_inference_mode_enabled():
         raise RuntimeError("Disable torch.inference_mode() before calling this function.")
 
     model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    model.zero_grad(set_to_none=True)
+    
+    # 1. 过滤我们需要微调的参数 (比如 qk_last_quarter)
+    target_params = []
+    for name, param in model.named_parameters():
+        if param_filter_fn(name, param):
+            param.requires_grad = True
+            target_params.append(param)
+        else:
+            param.requires_grad = False
 
     device = model.device
     input_ids = batch["input_ids"].to(device)
     target_vocab_id = input_ids[0, target_idx_in_seq]
+    
+    # 2. 截断输入，只计算到 target 送入前的那一刀
     curr_input_ids = input_ids[:, :target_idx_in_seq]
-
+    
+    # 获取 Embeddings，并使其成为一阶导的“叶子结点”
     get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
     embeddings = get_embeds_fn()(curr_input_ids).detach()
     embeddings.requires_grad_(True)
-
+    
     with torch.enable_grad():
+        # 为了解决 PyTorch "Trying to backward a second time" 问题
+        # 我们需要：
+        # 1. 临时强制关掉某些可能释放中间激活值的内存优化 (如 gradient checkpointing / flash attention 内部机制)
+        # 2. 如果模型在之前的代码中(如 outside)调用过 forward 并发生了 backward，那些图可能残破。
+        # 我们用干净的 forward。
+        
+        # 3. 第一次前向传播（获取 Logit）
         outputs = model(inputs_embeds=embeddings, use_cache=False)
-        target_logit = outputs.logits[0, -1, target_vocab_id]
-        grad_embeds = torch.autograd.grad(target_logit, embeddings)[0]  # [1, seq, d]
-
-    feature = (
-        embeddings[0, source_idx_in_seq].detach() *
-        grad_embeds[0, source_idx_in_seq].detach()
-    )  # (d,)
-
-    del outputs, embeddings, grad_embeds
-    torch.cuda.empty_cache()
-    return feature.cpu()
-
-# def compute_correlation_second_order_gradient(
-#     model,
-#     batch,
-#     target_idx_in_seq: int,
-#     source_idx_in_seq: int,
-#     param_filter_fn
-# ):
-#     """
-#     计算二阶导特征: 抽取 source Token 导致 target Token 产生的 Saliency 背后的参数梯度特征
-#     """
-#     if torch.is_inference_mode_enabled():
-#         raise RuntimeError("Disable torch.inference_mode() before calling this function.")
-#
-#     model.eval()
-#     model.zero_grad(set_to_none=True)
-#
-#     # 1. 过滤我们需要微调的参数 (比如 qk_last_quarter)
-#     target_params = []
-#     for name, param in model.named_parameters():
-#         if param_filter_fn(name, param):
-#             param.requires_grad = True
-#             target_params.append(param)
-#         else:
-#             param.requires_grad = False
-#
-#     device = model.device
-#     input_ids = batch["input_ids"].to(device)
-#     target_vocab_id = input_ids[0, target_idx_in_seq]
-#
-#     # 2. 截断输入，只计算到 target 送入前的那一刀
-#     curr_input_ids = input_ids[:, :target_idx_in_seq]
-#
-#     # 获取 Embeddings，并使其成为一阶导的“叶子结点”
-#     get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
-#     embeddings = get_embeds_fn()(curr_input_ids).detach()
-#     embeddings.requires_grad_(True)
-#
-#     with torch.enable_grad():
-#         # 为了解决 PyTorch "Trying to backward a second time" 问题
-#         # 我们需要：
-#         # 1. 临时强制关掉某些可能释放中间激活值的内存优化 (如 gradient checkpointing / flash attention 内部机制)
-#         # 2. 如果模型在之前的代码中(如 outside)调用过 forward 并发生了 backward，那些图可能残破。
-#         # 我们用干净的 forward。
-#
-#         # 3. 第一次前向传播（获取 Logit）
-#         outputs = model(inputs_embeds=embeddings, use_cache=False)
-#         target_logits = outputs.logits[0, -1, target_vocab_id]
-#
-#         # 4. 第一次反向传播
-#         # 注意 retain_graph=True 和 create_graph=True
-#         # 对 embeddings 取偏导数
-#         grad_embeds = torch.autograd.grad(
-#             target_logits,
-#             embeddings,
-#             retain_graph=True,
-#             create_graph=True,
-#             allow_unused=False
-#         )[0]
-#
-#         # 5. 计算特定的 Correlation Saliency
-#         saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
-#         # 如果 source_idx_in_seq 这个值依赖计算图，它提取的元素标量也继续附带计算图
-#         target_saliency = saliency_scores[0, source_idx_in_seq]
-#
-#         # Saliency 越大越好，等效于 Saliency_Loss (负的 Saliency) 越小越好
-#         saliency_loss = - target_saliency
-#
-#         # 6. 第二次反向传播
-#         # 这时求 saliency_loss 关于我们想要提取特征的 target_params 的导数。
-#         # 因为我们上面使用了 retain_graph=True，计算 target_logits 经历的从 params -> logits 的整条图都被保留了
-#         final_grads = torch.autograd.grad(
-#             saliency_loss,
-#             target_params,
-#             retain_graph=False,   # 最后一次求导了，把图释放掉
-#             create_graph=False,
-#             allow_unused=True
-#         )
-#
-#     # 7. 铺平并组装特征向量
-#     # 注意：device_map="auto" 时参数分布在多 GPU 上，各张量设备不同。
-#     # 统一搬到 CPU 再 cat，避免 "Expected all tensors on same device" 报错。
-#     flat_grad = torch.cat([
-#         g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
-#         for g, p in zip(final_grads, target_params)
-#     ])
-#
-#     # 恢复 param
-#     for param in target_params:
-#          param.requires_grad = False
-#
-#     return flat_grad.detach()
+        target_logits = outputs.logits[0, -1, target_vocab_id] 
+        
+        # 4. 第一次反向传播
+        # 注意 retain_graph=True 和 create_graph=True
+        # 对 embeddings 取偏导数
+        grad_embeds = torch.autograd.grad(
+            target_logits, 
+            embeddings, 
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=False
+        )[0]
+        
+        # 5. 计算特定的 Correlation Saliency
+        saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
+        # 如果 source_idx_in_seq 这个值依赖计算图，它提取的元素标量也继续附带计算图
+        target_saliency = saliency_scores[0, source_idx_in_seq]
+        
+        # Saliency 越大越好，等效于 Saliency_Loss (负的 Saliency) 越小越好
+        saliency_loss = - target_saliency
+        
+        # 6. 第二次反向传播
+        # 这时求 saliency_loss 关于我们想要提取特征的 target_params 的导数。
+        # 因为我们上面使用了 retain_graph=True，计算 target_logits 经历的从 params -> logits 的整条图都被保留了
+        final_grads = torch.autograd.grad(
+            saliency_loss, 
+            target_params, 
+            retain_graph=False,   # 最后一次求导了，把图释放掉
+            create_graph=False,
+            allow_unused=True
+        )
+        
+    # 7. 铺平并组装特征向量
+    # 注意：device_map="auto" 时参数分布在多 GPU 上，各张量设备不同。
+    # 统一搬到 CPU 再 cat，避免 "Expected all tensors on same device" 报错。
+    flat_grad = torch.cat([
+        g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
+        for g, p in zip(final_grads, target_params)
+    ])
+    
+    # 恢复 param
+    for param in target_params:
+         param.requires_grad = False
+            
+    return flat_grad.detach()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
