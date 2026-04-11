@@ -571,6 +571,15 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
     # ════════════════════════════════════════════════════════════════════════════
     else:
         max_end = min(prompt_len + MAX_OUTPUT_TOKENS, seq_len)
+
+        # ── Debug: show every generated token so we can see why some are trivial ──
+        print(f"\n[Debug] Generated {max_end - prompt_len} response tokens:")
+        for _t in range(prompt_len, max_end):
+            _tok_id  = int(test_batch["input_ids"][0, _t].item())
+            _tok_str = tokenizer.decode([_tok_id])
+            _trivial = is_trivial_token(tokenizer, _tok_id)
+            print(f"  pos={_t}  id={_tok_id}  repr={repr(_tok_str)}  trivial={_trivial}")
+
         valid_test_tokens = [
             t for t in range(prompt_len, max_end)
             if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
