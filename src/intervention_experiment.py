@@ -46,6 +46,10 @@ MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mo
 #   Set to 1 for minimal GPU memory (sequential), or larger for fewer scans.
 COARSE_CHUNK_SIZE = 4
 
+# Training samples longer than this are skipped in all gradient-based screenings
+# to prevent OOM during eager attention (O(N²) memory) on very long sequences.
+SEQUENCE_LENGTH_LIMIT = 3000
+
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
 _TRIVIAL_STRIPPED = {"{", "}", "(", ")", "[", "]", ",", ";"}
@@ -173,6 +177,11 @@ def _screen_training_set(
             del batch_device
             continue
 
+        # Skip sequences that would cause OOM during eager attention
+        if batch_device["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
+            del batch_device
+            continue
+
         train_ce_grads = compute_gradients(
             model=model,
             batch=batch_device,
@@ -201,8 +210,6 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
 
     train_samples = load_samples_from_formal_jsonl("sft_train.jsonl")
     test_samples  = load_samples_from_formal_jsonl("sft_test.jsonl")
-
-    SEQUENCE_LENGTH_LIMIT = 3000
 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer, model=model,
@@ -626,6 +633,11 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 batch_device = {k: v.to(accelerator.device) for k, v in batch.items()
                                 if isinstance(v, torch.Tensor)}
                 train_idx = int(batch_device["sample_index"].item())
+
+                # Skip sequences that would cause OOM during eager attention
+                if batch_device["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
+                    del batch_device
+                    continue
 
                 train_ce_grads = compute_gradients(
                     model=model, batch=batch_device,
