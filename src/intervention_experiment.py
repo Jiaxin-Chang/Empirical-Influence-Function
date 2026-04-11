@@ -229,12 +229,71 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
     # ── Build full test sequence (prompt + generated response) ──────────────
-    test_ds       = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml)
+    test_ds        = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml)
     raw_test_batch = base_collator([test_ds[0]])
     raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
 
+    # ── Lightweight generate helper (for all-tokens mode) ───────────────────
+    # infer_fw.infer() runs a heavy per-token saliency loop on the ground-truth
+    # response (can take 100+ seconds) that all-tokens mode never consumes.
+    # This helper skips that loop and generates only MAX_OUTPUT_TOKENS tokens,
+    # with a guard against sequences longer than the model's position limit.
+    MAX_POSITION_EMBEDDINGS = getattr(
+        model.config, "max_position_embeddings", 32768
+    )
+
+    def _lightweight_gen(raw_batch) -> dict:
+        """Generate response without expensive saliency computation."""
+        input_ids      = raw_batch["input_ids"].to(accelerator.device)
+        attention_mask = raw_batch["attention_mask"].to(accelerator.device)
+
+        prompt_start = _find_subseq_start(input_ids[0], marker_ids) + 3
+
+        # Truncate prompt to model's position limit to avoid RoPE overflow
+        safe_prompt_end = min(int(prompt_start), MAX_POSITION_EMBEDDINGS - MAX_OUTPUT_TOKENS - 1)
+        if safe_prompt_end < prompt_start:
+            print(f"  [Warning] Prompt length {prompt_start} > safe limit "
+                  f"{safe_prompt_end}; truncating for generation.")
+        trim_ids  = input_ids[:, :safe_prompt_end]
+        trim_mask = attention_mask[:, :safe_prompt_end]
+
+        with torch.no_grad():
+            gen_out = model.generate(
+                input_ids=trim_ids,
+                attention_mask=trim_mask,
+                max_new_tokens=MAX_OUTPUT_TOKENS,
+                do_sample=False,
+                eos_token_id=[
+                    tokenizer.eos_token_id,
+                    tokenizer.pad_token_id,
+                ],
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        gen_ids      = gen_out if isinstance(gen_out, torch.Tensor) else gen_out.sequences
+        pred_tok_ids = gen_ids[0, safe_prompt_end:].tolist()
+        full_gen_ids = gen_ids[0].tolist()
+        gt_ids       = input_ids[0, :int(attention_mask[0].sum().item())].tolist()
+
+        # Free GPU tensors before returning — only Python lists are needed downstream
+        del trim_ids, trim_mask, gen_out, gen_ids
+        torch.cuda.empty_cache()
+
+        return {
+            "target_idx":          [prompt_start],
+            "pred_ids":            [pred_tok_ids],
+            "pred_full_tokens":    [tokenizer.convert_ids_to_tokens(full_gen_ids)],
+            "full_tokens":         [tokenizer.convert_ids_to_tokens(gt_ids)],
+        }
+
     infer_fw.model.eval()
-    gen_result = infer_fw.infer(raw_test_batch)
+
+    # Always use the lightweight helper for this first call: the only fields consumed from
+    # gen_result are target_idx / pred_ids / pred_full_tokens / full_tokens.
+    # saliency_original is never read from gen_result in either mode — the single-token
+    # mode's saliency is obtained from a separate infer_fw.infer(test_batch, ...) call later.
+    gen_result = _lightweight_gen(raw_test_batch)
+
     prompt_len = int(gen_result["target_idx"][0])
     prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
     pred_ids   = torch.tensor(gen_result["pred_ids"][0], device=prompt_ids.device, dtype=prompt_ids.dtype)
@@ -376,6 +435,8 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                         "annotation": None,
                     })
                     pair_counter += 1
+
+                del train_feat  # free 2nd-order grad before next (t_tr, s_idx) pair
 
         del tr_batch_gpu
         torch.cuda.empty_cache()
@@ -600,10 +661,11 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             target_tok_text = tokenizer.decode([target_tok_id])
             print(f"\n=== Token {t}: '{target_tok_text}' ===")
 
-            # Stage 1a: cheap saliency at t
+            # Stage 1a: saliency at t (cheap, one forward+backward)
             with torch.inference_mode(False):
                 sal_vec = compute_full_saliency_vector(model, test_batch, t)
             top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(sal_vec), key=lambda x: x[1])
+            del sal_vec  # no longer needed after top-K selection
             top_test_correlations = [
                 {
                     "source_token_index": idx,
