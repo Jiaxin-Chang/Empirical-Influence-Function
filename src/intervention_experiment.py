@@ -39,12 +39,10 @@ CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for 
 
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
-# Coarse-screening chunk size for all-tokens mode:
-#   Test-token CE gradients are processed in groups of this size so that only
-#   COARSE_CHUNK_SIZE gradient vectors (each ≈ lm_head size) live on GPU at once.
-#   Training set is scanned ceil(N_tok / COARSE_CHUNK_SIZE) times.
-#   Set to 1 for minimal GPU memory (sequential), or larger for fewer scans.
-COARSE_CHUNK_SIZE = 4
+# Global pre-screen pool size. The full training set is scanned ONCE with the full-response
+# CE gradient to obtain this pool, then each per-token re-ranking only scans the pool
+# (COARSE_POOL_SIZE samples) instead of the full training set.
+COARSE_POOL_SIZE = 200
 
 # Training samples longer than this are skipped in all gradient-based screenings
 # to prevent OOM during eager attention (O(N²) memory) on very long sequences.
@@ -591,102 +589,50 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             t for t in range(prompt_len, max_end)
             if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
         ]
-        n_test_toks = len(valid_test_tokens)
-        print(f"\nAll-tokens mode: {n_test_toks} semantic tokens "
+        print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
               f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        # ── Phase 1: Chunked coarse screening ───────────────────────────────────
-        # Process test-token CE grads in chunks of COARSE_CHUNK_SIZE:
-        #   • Only K gradient vectors (≈ K × lm_head size) live on GPU at once.
-        #   • Training set is scanned ceil(N_tok / K) times.
-        #   • Each training sample's gradient is computed once per chunk scan, then freed.
-        # This avoids both storing all N_tok grads simultaneously AND rescanning
-        # the training set N_tok times.
-        n_chunks = (n_test_toks + COARSE_CHUNK_SIZE - 1) // COARSE_CHUNK_SIZE
-        print(f"\n=== Stage 2: Chunked coarse screening "
-              f"({n_test_toks} tokens, chunk_size={COARSE_CHUNK_SIZE}, "
-              f"→ {n_chunks} training-set scan(s)) ===")
+        # ── Stage 2: global pre-screening ───────────────────────────────────────
+        # Scan the full training set ONCE with the full-response CE gradient to
+        # build a candidate pool of COARSE_POOL_SIZE samples. Each per-token
+        # re-ranking then only re-scores this small pool instead of the full set.
+        # Cost: N_train + N_tok × COARSE_POOL_SIZE  (vs. N_tok × N_train before).
+        print(f"\n=== Stage 2 (global pre-screen): full-response CE grad → pool of {COARSE_POOL_SIZE} ===")
+        global_ce_grads = compute_gradients(
+            model=model, batch=test_batch,
+            param_filter_fn=lm_head_filter, device=accelerator.device,
+            ignored_token_ids=torch.tensor([], device=accelerator.device),
+        )
+        global_ce_grad = _flat_grad_on_device(global_ce_grads, filtered_params, lm_head_device).detach()
+        del global_ce_grads
 
-        # Accumulate scores keyed by tok position index (not tok_idx) for Phase 2 lookup
-        per_token_local_scores: dict[int, list[tuple[int, float]]] = {
-            t: [] for t in valid_test_tokens
-        }
-        empty_ignored = torch.tensor([], device=accelerator.device)
+        global_local_scores = _screen_training_set(
+            model, global_ce_grad, filtered_params, train_loader,
+            accelerator.device, lm_head_device, desc="Global pre-screen",
+        )
+        global_all_scores = _gather_scores(accelerator, global_local_scores, accelerator.device)
+        global_pool       = nlargest(COARSE_POOL_SIZE, global_all_scores, key=lambda x: x[1])
+        pool_indices      = {idx for idx, _ in global_pool}
+        del global_ce_grad
+        print(f"  Pool of {len(pool_indices)} candidates. "
+              f"Top-5: {[(i, round(s,4)) for i,s in global_pool[:5]]}")
 
-        for chunk_start in range(0, n_test_toks, COARSE_CHUNK_SIZE):
-            chunk_tokens = valid_test_tokens[chunk_start : chunk_start + COARSE_CHUNK_SIZE]
-            chunk_size   = len(chunk_tokens)
-
-            # Compute CE grads for this chunk and stack onto lm_head_device: [K, D]
-            chunk_grads = []
-            for t in chunk_tokens:
-                chunk_grads.append(_test_ce_grad_for_token(t))   # [D] on lm_head_device
-            chunk_grad_matrix = torch.stack(chunk_grads, dim=0)   # [K, D]
-            del chunk_grads
-
-            # One scan of the full training set for this chunk
-            for batch in tqdm(
-                train_loader,
-                desc=f"Stage 2 chunk {chunk_start // COARSE_CHUNK_SIZE + 1}/{n_chunks}",
-                leave=False,
-            ):
-                batch_device = {k: v.to(accelerator.device) for k, v in batch.items()
-                                if isinstance(v, torch.Tensor)}
-                train_idx = int(batch_device["sample_index"].item())
-
-                # Skip sequences that would cause OOM during eager attention
-                if batch_device["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
-                    del batch_device
-                    continue
-
-                train_ce_grads = compute_gradients(
-                    model=model, batch=batch_device,
-                    param_filter_fn=lm_head_filter, device=accelerator.device,
-                    ignored_token_ids=empty_ignored,
-                )
-                flat_train = _flat_grad_on_device(
-                    train_ce_grads, filtered_params, lm_head_device
-                )  # [D]
-
-                # Batched cosine: [K, D] × [1, D] → [K]
-                cos_sims = F.cosine_similarity(
-                    chunk_grad_matrix,       # [K, D]
-                    flat_train.unsqueeze(0), # [1, D]
-                    dim=1,
-                )
-
-                for t, cos_sim in zip(chunk_tokens, cos_sims.tolist()):
-                    per_token_local_scores[t].append((train_idx, float(cos_sim)))
-
-                del train_ce_grads, flat_train, batch_device
-
-            # Free chunk grads before loading the next chunk
-            del chunk_grad_matrix
-            torch.cuda.empty_cache()
-
-        # Gather across GPUs (no-op in single-process mode) and select top-K per token
-        per_token_related: dict[int, list[tuple[int, float]]] = {}
-        for t in valid_test_tokens:
-            all_s = _gather_scores(accelerator, per_token_local_scores[t], accelerator.device)
-            per_token_related[t] = nlargest(TOP_K_TRAIN_SAMPLES, all_s, key=lambda x: x[1])
-        del per_token_local_scores
-
-        # ── Phase 2: Per-token Stage 1 (saliency + 2nd-order) + Stage 3 ─────────
+        # ── Per-token loop: each token rescores the pool only ────────────────────
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
 
         for t in tqdm(valid_test_tokens, desc="Test tokens",
-                       disable=not accelerator.is_local_main_process):
+                      disable=not accelerator.is_local_main_process):
             target_tok_id   = int(test_batch["input_ids"][0, t].item())
             target_tok_text = tokenizer.decode([target_tok_id])
             print(f"\n=== Token {t}: '{target_tok_text}' ===")
 
-            # Stage 1a: saliency at t (cheap, one forward+backward)
+            # Stage 1a: cheap saliency at t
             with torch.inference_mode(False):
                 sal_vec = compute_full_saliency_vector(model, test_batch, t)
             top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(sal_vec), key=lambda x: x[1])
-            del sal_vec  # no longer needed after top-K selection
+            del sal_vec
             top_test_correlations = [
                 {
                     "source_token_index": idx,
@@ -711,9 +657,18 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Use pre-computed Stage 2 results — no additional training-set scan needed
-            related_samples = per_token_related[t]
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from Stage 2: "
+            # Stage 2: per-token CE grad → rescore the pre-screened pool only
+            token_ce_grad  = _test_ce_grad_for_token(t)
+            local_scores   = _screen_training_set(
+                model, token_ce_grad, filtered_params, train_loader,
+                accelerator.device, lm_head_device,
+                desc=f"Stage2 t={t}",
+                allowed_indices=pool_indices,
+            )
+            all_scores      = _gather_scores(accelerator, local_scores, accelerator.device)
+            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
+            del token_ce_grad
+            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples
@@ -755,13 +710,14 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 "mode":               "all_tokens",
                 "max_output_tokens":  MAX_OUTPUT_TOKENS,
                 "tokens_analyzed":    len(per_token_results),
-                "screening":          "single_pass_all_tokens",
+                "screening":          "global_prescreen_pool",
                 "config": {
                     "TOP_K_PROMPT_TOKENS":    TOP_K_PROMPT_TOKENS,
                     "TOP_K_TRAIN_SAMPLES":    TOP_K_TRAIN_SAMPLES,
                     "TOP_TARGETS":            TOP_TARGETS,
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":    CONTEXT_WINDOW_SIZE,
+                    "COARSE_POOL_SIZE":       COARSE_POOL_SIZE,
                 },
             },
             "test_sample_baseline": {
