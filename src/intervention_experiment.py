@@ -546,7 +546,18 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         del full_response_ce_grad
         print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
 
-        # ── Per-token loop: re-rank within the coarse pool, then run Stage 3 ──
+        # Materialise pool as a dedicated DataLoader so per-token Stage 2 truly iterates
+        # only COARSE_POOL_SIZE times (not N_train times with skip logic).
+        idx_to_row  = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
+        pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
+        pool_ds     = train_ds.select(pool_rows)
+        pool_loader = torch.utils.data.DataLoader(
+            DatasetWrapper(pool_ds), batch_size=1, collate_fn=collator,
+        )
+        pool_loader = accelerator.prepare(pool_loader)
+        print(f"  pool_loader built: {len(pool_rows)} samples")
+
+        # ── Per-token loop: re-rank within pool_loader, then run Stage 3 ──
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
@@ -585,19 +596,18 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Stage 2: per-token CE grad → re-rank within the coarse pool
-            # (pool already restricted to COARSE_POOL_SIZE candidates, NOT the full training set)
+            # Stage 2: per-token CE grad → re-rank within pool_loader only
+            # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
             token_ce_grad  = _test_ce_grad_for_token(t)
             local_scores   = _screen_training_set(
-                model, token_ce_grad, filtered_params, train_loader,
+                model, token_ce_grad, filtered_params, pool_loader,
                 accelerator.device, lm_head_device,
                 desc=f"Stage2 t={t}",
-                allowed_indices=coarse_pool,
             )
             all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
             del token_ce_grad
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from coarse pool: "
+            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples

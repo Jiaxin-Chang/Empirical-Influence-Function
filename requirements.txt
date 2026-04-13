@@ -19,3 +19,4 @@ torchvision
 peft
 deepspeed
 wandb
+openai
