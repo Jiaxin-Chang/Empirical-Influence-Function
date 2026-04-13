@@ -42,7 +42,8 @@ MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mo
 # Global pre-screen pool size. The full training set is scanned ONCE with the full-response
 # CE gradient to obtain this pool, then each per-token re-ranking only scans the pool
 # (COARSE_POOL_SIZE samples) instead of the full training set.
-COARSE_POOL_SIZE = 50
+# Cost: 1 × N_train (global) + N_tokens × COARSE_POOL_SIZE (per-token re-rank)
+COARSE_POOL_SIZE = 100
 
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
@@ -398,6 +399,20 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
 
     # ════════════════════════════════════════════════════════════════════════════
+    # Helper: compute test-side CE gradient aggregated over ALL response tokens
+    # Used for the global one-shot coarse pre-screen in all_tokens mode.
+    # test_batch["labels"] already masks prompt positions with -100, so
+    # compute_gradients naturally aggregates CE loss across all response tokens.
+    # ════════════════════════════════════════════════════════════════════════════
+    def _test_ce_grad_full_response() -> torch.Tensor:
+        grads = compute_gradients(
+            model=model, batch=test_batch,
+            param_filter_fn=param_filter, device=accelerator.device,
+            ignored_token_ids=torch.tensor([], device=accelerator.device),
+        )
+        return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+
+    # ════════════════════════════════════════════════════════════════════════════
     # ── SINGLE-TOKEN MODE ────────────────────────────────────────────────────
     # ════════════════════════════════════════════════════════════════════════════
     if not all_tokens:
@@ -515,7 +530,23 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
               f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        # ── Per-token loop: each token screens the FULL training set directly ──
+        # ── Stage 0: Global coarse pre-screen (one pass over the full training set) ──
+        # Aggregate CE loss over all response tokens → single gradient vector G_test.
+        # Cost: 1 × N_train  (vs. N_tokens × N_train in the old per-token approach)
+        print(f"\n=== Global Pre-Screen: full training set → Top-{COARSE_POOL_SIZE} pool ===")
+        full_response_ce_grad = _test_ce_grad_full_response()
+        local_pool_scores = _screen_training_set(
+            model, full_response_ce_grad, filtered_params, train_loader,
+            accelerator.device, lm_head_device, desc="Global Pre-Screen",
+        )
+        all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
+        coarse_pool: set[int] = {
+            idx for idx, _ in nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
+        }
+        del full_response_ce_grad
+        print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
+
+        # ── Per-token loop: re-rank within the coarse pool, then run Stage 3 ──
         per_token_results: list  = []
         train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
         pair_id_counter = 0
@@ -554,17 +585,19 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     )
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
-            # Stage 2: per-token CE grad → screen FULL training set
+            # Stage 2: per-token CE grad → re-rank within the coarse pool
+            # (pool already restricted to COARSE_POOL_SIZE candidates, NOT the full training set)
             token_ce_grad  = _test_ce_grad_for_token(t)
             local_scores   = _screen_training_set(
                 model, token_ce_grad, filtered_params, train_loader,
                 accelerator.device, lm_head_device,
                 desc=f"Stage2 t={t}",
+                allowed_indices=coarse_pool,
             )
             all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
             del token_ce_grad
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from full set: "
+            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from coarse pool: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
             # Stage 3: fine-grained matching for this token's top train samples
@@ -606,13 +639,14 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                 "mode":               "all_tokens",
                 "max_output_tokens":  MAX_OUTPUT_TOKENS,
                 "tokens_analyzed":    len(per_token_results),
-                "screening":          "full_set_per_token",
+                "screening":          "global_pool_then_per_token_rerank",
                 "config": {
-                    "TOP_K_PROMPT_TOKENS":    TOP_K_PROMPT_TOKENS,
-                    "TOP_K_TRAIN_SAMPLES":    TOP_K_TRAIN_SAMPLES,
-                    "TOP_TARGETS":            TOP_TARGETS,
+                    "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
+                    "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
+                    "COARSE_POOL_SIZE":        COARSE_POOL_SIZE,
+                    "TOP_TARGETS":             TOP_TARGETS,
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
-                    "CONTEXT_WINDOW_SIZE":    CONTEXT_WINDOW_SIZE,
+                    "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
                 },
             },
             "test_sample_baseline": {
