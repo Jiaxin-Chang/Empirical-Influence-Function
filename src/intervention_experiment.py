@@ -16,7 +16,6 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from src.NIF import (
-    load_samples_from_formal_jsonl,
     build_train_dataset,
     build_single_sample_dataset,
     NewInferenceFunction,
@@ -31,6 +30,68 @@ from src.loss import (
     compute_full_saliency_vector,
     compute_gradients,
 )
+
+# ====== DATA LOADING (auto-detects format) ======
+
+def load_samples(jsonl_path: str) -> list[dict]:
+    """Load samples from a JSONL file, auto-detecting the format.
+
+    Supported formats:
+
+    **Format A – messages array (original):**
+    ``{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."},
+                    {"role": "assistant", "content": "..."}]}``
+
+    **Format B – flat fields (new):**
+    ``{"prompt": "...", "response": "...", "task_id": "...", "system": "..."}``
+    ``system`` is optional; ``task_id`` is preserved for output file naming.
+
+    Both formats are normalised to ``{system, input, output, task_id}``.
+    """
+    samples: list[dict] = []
+    seen_inputs: set[str] = set()
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+
+            # ── Format A: messages array ──────────────────────────────────
+            if "messages" in obj:
+                msgs = obj["messages"]
+                if len(msgs) < 3 or not msgs[2]["content"]:
+                    continue
+                system = msgs[0]["content"]
+                inp    = msgs[1]["content"]
+                output = msgs[2]["content"]
+                task_id = obj.get("task_id", "")
+
+            # ── Format B: flat prompt / response ──────────────────────────
+            elif "prompt" in obj and "response" in obj:
+                system  = obj.get("system", "")
+                inp     = obj["prompt"]
+                output  = obj["response"]
+                task_id = str(obj.get("task_id", ""))
+                if not output:
+                    continue
+
+            else:
+                continue  # unrecognised format, skip
+
+            if inp in seen_inputs:
+                continue
+            seen_inputs.add(inp)
+
+            samples.append({
+                "system":  system,
+                "input":   inp,
+                "output":  output,
+                "task_id": task_id,
+            })
+
+    return samples
+
 
 # ====== MODEL LOADING (generic — supports Qwen2, Qwen3, Qwen3-MoE, etc.) ======
 
@@ -299,8 +360,8 @@ def run_causal_intervention_experiment(
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
-    train_samples = load_samples_from_formal_jsonl(train_data)
-    test_samples  = load_samples_from_formal_jsonl(test_data)
+    train_samples = load_samples(train_data)
+    test_samples  = load_samples(test_data)
 
     SEQUENCE_LENGTH_LIMIT = 3000
 
@@ -329,7 +390,10 @@ def run_causal_intervention_experiment(
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
     # ── Build full test sequence (prompt + generated response) ──────────────
-    test_ds       = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml)
+    _cur_test     = test_samples[SELECTED_TEST_SAMPLE_INDEX]
+    # Use task_id for output file naming; fall back to index if absent.
+    _task_id      = _cur_test.get("task_id") or f"test{SELECTED_TEST_SAMPLE_INDEX}"
+    test_ds       = build_single_sample_dataset(_cur_test, convert_to_chatml)
     raw_test_batch = base_collator([test_ds[0]])
     raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
 
@@ -617,7 +681,7 @@ def run_causal_intervention_experiment(
                   f"'{r['test_correlation']['target_token']}' "
                   f"| cos_sim={r['cos_sim']:.4f}")
 
-        report_filename = f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_tok{TOKEN_INDEX_TO_RETRIEVE}.json"
+        report_filename = f"correlation_matching_results_{_task_id}_tok{TOKEN_INDEX_TO_RETRIEVE}.json"
 
     # ════════════════════════════════════════════════════════════════════════════
     # ── ALL-TOKENS MODE ──────────────────────────────────────────────────────
@@ -769,7 +833,7 @@ def run_causal_intervention_experiment(
             "train_sample_details": train_sample_details,
         }
 
-        report_filename = f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_all_tokens.json"
+        report_filename = f"correlation_matching_results_{_task_id}_all_tokens.json"
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
     if accelerator.is_main_process:
