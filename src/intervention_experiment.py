@@ -6,9 +6,16 @@ from functools import partial
 from heapq import nlargest
 from accelerate import Accelerator
 from tqdm import tqdm
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    set_seed,
+)
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from src.NIF import (
-    load_model_and_tokenizer,
     load_samples_from_formal_jsonl,
     build_train_dataset,
     build_single_sample_dataset,
@@ -24,7 +31,96 @@ from src.loss import (
     compute_full_saliency_vector,
     compute_gradients,
 )
-from transformers import DataCollatorForSeq2Seq, set_seed
+
+# ====== MODEL LOADING (generic — supports Qwen2, Qwen3, Qwen3-MoE, etc.) ======
+
+def _patch_model_with_attn_hook(model: torch.nn.Module) -> torch.nn.Module:
+    """Replace the Qwen2-specific subclass approach with a generic forward hook.
+
+    After patching, any call to ``model(..., save_last_attention=True)`` will:
+      1. Register a hook on the *last* self-attention module before the forward pass.
+      2. Capture the attention weight tensor returned by that module.
+      3. Remove the hook and return a :class:`CausalLMOutputWithPast` whose
+         ``attentions`` field holds the captured weight (matching the interface
+         expected by ``compute_answer_only_saliency_masked_loss``).
+
+    Works for dense models (Qwen2, Qwen3) **and** MoE models (Qwen3.5 35B A3B)
+    because it only touches the attention module output, not the MoE routing.
+
+    Requires ``attn_implementation="eager"`` so that the attention module actually
+    computes and returns weight tensors (flash-attention variants return ``None``).
+    """
+    model.last_attention = None
+    _orig_forward = model.forward
+
+    def _patched_forward(*args, save_last_attention: bool = False, **kwargs):
+        model.last_attention = None
+        handle = None
+
+        if save_last_attention:
+            last_attn = model.model.layers[-1].self_attn
+
+            def _hook(_module, _inputs, output):
+                # Attention modules return (attn_output, attn_weights[, past_kv, ...]).
+                # attn_weights is a Tensor when attn_implementation="eager",
+                # and None for flash/sdpa variants.
+                if isinstance(output, tuple) and len(output) >= 2:
+                    model.last_attention = output[1]
+
+            handle = last_attn.register_forward_hook(_hook)
+
+        try:
+            outputs = _orig_forward(*args, **kwargs)
+        finally:
+            if handle is not None:
+                handle.remove()
+
+        if save_last_attention:
+            return CausalLMOutputWithPast(
+                loss=outputs.loss,
+                logits=outputs.logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=(model.last_attention,) if model.last_attention is not None else None,
+            )
+        return outputs
+
+    model.forward = _patched_forward
+    return model
+
+
+def load_model_and_tokenizer(model_path: str | None = None):
+    """Load any AutoModelForCausalLM checkpoint and patch it with the generic
+    attention hook so ``save_last_attention=True`` works for all architectures.
+
+    Args:
+        model_path: Absolute path to the model checkpoint directory.
+                    Defaults to the standard NIF checkpoint location.
+    """
+    if model_path is None:
+        model_path = os.path.join(
+            os.path.dirname(__file__), "sft", "scripts", "nif-checkpoints", "checkpoint-full"
+        )
+    print(f"Loading model from {model_path}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    config = AutoConfig.from_pretrained(
+        model_path,
+        attn_implementation="eager",
+        output_attentions=False,
+        use_cache=False,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+    ).eval()
+
+    model = _patch_model_with_attn_hook(model)
+    return model, tokenizer
+
 
 # ====== CONFIGURATION ======
 SEED = 42
@@ -189,11 +285,11 @@ def _screen_training_set(
     return sample_scores
 
 
-def run_causal_intervention_experiment(all_tokens: bool = False):
+def run_causal_intervention_experiment(all_tokens: bool = False, model_path: str | None = None):
     accelerator = Accelerator()
     set_seed(SEED)
 
-    model, tokenizer = load_model_and_tokenizer()
+    model, tokenizer = load_model_and_tokenizer(model_path)
     param_filter = lm_head_filter
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
@@ -698,6 +794,15 @@ if __name__ == "__main__":
         "--all-tokens", action="store_true",
         help="Attribute all output tokens (up to MAX_OUTPUT_TOKENS) instead of a single token.",
     )
+    parser.add_argument(
+        "--model-path", type=str, default=None,
+        help=(
+            "Path to the model checkpoint directory. "
+            "Supports any AutoModelForCausalLM architecture "
+            "(Qwen2, Qwen3, Qwen3-MoE, etc.). "
+            "Defaults to src/sft/scripts/nif-checkpoints/checkpoint-full."
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -707,5 +812,5 @@ if __name__ == "__main__":
 
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
-    run_causal_intervention_experiment(all_tokens=args.all_tokens)
+    run_causal_intervention_experiment(all_tokens=args.all_tokens, model_path=args.model_path)
 
