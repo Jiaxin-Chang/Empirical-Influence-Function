@@ -285,7 +285,12 @@ def _screen_training_set(
     return sample_scores
 
 
-def run_causal_intervention_experiment(all_tokens: bool = False, model_path: str | None = None):
+def run_causal_intervention_experiment(
+    all_tokens: bool = False,
+    model_path: str | None = None,
+    train_data: str = "sft_train.jsonl",
+    test_data: str = "sft_test.jsonl",
+):
     accelerator = Accelerator()
     set_seed(SEED)
 
@@ -294,8 +299,8 @@ def run_causal_intervention_experiment(all_tokens: bool = False, model_path: str
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
-    train_samples = load_samples_from_formal_jsonl("sft_train.jsonl")
-    test_samples  = load_samples_from_formal_jsonl("sft_test.jsonl")
+    train_samples = load_samples_from_formal_jsonl(train_data)
+    test_samples  = load_samples_from_formal_jsonl(test_data)
 
     SEQUENCE_LENGTH_LIMIT = 3000
 
@@ -803,6 +808,14 @@ if __name__ == "__main__":
             "Defaults to src/sft/scripts/nif-checkpoints/checkpoint-full."
         ),
     )
+    parser.add_argument(
+        "--train-data", type=str, default="sft_train.jsonl",
+        help="Path to the training JSONL file (default: sft_train.jsonl).",
+    )
+    parser.add_argument(
+        "--test-data", type=str, default="sft_test.jsonl",
+        help="Path to the test JSONL file containing error samples (default: sft_test.jsonl).",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -812,5 +825,10 @@ if __name__ == "__main__":
 
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
-    run_causal_intervention_experiment(all_tokens=args.all_tokens, model_path=args.model_path)
+    run_causal_intervention_experiment(
+        all_tokens=args.all_tokens,
+        model_path=args.model_path,
+        train_data=args.train_data,
+        test_data=args.test_data,
+    )
 
