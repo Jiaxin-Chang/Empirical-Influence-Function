@@ -74,9 +74,23 @@ if [[ ! -f "$TRAIN_DATA" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Count samples (each non-empty line = one sample)
+# Read task_ids from test JSONL (one per non-empty line).
+# Falls back to sequential index if a line has no task_id field.
 # ---------------------------------------------------------------------------
-TOTAL=$(grep -c . "$TEST_DATA" || true)
+mapfile -t TASK_IDS < <(python3 - "$TEST_DATA" <<'PYEOF'
+import sys, json
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    for i, line in enumerate(f):
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        print(obj.get("task_id") or f"test{i}")
+PYEOF
+)
+
+TOTAL=${#TASK_IDS[@]}
 if [[ -z "$END_IDX" ]]; then
     END_IDX=$((TOTAL - 1))
 fi
@@ -106,19 +120,20 @@ N_FAIL=0
 FAILED_INDICES=()
 
 for IDX in $(seq "$START_IDX" "$END_IDX"); do
-    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_test${IDX}_all_tokens.json"
+    TASK_ID="${TASK_IDS[$IDX]}"
+    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${TASK_ID}_all_tokens.json"
 
     # Resume: skip if result already exists
     if [[ -f "$RESULT_FILE" ]]; then
-        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] SKIP  (result exists)"
+        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] SKIP  ${TASK_ID}  (result exists)"
         N_SKIP=$((N_SKIP + 1))
         continue
     fi
 
     echo ""
-    echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] START  test_index=${IDX}"
+    echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] START  task_id=${TASK_ID}"
 
-    LOG_FILE="${LOG_DIR}/test_${IDX}.log"
+    LOG_FILE="${LOG_DIR}/${TASK_ID}.log"
 
     "${PYTHON}" -m src.intervention_experiment \
         --model-path  "${MODEL_PATH}" \
@@ -134,9 +149,9 @@ for IDX in $(seq "$START_IDX" "$END_IDX"); do
         echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] DONE  → ${RESULT_FILE}"
         N_DONE=$((N_DONE + 1))
     else
-        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] FAIL  (exit=${EXIT_CODE}, log: ${LOG_FILE})"
+        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] FAIL  ${TASK_ID}  (exit=${EXIT_CODE}, log: ${LOG_FILE})"
         N_FAIL=$((N_FAIL + 1))
-        FAILED_INDICES+=("$IDX")
+        FAILED_INDICES+=("$TASK_ID")
     fi
 done
 
@@ -150,14 +165,9 @@ echo "  Done  : ${N_DONE}"
 echo "  Skip  : ${N_SKIP}  (already existed)"
 echo "  Failed: ${N_FAIL}"
 if [[ ${#FAILED_INDICES[@]} -gt 0 ]]; then
-    echo "  Failed indices: ${FAILED_INDICES[*]}"
+    echo "  Failed task_ids: ${FAILED_INDICES[*]}"
     echo ""
-    echo "  To retry failed samples:"
-    echo "    for IDX in ${FAILED_INDICES[*]}; do"
-    echo "      bash run_batch_experiments.sh --model-path '${MODEL_PATH}' \\"
-    echo "          --train-data '${TRAIN_DATA}' --test-data '${TEST_DATA}' \\"
-    echo "          --start-idx \$IDX --end-idx \$IDX"
-    echo "    done"
+    echo "  Logs for failed samples are in: ${LOG_DIR}/"
 fi
 echo "  Results : ${ROOT_DIR}/correlation_matching_results_test*_all_tokens.json"
 echo "  Logs    : ${LOG_DIR}/"
