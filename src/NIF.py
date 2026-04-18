@@ -206,10 +206,10 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 
-def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
-    a, b, c = subseq
-    for i in range(row.numel() - 1):
-        if int(row[i]) == a and int(row[i + 1]) == b:
+def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, ...]) -> int:
+    n = len(subseq)
+    for i in range(row.numel() - n + 1):
+        if all(int(row[i + j]) == subseq[j] for j in range(n)):
             return i
     raise ValueError("marker sequence not found")
 
@@ -374,10 +374,10 @@ def finetune_on_sample(
         marker_ids = tuple(
             tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
         )
-        if len(marker_ids) != 3:
-            raise ValueError("expected three-token marker for <|im_start|>assistant\\n")
+        if len(marker_ids) == 0:
+            raise ValueError("marker tokenization produced empty sequence")
         for i in range(input_ids.size(0)):
-            start = _find_subseq_start(input_ids[i], marker_ids) + 3
+            start = _find_subseq_start(input_ids[i], marker_ids) + len(marker_ids)
             labels[i, :start] = -100
             # Auto-detect first_gen_pos if not provided
             if first_gen_pos is None:
@@ -646,10 +646,10 @@ class NewInferenceFunction:
             marker_ids = tuple(
                 self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
             )
-            if len(marker_ids) != 3:
-                raise ValueError("expected three-token marker for <|im_start|>assistant\\n")
+            if len(marker_ids) == 0:
+                raise ValueError("marker tokenization produced empty sequence")
             starts = [
-                _find_subseq_start(input_ids[i], marker_ids) + 3
+                _find_subseq_start(input_ids[i], marker_ids) + len(marker_ids)
                 for i in range(input_ids.size(0))
             ]
             target_idx = torch.tensor(starts, device=input_ids.device)

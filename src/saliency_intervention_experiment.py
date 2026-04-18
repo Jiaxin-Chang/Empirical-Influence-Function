@@ -600,7 +600,7 @@ def run_saliency_intervention_experiment():
                 if rc_batch["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:
                     continue
                 try:
-                    start_sys = _find_subseq_start(rc_batch["input_ids"][0], marker_ids_b) + 3
+                    start_sys = _find_subseq_start(rc_batch["input_ids"][0], marker_ids_b) + len(marker_ids_b)
                 except ValueError:
                     continue
 
