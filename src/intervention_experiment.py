@@ -177,7 +177,11 @@ def load_model_and_tokenizer(model_path: str | None = None):
         device_map="auto",
         torch_dtype=torch.bfloat16,
         local_files_only=True,
-    ).eval()
+    )
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    model.eval()
 
     model = _patch_model_with_attn_hook(model)
     return model, tokenizer
@@ -443,7 +447,7 @@ def run_causal_intervention_experiment(
                 return None, [], pair_id_start
 
             try:
-                start_sys = _find_subseq_start(tr_batch["input_ids"][0], marker_ids) + 3
+                start_sys = _find_subseq_start(tr_batch["input_ids"][0], marker_ids) + len(marker_ids)
             except ValueError:
                 print(f"  Skipping train {train_idx}: assistant marker not found")
                 return None, [], pair_id_start
