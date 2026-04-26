@@ -284,7 +284,7 @@ function App() {
         );
     }
 
-    if (manifest.experiments.length === 0 && !manifest.hasLegacySaliency) {
+    if (manifest.experiments.length === 0 && !manifest.hasLegacySaliency && (manifest.allTokensExperiments ?? []).length === 0) {
         return (
             <div className="app-root">
                 <header className="app-header"><h1>Attribution Analysis</h1></header>

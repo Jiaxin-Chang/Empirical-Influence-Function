@@ -86,6 +86,165 @@ function cosSimilarityColor(s: number): { bg: string; fg: string } {
     return { bg: '#fee2e2', fg: '#b91c1c' };
 }
 
+// ─── Export helpers ───────────────────────────────────────────────────────────
+
+function formatContextForExport(tokens: string[]): string {
+    return tokens.map(tok => {
+        const marked = tok.startsWith('→[') && tok.endsWith(']←');
+        const raw = decodeToken(marked ? tok.slice(2, -2) : tok);
+        return marked ? `[${raw.trim() || '·'}]` : raw;
+    }).join('');
+}
+
+interface ExportOptions {
+    tokenRange: 'all' | 'selected' | 'range';
+    selectedTokenIdx?: number;
+    rangeFrom?: number;
+    rangeTo?: number;
+    cosSimThreshold: number;
+    hideZero: boolean;
+}
+
+function generateExportMarkdown(report: AllTokensReport, options: ExportOptions): string {
+    const { test_sample_baseline: baseline, per_token_results, train_sample_details, experiment_meta } = report;
+    const promptLen = baseline.prompt_len;
+
+    let tokensToExport: PerTokenResult[];
+    if (options.tokenRange === 'selected' && options.selectedTokenIdx != null) {
+        const r = per_token_results.find(r => r.target_token_index === options.selectedTokenIdx);
+        tokensToExport = r ? [r] : [];
+    } else if (options.tokenRange === 'range' && options.rangeFrom != null && options.rangeTo != null) {
+        tokensToExport = per_token_results.filter(r =>
+            r.target_token_index >= options.rangeFrom! && r.target_token_index <= options.rangeTo!
+        );
+    } else {
+        tokensToExport = [...per_token_results];
+    }
+
+    const keepPair = (p: CorrelationPair) =>
+        p.cos_sim >= options.cosSimThreshold && !(options.hideZero && p.cos_sim === 0);
+
+    const L: string[] = [];
+
+    // Header
+    L.push(`# Attribution Report: Test Sample #${experiment_meta.test_sample_index}\n`);
+    L.push(`- Tokens exported: ${tokensToExport.length} / ${per_token_results.length} analyzed`);
+    L.push(`- Prompt length: ${promptLen}`);
+    L.push(`- cos_sim filter: ≥${options.cosSimThreshold.toFixed(3)}${options.hideZero ? ', hiding cos=0' : ''}`);
+    L.push('');
+
+    // Test Code
+    const promptText = decodeTokens(baseline.full_tokens.slice(0, promptLen)).join('');
+    const modelResp = decodeTokens(baseline.full_tokens.slice(promptLen)).join('');
+    const gtTokens = baseline.correct_full_tokens ?? [];
+    const correctResp = decodeTokens(gtTokens.slice(promptLen)).join('');
+
+    L.push('## Test Code\n');
+    L.push('### Prompt\n' + '```');
+    L.push(promptText.trimEnd());
+    L.push('```' + '\n');
+    L.push('### Model Output (response)\n' + '```');
+    L.push(modelResp.trimEnd());
+    L.push('```' + '\n');
+    if (correctResp) {
+        L.push('### Ground Truth (response)\n' + '```');
+        L.push(correctResp.trimEnd());
+        L.push('```' + '\n');
+    }
+
+    // Per-token analysis
+    L.push('## Token Analysis\n');
+
+    for (const tr of tokensToExport) {
+        const tgt = decodeToken(tr.target_token).trim() || '·';
+        const absIdx = tr.target_token_index;
+        const correctTok = gtTokens[absIdx];
+        const correctText = correctTok ? (decodeToken(correctTok).trim() || '·') : '?';
+        const isCorrect = tr.target_token === correctTok;
+
+        L.push(`### \`${tgt}\` @ pos ${absIdx} | GT: \`${correctText}\` | ${isCorrect ? '✓' : '✗'}\n`);
+
+        // Feature Attribution
+        L.push('Feature Attribution:');
+        for (const c of tr.top_correlations) {
+            const src = decodeToken(c.source_token).trim() || '·';
+            L.push(`- \`${src}\`@${c.source_token_index} → \`${tgt}\` (saliency: ${c.saliency_score.toFixed(4)})`);
+        }
+        L.push('');
+
+        // Data Attribution
+        const pairs = tr.correlation_pairs.filter(keepPair);
+        if (pairs.length === 0) {
+            L.push('Data Attribution: No matches above threshold.\n');
+            L.push('---\n');
+            continue;
+        }
+
+        const byTrain = new Map<number, CorrelationPair[]>();
+        for (const p of pairs) {
+            if (!byTrain.has(p.train_sample_id)) byTrain.set(p.train_sample_id, []);
+            byTrain.get(p.train_sample_id)!.push(p);
+        }
+
+        L.push('Data Attribution:');
+        for (const [tid, tpairs] of byTrain) {
+            const detail = train_sample_details[String(tid)];
+            const coarse = detail?.coarse_cos_sim ?? tpairs[0]?.coarse_cos_sim ?? 0;
+            L.push(`\n**Train #${tid}** (coarse: ${coarse.toFixed(4)}):`);
+            for (const p of tpairs.sort((a, b) => b.cos_sim - a.cos_sim)) {
+                const tSrc = decodeToken(p.test_correlation.source_token).trim() || '·';
+                const tTgt = decodeToken(p.test_correlation.target_token).trim() || '·';
+                const rSrc = decodeToken(p.train_correlation.source_token).trim() || '·';
+                const rTgt = decodeToken(p.train_correlation.target_token).trim() || '·';
+                const srcCtx = formatContextForExport(p.train_context.source_context);
+                const tgtCtx = formatContextForExport(p.train_context.target_context);
+                L.push(`- cos=${p.cos_sim.toFixed(4)} | test: \`${tSrc}\`→\`${tTgt}\` ⇔ train: \`${rSrc}\`→\`${rTgt}\``);
+                L.push(`  src_ctx: ${srcCtx}`);
+                L.push(`  tgt_ctx: ${tgtCtx}`);
+            }
+        }
+        L.push('\n---\n');
+    }
+
+    // Training Samples 汇总（每个 train sample 只出现一次）
+    const referencedTrainIds = new Set<number>();
+    for (const tr of tokensToExport) {
+        for (const p of tr.correlation_pairs.filter(keepPair)) {
+            referencedTrainIds.add(p.train_sample_id);
+        }
+    }
+
+    if (referencedTrainIds.size > 0) {
+        L.push('## Training Samples\n');
+        for (const tid of Array.from(referencedTrainIds).sort((a, b) => a - b)) {
+            const detail = train_sample_details[String(tid)];
+            if (!detail) continue;
+            const tokens = decodeTokens(detail.full_tokens);
+            const promptPart = tokens.slice(0, detail.answer_start_index).join('');
+            const respPart = tokens.slice(detail.answer_start_index).join('');
+            L.push(`### Train #${tid} (coarse: ${detail.coarse_cos_sim.toFixed(4)})\n`);
+            L.push('Prompt:\n' + '```');
+            L.push(promptPart.trimEnd());
+            L.push('```' + '\n');
+            L.push('Response:\n' + '```');
+            L.push(respPart.trimEnd());
+            L.push('```' + '\n');
+        }
+    }
+
+    return L.join('\n');
+}
+
+function downloadMarkdown(text: string, filename: string) {
+    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
 // ─── Token Renderer ───────────────────────────────────────────────────────────
 
 type TokenState = 'normal' | 'response' | 'selected' | 'source-highlight' | 'analyzed';
@@ -351,6 +510,13 @@ export function NewView({ metas }: Props) {
     // Whether to hide pairs with cos_sim exactly 0
     const [hideZero, setHideZero] = useState(false);
 
+    // Export state
+    const [exportScope, setExportScope] = useState<'all' | 'selected' | 'range'>('all');
+    const [rangeFrom, setRangeFrom] = useState(0);
+    const [rangeTo, setRangeTo] = useState(0);
+    const [exportBatch, setExportBatch] = useState(false);
+    const [exporting, setExporting] = useState(false);
+
     // Load report when meta selection changes
     useEffect(() => {
         if (metas.length === 0) return;
@@ -422,6 +588,46 @@ export function NewView({ metas }: Props) {
             .map(([id, pairs]) => ({ id, pairs, bestSim: Math.max(...pairs.map(p => p.cos_sim)) }))
             .sort((a, b) => b.bestSim - a.bestSim);
     }, [allDisplayPairs]);
+
+    // ── Export logic ─────────────────────────────────────────────────────────
+
+    // Initialize range bounds when report changes
+    useEffect(() => {
+        if (report && report.per_token_results.length > 0) {
+            const indices = report.per_token_results.map(r => r.target_token_index);
+            setRangeFrom(Math.min(...indices));
+            setRangeTo(Math.max(...indices));
+        }
+    }, [report]);
+
+    const handleExport = async () => {
+        if (exportBatch && metas.length > 1) {
+            setExporting(true);
+            for (const meta of metas) {
+                try {
+                    const url = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+                    const resp = await fetch(url);
+                    if (!resp.ok) continue;
+                    const data: AllTokensReport = await resp.json();
+                    const md = generateExportMarkdown(data, {
+                        tokenRange: 'all', cosSimThreshold: threshold, hideZero,
+                    });
+                    downloadMarkdown(md, `attribution_report_test${meta.testIdx}.md`);
+                    // 小延迟避免浏览器合并下载
+                    await new Promise(r => setTimeout(r, 300));
+                } catch { /* skip failed samples */ }
+            }
+            setExporting(false);
+        } else if (report) {
+            const md = generateExportMarkdown(report, {
+                tokenRange: exportScope,
+                selectedTokenIdx: selectedTokIdx ?? undefined,
+                rangeFrom, rangeTo,
+                cosSimThreshold: threshold, hideZero,
+            });
+            downloadMarkdown(md, `attribution_report_test${report.experiment_meta.test_sample_index}.md`);
+        }
+    };
 
     // ── Early states ──────────────────────────────────────────────────────────
 
@@ -548,6 +754,58 @@ export function NewView({ metas }: Props) {
                             }}
                         >
                             {hideZero ? '✗ 已隐藏 cos=0' : '隐藏 cos_sim=0'}
+                    </button>
+                    </div>
+                    {/* ── Export row ── */}
+                    <div style={{
+                        marginTop: 8, padding: '8px 0',
+                        borderTop: '1px solid #e5e7eb',
+                        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, fontSize: 13,
+                    }}>
+                        <span style={{ fontWeight: 600, color: '#374151' }}>Export:</span>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                            <input type="radio" name="exportScope" value="all"
+                                checked={exportScope === 'all'} onChange={() => setExportScope('all')} />
+                            All tokens
+                        </label>
+                        {selectedTokIdx !== null && (
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                                <input type="radio" name="exportScope" value="selected"
+                                    checked={exportScope === 'selected'} onChange={() => setExportScope('selected')} />
+                                Selected only
+                            </label>
+                        )}
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                            <input type="radio" name="exportScope" value="range"
+                                checked={exportScope === 'range'} onChange={() => setExportScope('range')} />
+                            Range:
+                            <input type="number" value={rangeFrom}
+                                onChange={e => setRangeFrom(+e.target.value)}
+                                disabled={exportScope !== 'range'}
+                                style={{ width: 56, padding: '2px 4px', border: '1px solid #d1d5db', borderRadius: 4 }} />
+                            <span>—</span>
+                            <input type="number" value={rangeTo}
+                                onChange={e => setRangeTo(+e.target.value)}
+                                disabled={exportScope !== 'range'}
+                                style={{ width: 56, padding: '2px 4px', border: '1px solid #d1d5db', borderRadius: 4 }} />
+                        </label>
+                        {metas.length > 1 && (
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 8, cursor: 'pointer' }}>
+                                <input type="checkbox" checked={exportBatch}
+                                    onChange={e => setExportBatch(e.target.checked)} />
+                                Batch ({metas.length} samples)
+                            </label>
+                        )}
+                        <button
+                            onClick={handleExport}
+                            disabled={exporting}
+                            style={{
+                                marginLeft: 'auto', padding: '4px 16px', borderRadius: 6,
+                                border: '1px solid #6366f1', background: '#eef2ff', color: '#4338ca',
+                                fontWeight: 600, fontSize: 13, cursor: exporting ? 'wait' : 'pointer',
+                            }}
+                        >
+                            {exporting ? 'Exporting…' : 'Export Markdown'}
                         </button>
                     </div>
                 </div>
