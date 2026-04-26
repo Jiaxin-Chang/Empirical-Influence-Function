@@ -603,21 +603,20 @@ export function NewView({ metas }: Props) {
     const handleExport = async () => {
         if (exportBatch && metas.length > 1) {
             setExporting(true);
+            const parts: string[] = [];
             for (const meta of metas) {
                 try {
                     const url = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
                     const resp = await fetch(url);
                     if (!resp.ok) continue;
                     const data: AllTokensReport = await resp.json();
-                    const md = generateExportMarkdown(data, {
+                    parts.push(generateExportMarkdown(data, {
                         tokenRange: 'all', cosSimThreshold: threshold, hideZero,
-                    });
-                    downloadMarkdown(md, `attribution_report_test${meta.testIdx}.md`);
-                    // 小延迟避免浏览器合并下载
-                    await new Promise(r => setTimeout(r, 300));
+                    }));
                 } catch { /* skip failed samples */ }
             }
             setExporting(false);
+            if (parts.length > 0) downloadMarkdown(parts.join('\n\n'), 'attribution_report_batch.md');
         } else if (report) {
             const md = generateExportMarkdown(report, {
                 tokenRange: exportScope,
