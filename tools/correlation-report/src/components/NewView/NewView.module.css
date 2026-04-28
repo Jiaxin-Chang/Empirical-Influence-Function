@@ -39,14 +39,9 @@
 .metaBtn:hover { border-color: #6366f1; color: #4338ca; }
 .metaBtnActive { background: #6366f1 !important; color: #fff !important; border-color: #6366f1 !important; }
 
-/* ── Two-panel top section ── */
-.topPanels {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-}
-@media (max-width: 900px) {
-    .topPanels { grid-template-columns: 1fr; }
+/* ── Top panel ── */
+.topPanel {
+    margin-bottom: 20px;
 }
 
 /* ── Code Panel ── */
@@ -120,81 +115,107 @@
     border-radius: 3px;
 }
 
-/* ── Selected token bar ── */
-.selectedBar {
+/* ── Bottom Section ── */
+.bottomSection {
     display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-    padding: 12px 16px;
-    background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
-    border-radius: 10px;
-    border: 1px solid #45475a;
+    gap: 20px;
+    align-items: flex-start;
 }
-.selectedBarLeft {
+@media (max-width: 900px) {
+    .bottomSection { flex-direction: column; }
+}
+
+.bottomLeft {
+    flex: 1;
+    position: sticky;
+    top: 20px;
     display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+}
+
+.bottomRight {
+    flex: 1;
+    min-width: 0;
+}
+
+/* ── Correlations List (Left Pane) ── */
+.correlationList {
+    background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
+    border-radius: 12px;
+    border: 1px solid #45475a;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.correlationListTitle {
+    font-size: 11px;
+    color: #a6adc8;
+    font-weight: 700;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+.correlationListItems {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+@media (max-width: 1200px) {
+    .correlationListItems { grid-template-columns: 1fr; }
+}
+
+.corrBtn {
+    background: #313244;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.15s;
+    display: flex;
+    justify-content: space-between;
     align-items: center;
     gap: 8px;
-    flex-wrap: wrap;
-    flex: 1;
 }
-.selectedBarRight { flex-shrink: 0; }
+.corrBtn:hover {
+    background: #45475a;
+}
+.corrBtnActive {
+    border-color: #89b4fa;
+    background: rgba(137, 180, 250, 0.15);
+}
 
-.selectedLabel { font-size: 11px; color: #a6adc8; font-weight: 700; text-transform: uppercase; }
-.selectedToken {
-    background: #fab387;
-    color: #1e1e2e;
-    font-family: monospace;
-    font-size: 13px;
+.corrBtnLeft {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.corrBtnRight {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    align-items: flex-end;
+}
+
+.corrLabel, .corrScoreLabel {
+    font-size: 9px;
     font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 5px;
+    color: #a6adc8;
+    text-transform: uppercase;
 }
-.selectedIdx { font-size: 11px; color: #585b70; font-family: monospace; }
-.selectedSources { font-size: 11px; color: #89b4fa; font-weight: 600; }
 
-.sourceChip {
-    display: inline-flex;
-    align-items: center;
-    background: #313244;
-    border: 1px solid #89b4fa;
-    color: #89b4fa;
+.corrSourceTok {
     font-family: monospace;
-    font-size: 11px;
-    padding: 1px 7px;
-    border-radius: 12px;
-    gap: 3px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #89b4fa;
+    background: #1e1e2e;
+    padding: 2px 6px;
+    border-radius: 4px;
 }
 .sourceChipSal { color: #a6adc8; font-size: 10px; }
-
-.traceBtn {
-    padding: 7px 18px;
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 700;
-    cursor: pointer;
-    box-shadow: 0 2px 8px rgba(99,102,241,0.4);
-    transition: all 0.15s;
-    white-space: nowrap;
-}
-.traceBtn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(99,102,241,0.5); }
-
-.traceBtnActive {
-    padding: 7px 18px;
-    background: #313244;
-    color: #a6e3a1;
-    border: 1.5px solid #a6e3a1;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 700;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.15s;
-}
-.traceBtnActive:hover { background: rgba(166,227,161,0.1); }
 
 /* ── Bottom panel ── */
 .bottomPanel {
@@ -269,7 +290,6 @@
     flex-direction: column;
     gap: 10px;
 }
-.trainFullView { }
 .subLabel {
     font-size: 10px;
     font-weight: 700;
