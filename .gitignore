@@ -224,4 +224,8 @@ node_modules/
 test*.json
 samples*.md
 *.json
+*.md
+!README.md
+.DS_Store
+reports/
 .vite/results.txt

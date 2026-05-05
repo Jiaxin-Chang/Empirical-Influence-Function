@@ -356,16 +356,22 @@ def run_causal_intervention_experiment(
     train_data: str = "sft_train.jsonl",
     test_data: str = "sft_test.jsonl",
 ):
+    import sys; sys.stdout.reconfigure(line_buffering=True)
+    print("[DEBUG] Initializing Accelerator...", flush=True)
     accelerator = Accelerator()
+    print(f"[DEBUG] Accelerator ready. num_processes={accelerator.num_processes}, device={accelerator.device}", flush=True)
     set_seed(SEED)
 
     model, tokenizer = load_model_and_tokenizer(model_path)
+    print("[DEBUG] Model and tokenizer loaded.", flush=True)
     param_filter = lm_head_filter
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
+    print("[DEBUG] Loading train/test samples...", flush=True)
     train_samples = load_samples(train_data)
     test_samples  = load_samples(test_data)
+    print(f"[DEBUG] Loaded {len(train_samples)} train, {len(test_samples)} test samples.", flush=True)
 
     SEQUENCE_LENGTH_LIMIT = 3000
 
@@ -375,21 +381,27 @@ def run_causal_intervention_experiment(
     )
     collator = CustomCollator(base_collator)
 
+    print("[DEBUG] Building train dataset...", flush=True)
     train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    print(f"[DEBUG] Train dataset built: {len(train_ds)} samples.", flush=True)
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(train_ds), batch_size=1, collate_fn=collator,
     )
+    print("[DEBUG] Calling accelerator.prepare(train_loader)...", flush=True)
     train_loader = accelerator.prepare(train_loader)
+    print("[DEBUG] train_loader prepared.", flush=True)
 
     infer_fw = NewInferenceFunction(
         model=model, tokenizer=tokenizer,
         train_loader=train_loader, accelerator=accelerator,
         param_filter_fn=param_filter, top_k=20,
     )
+    print("[DEBUG] NewInferenceFunction created.", flush=True)
 
     # lm_head might live on a different device under device_map="auto"
     filtered_params = [p for n, p in model.named_parameters() if param_filter(n, p)]
     lm_head_device  = filtered_params[0].device if filtered_params else accelerator.device
+    print(f"[DEBUG] lm_head_device={lm_head_device}", flush=True)
 
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
@@ -399,10 +411,14 @@ def run_causal_intervention_experiment(
     _task_id      = _cur_test.get("task_id") or f"test{SELECTED_TEST_SAMPLE_INDEX}"
     test_ds       = build_single_sample_dataset(_cur_test, convert_to_chatml)
     raw_test_batch = base_collator([test_ds[0]])
+    print(f"[DEBUG] Moving test batch to device {accelerator.device}...", flush=True)
     raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
+    print(f"[DEBUG] Test batch on device. input_ids shape={raw_test_batch['input_ids'].shape}", flush=True)
 
     infer_fw.model.eval()
+    print("[DEBUG] Starting infer_fw.infer(raw_test_batch)...", flush=True)
     gen_result = infer_fw.infer(raw_test_batch)
+    print("[DEBUG] Inference done.", flush=True)
     prompt_len = int(gen_result["target_idx"][0])
     prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
     pred_ids   = torch.tensor(gen_result["pred_ids"][0], device=prompt_ids.device, dtype=prompt_ids.dtype)
