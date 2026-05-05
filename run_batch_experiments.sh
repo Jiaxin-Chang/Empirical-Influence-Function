@@ -38,6 +38,7 @@ TRAIN_DATA="${TRAIN_DATA:-sft_train.jsonl}"
 TEST_DATA="${TEST_DATA:-sft_test.jsonl}"
 START_IDX="${START_IDX:-0}"
 END_IDX="${END_IDX:-}"          # empty = auto-detect from file
+TRAIN_LIMIT="${TRAIN_LIMIT:-}"  # empty = use all training samples
 PYTHON="${PYTHON:-python}"
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --test-data)  TEST_DATA="$2";   shift 2 ;;
         --start-idx)  START_IDX="$2";   shift 2 ;;
         --end-idx)    END_IDX="$2";     shift 2 ;;
+        --train-limit) TRAIN_LIMIT="$2"; shift 2 ;;
         *) echo "[batch] Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -108,6 +110,7 @@ echo "  model     : ${MODEL_PATH}"
 echo "  train data: ${TRAIN_DATA}"
 echo "  test data : ${TEST_DATA}  (${TOTAL} samples)"
 echo "  range     : [${START_IDX}, ${END_IDX}]"
+echo "  train_limit: ${TRAIN_LIMIT:-all}"
 echo "  log dir   : ${LOG_DIR}"
 echo "================================================================="
 
@@ -141,6 +144,7 @@ for IDX in $(seq "$START_IDX" "$END_IDX"); do
         --test-data   "${TEST_DATA}"  \
         --test-index  "${IDX}"        \
         --all-tokens  \
+        ${TRAIN_LIMIT:+--train-limit "${TRAIN_LIMIT}"} \
         2>&1 | tee "${LOG_FILE}"
 
     EXIT_CODE=${PIPESTATUS[0]}
