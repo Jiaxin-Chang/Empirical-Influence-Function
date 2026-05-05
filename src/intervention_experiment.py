@@ -355,6 +355,7 @@ def run_causal_intervention_experiment(
     model_path: str | None = None,
     train_data: str = "sft_train.jsonl",
     test_data: str = "sft_test.jsonl",
+    train_limit: int | None = None,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -371,6 +372,9 @@ def run_causal_intervention_experiment(
     print("[DEBUG] Loading train/test samples...", flush=True)
     train_samples = load_samples(train_data)
     test_samples  = load_samples(test_data)
+    if train_limit is not None and train_limit < len(train_samples):
+        print(f"[DEBUG] Limiting train samples: {len(train_samples)} -> {train_limit}", flush=True)
+        train_samples = train_samples[:train_limit]
     print(f"[DEBUG] Loaded {len(train_samples)} train, {len(test_samples)} test samples.", flush=True)
 
     SEQUENCE_LENGTH_LIMIT = 3000
@@ -900,6 +904,10 @@ if __name__ == "__main__":
         "--test-data", type=str, default="sft_test.jsonl",
         help="Path to the test JSONL file containing error samples (default: sft_test.jsonl).",
     )
+    parser.add_argument(
+        "--train-limit", type=int, default=None,
+        help="Limit the number of training samples to process (default: all). Useful for debugging.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -914,5 +922,6 @@ if __name__ == "__main__":
         model_path=args.model_path,
         train_data=args.train_data,
         test_data=args.test_data,
+        train_limit=args.train_limit,
     )
 

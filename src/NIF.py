@@ -151,11 +151,24 @@ def load_samples_from_formal_jsonl(jsonl_path: str):
 def build_train_dataset(train_samples, convert_fn):
     train_ds = Dataset.from_dict(dataset_list_to_dict(train_samples))
     train_ds = train_ds.map(lambda x, i: {"sample_index": i}, with_indices=True)
-    train_ds = train_ds.map(
-        convert_fn, 
-        batched=True,
-        remove_columns=["input", "output", "system"]
-    )
+    print(f"[DEBUG] Tokenizing {len(train_ds)} train samples...", flush=True)
+    try:
+        train_ds = train_ds.map(
+            convert_fn,
+            batched=True,
+            batch_size=1000,
+            num_proc=4,
+            remove_columns=["input", "output", "system"],
+            desc="Tokenizing train",
+        )
+    except Exception as e:
+        print(f"[DEBUG] Multiprocess map failed ({e}), falling back to single process...", flush=True)
+        train_ds = train_ds.map(
+            convert_fn,
+            batched=True,
+            remove_columns=["input", "output", "system"],
+            desc="Tokenizing train",
+        )
     train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
 
     return train_ds
