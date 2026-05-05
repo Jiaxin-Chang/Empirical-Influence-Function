@@ -650,7 +650,7 @@ class NewInferenceFunction:
         return new_mask
 
     @torch.no_grad()
-    def infer(self, batch, target_idx=None, gen_limit: int = 128):
+    def infer(self, batch, target_idx=None, gen_limit: int = 128, skip_saliency: bool = False):
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
 
@@ -682,12 +682,15 @@ class NewInferenceFunction:
         time_part_1_infer = time()
         print(f'Inferring single token costs {(time_part_1_infer - time_start):.3f}s')
 
-        _, _, saliency_original = compute_answer_only_saliency_masked_loss(
-            self.model,
-            batch,
-            self.device,
-            target_idx
-        )
+        if skip_saliency:
+            saliency_original = None
+        else:
+            _, _, saliency_original = compute_answer_only_saliency_masked_loss(
+                self.model,
+                batch,
+                self.device,
+                target_idx
+            )
 
         time_part_1_saliency = time()
         print(f'Computing saliency of original sample costs {(time_part_1_saliency - time_part_1_infer):.3f}s')
@@ -771,12 +774,15 @@ class NewInferenceFunction:
             "attention_mask": gen_attention_mask,
             "labels": gen_labels,
         }
-        _, _, saliency_generation = compute_answer_only_saliency_masked_loss(
-            self.model,
-            gen_batch,
-            self.device,
-            target_idx
-        )
+        if skip_saliency:
+            saliency_generation = None
+        else:
+            _, _, saliency_generation = compute_answer_only_saliency_masked_loss(
+                self.model,
+                gen_batch,
+                self.device,
+                target_idx
+            )
 
         time_part_2_saliency = time()
         print(f'Computing saliency on the generation result costs {(time_part_2_saliency-time_part_2_generation):.3f}s')

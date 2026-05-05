@@ -421,7 +421,7 @@ def run_causal_intervention_experiment(
 
     infer_fw.model.eval()
     print("[DEBUG] Starting infer_fw.infer(raw_test_batch)...", flush=True)
-    gen_result = infer_fw.infer(raw_test_batch)
+    gen_result = infer_fw.infer(raw_test_batch, skip_saliency=True)
     print("[DEBUG] Inference done.", flush=True)
     prompt_len = int(gen_result["target_idx"][0])
     prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
