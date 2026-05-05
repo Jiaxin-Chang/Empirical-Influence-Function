@@ -201,8 +201,9 @@ def compute_answer_only_saliency_masked_loss(
         mask.scatter_(1, topk_indices, True)
 
         # apply attention mask to token t-1
-        masked_attn = attn[:, :, t - 1, :] * mask[:, None, :]
-        token_weights[:, t - 1] = masked_attn.sum(dim=-1).mean(dim=1).detach()
+        attn_slice = attn[:, :, t - 1, :]
+        masked_attn = attn_slice * mask[:, None, :].to(attn_slice.device)
+        token_weights[:, t - 1] = masked_attn.sum(dim=-1).mean(dim=1).detach().to(device)
         # token_weights[:, t - 1] = torch.ones_like(masked_attn.sum(dim=-1).mean(dim=1).detach())
 
         for i in range(bsz):
