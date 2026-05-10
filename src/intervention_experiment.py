@@ -211,6 +211,7 @@ CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for 
 
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
+SEQUENCE_LENGTH_LIMIT = 3000   # Default guard for gradient-heavy train sample scans
 # Global pre-screen pool size. The full training set is scanned ONCE with the full-response
 # CE gradient to obtain this pool, then each per-token re-ranking only scans the pool
 # (COARSE_POOL_SIZE samples) instead of the full training set.
@@ -410,8 +411,6 @@ def run_causal_intervention_experiment(
         print(f"[DEBUG] Limiting train samples: {len(train_samples)} -> {train_limit}", flush=True)
         train_samples = train_samples[:train_limit]
     print(f"[DEBUG] Loaded {len(train_samples)} train, {len(test_samples)} test samples.", flush=True)
-
-    SEQUENCE_LENGTH_LIMIT = 3000
 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer, model=model,
