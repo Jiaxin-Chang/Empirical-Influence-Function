@@ -150,9 +150,14 @@ def _patch_model_with_attn_hook(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def load_model_and_tokenizer(model_path: str | None = None):
+def load_model_and_tokenizer(
+    model_path: str | None = None,
+    attn_implementation: str = "eager",
+    max_gpu_memory: str | None = None,
+):
     """Load any AutoModelForCausalLM checkpoint and patch it with the generic
-    attention hook so ``save_last_attention=True`` works for all architectures.
+    attention hook. ``save_last_attention=True`` only returns attention weights
+    when the backend materializes them (for example ``eager``).
 
     Args:
         model_path: Absolute path to the model checkpoint directory.
@@ -165,9 +170,10 @@ def load_model_and_tokenizer(model_path: str | None = None):
     print(f"Loading model from {model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    print(f"Using attention implementation: {attn_implementation}")
     config = AutoConfig.from_pretrained(
         model_path,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
         output_attentions=False,
         use_cache=False,
     )
@@ -175,6 +181,11 @@ def load_model_and_tokenizer(model_path: str | None = None):
         model_path,
         config=config,
         device_map="auto",
+        max_memory=(
+            {i: max_gpu_memory for i in range(torch.cuda.device_count())}
+            if max_gpu_memory and torch.cuda.is_available()
+            else None
+        ),
         torch_dtype=torch.bfloat16,
         local_files_only=True,
     )
@@ -320,19 +331,25 @@ def _screen_training_set(
     lm_head_device: torch.device, # device where lm_head lives (grad computed here)
     desc: str = "Scanning Train Samples",
     allowed_indices: set | None = None,
+    max_seq_len: int | None = None,
 ) -> list[tuple[int, float]]:
     """Compute cosine similarity on GPU (lm_head_device). Returns LOCAL scores for this process."""
     sample_scores: list[tuple[int, float]] = []
     empty_ignored = torch.tensor([], device=accel_device)
+    skipped_long = 0
 
     for batch in tqdm(train_loader, desc=desc, leave=False):
-        batch_device = {k: v.to(accel_device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-        train_idx = int(batch_device["sample_index"].item())
+        train_idx = int(batch["sample_index"].item())
 
         if allowed_indices is not None and train_idx not in allowed_indices:
-            del batch_device
             continue
 
+        seq_len = int(batch["input_ids"].size(1))
+        if max_seq_len is not None and seq_len > max_seq_len:
+            skipped_long += 1
+            continue
+
+        batch_device = {k: v.to(accel_device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         train_ce_grads = compute_gradients(
             model=model,
             batch=batch_device,
@@ -347,6 +364,9 @@ def _screen_training_set(
 
         del train_ce_grads, flat_train_ce, batch_device
 
+    if skipped_long:
+        print(f"[DEBUG] {desc}: skipped {skipped_long} samples longer than {max_seq_len} tokens.", flush=True)
+
     return sample_scores
 
 
@@ -356,6 +376,9 @@ def run_causal_intervention_experiment(
     train_data: str = "sft_train.jsonl",
     test_data: str = "sft_test.jsonl",
     train_limit: int | None = None,
+    attn_implementation: str | None = None,
+    prescreen_max_seq_len: int | None = SEQUENCE_LENGTH_LIMIT,
+    max_gpu_memory: str | None = None,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -363,7 +386,18 @@ def run_causal_intervention_experiment(
     print(f"[DEBUG] Accelerator ready. num_processes={accelerator.num_processes}, device={accelerator.device}", flush=True)
     set_seed(SEED)
 
-    model, tokenizer = load_model_and_tokenizer(model_path)
+    if attn_implementation is None:
+        # All-tokens mode uses embedding-gradient saliency and CE gradients; it
+        # does not need materialized attention weights. SDPA avoids the large
+        # eager attention matrix that can OOM during prescreening.
+        attn_implementation = "sdpa" if all_tokens else "eager"
+    if prescreen_max_seq_len is not None and prescreen_max_seq_len <= 0:
+        prescreen_max_seq_len = None
+    model, tokenizer = load_model_and_tokenizer(
+        model_path,
+        attn_implementation=attn_implementation,
+        max_gpu_memory=max_gpu_memory,
+    )
     print("[DEBUG] Model and tokenizer loaded.", flush=True)
     param_filter = lm_head_filter
 
@@ -644,6 +678,7 @@ def run_causal_intervention_experiment(
         local_scores  = _screen_training_set(
             model, test_ce_grad, filtered_params, train_loader,
             accelerator.device, lm_head_device, desc="Stage 2",
+            max_seq_len=prescreen_max_seq_len,
         )
         sample_scores  = _gather_scores(accelerator, local_scores, accelerator.device)
         related_samples = nlargest(TOP_K_TRAIN_SAMPLES, sample_scores, key=lambda x: x[1])
@@ -727,6 +762,7 @@ def run_causal_intervention_experiment(
         local_pool_scores = _screen_training_set(
             model, full_response_ce_grad, filtered_params, train_loader,
             accelerator.device, lm_head_device, desc="Global Pre-Screen",
+            max_seq_len=prescreen_max_seq_len,
         )
         all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
         coarse_pool: set[int] = {
@@ -792,6 +828,7 @@ def run_causal_intervention_experiment(
                 model, token_ce_grad, filtered_params, pool_loader,
                 accelerator.device, lm_head_device,
                 desc=f"Stage2 t={t}",
+                max_seq_len=prescreen_max_seq_len,
             )
             all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
@@ -908,6 +945,28 @@ if __name__ == "__main__":
         "--train-limit", type=int, default=None,
         help="Limit the number of training samples to process (default: all). Useful for debugging.",
     )
+    parser.add_argument(
+        "--attn-implementation", type=str, default=None,
+        choices=["eager", "sdpa", "flash_attention_2"],
+        help=(
+            "Attention backend for model loading. Defaults to sdpa in all-tokens "
+            "mode and eager in single-token mode."
+        ),
+    )
+    parser.add_argument(
+        "--prescreen-max-seq-len", type=int, default=SEQUENCE_LENGTH_LIMIT,
+        help=(
+            "Skip training samples longer than this during prescreen/rerank. "
+            "Use 0 to disable this guard."
+        ),
+    )
+    parser.add_argument(
+        "--max-gpu-memory", type=str, default=None,
+        help=(
+            "Per-GPU max_memory passed to from_pretrained, e.g. 26GiB. "
+            "Useful for leaving activation headroom with device_map=auto."
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -923,5 +982,7 @@ if __name__ == "__main__":
         train_data=args.train_data,
         test_data=args.test_data,
         train_limit=args.train_limit,
+        attn_implementation=args.attn_implementation,
+        prescreen_max_seq_len=args.prescreen_max_seq_len,
+        max_gpu_memory=args.max_gpu_memory,
     )
-
