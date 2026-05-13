@@ -29,6 +29,7 @@ from src.loss import (
     compute_correlation_second_order_gradient,
     compute_full_saliency_vector,
     compute_lm_head_ce_gradient_no_backward,
+    compute_lm_head_ce_gradient_scores_no_backward,
     compute_saliency_feature_proxy,
 )
 
@@ -327,7 +328,6 @@ def _gather_scores(
 def _screen_training_set(
     model,
     test_ce_grad: torch.Tensor,   # flat tensor already on lm_head_device
-    filtered_params: list,
     train_loader,
     accel_device: torch.device,   # accelerator.device for batch loading
     lm_head_device: torch.device, # device where lm_head lives (grad computed here)
@@ -341,29 +341,39 @@ def _screen_training_set(
     skipped_long = 0
 
     for batch in tqdm(train_loader, desc=desc, leave=False):
-        train_idx = int(batch["sample_index"].item())
+        train_indices = batch["sample_index"].view(-1).tolist()
+        keep_rows = []
+        for row, train_idx in enumerate(train_indices):
+            if allowed_indices is not None and train_idx not in allowed_indices:
+                continue
+            if max_seq_len is not None:
+                seq_len = int(batch["attention_mask"][row].sum().item())
+                if seq_len > max_seq_len:
+                    skipped_long += 1
+                    continue
+            keep_rows.append(row)
 
-        if allowed_indices is not None and train_idx not in allowed_indices:
+        if not keep_rows:
             continue
 
-        seq_len = int(batch["input_ids"].size(1))
-        if max_seq_len is not None and seq_len > max_seq_len:
-            skipped_long += 1
-            continue
-
-        batch_device = {k: v.to(accel_device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-        train_ce_grad = compute_lm_head_ce_gradient_no_backward(
+        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
+        batch_kept = {
+            k: v.index_select(0, rows).to(accel_device)
+            for k, v in batch.items()
+            if isinstance(v, torch.Tensor) and k != "sample_index"
+        }
+        scores = compute_lm_head_ce_gradient_scores_no_backward(
             model=model,
-            batch=batch_device,
+            batch=batch_kept,
             device=accel_device,
             ignored_token_ids=empty_ignored,
+            test_ce_grad=test_ce_grad,
+            score_device=lm_head_device,
         )
-        # Keep on lm_head_device — no CPU round-trip
-        flat_train_ce = train_ce_grad.reshape(-1).to(lm_head_device)
-        score = F.cosine_similarity(test_ce_grad, flat_train_ce, dim=0).item()
-        sample_scores.append((train_idx, score))
+        for row, score in zip(keep_rows, scores):
+            sample_scores.append((int(train_indices[row]), float(score)))
 
-        del train_ce_grad, flat_train_ce, batch_device
+        del batch_kept, scores, rows
 
     if skipped_long:
         print(f"[DEBUG] {desc}: skipped {skipped_long} samples longer than {max_seq_len} tokens.", flush=True)
@@ -381,6 +391,7 @@ def run_causal_intervention_experiment(
     prescreen_max_seq_len: int | None = SEQUENCE_LENGTH_LIMIT,
     max_gpu_memory: str | None = None,
     corr_feature_mode: str = "auto",
+    prescreen_batch_size: int = 1,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -395,6 +406,7 @@ def run_causal_intervention_experiment(
         attn_implementation = "sdpa" if all_tokens else "eager"
     if prescreen_max_seq_len is not None and prescreen_max_seq_len <= 0:
         prescreen_max_seq_len = None
+    prescreen_batch_size = max(1, int(prescreen_batch_size))
     model, tokenizer = load_model_and_tokenizer(
         model_path,
         attn_implementation=attn_implementation,
@@ -428,7 +440,7 @@ def run_causal_intervention_experiment(
     train_ds = build_train_dataset(train_samples, convert_to_chatml)
     print(f"[DEBUG] Train dataset built: {len(train_ds)} samples.", flush=True)
     train_loader = torch.utils.data.DataLoader(
-        DatasetWrapper(train_ds), batch_size=1, collate_fn=collator,
+        DatasetWrapper(train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
     )
     print("[DEBUG] Calling accelerator.prepare(train_loader)...", flush=True)
     train_loader = accelerator.prepare(train_loader)
@@ -694,7 +706,7 @@ def run_causal_intervention_experiment(
         print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
         test_ce_grad  = _test_ce_grad_for_token(TOKEN_INDEX_TO_RETRIEVE)
         local_scores  = _screen_training_set(
-            model, test_ce_grad, filtered_params, train_loader,
+            model, test_ce_grad, train_loader,
             accelerator.device, lm_head_device, desc="Stage 2",
             max_seq_len=prescreen_max_seq_len,
         )
@@ -778,7 +790,7 @@ def run_causal_intervention_experiment(
         print(f"\n=== Global Pre-Screen: full training set → Top-{COARSE_POOL_SIZE} pool ===")
         full_response_ce_grad = _test_ce_grad_full_response()
         local_pool_scores = _screen_training_set(
-            model, full_response_ce_grad, filtered_params, train_loader,
+            model, full_response_ce_grad, train_loader,
             accelerator.device, lm_head_device, desc="Global Pre-Screen",
             max_seq_len=prescreen_max_seq_len,
         )
@@ -795,7 +807,7 @@ def run_causal_intervention_experiment(
         pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
         pool_ds     = train_ds.select(pool_rows)
         pool_loader = torch.utils.data.DataLoader(
-            DatasetWrapper(pool_ds), batch_size=1, collate_fn=collator,
+            DatasetWrapper(pool_ds), batch_size=prescreen_batch_size, collate_fn=collator,
         )
         pool_loader = accelerator.prepare(pool_loader)
         print(f"  pool_loader built: {len(pool_rows)} samples")
@@ -839,7 +851,7 @@ def run_causal_intervention_experiment(
             # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
             token_ce_grad  = _test_ce_grad_for_token(t)
             local_scores   = _screen_training_set(
-                model, token_ce_grad, filtered_params, pool_loader,
+                model, token_ce_grad, pool_loader,
                 accelerator.device, lm_head_device,
                 desc=f"Stage2 t={t}",
                 max_seq_len=prescreen_max_seq_len,
@@ -989,6 +1001,10 @@ if __name__ == "__main__":
             "for MoE models because their grouped-mm kernels do not support 2nd-order AD."
         ),
     )
+    parser.add_argument(
+        "--prescreen-batch-size", type=int, default=1,
+        help="Batch size for global prescreen and pool rerank forwards.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -1008,4 +1024,5 @@ if __name__ == "__main__":
         prescreen_max_seq_len=args.prescreen_max_seq_len,
         max_gpu_memory=args.max_gpu_memory,
         corr_feature_mode=args.corr_feature_mode,
+        prescreen_batch_size=args.prescreen_batch_size,
     )

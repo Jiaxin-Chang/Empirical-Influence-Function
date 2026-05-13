@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from collections.abc import Callable, Iterable
 
@@ -347,6 +348,75 @@ def compute_lm_head_ce_gradient_no_backward(
 
     grad = grad_logits.t().to(valid_hidden.dtype).matmul(valid_hidden)
     return grad.to(dtype=lm_head.weight.dtype)
+
+
+@torch.no_grad()
+def compute_lm_head_ce_gradient_scores_no_backward(
+    model,
+    batch,
+    device,
+    ignored_token_ids,
+    test_ce_grad: Tensor,
+    score_device,
+) -> list[float]:
+    """Score each sample's analytic lm_head CE gradient against test_ce_grad.
+
+    Runs the transformer once for the whole batch, then computes each sample's
+    lm_head gradient and cosine score one at a time to avoid storing B full
+    vocab-by-hidden gradient matrices.
+    """
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+    labels = inputs["labels"]
+
+    base_model = getattr(model, "model", None)
+    lm_head = model.get_output_embeddings() if isinstance(model.get_output_embeddings, Callable) else None
+    if base_model is None or lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+
+    outputs = base_model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = outputs.last_hidden_state
+    shift_hidden = hidden[..., :-1, :]
+    shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
+
+    if ignored_token_ids is not None and ignored_token_ids.numel() > 0:
+        ignored_on_label_device = ignored_token_ids.to(shift_labels.device)
+        shift_labels[torch.isin(shift_labels, ignored_on_label_device)] = -100
+
+    head_device = lm_head.weight.device
+    test_flat = test_ce_grad.to(score_device)
+    scores: list[float] = []
+    for i in range(shift_labels.size(0)):
+        valid_mask = shift_labels[i].ne(-100)
+        if not bool(valid_mask.any().item()):
+            scores.append(float("-inf"))
+            continue
+
+        valid_hidden = shift_hidden[i][valid_mask].to(head_device)
+        valid_labels = shift_labels[i][valid_mask].to(head_device)
+        logits = lm_head(valid_hidden).float()
+        grad_logits = torch.softmax(logits, dim=-1)
+        grad_logits[torch.arange(valid_labels.numel(), device=head_device), valid_labels] -= 1.0
+        grad_logits /= valid_labels.numel()
+
+        grad = grad_logits.t().to(valid_hidden.dtype).matmul(valid_hidden)
+        score = F.cosine_similarity(test_flat, grad.reshape(-1).to(score_device), dim=0).item()
+        scores.append(score)
+
+        del valid_hidden, valid_labels, logits, grad_logits, grad
+
+    del outputs, hidden, shift_hidden, shift_labels
+    torch.cuda.empty_cache()
+    return scores
 
 
 def compute_saliency_feature_proxy(
