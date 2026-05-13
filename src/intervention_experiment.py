@@ -279,6 +279,18 @@ def get_context_window(tokenizer, input_ids_1d, idx, window=CONTEXT_WINDOW_SIZE)
     return tokens
 
 
+def _write_json_report(report_json: dict, report_filename: str, accelerator) -> str | None:
+    """Write a report JSON from the main process and return its path."""
+    if not accelerator.is_main_process:
+        return None
+    report_json = round_floats(report_json, 5)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    report_path = os.path.join(base_dir, report_filename)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report_json, f, indent=2, ensure_ascii=False)
+    return report_path
+
+
 def _flat_grad_on_device(
     grads: list,
     filtered_params: list,
@@ -795,15 +807,108 @@ def run_causal_intervention_experiment(
             max_seq_len=prescreen_max_seq_len,
         )
         all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
-        coarse_pool: set[int] = {
-            idx for idx, _ in nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
-        }
+        coarse_pool_ranked = nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
+        coarse_pool: set[int] = {idx for idx, _ in coarse_pool_ranked}
         del full_response_ce_grad
         print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
 
+        prescreen_train_details = {}
+        idx_to_row  = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
+        for train_idx, coarse_score in coarse_pool_ranked:
+            row = idx_to_row.get(int(train_idx))
+            if row is None:
+                continue
+            item = train_ds[row]
+            ids_1d = item["input_ids"]
+            labels_1d = item["labels"]
+            valid_label_positions = torch.where(labels_1d.ne(-100))[0]
+            answer_start = int(valid_label_positions[0].item()) if valid_label_positions.numel() else 0
+            prescreen_train_details[str(int(train_idx))] = {
+                "full_tokens": tokenizer.convert_ids_to_tokens(ids_1d.tolist()),
+                "answer_start_index": answer_start,
+                "coarse_cos_sim": float(coarse_score),
+                "saliencies_by_token": {},
+                "prescreen_only": True,
+            }
+
+        prescreen_per_token_results = []
+        for t in valid_test_tokens:
+            target_tok_text = tokenizer.decode([int(test_batch["input_ids"][0, t].item())])
+            placeholder_pairs = []
+            for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1):
+                placeholder_pairs.append({
+                    "id": f"prescreen_t{t}_{rank:04d}",
+                    "cos_sim": 0.0,
+                    "coarse_cos_sim": float(coarse_score),
+                    "train_sample_id": int(train_idx),
+                    "test_correlation": {
+                        "source_token": "",
+                        "source_token_index": -1,
+                        "target_token": target_tok_text,
+                        "target_token_index": int(t),
+                        "saliency_score": 0.0,
+                    },
+                    "train_correlation": {
+                        "source_token": "",
+                        "source_token_index": -1,
+                        "target_token": "",
+                        "target_token_index": -1,
+                        "saliency_score": 0.0,
+                        "response_token_offset": -1,
+                    },
+                    "train_context": {
+                        "source_context": [],
+                        "target_context": [],
+                    },
+                    "annotation": None,
+                })
+            prescreen_per_token_results.append({
+                "target_token_index": int(t),
+                "target_token": target_tok_text,
+                "top_correlations": [],
+                "correlation_pairs": placeholder_pairs,
+            })
+
+        prescreen_report_json = {
+            "experiment_meta": {
+                "test_sample_index": SELECTED_TEST_SAMPLE_INDEX,
+                "mode": "all_tokens",
+                "stage": "global_prescreen",
+                "is_checkpoint": True,
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+                "tokens_analyzed": len(prescreen_per_token_results),
+                "screening": "global_pool_only",
+                "config": {
+                    "COARSE_POOL_SIZE": COARSE_POOL_SIZE,
+                    "prescreen_max_seq_len": prescreen_max_seq_len,
+                    "prescreen_batch_size": prescreen_batch_size,
+                    "corr_feature_mode": corr_feature_mode,
+                },
+            },
+            "test_sample_baseline": {
+                "full_tokens": gen_result["pred_full_tokens"][0],
+                "correct_full_tokens": gen_result["full_tokens"][0],
+                "prompt_len": prompt_len,
+            },
+            "coarse_pool_samples": [
+                {
+                    "rank": rank,
+                    "train_sample_id": int(train_idx),
+                    "coarse_cos_sim": float(coarse_score),
+                    "correlation": 0.0,
+                }
+                for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1)
+            ],
+            "per_token_results": prescreen_per_token_results,
+            "train_sample_details": prescreen_train_details,
+        }
+        prescreen_filename = f"correlation_matching_results_{_task_id}_all_tokens_prescreen.json"
+        prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
+        if prescreen_path is not None:
+            print(f"  Prescreen checkpoint saved → {prescreen_path}", flush=True)
+
         # Materialise pool as a dedicated DataLoader so per-token Stage 2 truly iterates
         # only COARSE_POOL_SIZE times (not N_train times with skip logic).
-        idx_to_row  = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
         pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
         pool_ds     = train_ds.select(pool_rows)
         pool_loader = torch.utils.data.DataLoader(
@@ -923,12 +1028,8 @@ def run_causal_intervention_experiment(
         report_filename = f"correlation_matching_results_{_task_id}_all_tokens.json"
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
-    if accelerator.is_main_process:
-        report_json = round_floats(report_json, 5)
-        base_dir    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        report_path = os.path.join(base_dir, report_filename)
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(report_json, f, indent=2, ensure_ascii=False)
+    report_path = _write_json_report(report_json, report_filename, accelerator)
+    if report_path is not None:
         print(f"\nExperiment completed. Results → {report_path}")
 
 
