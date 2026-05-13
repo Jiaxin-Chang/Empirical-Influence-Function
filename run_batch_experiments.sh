@@ -42,6 +42,7 @@ TRAIN_LIMIT="${TRAIN_LIMIT:-}"  # empty = use all training samples
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"  # empty = intervention default
 PRESCREEN_MAX_SEQ_LEN="${PRESCREEN_MAX_SEQ_LEN:-}"  # empty = intervention default; 0 disables guard
 MAX_GPU_MEMORY="${MAX_GPU_MEMORY:-}"  # e.g. 26GiB to leave activation headroom
+CORR_FEATURE_MODE="${CORR_FEATURE_MODE:-}"  # auto, second_order, or saliency_proxy
 PYTHON="${PYTHON:-python}"
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --attn-implementation) ATTN_IMPLEMENTATION="$2"; shift 2 ;;
         --prescreen-max-seq-len) PRESCREEN_MAX_SEQ_LEN="$2"; shift 2 ;;
         --max-gpu-memory) MAX_GPU_MEMORY="$2"; shift 2 ;;
+        --corr-feature-mode) CORR_FEATURE_MODE="$2"; shift 2 ;;
         *) echo "[batch] Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -120,6 +122,7 @@ echo "  train_limit: ${TRAIN_LIMIT:-all}"
 echo "  attention : ${ATTN_IMPLEMENTATION:-auto}"
 echo "  prescreen max seq len: ${PRESCREEN_MAX_SEQ_LEN:-default}"
 echo "  max gpu memory: ${MAX_GPU_MEMORY:-auto}"
+echo "  corr feature mode: ${CORR_FEATURE_MODE:-auto}"
 echo "  log dir   : ${LOG_DIR}"
 echo "================================================================="
 
@@ -157,6 +160,7 @@ for IDX in $(seq "$START_IDX" "$END_IDX"); do
         ${ATTN_IMPLEMENTATION:+--attn-implementation "${ATTN_IMPLEMENTATION}"} \
         ${PRESCREEN_MAX_SEQ_LEN:+--prescreen-max-seq-len "${PRESCREEN_MAX_SEQ_LEN}"} \
         ${MAX_GPU_MEMORY:+--max-gpu-memory "${MAX_GPU_MEMORY}"} \
+        ${CORR_FEATURE_MODE:+--corr-feature-mode "${CORR_FEATURE_MODE}"} \
         2>&1 | tee "${LOG_FILE}"
 
     EXIT_CODE=${PIPESTATUS[0]}

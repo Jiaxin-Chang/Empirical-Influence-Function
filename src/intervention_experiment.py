@@ -28,7 +28,8 @@ from src.process_data import process_func_chatml
 from src.loss import (
     compute_correlation_second_order_gradient,
     compute_full_saliency_vector,
-    compute_gradients,
+    compute_lm_head_ce_gradient_no_backward,
+    compute_saliency_feature_proxy,
 )
 
 # ====== DATA LOADING (auto-detects format) ======
@@ -351,19 +352,18 @@ def _screen_training_set(
             continue
 
         batch_device = {k: v.to(accel_device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-        train_ce_grads = compute_gradients(
+        train_ce_grad = compute_lm_head_ce_gradient_no_backward(
             model=model,
             batch=batch_device,
-            param_filter_fn=lm_head_filter,
             device=accel_device,
             ignored_token_ids=empty_ignored,
         )
         # Keep on lm_head_device — no CPU round-trip
-        flat_train_ce = _flat_grad_on_device(train_ce_grads, filtered_params, lm_head_device)
+        flat_train_ce = train_ce_grad.reshape(-1).to(lm_head_device)
         score = F.cosine_similarity(test_ce_grad, flat_train_ce, dim=0).item()
         sample_scores.append((train_idx, score))
 
-        del train_ce_grads, flat_train_ce, batch_device
+        del train_ce_grad, flat_train_ce, batch_device
 
     if skipped_long:
         print(f"[DEBUG] {desc}: skipped {skipped_long} samples longer than {max_seq_len} tokens.", flush=True)
@@ -380,6 +380,7 @@ def run_causal_intervention_experiment(
     attn_implementation: str | None = None,
     prescreen_max_seq_len: int | None = SEQUENCE_LENGTH_LIMIT,
     max_gpu_memory: str | None = None,
+    corr_feature_mode: str = "auto",
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -399,6 +400,11 @@ def run_causal_intervention_experiment(
         attn_implementation=attn_implementation,
         max_gpu_memory=max_gpu_memory,
     )
+    if corr_feature_mode == "auto":
+        model_type = str(getattr(model.config, "model_type", "")).lower()
+        class_name = model.__class__.__name__.lower()
+        corr_feature_mode = "saliency_proxy" if "moe" in model_type or "moe" in class_name else "second_order"
+    print(f"[DEBUG] correlation feature mode: {corr_feature_mode}", flush=True)
     print("[DEBUG] Model and tokenizer loaded.", flush=True)
     param_filter = lm_head_filter
 
@@ -471,6 +477,24 @@ def run_causal_intervention_experiment(
     }
     seq_len = test_batch["input_ids"].size(1)
 
+    def _compute_correlation_feature(batch, target_idx_in_seq: int, source_idx_in_seq: int) -> torch.Tensor:
+        if corr_feature_mode == "second_order":
+            return compute_correlation_second_order_gradient(
+                model=model,
+                batch=batch,
+                target_idx_in_seq=target_idx_in_seq,
+                source_idx_in_seq=source_idx_in_seq,
+                param_filter_fn=param_filter,
+            )
+        if corr_feature_mode == "saliency_proxy":
+            return compute_saliency_feature_proxy(
+                model=model,
+                batch=batch,
+                target_idx_in_seq=target_idx_in_seq,
+                source_idx_in_seq=source_idx_in_seq,
+            )
+        raise ValueError(f"Unsupported corr_feature_mode: {corr_feature_mode}")
+
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: Stage 3 processing for one train sample
     # Returns (train_sample_detail_dict, pair_records_list)
@@ -538,7 +562,7 @@ def run_causal_intervention_experiment(
                 cached_detail["coarse_cos_sim"] = float(coarse_score)
             candidate_pairs = cached_detail["_candidate_pairs"]
 
-        # Move tr_batch to device for 2nd-order computation
+        # Move tr_batch to device for correlation feature computation
         tr_batch_gpu = {k: v.to(accelerator.device) for k, v in cached_detail["_tr_batch_cpu"].items()}
         ids_1d       = tr_batch_gpu["input_ids"][0]
         response_start = cached_detail["answer_start_index"]
@@ -554,11 +578,7 @@ def run_causal_intervention_experiment(
                 print(f"  Step B: '{train_source_tok}' -> '{train_target_tok}' "
                       f"(offset={response_tok_offset}, sal={saliency_score:.4f})")
 
-                train_feat = compute_correlation_second_order_gradient(
-                    model, tr_batch_gpu,
-                    target_idx_in_seq=t_tr, source_idx_in_seq=s_idx,
-                    param_filter_fn=param_filter,
-                )
+                train_feat = _compute_correlation_feature(tr_batch_gpu, t_tr, s_idx)
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
 
@@ -613,26 +633,29 @@ def run_causal_intervention_experiment(
             "attention_mask": test_batch["attention_mask"],
             "labels":         ce_labels,
         }
-        grads = compute_gradients(
-            model=model, batch=single_tok_batch,
-            param_filter_fn=param_filter, device=accelerator.device,
+        grad = compute_lm_head_ce_gradient_no_backward(
+            model=model,
+            batch=single_tok_batch,
+            device=accelerator.device,
             ignored_token_ids=torch.tensor([], device=accelerator.device),
         )
-        return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+        return grad.reshape(-1).to(lm_head_device).detach()
 
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: compute test-side CE gradient aggregated over ALL response tokens
     # Used for the global one-shot coarse pre-screen in all_tokens mode.
     # test_batch["labels"] already masks prompt positions with -100, so
-    # compute_gradients naturally aggregates CE loss across all response tokens.
+    # The analytic lm_head gradient naturally aggregates CE loss across all
+    # response tokens.
     # ════════════════════════════════════════════════════════════════════════════
     def _test_ce_grad_full_response() -> torch.Tensor:
-        grads = compute_gradients(
-            model=model, batch=test_batch,
-            param_filter_fn=param_filter, device=accelerator.device,
+        grad = compute_lm_head_ce_gradient_no_backward(
+            model=model,
+            batch=test_batch,
+            device=accelerator.device,
             ignored_token_ids=torch.tensor([], device=accelerator.device),
         )
-        return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+        return grad.reshape(-1).to(lm_head_device).detach()
 
     # ════════════════════════════════════════════════════════════════════════════
     # ── SINGLE-TOKEN MODE ────────────────────────────────────────────────────
@@ -659,17 +682,13 @@ def run_causal_intervention_experiment(
             for idx, score in top_test_corr
         ]
 
-        print("Computing 2nd-order test features...")
+        print(f"Computing test correlation features ({corr_feature_mode})...")
         test_corr_features: dict = {}
         with torch.inference_mode(False):
             for item in top_test_correlations:
                 p_idx = item["source_token_index"]
                 print(f"  '{item['source_token']}' -> '{item['target_token']}' (sal={item['saliency_score']:.4f})")
-                feat = compute_correlation_second_order_gradient(
-                    model=model, batch=test_batch,
-                    target_idx_in_seq=TOKEN_INDEX_TO_RETRIEVE, source_idx_in_seq=p_idx,
-                    param_filter_fn=param_filter,
-                )
+                feat = _compute_correlation_feature(test_batch, TOKEN_INDEX_TO_RETRIEVE, p_idx)
                 test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
         print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
@@ -807,17 +826,13 @@ def run_causal_intervention_experiment(
                 for idx, score in top_test_corr
             ]
 
-            # Stage 1b: 2nd-order test features (kept on lm_head_device, freed after this token)
-            print(f"  Computing {len(top_test_correlations)} test 2nd-order features...")
+            # Stage 1b: test correlation features (kept on lm_head_device, freed after this token)
+            print(f"  Computing {len(top_test_correlations)} test correlation features ({corr_feature_mode})...")
             test_corr_features: dict = {}
             with torch.inference_mode(False):
                 for item in top_test_correlations:
                     p_idx = item["source_token_index"]
-                    feat  = compute_correlation_second_order_gradient(
-                        model=model, batch=test_batch,
-                        target_idx_in_seq=t, source_idx_in_seq=p_idx,
-                        param_filter_fn=param_filter,
-                    )
+                    feat = _compute_correlation_feature(test_batch, t, p_idx)
                     test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
 
             # Stage 2: per-token CE grad → re-rank within pool_loader only
@@ -966,6 +981,14 @@ if __name__ == "__main__":
             "Useful for leaving activation headroom with device_map=auto."
         ),
     )
+    parser.add_argument(
+        "--corr-feature-mode", type=str, default="auto",
+        choices=["auto", "second_order", "saliency_proxy"],
+        help=(
+            "Feature used for fine correlation matching. auto uses saliency_proxy "
+            "for MoE models because their grouped-mm kernels do not support 2nd-order AD."
+        ),
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -984,4 +1007,5 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation,
         prescreen_max_seq_len=args.prescreen_max_seq_len,
         max_gpu_memory=args.max_gpu_memory,
+        corr_feature_mode=args.corr_feature_mode,
     )

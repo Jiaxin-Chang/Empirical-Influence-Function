@@ -291,6 +291,111 @@ def compute_gradients(
     return list(grads)
 
 
+@torch.no_grad()
+def compute_lm_head_ce_gradient_no_backward(
+    model,
+    batch,
+    device,
+    ignored_token_ids,
+):
+    """Compute the CE gradient w.r.t. lm_head.weight without model backward.
+
+    For a causal LM, d(loss)/d(lm_head.weight) can be computed from final hidden
+    states and softmax probabilities. This avoids backpropagating through all
+    transformer/MoE layers during coarse screening.
+    """
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+    labels = inputs["labels"]
+
+    base_model = getattr(model, "model", None)
+    lm_head = model.get_output_embeddings() if isinstance(model.get_output_embeddings, Callable) else None
+    if base_model is None or lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+
+    outputs = base_model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = outputs.last_hidden_state
+
+    shift_hidden = hidden[..., :-1, :]
+    shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
+
+    if ignored_token_ids is not None and ignored_token_ids.numel() > 0:
+        ignored_on_label_device = ignored_token_ids.to(shift_labels.device)
+        shift_labels[torch.isin(shift_labels, ignored_on_label_device)] = -100
+
+    valid_mask = shift_labels.ne(-100)
+    if not bool(valid_mask.any().item()):
+        return torch.zeros_like(lm_head.weight, device=lm_head.weight.device)
+
+    head_device = lm_head.weight.device
+    valid_hidden = shift_hidden[valid_mask].to(head_device)
+    valid_labels = shift_labels[valid_mask].to(head_device)
+
+    logits = lm_head(valid_hidden).float()
+    grad_logits = torch.softmax(logits, dim=-1)
+    grad_logits[torch.arange(valid_labels.numel(), device=head_device), valid_labels] -= 1.0
+    grad_logits /= valid_labels.numel()
+
+    grad = grad_logits.t().to(valid_hidden.dtype).matmul(valid_hidden)
+    return grad.to(dtype=lm_head.weight.dtype)
+
+
+def compute_saliency_feature_proxy(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+) -> torch.Tensor:
+    """First-order source-token feature for MoE models that lack 2nd-order AD.
+
+    Returns a hidden-size vector: embedding[source] * d logit[target] / d
+    embedding[source]. It is much smaller than lm_head gradients and avoids
+    differentiating through MoE backward kernels.
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    device = model.device
+    input_ids = batch["input_ids"].to(device)
+    target_vocab_id = input_ids[0, target_idx_in_seq]
+    curr_input_ids = input_ids[:, :target_idx_in_seq]
+
+    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
+    embeddings = get_embeds_fn()(curr_input_ids).detach()
+    embeddings.requires_grad_(True)
+
+    base_model = getattr(model, "model", None)
+    lm_head = model.get_output_embeddings() if isinstance(model.get_output_embeddings, Callable) else None
+    if base_model is None or lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+
+    with torch.enable_grad():
+        outputs = base_model(inputs_embeds=embeddings, use_cache=False, return_dict=True)
+        last_hidden = outputs.last_hidden_state[:, -1, :].to(lm_head.weight.device)
+        target_logits = lm_head(last_hidden)
+        target_logit = target_logits[0, target_vocab_id.to(target_logits.device)]
+        grad_embeds = torch.autograd.grad(target_logit, embeddings, create_graph=False)[0]
+
+    feature = (embeddings[0, source_idx_in_seq] * grad_embeds[0, source_idx_in_seq]).detach().float().cpu()
+
+    del outputs, embeddings, grad_embeds, target_logits, last_hidden
+    torch.cuda.empty_cache()
+    return feature
+
+
 def compute_gradients_selected_attention(
     model,
     batch,
