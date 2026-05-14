@@ -235,6 +235,52 @@ def _repeat_kv_for_alti(value_states: Tensor, num_attention_heads: int) -> Tenso
     )
 
 
+def _infer_qwen_attention_layout(model, self_attn, attention_probs: Tensor) -> tuple[int, int, int]:
+    """Infer (num_attention_heads, head_dim, num_key_value_heads) from config/weights.
+
+    Some Qwen checkpoints do not expose `self_attn.num_key_value_heads`. For
+    GQA/MQA models such as Qwen 1.5B, falling back to num_attention_heads is
+    wrong because `v_proj.out_features = num_key_value_heads * head_dim`.
+    """
+    config = getattr(model, "config", None)
+    num_heads = int(attention_probs.size(1))
+
+    head_dim = getattr(self_attn, "head_dim", None)
+    if head_dim is None and config is not None:
+        head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        q_out = getattr(self_attn.q_proj, "out_features", self_attn.q_proj.weight.shape[0])
+        if q_out % num_heads != 0:
+            raise ValueError(
+                f"Cannot infer head_dim: q_proj out_features={q_out}, num_heads={num_heads}."
+            )
+        head_dim = q_out // num_heads
+    head_dim = int(head_dim)
+
+    v_out = getattr(self_attn.v_proj, "out_features", self_attn.v_proj.weight.shape[0])
+    if v_out % head_dim != 0:
+        cfg_kv_heads = getattr(config, "num_key_value_heads", None) if config is not None else None
+        if cfg_kv_heads is None:
+            raise ValueError(
+                f"Cannot infer num_key_value_heads: v_proj out_features={v_out}, head_dim={head_dim}."
+            )
+        num_kv_heads = int(cfg_kv_heads)
+    else:
+        num_kv_heads = int(v_out // head_dim)
+
+    o_in = self_attn.o_proj.weight.shape[1]
+    if o_in != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj in_features={o_in}; expected num_heads({num_heads}) * head_dim({head_dim})."
+        )
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_attention_heads={num_heads} must be divisible by num_key_value_heads={num_kv_heads}."
+        )
+
+    return num_heads, head_dim, num_kv_heads
+
+
 def _normalize_alti_importance(
     source_vectors: Tensor,
     *,
@@ -306,9 +352,11 @@ def _compute_qwen_alti_layer_matrix(
         raise ValueError("Expected attention_probs with shape [1, heads, seq, seq].")
 
     bsz, seq_len, hidden_dim = hidden_states.shape
-    num_heads = attention_probs.size(1)
-    head_dim = getattr(self_attn, "head_dim", self_attn.o_proj.weight.shape[1] // num_heads)
-    num_kv_heads = getattr(self_attn, "num_key_value_heads", num_heads)
+    num_heads, head_dim, num_kv_heads = _infer_qwen_attention_layout(
+        model,
+        self_attn,
+        attention_probs,
+    )
 
     normed_states = layer.input_layernorm(hidden_states)
     value_states = self_attn.v_proj(normed_states)
@@ -393,9 +441,11 @@ def _compute_qwen_alti_layer_relevance(
             f"prev_relevance length {prev_relevance.numel()} does not match sequence length {seq_len}."
         )
 
-    num_heads = attention_probs.size(1)
-    head_dim = getattr(self_attn, "head_dim", self_attn.o_proj.weight.shape[1] // num_heads)
-    num_kv_heads = getattr(self_attn, "num_key_value_heads", num_heads)
+    num_heads, head_dim, num_kv_heads = _infer_qwen_attention_layout(
+        model,
+        self_attn,
+        attention_probs,
+    )
 
     normed_states = layer.input_layernorm(hidden_states)
     value_states = self_attn.v_proj(normed_states)
