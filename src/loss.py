@@ -303,7 +303,7 @@ def _normalize_alti_importance(
             dtype=source_vectors.dtype,
             device=source_vectors.device,
         )
-        hidden_chunk = 256
+        hidden_chunk = 2048
         for start in range(0, source_vectors.size(-1), hidden_chunk):
             end = min(start + hidden_chunk, source_vectors.size(-1))
             distances += (
