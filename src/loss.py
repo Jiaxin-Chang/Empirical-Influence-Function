@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor, nn
-from collections.abc import Callable, Iterable
+import re
 
 def compute_loss_per_sample(model, batch, device, ignored_token_ids):
     """
@@ -45,211 +45,6 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
     return mean_loss, token_losses
 
 
-def compute_answer_only_union_topk_loss(
-    model: torch.nn.Module,
-    batch: dict[str, Tensor],
-    device: torch.device,
-    target_idx: Tensor,
-    top_k: int = 10,
-    ignored_token_ids: Iterable[int] | Tensor | None = None,
-    *,
-    enable_grad: bool = False,
-    renormalize: bool = True,
-) -> tuple[Tensor, Tensor]:
-    '''
-    Deprecated. Compute loss on a union of top-k correlated tokens of answer tokens.
-    '''
-    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
-        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
-    elif ignored_token_ids is not None:
-        ignored_token_ids = ignored_token_ids.to(device)
-
-    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
-    labels = inputs["labels"].clone()
-    start = int(target_idx[0].item())
-    labels[..., :start] = -100
-
-    with torch.set_grad_enabled(enable_grad):
-        outputs = model(
-            **inputs,
-            return_dict=True,
-            save_last_attention=True,
-            use_cache=False,
-        )
-
-    logits = outputs.logits
-    attn = outputs.attentions[-1].detach()
-    del outputs
-
-    bsz, n_heads, q_len, k_len = attn.shape
-    k = min(top_k, k_len)
-    attn_avg = attn.mean(dim=1)  # [B, Q, K]
-
-    q_from = max(start, 0)
-    if q_from >= q_len:
-        raise ValueError("target_idx is beyond sequence length.")
-
-    topk_indices = torch.topk(attn_avg[:, q_from:, :], k=k, dim=-1).indices
-    union_mask = torch.zeros((bsz, k_len), device=attn.device, dtype=torch.bool)
-    union_mask.scatter_(1, topk_indices.reshape(bsz, -1), True)
-
-    masked_attn = attn_avg * union_mask[:, None, :]
-    if renormalize:
-        masked_attn = masked_attn / (masked_attn.sum(dim=-1, keepdim=True) + 1e-9)
-
-    token_weights = torch.zeros_like(attn_avg)
-    token_weights[:, q_from:, :] = masked_attn[:, q_from:, :].detach()
-
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-
-    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
-        shift_labels[torch.isin(shift_labels, ignored_token_ids)] = -100
-
-    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-    token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    token_losses = token_losses.view(shift_labels.size())
-
-    weights = token_weights[..., :-1].contiguous()
-    mask = shift_labels.ne(-100)
-    weights = weights * mask
-
-    weighted_token_losses = token_losses * weights
-    denom = weights.sum(dim=1).clamp_min(1e-9)
-    mean_loss = weighted_token_losses.sum(dim=1) / denom
-    return mean_loss, weighted_token_losses
-
-
-def compute_answer_only_saliency_masked_loss(
-    model: torch.nn.Module,
-    batch: dict[str, Tensor],
-    device: torch.device,
-    target_idx: Tensor,
-    top_k: int = 10,
-    ignored_token_ids: Iterable[int] | Tensor | None = None,
-    *,
-    enable_grad: bool = False,
-) -> tuple[Tensor, Tensor, list[list[dict[str, object]]]]:
-    '''
-    Compute loss on answer part (>= `target_idx`), with gradient,
-    attention-masked by `top_k` most relative tokens.
-
-    Returns a tuple:
-    - `mean_loss`:                of shape `(batch,)`.
-    - `weighted_token_losses`:    of shape `(batch, token)`.
-    - `saliency_list`:            list[list[dict]], of shape `(batch, target_token, previous_token)`.
-    '''
-    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
-        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
-    elif ignored_token_ids is not None:
-        ignored_token_ids = ignored_token_ids.to(device)
-
-    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
-    labels = inputs["labels"].clone()
-    start = int(target_idx[0].item())
-    labels[..., :start] = -100
-
-    with torch.set_grad_enabled(enable_grad):
-        outputs = model(
-            **inputs,
-            return_dict=True,
-            save_last_attention=True,
-            use_cache=False,
-        )
-
-    logits = outputs.logits
-    attn = outputs.attentions[-1].detach()
-    del outputs
-
-    bsz, n_heads, q_len, k_len = attn.shape
-    token_weights = torch.zeros((bsz, q_len), device=device, dtype=attn.dtype)
-
-    saliency_list = []
-    for i in range(bsz):
-        saliency_list.append([])
-
-    if not isinstance(model.get_input_embeddings, Callable):
-        raise ValueError("Expect model.get_input_embeddings to be torch.nn.Module")
-
-    for t in range(max(start, 1), q_len):
-        curr_input_ids = inputs["input_ids"][:, :t]
-        target_vocab_id = inputs["input_ids"][:, t]
-
-        embeddings = model.get_input_embeddings()(curr_input_ids).detach()
-        embeddings.requires_grad_(True)
-
-        with torch.enable_grad():
-            step_outputs = model(inputs_embeds=embeddings)
-            target_logits = step_outputs.logits[:, -1, :]
-
-            target_vocab_id_on_logits_device = target_vocab_id[:, None].to(target_logits.device)
-            picked = target_logits.gather(1, target_vocab_id_on_logits_device).sum()
-            # gradients from target logits to input embeddings
-            grads = torch.autograd.grad(picked, embeddings, retain_graph=False, create_graph=False)[0]
-
-        saliency = (embeddings * grads).abs().sum(dim=-1)   # [batch, token], l1 norm
-        k = min(top_k, saliency.size(-1))
-
-        # get top-k saliency token indices
-        topk_indices = torch.topk(saliency, k=k, dim=-1).indices
-
-        # ensure same device as mask (model may be split across GPUs with device_map="auto")
-        topk_indices = topk_indices.to(device)
-        
-        # build masks
-        mask = torch.zeros((bsz, k_len), device=device, dtype=torch.bool)
-        mask.scatter_(1, topk_indices, True)
-
-        # apply attention mask to token t-1
-        masked_attn = attn[:, :, t - 1, :] * mask[:, None, :]
-        token_weights[:, t - 1] = masked_attn.sum(dim=-1).mean(dim=1).detach()
-        # token_weights[:, t - 1] = torch.ones_like(masked_attn.sum(dim=-1).mean(dim=1).detach())
-
-        for i in range(bsz):
-            saliency_list[i].append({
-                "index": t,
-                "saliency": saliency[i].tolist()
-            })
-        del embeddings, grads, step_outputs
-
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-
-    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
-        shift_labels[torch.isin(shift_labels, ignored_token_ids)] = -100
-
-    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-    token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    token_losses = token_losses.view(shift_labels.size())
-
-    weights = token_weights[..., : token_losses.size(-1)]
-    mask = shift_labels.ne(-100)
-    weights = weights * mask
-
-    weighted_token_losses = token_losses * weights
-    denom = weights.sum(dim=1).clamp_min(1e-9)
-    mean_loss = weighted_token_losses.sum(dim=1) / denom
-    return mean_loss, weighted_token_losses, saliency_list
-
-
-@torch.no_grad()
-def compute_loss_in_minibatches(model, collator, samples_list, ignored_token_ids, batch_size=2):
-    all_samples_loss_list = []  # 存储每个样本的 1D Tensor
-    for i in range(0, len(samples_list), batch_size):
-        batch_samples = samples_list[i: i + batch_size]
-        batch = collator(batch_samples)
-        batch = {k: v.to(model.device) for k, v in batch.items() if isinstance(v, torch.Tensor)} # 移到 GPU
-
-        with torch.no_grad():
-            _, token_loss = compute_loss_per_sample(model, batch, model.device, ignored_token_ids)
-
-        # 立即上 CPU
-        token_loss_cpu = token_loss.detach().cpu()
-        all_samples_loss_list.extend(token_loss_cpu.unbind(0))
-        del batch
-
-    return all_samples_loss_list
-
 def compute_gradients(
         model,
         batch,
@@ -261,8 +56,6 @@ def compute_gradients(
     model.zero_grad(set_to_none=True)
 
     # Explicitly re-enable requires_grad for filtered params.
-    # compute_correlation_second_order_gradient may have frozen all non-Q/K params,
-    # so we need to ensure the target params are trainable before the forward pass.
     params = []
     for name, param in model.named_parameters():
         if param_filter_fn is None or param_filter_fn(name, param):
@@ -284,373 +77,457 @@ def compute_gradients(
         if loss.numel() > 1:
             loss = loss.mean()
 
-        # allow_unused=True: if a param doesn't appear in the graph (e.g. a Q/K
-        # whose layer is never reached), autograd returns None instead of raising.
         grads = torch.autograd.grad(loss, params, create_graph=False, allow_unused=True)
     return list(grads)
 
 
-def compute_gradients_selected_attention(
-    model,
-    batch,
-    param_filter_fn,
-    device,
-    ignored_token_ids,
+def _repeat_kv_for_alti(value_states: Tensor, num_attention_heads: int) -> Tensor:
+    """
+    Expand grouped-query value states from [B, H_kv, S, D] to [B, H, S, D].
+    Qwen2 uses GQA/MQA in some sizes, while attention probabilities are already
+    expanded to the query-head count.
+    """
+    num_kv_heads = value_states.size(1)
+    if num_kv_heads == num_attention_heads:
+        return value_states
+    if num_attention_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Cannot repeat {num_kv_heads} KV heads to {num_attention_heads} attention heads."
+        )
+    n_rep = num_attention_heads // num_kv_heads
+    bsz, _, seq_len, head_dim = value_states.shape
+    return (
+        value_states[:, :, None, :, :]
+        .expand(bsz, num_kv_heads, n_rep, seq_len, head_dim)
+        .reshape(bsz, num_attention_heads, seq_len, head_dim)
+    )
+
+
+def _normalize_alti_importance(
+    source_vectors: Tensor,
     *,
-    target_idx
-):
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+    p: int = 1,
+    eps: float = 1e-9,
+) -> Tensor:
+    """
+    Convert ALTI source contribution vectors T_i(x_j) into row-stochastic scalar
+    weights. This follows the paper implementation's min_sum normalization:
 
-    model.eval()
-    model.zero_grad(set_to_none=True)
+        max(||y_i||_p - ||T_i(x_j) - y_i||_p, 0), normalized over j
 
-    params = [p for n, p in model.named_parameters()
-              if (param_filter_fn is None or param_filter_fn(n, p))]
-    if not params:
-        raise RuntimeError("No parameters selected by param_filter_fn.")
+    where y_i is the reconstructed attention-block output for target position i.
+    """
+    resultant = source_vectors.sum(dim=1)
+    resultant_norm = torch.linalg.vector_norm(resultant, ord=p, dim=-1, keepdim=True)
+    distances = torch.linalg.vector_norm(source_vectors - resultant[:, None, :], ord=p, dim=-1)
+    scores = torch.clamp(resultant_norm - distances, min=0.0)
 
-    orig_flags = [p.requires_grad for p in params]
-    for p in params:
-        p.requires_grad_(True)
+    denom = scores.sum(dim=-1, keepdim=True)
+    if torch.all(denom > eps):
+        return scores / denom.clamp_min(eps)
 
-    with torch.enable_grad():
-        mean_loss, _, saliency = compute_answer_only_saliency_masked_loss(
-            model,
-            batch,
-            device,
-            target_idx,
-            ignored_token_ids=ignored_token_ids,
-            enable_grad=True,
+    # Rare numerical fallback: if distance-based scores are all zero for a row,
+    # fall back to contribution vector norms so the rollout remains well-defined.
+    norm_scores = torch.linalg.vector_norm(source_vectors, ord=p, dim=-1)
+    norm_denom = norm_scores.sum(dim=-1, keepdim=True)
+    normalized = norm_scores / norm_denom.clamp_min(eps)
+
+    zero_rows = denom <= eps
+    if torch.any(zero_rows):
+        uniform = torch.full_like(scores, 1.0 / max(scores.size(-1), 1))
+        normalized = torch.where((norm_denom <= eps) & zero_rows, uniform, normalized)
+        scores = torch.where(zero_rows, normalized, scores / denom.clamp_min(eps))
+    return scores
+
+
+@torch.no_grad()
+def _compute_qwen_alti_layer_matrix(
+    model,
+    layer_idx: int,
+    hidden_states: Tensor,
+    attention_probs: Tensor,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
+) -> Tensor:
+    """
+    Compute one Qwen decoder layer's ALTI token-to-token contribution matrix.
+
+    Rows are target/query positions and columns are source/key positions. The
+    matrix is row-stochastic and includes the self residual contribution.
+    FFN blocks are position-wise, so they do not introduce token mixing; this
+    matrix tracks the attention block's mixing in the residual stream.
+    """
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("compute_alti_saliency_vector currently expects a Qwen-style model.model.layers stack.")
+
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+
+    device = self_attn.v_proj.weight.device
+    hidden_states = hidden_states.to(device)
+    attention_probs = attention_probs.to(device)
+
+    if hidden_states.dim() != 3 or hidden_states.size(0) != 1:
+        raise ValueError("ALTI saliency currently supports batch_size=1.")
+    if attention_probs.dim() != 4 or attention_probs.size(0) != 1:
+        raise ValueError("Expected attention_probs with shape [1, heads, seq, seq].")
+
+    bsz, seq_len, hidden_dim = hidden_states.shape
+    num_heads = attention_probs.size(1)
+    head_dim = getattr(self_attn, "head_dim", self_attn.o_proj.weight.shape[1] // num_heads)
+    num_kv_heads = getattr(self_attn, "num_key_value_heads", num_heads)
+
+    normed_states = layer.input_layernorm(hidden_states)
+    value_states = self_attn.v_proj(normed_states)
+    value_states = value_states.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = _repeat_kv_for_alti(value_states, num_heads)
+
+    out_weight = self_attn.o_proj.weight.to(device)
+    out_dim, in_dim = out_weight.shape
+    if in_dim != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj shape {tuple(out_weight.shape)} for {num_heads} heads × {head_dim}."
         )
-        loss = mean_loss.mean()
+    out_weight_by_head = out_weight.view(out_dim, num_heads, head_dim)
 
-        if not loss.requires_grad:
-            raise RuntimeError("Loss is detached. Check outer contexts and model freezing.")
+    # Per-head value vectors after the corresponding slice of W_O:
+    # [heads, source, hidden_dim].
+    transformed_values = torch.einsum(
+        "bhsd,ohd->bhso",
+        value_states,
+        out_weight_by_head,
+    )[0].float()
 
-        grads = torch.autograd.grad(loss, params, create_graph=False, allow_unused=False)
+    attention_probs = attention_probs[0].float()
+    residual_states = hidden_states[0].float()
 
-    for p, flag in zip(params, orig_flags):
-        p.requires_grad_(flag)
+    contribution_rows = []
+    for q_start in range(0, seq_len, chunk_size):
+        q_end = min(q_start + chunk_size, seq_len)
+        attn_chunk = attention_probs[:, q_start:q_end, :]  # [heads, q_chunk, source]
 
-    return grads, saliency
-
-def compute_token_specific_update(
-        model,
-        batch,
-        param_filter_fn,
-        device,
-        ignored_token_ids,
-        target_sequence_idx: int,
-        lr: float
-):
-    """
-    针对 query_batch 中特定序列索引的 token 计算梯度，并应用一次更新。
-    """
-    model.zero_grad(set_to_none=True)
-
-    # 1. 前向传播
-    inputs = {k: v.to(device) for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'labels']}
-    outputs = model(**inputs, return_dict=True)
-    logits = outputs.logits.float()
-
-    # 2. 错位和屏蔽 (与 compute_loss_per_sample 逻辑相似)
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = inputs["labels"][..., 1:].contiguous().clone()
-
-    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
-        mask_to_ignore = torch.isin(shift_labels, ignored_token_ids.cpu())  # 确保在 CPU 上比较
-        shift_labels[mask_to_ignore] = -100
-
-    # 3. 提取单 Token Loss
-    loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-    token_losses_flat = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    token_losses = token_losses_flat.view(shift_labels.size())
-
-    # 4. 选取目标 Token 的损失并进行 Backward
-    # 确保索引在范围内
-    loss_index_in_shifted = target_sequence_idx - 1
-
-    if loss_index_in_shifted >= shift_logits.shape[1] or loss_index_in_shifted < 0:
-        raise IndexError(f"Warning: Token index {loss_index_in_shifted} out of bounds.")
-
-    # 仅对该 Token 的损失进行反向传播
-    single_token_loss = token_losses[0, loss_index_in_shifted]  # 假设 batch_size=1
-
-    # 仅在损失有效时才反向传播（避免对 -100 的位置求导）
-    if single_token_loss.item() != 0 or shift_labels[0, target_sequence_idx].item() != -100:
-        single_token_loss.backward()
-
-        # 5. 收集梯度并应用更新
-        params = [p for n, p in model.named_parameters() if
-                  p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
-        grads = [p.grad for p in params]  # 直接使用 .grad
-
-        return grads
-
-    raise IndexError(f"Warning: Token index has label mask as -100.")
-
-
-@torch.inference_mode()
-def get_first_response_token(
-        batch,
-        ignored_token_ids,
-):
-    # 找到第一个未被忽略（即需要计算损失）的 Token 索引
-    labels_shifted = batch["labels"][0, 1:].cpu()
-
-    effective_ignored_ids = ignored_token_ids.cpu() if ignored_token_ids is not None and ignored_token_ids.numel() > 0 else torch.tensor([])
-    is_valid = labels_shifted.ne(-100)
-    if effective_ignored_ids.numel() > 0:
-        is_valid = is_valid & ~torch.isin(labels_shifted, effective_ignored_ids)
-
-    # 找到第一个为 True 的索引
-    valid_indices = torch.where(is_valid)[0]
-    if valid_indices.numel() == 0:
-        print(f"Could not find any valid response token. Skipping report generation.")
-        return None, None
-
-    # query_response_start_idx_in_shifted_labels 是响应在 shift_labels 中的起始索引
-    response_start_idx_in_shifted_labels = valid_indices[0].item()
-
-    # 序列总长度 (shift_labels 的长度)
-    total_shifted_len = labels_shifted.shape[0]
-
-    # 响应的有效长度
-    query_response_len = total_shifted_len - response_start_idx_in_shifted_labels
-    return response_start_idx_in_shifted_labels, query_response_len
-
-
-def compute_correlation_second_order_gradient(
-    model, 
-    batch, 
-    target_idx_in_seq: int,
-    source_idx_in_seq: int,
-    param_filter_fn
-):
-    """
-    计算二阶导特征: 抽取 source Token 导致 target Token 产生的 Saliency 背后的参数梯度特征
-    """
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
-
-    model.eval()
-    model.zero_grad(set_to_none=True)
-    
-    # 1. 过滤我们需要微调的参数 (比如 qk_last_quarter)
-    target_params = []
-    for name, param in model.named_parameters():
-        if param_filter_fn(name, param):
-            param.requires_grad = True
-            target_params.append(param)
-        else:
-            param.requires_grad = False
-
-    device = model.device
-    input_ids = batch["input_ids"].to(device)
-    target_vocab_id = input_ids[0, target_idx_in_seq]
-    
-    # 2. 截断输入，只计算到 target 送入前的那一刀
-    curr_input_ids = input_ids[:, :target_idx_in_seq]
-    
-    # 获取 Embeddings，并使其成为一阶导的“叶子结点”
-    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
-    embeddings = get_embeds_fn()(curr_input_ids).detach()
-    embeddings.requires_grad_(True)
-    
-    with torch.enable_grad():
-        # 为了解决 PyTorch "Trying to backward a second time" 问题
-        # 我们需要：
-        # 1. 临时强制关掉某些可能释放中间激活值的内存优化 (如 gradient checkpointing / flash attention 内部机制)
-        # 2. 如果模型在之前的代码中(如 outside)调用过 forward 并发生了 backward，那些图可能残破。
-        # 我们用干净的 forward。
-        
-        # 3. 第一次前向传播（获取 Logit）
-        outputs = model(inputs_embeds=embeddings, use_cache=False)
-        target_logits = outputs.logits[0, -1, target_vocab_id] 
-        
-        # 4. 第一次反向传播
-        # 注意 retain_graph=True 和 create_graph=True
-        # 对 embeddings 取偏导数
-        grad_embeds = torch.autograd.grad(
-            target_logits, 
-            embeddings, 
-            retain_graph=True,
-            create_graph=True,
-            allow_unused=False
-        )[0]
-        
-        # 5. 计算特定的 Correlation Saliency
-        saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
-        # 如果 source_idx_in_seq 这个值依赖计算图，它提取的元素标量也继续附带计算图
-        target_saliency = saliency_scores[0, source_idx_in_seq]
-        
-        # Saliency 越大越好，等效于 Saliency_Loss (负的 Saliency) 越小越好
-        saliency_loss = - target_saliency
-        
-        # 6. 第二次反向传播
-        # 这时求 saliency_loss 关于我们想要提取特征的 target_params 的导数。
-        # 因为我们上面使用了 retain_graph=True，计算 target_logits 经历的从 params -> logits 的整条图都被保留了
-        final_grads = torch.autograd.grad(
-            saliency_loss, 
-            target_params, 
-            retain_graph=False,   # 最后一次求导了，把图释放掉
-            create_graph=False,
-            allow_unused=True
+        source_vectors = torch.einsum(
+            "hqs,hso->qso",
+            attn_chunk,
+            transformed_values,
         )
-        
-    # 7. 铺平并组装特征向量
-    # 注意：device_map="auto" 时参数分布在多 GPU 上，各张量设备不同。
-    # 统一搬到 CPU 再 cat，避免 "Expected all tensors on same device" 报错。
-    flat_grad = torch.cat([
-        g.reshape(-1).cpu() if g is not None else torch.zeros(p.numel(), dtype=p.dtype)
-        for g, p in zip(final_grads, target_params)
-    ])
-    
-    # 恢复 param
-    for param in target_params:
-         param.requires_grad = False
-            
-    return flat_grad.detach()
+
+        q_positions = torch.arange(q_start, q_end, device=device)
+        local_rows = torch.arange(q_end - q_start, device=device)
+        source_vectors[local_rows, q_positions, :] += residual_states[q_positions]
+
+        contribution_rows.append(_normalize_alti_importance(source_vectors, p=p))
+
+        del attn_chunk, source_vectors
+
+    return torch.cat(contribution_rows, dim=0)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Causal Intervention Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+def _compute_qwen_alti_layer_relevance(
+    model,
+    layer_idx: int,
+    hidden_states: Tensor,
+    attention_probs: Tensor,
+    prev_relevance: Tensor,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
+) -> Tensor:
+    """
+    Compute C_l @ prev_relevance for one Qwen decoder layer without materializing
+    the full rollout. This is the differentiable counterpart used for pair-level
+    ALTI gradients.
+    """
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("compute_alti_correlation_gradient currently expects a Qwen-style model.model.layers stack.")
 
-def compute_full_saliency_vector(
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+
+    device = self_attn.v_proj.weight.device
+    hidden_states = hidden_states.to(device)
+    attention_probs = attention_probs.to(device)
+    prev_relevance = prev_relevance.to(device=device, dtype=torch.float32)
+
+    if hidden_states.dim() != 3 or hidden_states.size(0) != 1:
+        raise ValueError("ALTI correlation gradients currently support batch_size=1.")
+    if attention_probs.dim() != 4 or attention_probs.size(0) != 1:
+        raise ValueError("Expected attention_probs with shape [1, heads, seq, seq].")
+
+    bsz, seq_len, hidden_dim = hidden_states.shape
+    if prev_relevance.numel() != seq_len:
+        raise ValueError(
+            f"prev_relevance length {prev_relevance.numel()} does not match sequence length {seq_len}."
+        )
+
+    num_heads = attention_probs.size(1)
+    head_dim = getattr(self_attn, "head_dim", self_attn.o_proj.weight.shape[1] // num_heads)
+    num_kv_heads = getattr(self_attn, "num_key_value_heads", num_heads)
+
+    normed_states = layer.input_layernorm(hidden_states)
+    value_states = self_attn.v_proj(normed_states)
+    value_states = value_states.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = _repeat_kv_for_alti(value_states, num_heads)
+
+    out_weight = self_attn.o_proj.weight.to(device)
+    out_dim, in_dim = out_weight.shape
+    if in_dim != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj shape {tuple(out_weight.shape)} for {num_heads} heads × {head_dim}."
+        )
+    out_weight_by_head = out_weight.view(out_dim, num_heads, head_dim)
+
+    transformed_values = torch.einsum(
+        "bhsd,ohd->bhso",
+        value_states,
+        out_weight_by_head,
+    )[0].float()
+
+    attention_probs = attention_probs[0].float()
+    residual_states = hidden_states[0].float()
+
+    next_relevance_chunks = []
+    for q_start in range(0, seq_len, chunk_size):
+        q_end = min(q_start + chunk_size, seq_len)
+        attn_chunk = attention_probs[:, q_start:q_end, :]
+
+        source_vectors = torch.einsum(
+            "hqs,hso->qso",
+            attn_chunk,
+            transformed_values,
+        )
+
+        q_positions = torch.arange(q_start, q_end, device=device)
+        local_rows = torch.arange(q_end - q_start, device=device)
+        source_vectors[local_rows, q_positions, :] += residual_states[q_positions]
+
+        contribution_chunk = _normalize_alti_importance(source_vectors, p=p)
+        next_relevance_chunks.append(torch.matmul(contribution_chunk, prev_relevance))
+
+        del attn_chunk, source_vectors, contribution_chunk
+
+    return torch.cat(next_relevance_chunks, dim=0)
+
+
+@torch.no_grad()
+def compute_alti_saliency_vector(
     model,
     batch,
     target_idx_in_seq: int,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
 ) -> list[float]:
     """
-    用一次前向 + 一次反向计算 [source_0 … source_{target_idx-1}] 对
-    target_idx 处 token 的完整 saliency 向量。
+    Forward-only ALTI token-to-token saliency for Qwen-style causal LMs.
 
-    比 compute_answer_only_saliency_masked_loss 快得多：
-      - 只需一次 forward，不迭代所有 response token
-      - 不需要对 model params 求导（纯 embeddings 梯度）
+    `target_idx_in_seq` is the sequence index of the token being predicted. The
+    model is run on input_ids[:, :target_idx_in_seq], and the returned vector
+    has length target_idx_in_seq. Entry j is the rollout contribution from
+    source token j to the final prefix position target_idx_in_seq - 1, whose
+    hidden state predicts token target_idx_in_seq.
 
-    Returns:
-        list[float], 长度为 target_idx_in_seq。
+    This avoids embedding gradients and second-order derivatives. It uses each
+    layer's attention probabilities, V projection, O projection, and residual
+    stream to build ALTI contribution matrices, then rolls them out across
+    layers by matrix multiplication.
     """
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+    if target_idx_in_seq <= 0:
+        raise ValueError("target_idx_in_seq must be > 0 because it denotes the next token to predict.")
 
     model.eval()
-    # 确保 model params 不参与梯度图（只对 embeddings 求导）
-    for p in model.parameters():
-        p.requires_grad_(False)
-
     device = model.device
-    input_ids = batch["input_ids"].to(device)
-    target_vocab_id = input_ids[0, target_idx_in_seq]
-    curr_input_ids = input_ids[:, :target_idx_in_seq]
 
-    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
-    embeddings = get_embeds_fn()(curr_input_ids).detach()
-    embeddings.requires_grad_(True)
+    input_ids = batch["input_ids"][:, :target_idx_in_seq].to(device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :target_idx_in_seq].to(device)
 
-    with torch.enable_grad():
-        outputs = model(inputs_embeds=embeddings, use_cache=False)
-        target_logit = outputs.logits[0, -1, target_vocab_id]
-        grad_embeds = torch.autograd.grad(target_logit, embeddings)[0]  # [1, seq, dim]
+    outputs = model(
+        **inputs,
+        output_hidden_states=True,
+        output_attentions=True,
+        use_cache=False,
+        return_dict=True,
+    )
 
-    saliency = (embeddings.detach() * grad_embeds.detach()).abs().sum(dim=-1)  # [1, seq]
-    result = saliency[0].tolist()
+    hidden_states = outputs.hidden_states
+    attentions = outputs.attentions
+    if hidden_states is None or attentions is None:
+        raise RuntimeError(
+            "Model did not return hidden_states/attentions. Ensure output_hidden_states and "
+            "output_attentions are supported; Qwen may need attn_implementation='eager'."
+        )
 
-    del outputs, embeddings, grad_embeds, saliency
+    rollout = None
+    num_layers = len(attentions)
+    for layer_idx in range(num_layers):
+        if attentions[layer_idx] is None:
+            raise RuntimeError("Encountered None attention tensor; use eager attention when computing ALTI.")
+
+        layer_contrib = _compute_qwen_alti_layer_matrix(
+            model,
+            layer_idx,
+            hidden_states[layer_idx],
+            attentions[layer_idx],
+            p=p,
+            chunk_size=chunk_size,
+        )
+        rollout = layer_contrib if rollout is None else torch.matmul(layer_contrib, rollout.to(layer_contrib.device))
+
+        del layer_contrib
+
+    if rollout is None:
+        raise RuntimeError("No transformer layers were found while computing ALTI saliency.")
+
+    query_pos = target_idx_in_seq - 1
+    result = rollout[query_pos, :target_idx_in_seq].detach().cpu().tolist()
+
+    del outputs, hidden_states, attentions, rollout
     torch.cuda.empty_cache()
 
     return result
 
 
-def compute_saliency_score_only(
-    model,
-    batch,
-    target_idx_in_seq: int,
-    source_idx_in_seq: int,
-) -> float:
-    """
-    compute_full_saliency_vector 的单值版本。
-    仅返回 source_idx → target_idx 的 saliency 标量，用于干预前后的快速测量。
-    """
-    vec = compute_full_saliency_vector(model, batch, target_idx_in_seq)
-    return vec[source_idx_in_seq]
+def _selected_layer_start_from_filter(model, param_filter_fn) -> int:
+    if param_filter_fn is None or not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        return 0
+
+    selected_layers = []
+    for name, param in model.named_parameters():
+        if param_filter_fn(name, param):
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+            if match:
+                selected_layers.append(int(match.group(1)))
+
+    return min(selected_layers) if selected_layers else 0
 
 
-def do_saliency_loss_step(
+def compute_alti_correlation_gradient(
     model,
     batch,
     target_idx_in_seq: int,
     source_idx_in_seq: int,
     param_filter_fn,
-    optimizer: torch.optim.Optimizer,
-) -> float:
+    *,
+    device=None,
+    p: int = 1,
+    chunk_size: int = 8,
+    return_score: bool = False,
+):
     """
-    对 saliency(source_idx → target_idx) 做一步最大化梯度更新。
+    Compute a first-order parameter-space feature for one ALTI correlation pair:
 
-    Loss = -saliency(source_idx → target_idx)
-    使用二阶导路径（retain_graph + create_graph），与
-    compute_correlation_second_order_gradient 的前向计算完全一致。
+        ∇_θ ALTI(source_idx_in_seq -> target_idx_in_seq)
 
-    调用者负责：
-      1. 在调用前通过 optimizer 绑定好 filtered params（requires_grad=True）
-      2. 在所有步骤完成后恢复权重快照
-
-    Returns:
-        float  saliency_loss 的值（负的 saliency score）
+    `target_idx_in_seq` is the token being predicted, so the model runs on
+    prefix [:target_idx_in_seq] and the final query position is
+    target_idx_in_seq - 1.
     """
     if torch.is_inference_mode_enabled():
         raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+    if target_idx_in_seq <= 0:
+        raise ValueError("target_idx_in_seq must be > 0.")
+    if source_idx_in_seq < 0 or source_idx_in_seq >= target_idx_in_seq:
+        raise ValueError(
+            f"source_idx_in_seq={source_idx_in_seq} must be in [0, {target_idx_in_seq})."
+        )
 
     model.eval()
     model.zero_grad(set_to_none=True)
 
-    # 开放 filtered params 的梯度，屏蔽其余参数
+    target_params = []
+    original_flags = []
     for name, param in model.named_parameters():
-        param.requires_grad_(param_filter_fn(name, param))
+        selected = param_filter_fn is None or param_filter_fn(name, param)
+        original_flags.append((param, param.requires_grad))
+        param.requires_grad_(selected)
+        if selected:
+            target_params.append(param)
 
-    device = model.device
-    input_ids = batch["input_ids"].to(device)
-    target_vocab_id = input_ids[0, target_idx_in_seq]
-    curr_input_ids = input_ids[:, :target_idx_in_seq]
+    if not target_params:
+        for param, flag in original_flags:
+            param.requires_grad_(flag)
+        raise RuntimeError("compute_alti_correlation_gradient: no parameters matched param_filter_fn.")
 
-    get_embeds_fn = getattr(model, "get_input_embeddings", lambda: model.model.embed_tokens)
-    embeddings = get_embeds_fn()(curr_input_ids).detach()
-    embeddings.requires_grad_(True)
+    device = device or model.device
+    input_ids = batch["input_ids"][:, :target_idx_in_seq].to(device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :target_idx_in_seq].to(device)
 
-    with torch.enable_grad():
-        # 第一次前向
-        outputs = model(inputs_embeds=embeddings, use_cache=False)
-        target_logit = outputs.logits[0, -1, target_vocab_id]
+    grad_start_layer = _selected_layer_start_from_filter(model, param_filter_fn)
 
-        # 第一次反向（对 embeddings；retain_graph + create_graph 保留计算图）
-        grad_embeds = torch.autograd.grad(
-            target_logit, embeddings,
-            retain_graph=True,
-            create_graph=True,
-            allow_unused=False,
-        )[0]
+    try:
+        with torch.enable_grad():
+            outputs = model(
+                **inputs,
+                output_hidden_states=True,
+                output_attentions=True,
+                use_cache=False,
+                return_dict=True,
+            )
 
-        # saliency score（标量，仍挂载计算图）
-        saliency_scores = (embeddings * grad_embeds).abs().sum(dim=-1)
-        target_saliency = saliency_scores[0, source_idx_in_seq]
-        saliency_loss = -target_saliency  # 最大化 saliency ⇔ 最小化 -saliency
+            hidden_states = outputs.hidden_states
+            attentions = outputs.attentions
+            if hidden_states is None or attentions is None:
+                raise RuntimeError(
+                    "Model did not return hidden_states/attentions. Use eager attention for ALTI gradients."
+                )
 
-        # 第二次反向（对 model params）
-        saliency_loss.backward()
+            seq_len = input_ids.size(1)
+            relevance = torch.zeros(seq_len, dtype=torch.float32, device=device)
+            relevance[source_idx_in_seq] = 1.0
 
-    loss_val = saliency_loss.item()
+            for layer_idx in range(len(attentions)):
+                if attentions[layer_idx] is None:
+                    raise RuntimeError("Encountered None attention tensor; use eager attention for ALTI gradients.")
 
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+                if layer_idx < grad_start_layer:
+                    with torch.no_grad():
+                        relevance = _compute_qwen_alti_layer_relevance(
+                            model,
+                            layer_idx,
+                            hidden_states[layer_idx].detach(),
+                            attentions[layer_idx].detach(),
+                            relevance.detach(),
+                            p=p,
+                            chunk_size=chunk_size,
+                        ).detach()
+                else:
+                    relevance = _compute_qwen_alti_layer_relevance(
+                        model,
+                        layer_idx,
+                        hidden_states[layer_idx],
+                        attentions[layer_idx],
+                        relevance,
+                        p=p,
+                        chunk_size=chunk_size,
+                    )
 
-    # 恢复所有 param 的 requires_grad = False（保持 model 的干净状态）
-    for param in model.parameters():
-        param.requires_grad_(False)
+            alti_score = relevance[target_idx_in_seq - 1]
+            grads = torch.autograd.grad(
+                alti_score,
+                target_params,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=True,
+            )
 
-    del outputs, embeddings, grad_embeds, saliency_scores, target_saliency, saliency_loss
-    torch.cuda.empty_cache()
+        flat_grad = torch.cat([
+            g.reshape(-1).detach().cpu().float()
+            if g is not None else torch.zeros(p.numel(), dtype=torch.float32)
+            for g, p in zip(grads, target_params)
+        ])
+        score_value = float(alti_score.detach().cpu().item())
 
-    return loss_val
+    finally:
+        for param, flag in original_flags:
+            param.requires_grad_(flag)
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+
+    if return_score:
+        return flat_grad, score_value
+    return flat_grad
