@@ -51,6 +51,7 @@ MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mo
 COARSE_POOL_SIZE = 100
 PRESCREEN_BATCH_SIZE = 1       # Increase via --prescreen-batch-size when GPU memory allows
 PRESCREEN_SAMPLE_LIMIT = None  # Limit coarse prescreen scan for quick/debug runs
+PRESCREEN_MAX_SEQ_LEN = 3000   # Skip longer train samples during prescreen/rerank; <=0 disables
 
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
@@ -169,17 +170,26 @@ def _screen_training_set(
     lm_head_device: torch.device, # device where lm_head lives (grad computed here)
     desc: str = "Scanning Train Samples",
     allowed_indices: set | None = None,
+    max_seq_len: int | None = None,
 ) -> list[tuple[int, float]]:
     """Compute cosine similarity on GPU (lm_head_device). Returns LOCAL scores for this process."""
     sample_scores: list[tuple[int, float]] = []
     empty_ignored = torch.tensor([], device=accel_device)
+    skipped_long = 0
 
     for batch in tqdm(train_loader, desc=desc, leave=False):
         train_indices = batch["sample_index"].view(-1).tolist()
-        keep_rows = [
-            row for row, train_idx in enumerate(train_indices)
-            if allowed_indices is None or int(train_idx) in allowed_indices
-        ]
+        keep_rows = []
+        for row, train_idx in enumerate(train_indices):
+            if allowed_indices is not None and int(train_idx) not in allowed_indices:
+                continue
+            if max_seq_len is not None:
+                seq_len = int(batch["attention_mask"][row].sum().item())
+                if seq_len > max_seq_len:
+                    skipped_long += 1
+                    continue
+            keep_rows.append(row)
+
         if not keep_rows:
             continue
 
@@ -204,6 +214,9 @@ def _screen_training_set(
 
         del batch_kept, scores, rows
 
+    if skipped_long:
+        print(f"  {desc}: skipped {skipped_long} samples longer than {max_seq_len} tokens")
+
     return sample_scores
 
 
@@ -211,12 +224,15 @@ def run_causal_intervention_experiment(
     all_tokens: bool = False,
     prescreen_batch_size: int = PRESCREEN_BATCH_SIZE,
     prescreen_limit: int | None = PRESCREEN_SAMPLE_LIMIT,
+    prescreen_max_seq_len: int | None = PRESCREEN_MAX_SEQ_LEN,
 ):
     accelerator = Accelerator()
     set_seed(SEED)
     prescreen_batch_size = max(1, int(prescreen_batch_size))
     if prescreen_limit is not None and prescreen_limit <= 0:
         prescreen_limit = None
+    if prescreen_max_seq_len is not None and prescreen_max_seq_len <= 0:
+        prescreen_max_seq_len = None
 
     model, tokenizer = load_model_and_tokenizer()
     param_filter = lm_head_filter
@@ -542,6 +558,7 @@ def run_causal_intervention_experiment(
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
+                    "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
                 },
             },
             "test_sample_baseline": {
@@ -590,6 +607,7 @@ def run_causal_intervention_experiment(
         local_pool_scores = _screen_training_set(
             model, full_response_ce_grad, filtered_params, train_loader,
             accelerator.device, lm_head_device, desc="Global Pre-Screen",
+            max_seq_len=prescreen_max_seq_len,
         )
         all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
         coarse_pool: set[int] = {
@@ -664,6 +682,7 @@ def run_causal_intervention_experiment(
                 model, token_ce_grad, filtered_params, pool_loader,
                 accelerator.device, lm_head_device,
                 desc=f"Stage2 t={t}",
+                max_seq_len=prescreen_max_seq_len,
             )
             all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
@@ -724,6 +743,7 @@ def run_causal_intervention_experiment(
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
                     "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
+                    "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
                 },
             },
             "test_sample_baseline": {
@@ -773,6 +793,10 @@ if __name__ == "__main__":
         "--prescreen-limit", type=int, default=PRESCREEN_SAMPLE_LIMIT,
         help="Limit coarse prescreen to the first N train samples. Use <=0 to disable.",
     )
+    parser.add_argument(
+        "--prescreen-max-seq-len", type=int, default=PRESCREEN_MAX_SEQ_LEN,
+        help="Skip train samples longer than this during prescreen/rerank. Use <=0 to disable.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -786,4 +810,5 @@ if __name__ == "__main__":
         all_tokens=args.all_tokens,
         prescreen_batch_size=args.prescreen_batch_size,
         prescreen_limit=args.prescreen_limit,
+        prescreen_max_seq_len=args.prescreen_max_seq_len,
     )
