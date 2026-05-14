@@ -50,6 +50,7 @@ MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mo
 # Cost: 1 × N_train (global) + N_tokens × COARSE_POOL_SIZE (per-token re-rank)
 COARSE_POOL_SIZE = 100
 PRESCREEN_BATCH_SIZE = 1       # Increase via --prescreen-batch-size when GPU memory allows
+PRESCREEN_SAMPLE_LIMIT = None  # Limit coarse prescreen scan for quick/debug runs
 
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
@@ -209,10 +210,13 @@ def _screen_training_set(
 def run_causal_intervention_experiment(
     all_tokens: bool = False,
     prescreen_batch_size: int = PRESCREEN_BATCH_SIZE,
+    prescreen_limit: int | None = PRESCREEN_SAMPLE_LIMIT,
 ):
     accelerator = Accelerator()
     set_seed(SEED)
     prescreen_batch_size = max(1, int(prescreen_batch_size))
+    if prescreen_limit is not None and prescreen_limit <= 0:
+        prescreen_limit = None
 
     model, tokenizer = load_model_and_tokenizer()
     param_filter = lm_head_filter
@@ -232,8 +236,13 @@ def run_causal_intervention_experiment(
     collator = CustomCollator(base_collator)
 
     train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    prescreen_train_ds = train_ds
+    if prescreen_limit is not None and prescreen_limit < len(train_ds):
+        prescreen_train_ds = train_ds.select(range(prescreen_limit))
+        print(f"Prescreen limited: scanning {len(prescreen_train_ds)} / {len(train_ds)} train samples")
+
     train_loader = torch.utils.data.DataLoader(
-        DatasetWrapper(train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
+        DatasetWrapper(prescreen_train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
     )
     train_loader = accelerator.prepare(train_loader)
 
@@ -532,6 +541,7 @@ def run_causal_intervention_experiment(
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
+                    "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                 },
             },
             "test_sample_baseline": {
@@ -713,6 +723,7 @@ def run_causal_intervention_experiment(
                     "MATCHING_METHOD":         "alti_gradient_qkvo",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
+                    "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
                 },
             },
             "test_sample_baseline": {
@@ -758,6 +769,10 @@ if __name__ == "__main__":
         "--prescreen-batch-size", type=int, default=PRESCREEN_BATCH_SIZE,
         help="Batch size for coarse prescreen and pool rerank scoring.",
     )
+    parser.add_argument(
+        "--prescreen-limit", type=int, default=PRESCREEN_SAMPLE_LIMIT,
+        help="Limit coarse prescreen to the first N train samples. Use <=0 to disable.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -770,4 +785,5 @@ if __name__ == "__main__":
     run_causal_intervention_experiment(
         all_tokens=args.all_tokens,
         prescreen_batch_size=args.prescreen_batch_size,
+        prescreen_limit=args.prescreen_limit,
     )
