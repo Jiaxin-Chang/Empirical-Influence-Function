@@ -24,7 +24,8 @@ from src.process_data import process_func_chatml
 from src.loss import (
     compute_alti_correlation_gradient,
     compute_alti_saliency_vector,
-    compute_gradients,
+    compute_lm_head_ce_gradient_no_backward,
+    compute_lm_head_ce_gradient_scores_no_backward,
 )
 from transformers import DataCollatorForSeq2Seq, set_seed
 
@@ -48,6 +49,7 @@ MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mo
 # (COARSE_POOL_SIZE samples) instead of the full training set.
 # Cost: 1 × N_train (global) + N_tokens × COARSE_POOL_SIZE (per-token re-rank)
 COARSE_POOL_SIZE = 100
+PRESCREEN_BATCH_SIZE = 1       # Increase via --prescreen-batch-size when GPU memory allows
 
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
@@ -124,19 +126,6 @@ def get_context_window(tokenizer, input_ids_1d, idx, window=CONTEXT_WINDOW_SIZE)
     return tokens
 
 
-def _flat_grad_on_device(
-    grads: list,
-    filtered_params: list,
-    target_device: torch.device,
-) -> torch.Tensor:
-    """Flatten and concatenate gradients onto `target_device` without moving to CPU."""
-    return torch.cat([
-        g.reshape(-1).to(target_device) if g is not None
-        else torch.zeros(p.numel(), dtype=p.dtype, device=target_device)
-        for g, p in zip(grads, filtered_params)
-    ])
-
-
 def _gather_scores(
     accelerator,
     local_scores: list[tuple[int, float]],
@@ -185,33 +174,45 @@ def _screen_training_set(
     empty_ignored = torch.tensor([], device=accel_device)
 
     for batch in tqdm(train_loader, desc=desc, leave=False):
-        batch_device = {k: v.to(accel_device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-        train_idx = int(batch_device["sample_index"].item())
-
-        if allowed_indices is not None and train_idx not in allowed_indices:
-            del batch_device
+        train_indices = batch["sample_index"].view(-1).tolist()
+        keep_rows = [
+            row for row, train_idx in enumerate(train_indices)
+            if allowed_indices is None or int(train_idx) in allowed_indices
+        ]
+        if not keep_rows:
             continue
 
-        train_ce_grads = compute_gradients(
+        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
+        batch_kept = {
+            k: v.index_select(0, rows).to(accel_device)
+            for k, v in batch.items()
+            if isinstance(v, torch.Tensor) and k != "sample_index"
+        }
+
+        scores = compute_lm_head_ce_gradient_scores_no_backward(
             model=model,
-            batch=batch_device,
-            param_filter_fn=lm_head_filter,
+            batch=batch_kept,
             device=accel_device,
             ignored_token_ids=empty_ignored,
+            test_ce_grad=test_ce_grad,
+            score_device=lm_head_device,
         )
-        # Keep on lm_head_device — no CPU round-trip
-        flat_train_ce = _flat_grad_on_device(train_ce_grads, filtered_params, lm_head_device)
-        score = F.cosine_similarity(test_ce_grad, flat_train_ce, dim=0).item()
-        sample_scores.append((train_idx, score))
 
-        del train_ce_grads, flat_train_ce, batch_device
+        for row, score in zip(keep_rows, scores):
+            sample_scores.append((int(train_indices[row]), float(score)))
+
+        del batch_kept, scores, rows
 
     return sample_scores
 
 
-def run_causal_intervention_experiment(all_tokens: bool = False):
+def run_causal_intervention_experiment(
+    all_tokens: bool = False,
+    prescreen_batch_size: int = PRESCREEN_BATCH_SIZE,
+):
     accelerator = Accelerator()
     set_seed(SEED)
+    prescreen_batch_size = max(1, int(prescreen_batch_size))
 
     model, tokenizer = load_model_and_tokenizer()
     param_filter = lm_head_filter
@@ -232,7 +233,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
 
     train_ds = build_train_dataset(train_samples, convert_to_chatml)
     train_loader = torch.utils.data.DataLoader(
-        DatasetWrapper(train_ds), batch_size=1, collate_fn=collator,
+        DatasetWrapper(train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
     )
     train_loader = accelerator.prepare(train_loader)
 
@@ -420,26 +421,27 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
             "attention_mask": test_batch["attention_mask"],
             "labels":         ce_labels,
         }
-        grads = compute_gradients(
+        grad = compute_lm_head_ce_gradient_no_backward(
             model=model, batch=single_tok_batch,
-            param_filter_fn=param_filter, device=accelerator.device,
+            device=accelerator.device,
             ignored_token_ids=torch.tensor([], device=accelerator.device),
         )
-        return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+        return grad.reshape(-1).to(lm_head_device).detach()
 
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: compute test-side CE gradient aggregated over ALL response tokens
     # Used for the global one-shot coarse pre-screen in all_tokens mode.
     # test_batch["labels"] already masks prompt positions with -100, so
-    # compute_gradients naturally aggregates CE loss across all response tokens.
+    # The analytic LM-head gradient naturally aggregates CE loss across all
+    # response tokens.
     # ════════════════════════════════════════════════════════════════════════════
     def _test_ce_grad_full_response() -> torch.Tensor:
-        grads = compute_gradients(
+        grad = compute_lm_head_ce_gradient_no_backward(
             model=model, batch=test_batch,
-            param_filter_fn=param_filter, device=accelerator.device,
+            device=accelerator.device,
             ignored_token_ids=torch.tensor([], device=accelerator.device),
         )
-        return _flat_grad_on_device(grads, filtered_params, lm_head_device).detach()
+        return grad.reshape(-1).to(lm_head_device).detach()
 
     # ════════════════════════════════════════════════════════════════════════════
     # ── SINGLE-TOKEN MODE ────────────────────────────────────────────────────
@@ -529,6 +531,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     "MATCHING_METHOD":        "alti_gradient_qkvo",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
+                    "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                 },
             },
             "test_sample_baseline": {
@@ -591,7 +594,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
         pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
         pool_ds     = train_ds.select(pool_rows)
         pool_loader = torch.utils.data.DataLoader(
-            DatasetWrapper(pool_ds), batch_size=1, collate_fn=collator,
+            DatasetWrapper(pool_ds), batch_size=prescreen_batch_size, collate_fn=collator,
         )
         pool_loader = accelerator.prepare(pool_loader)
         print(f"  pool_loader built: {len(pool_rows)} samples")
@@ -702,6 +705,7 @@ def run_causal_intervention_experiment(all_tokens: bool = False):
                     "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
                     "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
                     "COARSE_POOL_SIZE":        COARSE_POOL_SIZE,
+                    "PRESCREEN_BATCH_SIZE":    prescreen_batch_size,
                     "TOP_TARGETS":             TOP_TARGETS,
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
@@ -750,6 +754,10 @@ if __name__ == "__main__":
         "--all-tokens", action="store_true",
         help="Attribute all output tokens (up to MAX_OUTPUT_TOKENS) instead of a single token.",
     )
+    parser.add_argument(
+        "--prescreen-batch-size", type=int, default=PRESCREEN_BATCH_SIZE,
+        help="Batch size for coarse prescreen and pool rerank scoring.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -759,4 +767,7 @@ if __name__ == "__main__":
 
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
-    run_causal_intervention_experiment(all_tokens=args.all_tokens)
+    run_causal_intervention_experiment(
+        all_tokens=args.all_tokens,
+        prescreen_batch_size=args.prescreen_batch_size,
+    )
