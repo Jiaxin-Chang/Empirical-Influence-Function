@@ -296,8 +296,22 @@ def _normalize_alti_importance(
     where y_i is the reconstructed attention-block output for target position i.
     """
     resultant = source_vectors.sum(dim=1)
-    resultant_norm = torch.linalg.vector_norm(resultant, ord=p, dim=-1, keepdim=True)
-    distances = torch.linalg.vector_norm(source_vectors - resultant[:, None, :], ord=p, dim=-1)
+    if p == 1:
+        resultant_norm = resultant.abs().sum(dim=-1, keepdim=True)
+        distances = torch.zeros(
+            source_vectors.shape[:-1],
+            dtype=source_vectors.dtype,
+            device=source_vectors.device,
+        )
+        hidden_chunk = 256
+        for start in range(0, source_vectors.size(-1), hidden_chunk):
+            end = min(start + hidden_chunk, source_vectors.size(-1))
+            distances += (
+                source_vectors[..., start:end] - resultant[:, None, start:end]
+            ).abs().sum(dim=-1)
+    else:
+        resultant_norm = torch.linalg.vector_norm(resultant, ord=p, dim=-1, keepdim=True)
+        distances = torch.linalg.vector_norm(source_vectors - resultant[:, None, :], ord=p, dim=-1)
     scores = torch.clamp(resultant_norm - distances, min=0.0)
 
     denom = scores.sum(dim=-1, keepdim=True)
@@ -651,9 +665,10 @@ def compute_alti_correlation_gradient(
                 return_dict=True,
             )
 
-            hidden_states = outputs.hidden_states
-            attentions = outputs.attentions
-            if hidden_states is None or attentions is None:
+            hidden_states = list(outputs.hidden_states or [])
+            attentions = list(outputs.attentions or [])
+            del outputs
+            if not hidden_states or not attentions:
                 raise RuntimeError(
                     "Model did not return hidden_states/attentions. Use eager attention for ALTI gradients."
                 )
@@ -688,6 +703,9 @@ def compute_alti_correlation_gradient(
                         chunk_size=chunk_size,
                     )
 
+                hidden_states[layer_idx] = None
+                attentions[layer_idx] = None
+
             alti_score = relevance[target_idx_in_seq - 1]
             grads = torch.autograd.grad(
                 alti_score,
@@ -703,6 +721,7 @@ def compute_alti_correlation_gradient(
             for g, p in zip(grads, target_params)
         ])
         score_value = float(alti_score.detach().cpu().item())
+        del hidden_states, attentions, relevance
 
     finally:
         for param, flag in original_flags:

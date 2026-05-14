@@ -41,6 +41,7 @@ TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 FINE_MATCH_LAST_N_LAYERS = 2   # ALTI-gradient matching params: last N layers
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
+ALTI_GRAD_CHUNK_SIZE = 1       # Smaller chunks keep pair-gradient peak memory bounded
 
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
@@ -391,7 +392,7 @@ def run_causal_intervention_experiment(
                     source_idx_in_seq=s_idx,
                     param_filter_fn=fine_param_filter,
                     device=accelerator.device,
-                    chunk_size=ALTI_CHUNK_SIZE,
+                    chunk_size=ALTI_GRAD_CHUNK_SIZE,
                 )
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
@@ -508,7 +509,7 @@ def run_causal_intervention_experiment(
                     source_idx_in_seq=p_idx,
                     param_filter_fn=fine_param_filter,
                     device=accelerator.device,
-                    chunk_size=ALTI_CHUNK_SIZE,
+                    chunk_size=ALTI_GRAD_CHUNK_SIZE,
                 )
                 test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
@@ -556,6 +557,7 @@ def run_causal_intervention_experiment(
                     "MATCHING_METHOD":        "alti_gradient_qkvo",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE":   ALTI_GRAD_CHUNK_SIZE,
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
@@ -671,7 +673,7 @@ def run_causal_intervention_experiment(
                         source_idx_in_seq=p_idx,
                         param_filter_fn=fine_param_filter,
                         device=accelerator.device,
-                        chunk_size=ALTI_CHUNK_SIZE,
+                        chunk_size=ALTI_GRAD_CHUNK_SIZE,
                     )
                     test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
@@ -742,6 +744,7 @@ def run_causal_intervention_experiment(
                     "MATCHING_METHOD":         "alti_gradient_qkvo",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE":    ALTI_GRAD_CHUNK_SIZE,
                     "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
                 },
