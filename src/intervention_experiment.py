@@ -227,6 +227,14 @@ COARSE_POOL_SIZE = 100
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
 _TRIVIAL_STRIPPED = {"{", "}", "(", ")", "[", "]", ",", ";"}
+_CHAT_TEMPLATE_STRIPPED = {
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "system",
+    "user",
+    "assistant",
+}
 
 
 def lm_head_filter(name, param):
@@ -271,18 +279,38 @@ def make_attention_projection_filter(model, last_n_layers: int, proj_mode: str):
 def is_trivial_token(tokenizer, token_id: int) -> bool:
     """Return True for tokens that carry no semantic meaning.
 
-    Skips: pure whitespace, lone punctuation ({, }, (, ), [, ], comma, semicolon),
-    and any single non-alphanumeric/non-underscore character.
+    Skips chat-template tokens, role labels, pure whitespace, lone punctuation
+    ({, }, (, ), [, ], comma, semicolon), and any single non-alphanumeric /
+    non-underscore character.
     """
+    all_special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    if token_id in all_special_ids:
+        return True
+
     tok_str = tokenizer.decode([token_id])
     stripped = tok_str.strip()
     if not stripped:
+        return True
+    if stripped in _CHAT_TEMPLATE_STRIPPED:
+        return True
+    raw_tok = tokenizer.convert_ids_to_tokens([token_id])[0]
+    if raw_tok.strip() in _CHAT_TEMPLATE_STRIPPED:
         return True
     if stripped in _TRIVIAL_STRIPPED:
         return True
     if len(stripped) == 1 and not (stripped.isalnum() or stripped == "_"):
         return True
     return False
+
+
+def top_nontrivial_saliency_sources(tokenizer, input_ids_1d, sal_vec, k: int):
+    """Return top-k saliency sources after removing chat-template/trivial tokens."""
+    candidates = (
+        (idx, score)
+        for idx, score in enumerate(sal_vec)
+        if not is_trivial_token(tokenizer, int(input_ids_1d[idx].item()))
+    )
+    return nlargest(k, candidates, key=lambda x: x[1])
 
 
 def find_first_valid_token_index(tokenizer, input_ids_tensor, start_idx):
@@ -642,10 +670,12 @@ def run_causal_intervention_experiment(
             candidate_pairs: list[tuple[float, int, int]] = []
 
             with torch.inference_mode(False):
-                for t_offset in range(TOP_TARGETS):
-                    t_tr = response_start + t_offset
-                    if t_tr >= tr_seq_len:
-                        break
+                t_tr = response_start
+                kept_targets = 0
+                while t_tr < tr_seq_len and kept_targets < TOP_TARGETS:
+                    if is_trivial_token(tokenizer, int(tr_batch["input_ids"][0, t_tr].item())):
+                        t_tr += 1
+                        continue
                     sal_vec = compute_alti_saliency_vector(
                         model,
                         tr_batch,
@@ -653,8 +683,15 @@ def run_causal_intervention_experiment(
                         chunk_size=ALTI_CHUNK_SIZE,
                     )
                     target_saliencies[t_tr] = [round(float(s), 6) for s in sal_vec]
-                    for s_idx, s_score in nlargest(TOP_K_SOURCE_PER_TARGET, enumerate(sal_vec), key=lambda x: x[1]):
+                    for s_idx, s_score in top_nontrivial_saliency_sources(
+                        tokenizer,
+                        tr_batch["input_ids"][0],
+                        sal_vec,
+                        TOP_K_SOURCE_PER_TARGET,
+                    ):
                         candidate_pairs.append((float(s_score), t_tr, int(s_idx)))
+                    kept_targets += 1
+                    t_tr += 1
 
             print(f"  Step A: {len(candidate_pairs)} candidate pairs "
                   f"({TOP_TARGETS}t × {TOP_K_SOURCE_PER_TARGET}s each)")
@@ -801,7 +838,12 @@ def run_causal_intervention_experiment(
             chunk_size=ALTI_CHUNK_SIZE,
         )
 
-        top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(baseline_saliency), key=lambda x: x[1])
+        top_test_corr = top_nontrivial_saliency_sources(
+            tokenizer,
+            test_batch["input_ids"][0],
+            baseline_saliency,
+            TOP_K_PROMPT_TOKENS,
+        )
         top_test_correlations = [
             {
                 "source_token_index": idx,
@@ -1067,7 +1109,12 @@ def run_causal_intervention_experiment(
                     t,
                     chunk_size=ALTI_CHUNK_SIZE,
                 )
-            top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(sal_vec), key=lambda x: x[1])
+            top_test_corr = top_nontrivial_saliency_sources(
+                tokenizer,
+                test_batch["input_ids"][0],
+                sal_vec,
+                TOP_K_PROMPT_TOKENS,
+            )
             top_test_correlations = [
                 {
                     "source_token_index": idx,
