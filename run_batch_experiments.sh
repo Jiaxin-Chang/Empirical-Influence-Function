@@ -42,8 +42,13 @@ TRAIN_LIMIT="${TRAIN_LIMIT:-}"  # empty = use all training samples
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"  # empty = intervention default
 PRESCREEN_MAX_SEQ_LEN="${PRESCREEN_MAX_SEQ_LEN:-}"  # empty = intervention default; 0 disables guard
 MAX_GPU_MEMORY="${MAX_GPU_MEMORY:-}"  # e.g. 26GiB to leave activation headroom
-CORR_FEATURE_MODE="${CORR_FEATURE_MODE:-}"  # auto, second_order, or saliency_proxy
+CORR_FEATURE_MODE="${CORR_FEATURE_MODE:-}"  # deprecated; accepted for compatibility
 PRESCREEN_BATCH_SIZE="${PRESCREEN_BATCH_SIZE:-}"  # empty = 1
+ALTI_GRAD_CHUNK_SIZE="${ALTI_GRAD_CHUNK_SIZE:-}"  # empty = intervention default
+ALTI_GRAD_MAX_SEQ_LEN="${ALTI_GRAD_MAX_SEQ_LEN:-}"  # empty = intervention default; 0 disables
+FINE_MATCH_PROJ="${FINE_MATCH_PROJ:-}"  # empty = qk; use qkvo/all for previous behavior
+TOP_TARGETS="${TOP_TARGETS:-}"  # empty = intervention default
+TOP_K_SOURCE_PER_TARGET="${TOP_K_SOURCE_PER_TARGET:-}"  # empty = intervention default
 PYTHON="${PYTHON:-python}"
 
 # ---------------------------------------------------------------------------
@@ -62,6 +67,11 @@ while [[ $# -gt 0 ]]; do
         --max-gpu-memory) MAX_GPU_MEMORY="$2"; shift 2 ;;
         --corr-feature-mode) CORR_FEATURE_MODE="$2"; shift 2 ;;
         --prescreen-batch-size) PRESCREEN_BATCH_SIZE="$2"; shift 2 ;;
+        --alti-grad-chunk-size) ALTI_GRAD_CHUNK_SIZE="$2"; shift 2 ;;
+        --alti-grad-max-seq-len) ALTI_GRAD_MAX_SEQ_LEN="$2"; shift 2 ;;
+        --fine-match-proj) FINE_MATCH_PROJ="$2"; shift 2 ;;
+        --top-targets) TOP_TARGETS="$2"; shift 2 ;;
+        --top-k-source-per-target) TOP_K_SOURCE_PER_TARGET="$2"; shift 2 ;;
         *) echo "[batch] Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -124,7 +134,8 @@ echo "  train_limit: ${TRAIN_LIMIT:-all}"
 echo "  attention : ${ATTN_IMPLEMENTATION:-auto}"
 echo "  prescreen max seq len: ${PRESCREEN_MAX_SEQ_LEN:-default}"
 echo "  max gpu memory: ${MAX_GPU_MEMORY:-auto}"
-echo "  corr feature mode: ${CORR_FEATURE_MODE:-auto}"
+echo "  fine match proj: ${FINE_MATCH_PROJ:-qk}"
+echo "  alti grad chunk: ${ALTI_GRAD_CHUNK_SIZE:-default}"
 echo "  prescreen batch size: ${PRESCREEN_BATCH_SIZE:-1}"
 echo "  log dir   : ${LOG_DIR}"
 echo "================================================================="
@@ -165,6 +176,11 @@ for IDX in $(seq "$START_IDX" "$END_IDX"); do
         ${MAX_GPU_MEMORY:+--max-gpu-memory "${MAX_GPU_MEMORY}"} \
         ${CORR_FEATURE_MODE:+--corr-feature-mode "${CORR_FEATURE_MODE}"} \
         ${PRESCREEN_BATCH_SIZE:+--prescreen-batch-size "${PRESCREEN_BATCH_SIZE}"} \
+        ${ALTI_GRAD_CHUNK_SIZE:+--alti-grad-chunk-size "${ALTI_GRAD_CHUNK_SIZE}"} \
+        ${ALTI_GRAD_MAX_SEQ_LEN:+--alti-grad-max-seq-len "${ALTI_GRAD_MAX_SEQ_LEN}"} \
+        ${FINE_MATCH_PROJ:+--fine-match-proj "${FINE_MATCH_PROJ}"} \
+        ${TOP_TARGETS:+--top-targets "${TOP_TARGETS}"} \
+        ${TOP_K_SOURCE_PER_TARGET:+--top-k-source-per-target "${TOP_K_SOURCE_PER_TARGET}"} \
         2>&1 | tee "${LOG_FILE}"
 
     EXIT_CODE=${PIPESTATUS[0]}
