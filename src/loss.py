@@ -213,6 +213,141 @@ def compute_lm_head_ce_gradient_scores_no_backward(
     return scores
 
 
+_COUNTSKETCH_CACHE: dict[tuple[int, int, int], tuple[Tensor, Tensor]] = {}
+
+
+def _get_countsketch_hashes(
+    size: int,
+    sketch_dim: int,
+    seed: int,
+    device,
+) -> tuple[Tensor, Tensor]:
+    """Deterministic CountSketch hash/sign vectors, cached on CPU then moved."""
+    key = (int(size), int(sketch_dim), int(seed))
+    if key not in _COUNTSKETCH_CACHE:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(seed))
+        hashes = torch.randint(sketch_dim, (size,), generator=gen, dtype=torch.long)
+        signs = torch.randint(2, (size,), generator=gen, dtype=torch.int8)
+        signs = signs.to(torch.float32).mul_(2.0).sub_(1.0)
+        _COUNTSKETCH_CACHE[key] = (hashes, signs)
+
+    hashes, signs = _COUNTSKETCH_CACHE[key]
+    return hashes.to(device), signs.to(device)
+
+
+def _countsketch_rows(x: Tensor, sketch_dim: int, seed: int) -> Tensor:
+    """CountSketch each row of x from [rows, dim] to [rows, sketch_dim]."""
+    if x.dim() != 2:
+        raise ValueError(f"_countsketch_rows expects [rows, dim], got {tuple(x.shape)}")
+    hashes, signs = _get_countsketch_hashes(x.size(1), sketch_dim, seed, x.device)
+    out = torch.zeros((x.size(0), sketch_dim), dtype=torch.float32, device=x.device)
+    index = hashes.unsqueeze(0).expand(x.size(0), -1)
+    values = x.float() * signs.unsqueeze(0)
+    out.scatter_add_(1, index, values)
+    return out
+
+
+def _tensor_sketch_lm_head_gradient(
+    grad_logits: Tensor,
+    hidden: Tensor,
+    *,
+    sketch_dim: int,
+    sketch_seed: int,
+) -> Tensor:
+    """
+    TensorSketch approximation for vec(sum_t grad_logits_t outer hidden_t).
+
+    CountSketch(a outer b) is the circular convolution of CountSketch(a) and
+    CountSketch(b), which preserves inner products in expectation while avoiding
+    materializing the vocab_size x hidden_size LM-head gradient.
+    """
+    if grad_logits.size(0) == 0:
+        return torch.zeros(sketch_dim, dtype=torch.float32, device=hidden.device)
+
+    vocab_sketch = _countsketch_rows(grad_logits, sketch_dim, sketch_seed)
+    hidden_sketch = _countsketch_rows(hidden, sketch_dim, sketch_seed + 1)
+    prod_fft = torch.fft.rfft(vocab_sketch, n=sketch_dim) * torch.fft.rfft(hidden_sketch, n=sketch_dim)
+    token_sketches = torch.fft.irfft(prod_fft, n=sketch_dim)
+    return token_sketches.mean(dim=0)
+
+
+@torch.no_grad()
+def compute_lm_head_ce_gradient_sketches_no_backward(
+    model,
+    batch,
+    device,
+    ignored_token_ids,
+    *,
+    sketch_dim: int = 8192,
+    sketch_seed: int = 42,
+) -> Tensor:
+    """Compute low-dimensional TensorSketches of LM-head CE gradients.
+
+    Returns one normalized sketch per sample with shape [batch, sketch_dim].
+    These sketches are intended for fast coarse pre-screen retrieval/cache.
+    """
+    if sketch_dim <= 0:
+        raise ValueError("sketch_dim must be positive.")
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+    labels = inputs["labels"]
+
+    base_model = getattr(model, "model", None)
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
+    if base_model is None or lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+
+    outputs = base_model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs.get("attention_mask"),
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = outputs.last_hidden_state
+    shift_hidden = hidden[..., :-1, :]
+    shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
+
+    if ignored_token_ids is not None and ignored_token_ids.numel() > 0:
+        ignored_on_label_device = ignored_token_ids.to(shift_labels.device)
+        shift_labels[torch.isin(shift_labels, ignored_on_label_device)] = -100
+
+    head_device = lm_head.weight.device
+    sketches = []
+    for sample_idx in range(shift_labels.size(0)):
+        valid_mask = shift_labels[sample_idx].ne(-100)
+        if not bool(valid_mask.any().item()):
+            sketches.append(torch.zeros(sketch_dim, dtype=torch.float32, device=head_device))
+            continue
+
+        valid_hidden = shift_hidden[sample_idx][valid_mask].to(head_device)
+        valid_labels = shift_labels[sample_idx][valid_mask].to(head_device)
+
+        logits = lm_head(valid_hidden).float()
+        grad_logits = torch.softmax(logits, dim=-1)
+        grad_logits[torch.arange(valid_labels.numel(), device=head_device), valid_labels] -= 1.0
+
+        sketch = _tensor_sketch_lm_head_gradient(
+            grad_logits,
+            valid_hidden.float(),
+            sketch_dim=sketch_dim,
+            sketch_seed=sketch_seed,
+        )
+        sketch = F.normalize(sketch, dim=0, eps=1e-12)
+        sketches.append(sketch.detach())
+
+        del valid_hidden, valid_labels, logits, grad_logits, sketch
+
+    del outputs, hidden, shift_hidden, shift_labels
+    torch.cuda.empty_cache()
+    return torch.stack(sketches, dim=0)
+
+
 def _repeat_kv_for_alti(value_states: Tensor, num_attention_heads: int) -> Tensor:
     """
     Expand grouped-query value states from [B, H_kv, S, D] to [B, H, S, D].
