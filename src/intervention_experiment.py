@@ -40,6 +40,7 @@ TOP_TARGETS = 8                # How many response tokens to scan per train samp
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 FINE_MATCH_LAST_N_LAYERS = 1   # ALTI-gradient matching params: last N layers
+FINE_MATCH_PROJ = "qk"         # Attention projections used for fine matching: qk, qkvo, vo, q/k/v/o, all
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
 ALTI_GRAD_CHUNK_SIZE = 32      # Pair-gradient starts fast and falls back on OOM
 ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables
@@ -68,11 +69,26 @@ def lm_head_filter(name, param):
     return name == "lm_head.weight"
 
 
-def make_qkvo_last_n_filter(model, last_n_layers: int):
-    """Select Q/K/V/O projection parameters in the final N decoder layers."""
+def _fine_match_projection_names(proj_mode: str) -> tuple[str, ...]:
+    """Map a compact projection mode such as 'qk' to module name fragments."""
+    normalized = (proj_mode or "").lower().replace("_", "").replace("-", "").replace(",", "")
+    if normalized == "all":
+        normalized = "qkvo"
+    if not normalized or any(ch not in "qkvo" for ch in normalized):
+        raise ValueError(
+            f"Unsupported fine-match projection mode: {proj_mode!r}. "
+            "Use a combination of q/k/v/o, e.g. 'qk', 'vo', 'qkvo', or 'all'."
+        )
+
+    selected = set(normalized)
+    return tuple(f"{ch}_proj" for ch in "qkvo" if ch in selected)
+
+
+def make_attention_projection_filter(model, last_n_layers: int, proj_mode: str):
+    """Select requested attention projection parameters in the final N decoder layers."""
     num_layers = len(model.model.layers)
     start_layer = max(0, num_layers - last_n_layers)
-    projection_names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    projection_names = _fine_match_projection_names(proj_mode)
 
     def _filter(name, param):
         for layer_idx in range(start_layer, num_layers):
@@ -229,6 +245,7 @@ def run_causal_intervention_experiment(
     prescreen_max_seq_len: int | None = PRESCREEN_MAX_SEQ_LEN,
     alti_grad_chunk_size: int = ALTI_GRAD_CHUNK_SIZE,
     alti_grad_max_seq_len: int | None = ALTI_GRAD_MAX_SEQ_LEN,
+    fine_match_proj: str = FINE_MATCH_PROJ,
 ):
     accelerator = Accelerator()
     set_seed(SEED)
@@ -240,10 +257,17 @@ def run_causal_intervention_experiment(
         prescreen_max_seq_len = None
     if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
         alti_grad_max_seq_len = None
+    fine_match_proj = (fine_match_proj or FINE_MATCH_PROJ).lower()
+    fine_match_projection_names = _fine_match_projection_names(fine_match_proj)
 
     model, tokenizer = load_model_and_tokenizer()
     param_filter = lm_head_filter
-    fine_param_filter = make_qkvo_last_n_filter(model, FINE_MATCH_LAST_N_LAYERS)
+    fine_param_filter = make_attention_projection_filter(model, FINE_MATCH_LAST_N_LAYERS, fine_match_proj)
+    print(
+        "Fine matching uses ALTI gradients over "
+        f"last {FINE_MATCH_LAST_N_LAYERS} layer(s), projections={fine_match_proj} "
+        f"({', '.join(fine_match_projection_names)})"
+    )
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
@@ -622,8 +646,9 @@ def run_causal_intervention_experiment(
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":    CONTEXT_WINDOW_SIZE,
                     "SALIENCY_METHOD":        "alti",
-                    "MATCHING_METHOD":        "alti_gradient_qkvo",
+                    "MATCHING_METHOD":        f"alti_gradient_{fine_match_proj}",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ":        fine_match_proj,
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
                     "ALTI_GRAD_CHUNK_SIZE":   alti_grad_chunk_size,
                     "ALTI_GRAD_MAX_SEQ_LEN":  alti_grad_max_seq_len,
@@ -822,8 +847,9 @@ def run_causal_intervention_experiment(
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
                     "SALIENCY_METHOD":         "alti",
-                    "MATCHING_METHOD":         "alti_gradient_qkvo",
+                    "MATCHING_METHOD":         f"alti_gradient_{fine_match_proj}",
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ":         fine_match_proj,
                     "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
                     "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
                     "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
@@ -891,6 +917,13 @@ if __name__ == "__main__":
         help="Skip ALTI-gradient pairs whose target prefix is longer than this. Use <=0 to disable.",
     )
     parser.add_argument(
+        "--fine-match-proj", type=str, default=FINE_MATCH_PROJ,
+        help=(
+            "Attention projections used for ALTI-gradient fine matching. "
+            "Default: qk. Use qkvo/all for the previous behavior, or vo/q/k/v/o for ablations."
+        ),
+    )
+    parser.add_argument(
         "--top-targets", type=int, default=None,
         help="How many response target tokens to scan per train sample.",
     )
@@ -918,4 +951,5 @@ if __name__ == "__main__":
         prescreen_max_seq_len=args.prescreen_max_seq_len,
         alti_grad_chunk_size=args.alti_grad_chunk_size,
         alti_grad_max_seq_len=args.alti_grad_max_seq_len,
+        fine_match_proj=args.fine_match_proj,
     )
