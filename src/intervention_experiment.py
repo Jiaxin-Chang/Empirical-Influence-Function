@@ -39,7 +39,7 @@ TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screenin
 TOP_TARGETS = 3                # How many response tokens to scan per train sample
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
-FINE_MATCH_LAST_N_LAYERS = 2   # ALTI-gradient matching params: last N layers
+FINE_MATCH_LAST_N_LAYERS = 1   # ALTI-gradient matching params: last N layers
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
 ALTI_GRAD_CHUNK_SIZE = 4       # Pair-gradient starts fast and falls back on OOM
 ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables

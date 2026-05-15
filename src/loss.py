@@ -506,6 +506,83 @@ def _compute_qwen_alti_layer_relevance(
     return torch.cat(next_relevance_chunks, dim=0)
 
 
+def _compute_qwen_alti_layer_target_relevance(
+    model,
+    layer_idx: int,
+    hidden_states: Tensor,
+    attention_probs: Tensor,
+    prev_relevance: Tensor,
+    query_idx: int,
+    *,
+    p: int = 1,
+) -> Tensor:
+    """
+    Compute one row of C_l @ prev_relevance for a single target query.
+
+    This is the memory-critical fast path for last-layer-only matching: the
+    final score needs only the target row, not all query rows in the sequence.
+    """
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("compute_alti_correlation_gradient currently expects a Qwen-style model.model.layers stack.")
+
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+
+    device = self_attn.v_proj.weight.device
+    hidden_states = hidden_states.to(device)
+    attention_probs = attention_probs.to(device)
+    prev_relevance = prev_relevance.to(device=device, dtype=torch.float32)
+
+    if hidden_states.dim() != 3 or hidden_states.size(0) != 1:
+        raise ValueError("ALTI correlation gradients currently support batch_size=1.")
+    if attention_probs.dim() != 4 or attention_probs.size(0) != 1:
+        raise ValueError("Expected attention_probs with shape [1, heads, seq, seq].")
+
+    bsz, seq_len, hidden_dim = hidden_states.shape
+    if query_idx < 0 or query_idx >= seq_len:
+        raise ValueError(f"query_idx={query_idx} is outside [0, {seq_len}).")
+    if prev_relevance.numel() != seq_len:
+        raise ValueError(
+            f"prev_relevance length {prev_relevance.numel()} does not match sequence length {seq_len}."
+        )
+
+    num_heads, head_dim, num_kv_heads = _infer_qwen_attention_layout(
+        model,
+        self_attn,
+        attention_probs,
+    )
+
+    normed_states = layer.input_layernorm(hidden_states)
+    value_states = self_attn.v_proj(normed_states)
+    value_states = value_states.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = _repeat_kv_for_alti(value_states, num_heads)
+
+    out_weight = self_attn.o_proj.weight.to(device)
+    out_dim, in_dim = out_weight.shape
+    if in_dim != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj shape {tuple(out_weight.shape)} for {num_heads} heads × {head_dim}."
+        )
+    out_weight_by_head = out_weight.view(out_dim, num_heads, head_dim)
+
+    transformed_values = torch.einsum(
+        "bhsd,ohd->bhso",
+        value_states,
+        out_weight_by_head,
+    )[0].float()
+
+    attn_row = attention_probs[0, :, query_idx, :].float()
+    source_vectors = torch.einsum(
+        "hs,hso->so",
+        attn_row,
+        transformed_values,
+    )
+    source_vectors[query_idx, :] += hidden_states[0, query_idx].float()
+
+    contribution_row = _normalize_alti_importance(source_vectors.unsqueeze(0), p=p)[0]
+    return torch.dot(contribution_row, prev_relevance)
+
+
 @torch.no_grad()
 def compute_alti_saliency_vector(
     model,
@@ -600,6 +677,20 @@ def _selected_layer_start_from_filter(model, param_filter_fn) -> int:
     return min(selected_layers) if selected_layers else 0
 
 
+def _selected_layers_from_filter(model, param_filter_fn) -> list[int]:
+    if param_filter_fn is None or not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        return []
+
+    selected_layers = set()
+    for name, param in model.named_parameters():
+        if param_filter_fn(name, param):
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+            if match:
+                selected_layers.add(int(match.group(1)))
+
+    return sorted(selected_layers)
+
+
 def compute_alti_correlation_gradient(
     model,
     batch,
@@ -654,6 +745,7 @@ def compute_alti_correlation_gradient(
         inputs["attention_mask"] = batch["attention_mask"][:, :target_idx_in_seq].to(device)
 
     grad_start_layer = _selected_layer_start_from_filter(model, param_filter_fn)
+    selected_layers = _selected_layers_from_filter(model, param_filter_fn)
 
     try:
         with torch.enable_grad():
@@ -676,12 +768,12 @@ def compute_alti_correlation_gradient(
             seq_len = input_ids.size(1)
             relevance = torch.zeros(seq_len, dtype=torch.float32, device=device)
             relevance[source_idx_in_seq] = 1.0
+            last_layer_idx = len(attentions) - 1
 
-            for layer_idx in range(len(attentions)):
-                if attentions[layer_idx] is None:
-                    raise RuntimeError("Encountered None attention tensor; use eager attention for ALTI gradients.")
-
-                if layer_idx < grad_start_layer:
+            if selected_layers == [last_layer_idx]:
+                for layer_idx in range(last_layer_idx):
+                    if attentions[layer_idx] is None:
+                        raise RuntimeError("Encountered None attention tensor; use eager attention for ALTI gradients.")
                     with torch.no_grad():
                         relevance = _compute_qwen_alti_layer_relevance(
                             model,
@@ -692,21 +784,55 @@ def compute_alti_correlation_gradient(
                             p=p,
                             chunk_size=chunk_size,
                         ).detach()
-                else:
-                    relevance = _compute_qwen_alti_layer_relevance(
-                        model,
-                        layer_idx,
-                        hidden_states[layer_idx],
-                        attentions[layer_idx],
-                        relevance,
-                        p=p,
-                        chunk_size=chunk_size,
-                    )
+                    hidden_states[layer_idx] = None
+                    attentions[layer_idx] = None
 
-                hidden_states[layer_idx] = None
-                attentions[layer_idx] = None
+                if attentions[last_layer_idx] is None:
+                    raise RuntimeError("Encountered None attention tensor; use eager attention for ALTI gradients.")
 
-            alti_score = relevance[target_idx_in_seq - 1]
+                alti_score = _compute_qwen_alti_layer_target_relevance(
+                    model,
+                    last_layer_idx,
+                    hidden_states[last_layer_idx],
+                    attentions[last_layer_idx],
+                    relevance,
+                    target_idx_in_seq - 1,
+                    p=p,
+                )
+                hidden_states[last_layer_idx] = None
+                attentions[last_layer_idx] = None
+            else:
+                for layer_idx in range(len(attentions)):
+                    if attentions[layer_idx] is None:
+                        raise RuntimeError("Encountered None attention tensor; use eager attention for ALTI gradients.")
+
+                    if layer_idx < grad_start_layer:
+                        with torch.no_grad():
+                            relevance = _compute_qwen_alti_layer_relevance(
+                                model,
+                                layer_idx,
+                                hidden_states[layer_idx].detach(),
+                                attentions[layer_idx].detach(),
+                                relevance.detach(),
+                                p=p,
+                                chunk_size=chunk_size,
+                            ).detach()
+                    else:
+                        relevance = _compute_qwen_alti_layer_relevance(
+                            model,
+                            layer_idx,
+                            hidden_states[layer_idx],
+                            attentions[layer_idx],
+                            relevance,
+                            p=p,
+                            chunk_size=chunk_size,
+                        )
+
+                    hidden_states[layer_idx] = None
+                    attentions[layer_idx] = None
+
+                alti_score = relevance[target_idx_in_seq - 1]
+
             grads = torch.autograd.grad(
                 alti_score,
                 target_params,
