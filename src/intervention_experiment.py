@@ -418,12 +418,14 @@ def run_causal_intervention_experiment(
                 "saliencies_by_token": {str(k): v for k, v in target_saliencies.items()},
                 "_candidate_pairs":   candidate_pairs,
                 "_tr_batch_cpu":      {k: v.cpu() for k, v in tr_batch.items()},
+                "_feature_cache":     {},
             }
         else:
             # Update coarse score to the maximum seen across test tokens
             if coarse_score > cached_detail["coarse_cos_sim"]:
                 cached_detail["coarse_cos_sim"] = float(coarse_score)
             candidate_pairs = cached_detail["_candidate_pairs"]
+            cached_detail.setdefault("_feature_cache", {})
 
         # Move tr_batch to device for ALTI-gradient correlation matching
         tr_batch_gpu = {k: v.to(accelerator.device) for k, v in cached_detail["_tr_batch_cpu"].items()}
@@ -441,16 +443,24 @@ def run_causal_intervention_experiment(
                 print(f"  Step B: '{train_source_tok}' -> '{train_target_tok}' "
                       f"(offset={response_tok_offset}, sal={saliency_score:.4f})")
 
-                train_feat = _compute_alti_correlation_gradient_retry(
-                    model=model,
-                    batch=tr_batch_gpu,
-                    target_idx_in_seq=t_tr,
-                    source_idx_in_seq=s_idx,
-                    param_filter_fn=fine_param_filter,
-                    device=accelerator.device,
-                )
-                if train_feat is None:
-                    continue
+                feature_key = (int(t_tr), int(s_idx))
+                if feature_key in cached_detail["_feature_cache"]:
+                    train_feat = cached_detail["_feature_cache"][feature_key]
+                    if train_feat is None:
+                        continue
+                    print("    feature cache hit")
+                else:
+                    train_feat = _compute_alti_correlation_gradient_retry(
+                        model=model,
+                        batch=tr_batch_gpu,
+                        target_idx_in_seq=t_tr,
+                        source_idx_in_seq=s_idx,
+                        param_filter_fn=fine_param_filter,
+                        device=accelerator.device,
+                    )
+                    cached_detail["_feature_cache"][feature_key] = train_feat
+                    if train_feat is None:
+                        continue
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
 
