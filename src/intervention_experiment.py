@@ -42,6 +42,7 @@ CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for 
 FINE_MATCH_LAST_N_LAYERS = 2   # ALTI-gradient matching params: last N layers
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
 ALTI_GRAD_CHUNK_SIZE = 4       # Pair-gradient starts fast and falls back on OOM
+ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables
 
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
@@ -227,6 +228,7 @@ def run_causal_intervention_experiment(
     prescreen_limit: int | None = PRESCREEN_SAMPLE_LIMIT,
     prescreen_max_seq_len: int | None = PRESCREEN_MAX_SEQ_LEN,
     alti_grad_chunk_size: int = ALTI_GRAD_CHUNK_SIZE,
+    alti_grad_max_seq_len: int | None = ALTI_GRAD_MAX_SEQ_LEN,
 ):
     accelerator = Accelerator()
     set_seed(SEED)
@@ -236,6 +238,8 @@ def run_causal_intervention_experiment(
         prescreen_limit = None
     if prescreen_max_seq_len is not None and prescreen_max_seq_len <= 0:
         prescreen_max_seq_len = None
+    if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
+        alti_grad_max_seq_len = None
 
     model, tokenizer = load_model_and_tokenizer()
     param_filter = lm_head_filter
@@ -310,7 +314,24 @@ def run_causal_intervention_experiment(
             chunks.append(1)
         return chunks
 
+    def _is_cuda_alloc_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cublas_status_alloc_failed" in msg
+            or "cublascreate" in msg
+            or "cuda error: cublas" in msg
+        )
+
     def _compute_alti_correlation_gradient_retry(**kwargs):
+        target_idx = int(kwargs["target_idx_in_seq"])
+        if alti_grad_max_seq_len is not None and target_idx > alti_grad_max_seq_len:
+            print(
+                f"  Skipping ALTI-gradient target={target_idx}: "
+                f"exceeds --alti-grad-max-seq-len={alti_grad_max_seq_len}"
+            )
+            return None
+
         chunks = _alti_grad_chunks()
         last_error_message = None
         for chunk in chunks:
@@ -324,12 +345,13 @@ def run_causal_intervention_experiment(
                 print(f"  OOM in ALTI-gradient chunk={chunk}; retrying smaller chunk...")
                 torch.cuda.empty_cache()
             except RuntimeError as exc:
-                if "out of memory" not in str(exc).lower():
+                if not _is_cuda_alloc_error(exc):
                     raise
                 last_error_message = str(exc)
                 print(f"  OOM in ALTI-gradient chunk={chunk}; retrying smaller chunk...")
                 torch.cuda.empty_cache()
-        raise RuntimeError(f"ALTI-gradient OOM after trying chunks {chunks}: {last_error_message}")
+        print(f"  Skipping ALTI-gradient after OOM chunks {chunks}: {last_error_message}")
+        return None
 
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: Stage 3 processing for one train sample
@@ -427,6 +449,8 @@ def run_causal_intervention_experiment(
                     param_filter_fn=fine_param_filter,
                     device=accelerator.device,
                 )
+                if train_feat is None:
+                    continue
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
 
@@ -543,6 +567,8 @@ def run_causal_intervention_experiment(
                     param_filter_fn=fine_param_filter,
                     device=accelerator.device,
                 )
+                if feat is None:
+                    continue
                 test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
         print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
@@ -590,6 +616,7 @@ def run_causal_intervention_experiment(
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
                     "ALTI_GRAD_CHUNK_SIZE":   alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN":  alti_grad_max_seq_len,
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
@@ -706,7 +733,20 @@ def run_causal_intervention_experiment(
                         param_filter_fn=fine_param_filter,
                         device=accelerator.device,
                     )
+                    if feat is None:
+                        continue
                     test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
+
+            if not test_corr_features:
+                print(f"  No ALTI-gradient test features survived for token {t}; skipping Stage 2/3.")
+                per_token_results.append({
+                    "target_token_index": t,
+                    "target_token":       target_tok_text,
+                    "top_correlations":   top_test_correlations,
+                    "correlation_pairs":  [],
+                })
+                torch.cuda.empty_cache()
+                continue
 
             # Stage 2: per-token CE grad → re-rank within pool_loader only
             # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
@@ -776,6 +816,7 @@ def run_causal_intervention_experiment(
                     "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
                     "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
                     "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
                     "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
                 },
@@ -835,6 +876,10 @@ if __name__ == "__main__":
         "--alti-grad-chunk-size", type=int, default=ALTI_GRAD_CHUNK_SIZE,
         help="Initial query chunk size for ALTI-gradient matching; OOM retries use smaller chunks.",
     )
+    parser.add_argument(
+        "--alti-grad-max-seq-len", type=int, default=ALTI_GRAD_MAX_SEQ_LEN,
+        help="Skip ALTI-gradient pairs whose target prefix is longer than this. Use <=0 to disable.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
@@ -850,4 +895,5 @@ if __name__ == "__main__":
         prescreen_limit=args.prescreen_limit,
         prescreen_max_seq_len=args.prescreen_max_seq_len,
         alti_grad_chunk_size=args.alti_grad_chunk_size,
+        alti_grad_max_seq_len=args.alti_grad_max_seq_len,
     )
