@@ -31,7 +31,7 @@ EXPERIMENTS=(
 PYTHON="${PYTHON:-python}"
 
 # Optional extra args, e.g.
-#   IE_EXTRA_ARGS="--fine-match-proj qk --alti-grad-chunk-size 32 --top-targets 8" bash run_batch_experiments.sh
+#   IE_EXTRA_ARGS="--prescreen-sketch-dim 8192 --fine-match-proj qk --alti-grad-chunk-size 32 --top-targets 8" bash run_batch_experiments.sh
 IE_EXTRA_ARGS="${IE_EXTRA_ARGS:-}"
 
 # Project root (directory containing this script)

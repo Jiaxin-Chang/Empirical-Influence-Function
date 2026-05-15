@@ -4,6 +4,7 @@ import os
 import json
 import torch
 import torch.nn.functional as F
+import hashlib
 from functools import partial
 from heapq import nlargest
 from accelerate import Accelerator
@@ -26,6 +27,7 @@ from src.loss import (
     compute_alti_saliency_vector,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_scores_no_backward,
+    compute_lm_head_ce_gradient_sketches_no_backward,
 )
 from transformers import DataCollatorForSeq2Seq, set_seed
 
@@ -55,6 +57,9 @@ COARSE_POOL_SIZE = 100
 PRESCREEN_BATCH_SIZE = 1       # Increase via --prescreen-batch-size when GPU memory allows
 PRESCREEN_SAMPLE_LIMIT = None  # Limit coarse prescreen scan for quick/debug runs
 PRESCREEN_MAX_SEQ_LEN = 3000   # Skip longer train samples during prescreen/rerank; <=0 disables
+PRESCREEN_SKETCH_DIM = 8192    # <=0 disables cached TensorSketch coarse retrieval
+PRESCREEN_SKETCH_SEED = 42
+PRESCREEN_SKETCH_CACHE_DIR = ".cache/prescreen_sketch"
 
 # Token strings (after strip) that carry no semantic content and should be skipped
 # in all-tokens mode. Single non-alphanumeric characters are also skipped.
@@ -266,6 +271,163 @@ def _screen_training_set(
     return sample_scores
 
 
+def _dataset_fingerprint(train_ds, *, max_seq_len: int | None, sketch_dim: int, sketch_seed: int) -> str:
+    """Stable-enough fingerprint for the tokenized train set used by the sketch cache."""
+    h = hashlib.sha1()
+    h.update(f"n={len(train_ds)}|max_seq_len={max_seq_len}|dim={sketch_dim}|seed={sketch_seed}".encode())
+    for i in range(len(train_ds)):
+        item = train_ds[i]
+        ids = item["input_ids"]
+        labels = item.get("labels")
+        sample_index = int(item.get("sample_index", i))
+        if not isinstance(ids, torch.Tensor):
+            ids = torch.tensor(ids)
+        h.update(str(sample_index).encode())
+        h.update(str(int(ids.numel())).encode())
+        h.update(str(int(ids[: min(32, ids.numel())].long().sum().item())).encode())
+        h.update(str(int(ids[-min(32, ids.numel()):].long().sum().item())).encode())
+        if isinstance(labels, torch.Tensor):
+            valid = int(labels.ne(-100).sum().item())
+        else:
+            valid = 0
+        h.update(str(valid).encode())
+    return h.hexdigest()[:16]
+
+
+def _prescreen_sketch_cache_path(
+    model,
+    train_ds,
+    *,
+    max_seq_len: int | None,
+    sketch_dim: int,
+    sketch_seed: int,
+    cache_dir: str,
+) -> str:
+    model_name = str(getattr(getattr(model, "config", None), "_name_or_path", "model"))
+    model_hash = hashlib.sha1(model_name.encode()).hexdigest()[:8]
+    data_hash = _dataset_fingerprint(
+        train_ds,
+        max_seq_len=max_seq_len,
+        sketch_dim=sketch_dim,
+        sketch_seed=sketch_seed,
+    )
+    return os.path.join(
+        cache_dir,
+        f"lmhead_sketch_{model_hash}_{data_hash}_d{sketch_dim}_s{sketch_seed}.pt",
+    )
+
+
+def _load_or_build_prescreen_sketch_cache(
+    model,
+    train_ds,
+    train_loader,
+    accelerator,
+    *,
+    max_seq_len: int | None,
+    sketch_dim: int,
+    sketch_seed: int,
+    cache_dir: str,
+):
+    """Build/load cached low-dimensional train LM-head gradient sketches."""
+    if sketch_dim <= 0:
+        return None
+    if accelerator.num_processes != 1:
+        print("Prescreen sketch cache disabled for multi-process Accelerator runs.")
+        return None
+
+    cache_path = _prescreen_sketch_cache_path(
+        model,
+        train_ds,
+        max_seq_len=max_seq_len,
+        sketch_dim=sketch_dim,
+        sketch_seed=sketch_seed,
+        cache_dir=cache_dir,
+    )
+    if os.path.exists(cache_path):
+        print(f"Loading prescreen sketch cache: {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"Building prescreen sketch cache: {cache_path}")
+    print("  First run is expected to be slow; later test samples reuse this file.")
+    sample_ids = []
+    sketch_chunks = []
+    empty_ignored = torch.tensor([], device=accelerator.device)
+    skipped_long = 0
+
+    for batch in tqdm(train_loader, desc="Build Prescreen Sketch Cache", leave=False):
+        train_indices = batch["sample_index"].view(-1).tolist()
+        keep_rows = []
+        for row, train_idx in enumerate(train_indices):
+            if max_seq_len is not None:
+                seq_len = int(batch["attention_mask"][row].sum().item())
+                if seq_len > max_seq_len:
+                    skipped_long += 1
+                    continue
+            keep_rows.append(row)
+
+        if not keep_rows:
+            continue
+
+        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
+        batch_kept = {
+            k: v.index_select(0, rows).to(accelerator.device)
+            for k, v in batch.items()
+            if isinstance(v, torch.Tensor) and k != "sample_index"
+        }
+        sketches = compute_lm_head_ce_gradient_sketches_no_backward(
+            model=model,
+            batch=batch_kept,
+            device=accelerator.device,
+            ignored_token_ids=empty_ignored,
+            sketch_dim=sketch_dim,
+            sketch_seed=sketch_seed,
+        ).detach().cpu().to(torch.float16)
+
+        sample_ids.extend(int(train_indices[row]) for row in keep_rows)
+        sketch_chunks.append(sketches)
+        del batch_kept, sketches, rows
+
+    if not sketch_chunks:
+        print("Prescreen sketch cache is empty; falling back to exact scanning.")
+        return None
+
+    cache = {
+        "sample_ids": torch.tensor(sample_ids, dtype=torch.long),
+        "sketches": torch.cat(sketch_chunks, dim=0).contiguous(),
+        "sketch_dim": int(sketch_dim),
+        "sketch_seed": int(sketch_seed),
+        "max_seq_len": max_seq_len,
+    }
+    torch.save(cache, cache_path)
+    if skipped_long:
+        print(f"  Sketch cache skipped {skipped_long} samples longer than {max_seq_len} tokens.")
+    print(f"  Saved {cache['sketches'].size(0)} train sketches.")
+    return cache
+
+
+def _score_prescreen_sketch_cache(
+    query_sketch: torch.Tensor,
+    cache,
+    device,
+    *,
+    allowed_indices: set[int] | None = None,
+) -> list[tuple[int, float]]:
+    ids = cache["sample_ids"]
+    sketches = cache["sketches"]
+    if allowed_indices is not None:
+        allowed = torch.tensor(sorted(int(x) for x in allowed_indices), dtype=torch.long)
+        mask = torch.isin(ids, allowed)
+        ids = ids[mask]
+        sketches = sketches[mask]
+    if ids.numel() == 0:
+        return []
+
+    q = F.normalize(query_sketch.to(device=device, dtype=torch.float32), dim=0, eps=1e-12)
+    scores = sketches.to(device=device, dtype=torch.float32).matmul(q)
+    return list(zip(ids.cpu().tolist(), scores.detach().cpu().tolist()))
+
+
 def run_causal_intervention_experiment(
     all_tokens: bool = False,
     prescreen_batch_size: int = PRESCREEN_BATCH_SIZE,
@@ -274,6 +436,9 @@ def run_causal_intervention_experiment(
     alti_grad_chunk_size: int = ALTI_GRAD_CHUNK_SIZE,
     alti_grad_max_seq_len: int | None = ALTI_GRAD_MAX_SEQ_LEN,
     fine_match_proj: str = FINE_MATCH_PROJ,
+    prescreen_sketch_dim: int = PRESCREEN_SKETCH_DIM,
+    prescreen_sketch_seed: int = PRESCREEN_SKETCH_SEED,
+    prescreen_sketch_cache_dir: str = PRESCREEN_SKETCH_CACHE_DIR,
 ):
     accelerator = Accelerator()
     set_seed(SEED)
@@ -285,6 +450,7 @@ def run_causal_intervention_experiment(
         prescreen_max_seq_len = None
     if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
         alti_grad_max_seq_len = None
+    prescreen_sketch_dim = int(prescreen_sketch_dim or 0)
     fine_match_proj = (fine_match_proj or FINE_MATCH_PROJ).lower()
     fine_match_projection_names = _fine_match_projection_names(fine_match_proj)
 
@@ -320,6 +486,16 @@ def run_causal_intervention_experiment(
         DatasetWrapper(prescreen_train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
     )
     train_loader = accelerator.prepare(train_loader)
+    prescreen_sketch_cache = _load_or_build_prescreen_sketch_cache(
+        model,
+        prescreen_train_ds,
+        train_loader,
+        accelerator,
+        max_seq_len=prescreen_max_seq_len,
+        sketch_dim=prescreen_sketch_dim,
+        sketch_seed=prescreen_sketch_seed,
+        cache_dir=prescreen_sketch_cache_dir,
+    )
 
     infer_fw = NewInferenceFunction(
         model=model, tokenizer=tokenizer,
@@ -582,6 +758,23 @@ def run_causal_intervention_experiment(
         )
         return grad.reshape(-1).to(lm_head_device).detach()
 
+    def _test_ce_sketch_for_token(tok_idx: int) -> torch.Tensor:
+        ce_labels = torch.full_like(test_batch["input_ids"], -100)
+        ce_labels[0, tok_idx] = test_batch["input_ids"][0, tok_idx]
+        single_tok_batch = {
+            "input_ids":      test_batch["input_ids"],
+            "attention_mask": test_batch["attention_mask"],
+            "labels":         ce_labels,
+        }
+        return compute_lm_head_ce_gradient_sketches_no_backward(
+            model=model,
+            batch=single_tok_batch,
+            device=accelerator.device,
+            ignored_token_ids=torch.tensor([], device=accelerator.device),
+            sketch_dim=prescreen_sketch_dim,
+            sketch_seed=prescreen_sketch_seed,
+        )[0].detach()
+
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: compute test-side CE gradient aggregated over ALL response tokens
     # Used for the global one-shot coarse pre-screen in all_tokens mode.
@@ -596,6 +789,16 @@ def run_causal_intervention_experiment(
             ignored_token_ids=torch.tensor([], device=accelerator.device),
         )
         return grad.reshape(-1).to(lm_head_device).detach()
+
+    def _test_ce_sketch_full_response() -> torch.Tensor:
+        return compute_lm_head_ce_gradient_sketches_no_backward(
+            model=model,
+            batch=test_batch,
+            device=accelerator.device,
+            ignored_token_ids=torch.tensor([], device=accelerator.device),
+            sketch_dim=prescreen_sketch_dim,
+            sketch_seed=prescreen_sketch_seed,
+        )[0].detach()
 
     # ════════════════════════════════════════════════════════════════════════════
     # ── SINGLE-TOKEN MODE ────────────────────────────────────────────────────
@@ -648,12 +851,20 @@ def run_causal_intervention_experiment(
                 test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
         print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
-        test_ce_grad  = _test_ce_grad_for_token(TOKEN_INDEX_TO_RETRIEVE)
-        local_scores  = _screen_training_set(
-            model, test_ce_grad, filtered_params, train_loader,
-            accelerator.device, lm_head_device, desc="Stage 2",
-        )
-        sample_scores  = _gather_scores(accelerator, local_scores, accelerator.device)
+        if prescreen_sketch_cache is not None:
+            test_ce_sketch = _test_ce_sketch_for_token(TOKEN_INDEX_TO_RETRIEVE)
+            sample_scores = _score_prescreen_sketch_cache(
+                test_ce_sketch,
+                prescreen_sketch_cache,
+                accelerator.device,
+            )
+        else:
+            test_ce_grad  = _test_ce_grad_for_token(TOKEN_INDEX_TO_RETRIEVE)
+            local_scores  = _screen_training_set(
+                model, test_ce_grad, filtered_params, train_loader,
+                accelerator.device, lm_head_device, desc="Stage 2",
+            )
+            sample_scores  = _gather_scores(accelerator, local_scores, accelerator.device)
         related_samples = nlargest(TOP_K_TRAIN_SAMPLES, sample_scores, key=lambda x: x[1])
         print(f"  Top-{TOP_K_TRAIN_SAMPLES} selected: {[(i, round(s,4)) for i,s in related_samples]}")
 
@@ -697,6 +908,9 @@ def run_causal_intervention_experiment(
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
+                    "PRESCREEN_SKETCH_DIM":   prescreen_sketch_dim,
+                    "PRESCREEN_SKETCH_SEED":  prescreen_sketch_seed,
+                    "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
                 },
             },
             "test_sample_baseline": {
@@ -741,17 +955,26 @@ def run_causal_intervention_experiment(
         # Aggregate CE loss over all response tokens → single gradient vector G_test.
         # Cost: 1 × N_train  (vs. N_tokens × N_train in the old per-token approach)
         print(f"\n=== Global Pre-Screen: full training set → Top-{COARSE_POOL_SIZE} pool ===")
-        full_response_ce_grad = _test_ce_grad_full_response()
-        local_pool_scores = _screen_training_set(
-            model, full_response_ce_grad, filtered_params, train_loader,
-            accelerator.device, lm_head_device, desc="Global Pre-Screen",
-            max_seq_len=prescreen_max_seq_len,
-        )
-        all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
+        if prescreen_sketch_cache is not None:
+            full_response_ce_sketch = _test_ce_sketch_full_response()
+            all_pool_scores = _score_prescreen_sketch_cache(
+                full_response_ce_sketch,
+                prescreen_sketch_cache,
+                accelerator.device,
+            )
+            del full_response_ce_sketch
+        else:
+            full_response_ce_grad = _test_ce_grad_full_response()
+            local_pool_scores = _screen_training_set(
+                model, full_response_ce_grad, filtered_params, train_loader,
+                accelerator.device, lm_head_device, desc="Global Pre-Screen",
+                max_seq_len=prescreen_max_seq_len,
+            )
+            all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
+            del full_response_ce_grad
         coarse_pool: set[int] = {
             idx for idx, _ in nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
         }
-        del full_response_ce_grad
         print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
 
         # Materialise pool as a dedicated DataLoader so per-token Stage 2 truly iterates
@@ -832,16 +1055,26 @@ def run_causal_intervention_experiment(
 
             # Stage 2: per-token CE grad → re-rank within pool_loader only
             # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
-            token_ce_grad  = _test_ce_grad_for_token(t)
-            local_scores   = _screen_training_set(
-                model, token_ce_grad, filtered_params, pool_loader,
-                accelerator.device, lm_head_device,
-                desc=f"Stage2 t={t}",
-                max_seq_len=prescreen_max_seq_len,
-            )
-            all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
+            if prescreen_sketch_cache is not None:
+                token_ce_sketch = _test_ce_sketch_for_token(t)
+                all_scores = _score_prescreen_sketch_cache(
+                    token_ce_sketch,
+                    prescreen_sketch_cache,
+                    accelerator.device,
+                    allowed_indices=coarse_pool,
+                )
+                del token_ce_sketch
+            else:
+                token_ce_grad  = _test_ce_grad_for_token(t)
+                local_scores   = _screen_training_set(
+                    model, token_ce_grad, filtered_params, pool_loader,
+                    accelerator.device, lm_head_device,
+                    desc=f"Stage2 t={t}",
+                    max_seq_len=prescreen_max_seq_len,
+                )
+                all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
+                del token_ce_grad
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
-            del token_ce_grad
             print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
                   f"{[(i, round(s,4)) for i,s in related_samples]}")
 
@@ -902,6 +1135,9 @@ def run_causal_intervention_experiment(
                     "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
                     "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
+                    "PRESCREEN_SKETCH_DIM":    prescreen_sketch_dim,
+                    "PRESCREEN_SKETCH_SEED":   prescreen_sketch_seed,
+                    "PRESCREEN_SKETCH_CACHE":  prescreen_sketch_cache is not None,
                 },
             },
             "test_sample_baseline": {
@@ -956,6 +1192,18 @@ if __name__ == "__main__":
         help="Skip train samples longer than this during prescreen/rerank. Use <=0 to disable.",
     )
     parser.add_argument(
+        "--prescreen-sketch-dim", type=int, default=PRESCREEN_SKETCH_DIM,
+        help="TensorSketch dimension for cached coarse prescreen retrieval. Use <=0 to disable.",
+    )
+    parser.add_argument(
+        "--prescreen-sketch-seed", type=int, default=PRESCREEN_SKETCH_SEED,
+        help="Random seed for deterministic TensorSketch hashes.",
+    )
+    parser.add_argument(
+        "--prescreen-sketch-cache-dir", type=str, default=PRESCREEN_SKETCH_CACHE_DIR,
+        help="Directory used to store/reuse train coarse sketch caches.",
+    )
+    parser.add_argument(
         "--alti-grad-chunk-size", type=int, default=ALTI_GRAD_CHUNK_SIZE,
         help="Initial query chunk size for ALTI-gradient matching; OOM retries use smaller chunks.",
     )
@@ -999,4 +1247,7 @@ if __name__ == "__main__":
         alti_grad_chunk_size=args.alti_grad_chunk_size,
         alti_grad_max_seq_len=args.alti_grad_max_seq_len,
         fine_match_proj=args.fine_match_proj,
+        prescreen_sketch_dim=args.prescreen_sketch_dim,
+        prescreen_sketch_seed=args.prescreen_sketch_seed,
+        prescreen_sketch_cache_dir=args.prescreen_sketch_cache_dir,
     )
