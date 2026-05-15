@@ -26,11 +26,10 @@ from src.NIF import (
 )
 from src.process_data import process_func_chatml
 from src.loss import (
-    compute_correlation_second_order_gradient,
-    compute_full_saliency_vector,
+    compute_alti_correlation_gradient,
+    compute_alti_saliency_vector,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_scores_no_backward,
-    compute_saliency_feature_proxy,
 )
 
 # ====== DATA LOADING (auto-detects format) ======
@@ -104,8 +103,8 @@ def _patch_model_with_attn_hook(model: torch.nn.Module) -> torch.nn.Module:
       1. Register a hook on the *last* self-attention module before the forward pass.
       2. Capture the attention weight tensor returned by that module.
       3. Remove the hook and return a :class:`CausalLMOutputWithPast` whose
-         ``attentions`` field holds the captured weight (matching the interface
-         expected by ``compute_answer_only_saliency_masked_loss``).
+         ``attentions`` field holds the captured weight for legacy callers that
+         still use ``save_last_attention=True``.
 
     Works for dense models (Qwen2, Qwen3) **and** MoE models (Qwen3.5 35B A3B)
     because it only touches the attention module output, not the MoE routing.
@@ -210,6 +209,11 @@ TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screenin
 TOP_TARGETS = 3                # How many response tokens to scan per train sample
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
+FINE_MATCH_LAST_N_LAYERS = 1   # ALTI-gradient matching params: last N layers
+FINE_MATCH_PROJ = "qk"         # Attention projections used for fine matching: qk, qkvo, vo, q/k/v/o, all
+ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
+ALTI_GRAD_CHUNK_SIZE = 32      # Pair-gradient starts fast and falls back on OOM
+ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables
 
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
@@ -231,6 +235,37 @@ def lm_head_filter(name, param):
     This gives a compact, task-agnostic feature for every token prediction.
     """
     return name == "lm_head.weight"
+
+
+def _fine_match_projection_names(proj_mode: str) -> tuple[str, ...]:
+    """Map a compact projection mode such as 'qk' to module name fragments."""
+    normalized = (proj_mode or "").lower().replace("_", "").replace("-", "").replace(",", "")
+    if normalized == "all":
+        normalized = "qkvo"
+    if not normalized or any(ch not in "qkvo" for ch in normalized):
+        raise ValueError(
+            f"Unsupported fine-match projection mode: {proj_mode!r}. "
+            "Use a combination of q/k/v/o, e.g. 'qk', 'vo', 'qkvo', or 'all'."
+        )
+
+    selected = set(normalized)
+    return tuple(f"{ch}_proj" for ch in "qkvo" if ch in selected)
+
+
+def make_attention_projection_filter(model, last_n_layers: int, proj_mode: str):
+    """Select requested attention projection parameters in the final N decoder layers."""
+    num_layers = len(model.model.layers)
+    start_layer = max(0, num_layers - last_n_layers)
+    projection_names = _fine_match_projection_names(proj_mode)
+
+    def _filter(name, param):
+        for layer_idx in range(start_layer, num_layers):
+            prefix = f"model.layers.{layer_idx}.self_attn."
+            if name.startswith(prefix) and any(proj in name for proj in projection_names):
+                return True
+        return False
+
+    return _filter
 
 
 def is_trivial_token(tokenizer, token_id: int) -> bool:
@@ -404,6 +439,9 @@ def run_causal_intervention_experiment(
     max_gpu_memory: str | None = None,
     corr_feature_mode: str = "auto",
     prescreen_batch_size: int = 1,
+    alti_grad_chunk_size: int = ALTI_GRAD_CHUNK_SIZE,
+    alti_grad_max_seq_len: int | None = ALTI_GRAD_MAX_SEQ_LEN,
+    fine_match_proj: str = FINE_MATCH_PROJ,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -412,25 +450,37 @@ def run_causal_intervention_experiment(
     set_seed(SEED)
 
     if attn_implementation is None:
-        # All-tokens mode uses embedding-gradient saliency and CE gradients; it
-        # does not need materialized attention weights. SDPA avoids the large
-        # eager attention matrix that can OOM during prescreening.
-        attn_implementation = "sdpa" if all_tokens else "eager"
+        # ALTI needs materialized attention probabilities. SDPA/flash attention
+        # often returns None for output_attentions in Qwen-family models.
+        attn_implementation = "eager"
     if prescreen_max_seq_len is not None and prescreen_max_seq_len <= 0:
         prescreen_max_seq_len = None
     prescreen_batch_size = max(1, int(prescreen_batch_size))
+    alti_grad_chunk_size = max(1, int(alti_grad_chunk_size))
+    if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
+        alti_grad_max_seq_len = None
+    fine_match_proj = (fine_match_proj or FINE_MATCH_PROJ).lower()
+    fine_match_projection_names = _fine_match_projection_names(fine_match_proj)
     model, tokenizer = load_model_and_tokenizer(
         model_path,
         attn_implementation=attn_implementation,
         max_gpu_memory=max_gpu_memory,
     )
-    if corr_feature_mode == "auto":
-        model_type = str(getattr(model.config, "model_type", "")).lower()
-        class_name = model.__class__.__name__.lower()
-        corr_feature_mode = "saliency_proxy" if "moe" in model_type or "moe" in class_name else "second_order"
-    print(f"[DEBUG] correlation feature mode: {corr_feature_mode}", flush=True)
+    if corr_feature_mode != "auto":
+        print(
+            f"[DEBUG] --corr-feature-mode={corr_feature_mode} is ignored; "
+            "fine matching now always uses ALTI-gradient features.",
+            flush=True,
+        )
+    print(
+        "[DEBUG] correlation feature mode: "
+        f"alti_gradient_{fine_match_proj} over last {FINE_MATCH_LAST_N_LAYERS} layer(s) "
+        f"({', '.join(fine_match_projection_names)})",
+        flush=True,
+    )
     print("[DEBUG] Model and tokenizer loaded.", flush=True)
     param_filter = lm_head_filter
+    fine_param_filter = make_attention_projection_filter(model, FINE_MATCH_LAST_N_LAYERS, fine_match_proj)
 
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
@@ -501,23 +551,55 @@ def run_causal_intervention_experiment(
     }
     seq_len = test_batch["input_ids"].size(1)
 
-    def _compute_correlation_feature(batch, target_idx_in_seq: int, source_idx_in_seq: int) -> torch.Tensor:
-        if corr_feature_mode == "second_order":
-            return compute_correlation_second_order_gradient(
-                model=model,
-                batch=batch,
-                target_idx_in_seq=target_idx_in_seq,
-                source_idx_in_seq=source_idx_in_seq,
-                param_filter_fn=param_filter,
+    def _alti_grad_chunks() -> list[int]:
+        chunks = []
+        chunk = alti_grad_chunk_size
+        while chunk >= 1:
+            if chunk not in chunks:
+                chunks.append(chunk)
+            chunk //= 2
+        if 1 not in chunks:
+            chunks.append(1)
+        return chunks
+
+    def _is_cuda_alloc_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cublas_status_alloc_failed" in msg
+            or "cublascreate" in msg
+            or "cuda error: cublas" in msg
+        )
+
+    def _compute_alti_correlation_gradient_retry(**kwargs):
+        target_idx = int(kwargs["target_idx_in_seq"])
+        if alti_grad_max_seq_len is not None and target_idx > alti_grad_max_seq_len:
+            print(
+                f"  Skipping ALTI-gradient target={target_idx}: "
+                f"exceeds --alti-grad-max-seq-len={alti_grad_max_seq_len}"
             )
-        if corr_feature_mode == "saliency_proxy":
-            return compute_saliency_feature_proxy(
-                model=model,
-                batch=batch,
-                target_idx_in_seq=target_idx_in_seq,
-                source_idx_in_seq=source_idx_in_seq,
-            )
-        raise ValueError(f"Unsupported corr_feature_mode: {corr_feature_mode}")
+            return None
+
+        chunks = _alti_grad_chunks()
+        last_error_message = None
+        for chunk in chunks:
+            try:
+                return compute_alti_correlation_gradient(
+                    **kwargs,
+                    chunk_size=chunk,
+                )
+            except torch.OutOfMemoryError as exc:
+                last_error_message = str(exc)
+                print(f"  OOM in ALTI-gradient chunk={chunk}; retrying smaller chunk...")
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                if not _is_cuda_alloc_error(exc):
+                    raise
+                last_error_message = str(exc)
+                print(f"  OOM in ALTI-gradient chunk={chunk}; retrying smaller chunk...")
+                torch.cuda.empty_cache()
+        print(f"  Skipping ALTI-gradient after OOM chunks {chunks}: {last_error_message}")
+        return None
 
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: Stage 3 processing for one train sample
@@ -536,7 +618,7 @@ def run_causal_intervention_experiment(
         cached_detail: dict | None = None,
     ) -> tuple[dict | None, list, int]:
         """Returns (detail_dict_or_None, pair_records, next_pair_id)."""
-        nonlocal model, tokenizer, base_collator, accelerator, param_filter
+        nonlocal model, tokenizer, base_collator, accelerator, fine_param_filter
 
         if cached_detail is None:
             tr_ds   = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
@@ -564,7 +646,12 @@ def run_causal_intervention_experiment(
                     t_tr = response_start + t_offset
                     if t_tr >= tr_seq_len:
                         break
-                    sal_vec = compute_full_saliency_vector(model, tr_batch, t_tr)
+                    sal_vec = compute_alti_saliency_vector(
+                        model,
+                        tr_batch,
+                        t_tr,
+                        chunk_size=ALTI_CHUNK_SIZE,
+                    )
                     target_saliencies[t_tr] = [round(float(s), 6) for s in sal_vec]
                     for s_idx, s_score in nlargest(TOP_K_SOURCE_PER_TARGET, enumerate(sal_vec), key=lambda x: x[1]):
                         candidate_pairs.append((float(s_score), t_tr, int(s_idx)))
@@ -579,14 +666,16 @@ def run_causal_intervention_experiment(
                 "saliencies_by_token": {str(k): v for k, v in target_saliencies.items()},
                 "_candidate_pairs":   candidate_pairs,
                 "_tr_batch_cpu":      {k: v.cpu() for k, v in tr_batch.items()},
+                "_feature_cache":     {},
             }
         else:
             # Update coarse score to the maximum seen across test tokens
             if coarse_score > cached_detail["coarse_cos_sim"]:
                 cached_detail["coarse_cos_sim"] = float(coarse_score)
             candidate_pairs = cached_detail["_candidate_pairs"]
+            cached_detail.setdefault("_feature_cache", {})
 
-        # Move tr_batch to device for correlation feature computation
+        # Move tr_batch to device for ALTI-gradient correlation matching
         tr_batch_gpu = {k: v.to(accelerator.device) for k, v in cached_detail["_tr_batch_cpu"].items()}
         ids_1d       = tr_batch_gpu["input_ids"][0]
         response_start = cached_detail["answer_start_index"]
@@ -602,15 +691,31 @@ def run_causal_intervention_experiment(
                 print(f"  Step B: '{train_source_tok}' -> '{train_target_tok}' "
                       f"(offset={response_tok_offset}, sal={saliency_score:.4f})")
 
-                train_feat = _compute_correlation_feature(tr_batch_gpu, t_tr, s_idx)
+                feature_key = (int(t_tr), int(s_idx))
+                if feature_key in cached_detail["_feature_cache"]:
+                    train_feat = cached_detail["_feature_cache"][feature_key]
+                    if train_feat is None:
+                        continue
+                    print("    feature cache hit")
+                else:
+                    train_feat = _compute_alti_correlation_gradient_retry(
+                        model=model,
+                        batch=tr_batch_gpu,
+                        target_idx_in_seq=t_tr,
+                        source_idx_in_seq=s_idx,
+                        param_filter_fn=fine_param_filter,
+                        device=accelerator.device,
+                    )
+                    cached_detail["_feature_cache"][feature_key] = train_feat
+                    if train_feat is None:
+                        continue
                 source_ctx = get_context_window(tokenizer, ids_1d, s_idx)
                 target_ctx = get_context_window(tokenizer, ids_1d, t_tr)
 
                 for test_p_idx, (test_feat, test_src_text, test_saliency) in test_corr_features.items():
-                    # Cosine similarity on lm_head_device (no CPU round-trip)
                     cos_sim = F.cosine_similarity(
-                        test_feat.to(lm_head_device),
-                        train_feat.to(lm_head_device),
+                        test_feat,
+                        train_feat,
                         dim=0,
                     ).item()
 
@@ -687,12 +792,14 @@ def run_causal_intervention_experiment(
     if not all_tokens:
         print("\n=== Stage 1: Extracting test correlation features ===")
 
-        target_idx_tensor = torch.tensor([TOKEN_INDEX_TO_RETRIEVE], device=accelerator.device)
-        baseline_res      = infer_fw.infer(test_batch, target_idx=target_idx_tensor)
-
         target_tok_id   = test_batch["input_ids"][0, TOKEN_INDEX_TO_RETRIEVE].item()
         target_tok_text = tokenizer.decode([target_tok_id])
-        baseline_saliency = baseline_res["saliency_original"][0][0]["saliency"]
+        baseline_saliency = compute_alti_saliency_vector(
+            model,
+            test_batch,
+            TOKEN_INDEX_TO_RETRIEVE,
+            chunk_size=ALTI_CHUNK_SIZE,
+        )
 
         top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(baseline_saliency), key=lambda x: x[1])
         top_test_correlations = [
@@ -706,14 +813,23 @@ def run_causal_intervention_experiment(
             for idx, score in top_test_corr
         ]
 
-        print(f"Computing test correlation features ({corr_feature_mode})...")
+        print("Computing ALTI-gradient test features...")
         test_corr_features: dict = {}
         with torch.inference_mode(False):
             for item in top_test_correlations:
                 p_idx = item["source_token_index"]
                 print(f"  '{item['source_token']}' -> '{item['target_token']}' (sal={item['saliency_score']:.4f})")
-                feat = _compute_correlation_feature(test_batch, TOKEN_INDEX_TO_RETRIEVE, p_idx)
-                test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
+                feat = _compute_alti_correlation_gradient_retry(
+                    model=model,
+                    batch=test_batch,
+                    target_idx_in_seq=TOKEN_INDEX_TO_RETRIEVE,
+                    source_idx_in_seq=p_idx,
+                    param_filter_fn=fine_param_filter,
+                    device=accelerator.device,
+                )
+                if feat is None:
+                    continue
+                test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
         print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
         test_ce_grad  = _test_ce_grad_for_token(TOKEN_INDEX_TO_RETRIEVE)
@@ -756,12 +872,21 @@ def run_causal_intervention_experiment(
                     "TOP_TARGETS":            TOP_TARGETS,
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":    CONTEXT_WINDOW_SIZE,
+                    "SALIENCY_METHOD":        "alti",
+                    "MATCHING_METHOD":        f"alti_gradient_{fine_match_proj}",
+                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ":        fine_match_proj,
+                    "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE":   alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN":  alti_grad_max_seq_len,
+                    "prescreen_max_seq_len":  prescreen_max_seq_len,
+                    "prescreen_batch_size":   prescreen_batch_size,
                 },
             },
             "test_sample_baseline": {
                 "target_token":        target_tok_text,
                 "target_token_index":  TOKEN_INDEX_TO_RETRIEVE,
-                "full_tokens":         baseline_res["full_tokens"][0],  # prompt + model output (test_batch input)
+                "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output
                 "correct_full_tokens": gen_result["full_tokens"][0],    # prompt + ground truth answer
                 "top_correlations":    top_test_correlations,
             },
@@ -882,7 +1007,13 @@ def run_causal_intervention_experiment(
                     "COARSE_POOL_SIZE": COARSE_POOL_SIZE,
                     "prescreen_max_seq_len": prescreen_max_seq_len,
                     "prescreen_batch_size": prescreen_batch_size,
-                    "corr_feature_mode": corr_feature_mode,
+                    "SALIENCY_METHOD": "alti",
+                    "MATCHING_METHOD": f"alti_gradient_{fine_match_proj}",
+                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ": fine_match_proj,
+                    "ALTI_CHUNK_SIZE": ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE": alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN": alti_grad_max_seq_len,
                 },
             },
             "test_sample_baseline": {
@@ -930,7 +1061,12 @@ def run_causal_intervention_experiment(
 
             # Stage 1a: cheap saliency at t
             with torch.inference_mode(False):
-                sal_vec = compute_full_saliency_vector(model, test_batch, t)
+                sal_vec = compute_alti_saliency_vector(
+                    model,
+                    test_batch,
+                    t,
+                    chunk_size=ALTI_CHUNK_SIZE,
+                )
             top_test_corr = nlargest(TOP_K_PROMPT_TOKENS, enumerate(sal_vec), key=lambda x: x[1])
             top_test_correlations = [
                 {
@@ -943,14 +1079,34 @@ def run_causal_intervention_experiment(
                 for idx, score in top_test_corr
             ]
 
-            # Stage 1b: test correlation features (kept on lm_head_device, freed after this token)
-            print(f"  Computing {len(top_test_correlations)} test correlation features ({corr_feature_mode})...")
+            # Stage 1b: ALTI-gradient test features (freed after this token)
+            print(f"  Computing {len(top_test_correlations)} test ALTI-gradient features...")
             test_corr_features: dict = {}
             with torch.inference_mode(False):
                 for item in top_test_correlations:
                     p_idx = item["source_token_index"]
-                    feat = _compute_correlation_feature(test_batch, t, p_idx)
-                    test_corr_features[p_idx] = (feat.to(lm_head_device), item["source_token"], item["saliency_score"])
+                    feat = _compute_alti_correlation_gradient_retry(
+                        model=model,
+                        batch=test_batch,
+                        target_idx_in_seq=t,
+                        source_idx_in_seq=p_idx,
+                        param_filter_fn=fine_param_filter,
+                        device=accelerator.device,
+                    )
+                    if feat is None:
+                        continue
+                    test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
+
+            if not test_corr_features:
+                print(f"  No ALTI-gradient test features survived for token {t}; skipping Stage 2/3.")
+                per_token_results.append({
+                    "target_token_index": t,
+                    "target_token":       target_tok_text,
+                    "top_correlations":   top_test_correlations,
+                    "correlation_pairs":  [],
+                })
+                torch.cuda.empty_cache()
+                continue
 
             # Stage 2: per-token CE grad → re-rank within pool_loader only
             # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
@@ -1014,6 +1170,15 @@ def run_causal_intervention_experiment(
                     "TOP_TARGETS":             TOP_TARGETS,
                     "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
                     "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
+                    "SALIENCY_METHOD":         "alti",
+                    "MATCHING_METHOD":         f"alti_gradient_{fine_match_proj}",
+                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ":         fine_match_proj,
+                    "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
+                    "prescreen_max_seq_len":   prescreen_max_seq_len,
+                    "prescreen_batch_size":    prescreen_batch_size,
                 },
             },
             "test_sample_baseline": {
@@ -1076,8 +1241,8 @@ if __name__ == "__main__":
         "--attn-implementation", type=str, default=None,
         choices=["eager", "sdpa", "flash_attention_2"],
         help=(
-            "Attention backend for model loading. Defaults to sdpa in all-tokens "
-            "mode and eager in single-token mode."
+            "Attention backend for model loading. Defaults to eager because ALTI "
+            "requires materialized attention probabilities."
         ),
     )
     parser.add_argument(
@@ -1098,13 +1263,35 @@ if __name__ == "__main__":
         "--corr-feature-mode", type=str, default="auto",
         choices=["auto", "second_order", "saliency_proxy"],
         help=(
-            "Feature used for fine correlation matching. auto uses saliency_proxy "
-            "for MoE models because their grouped-mm kernels do not support 2nd-order AD."
+            "Deprecated compatibility flag. Fine matching now always uses ALTI-gradient features."
         ),
     )
     parser.add_argument(
         "--prescreen-batch-size", type=int, default=1,
         help="Batch size for global prescreen and pool rerank forwards.",
+    )
+    parser.add_argument(
+        "--alti-grad-chunk-size", type=int, default=ALTI_GRAD_CHUNK_SIZE,
+        help="Initial query chunk size for ALTI-gradient matching; OOM retries use smaller chunks.",
+    )
+    parser.add_argument(
+        "--alti-grad-max-seq-len", type=int, default=ALTI_GRAD_MAX_SEQ_LEN,
+        help="Skip ALTI-gradient pairs whose target prefix is longer than this. Use <=0 to disable.",
+    )
+    parser.add_argument(
+        "--fine-match-proj", type=str, default=FINE_MATCH_PROJ,
+        help=(
+            "Attention projections used for ALTI-gradient fine matching. "
+            "Default: qk. Use qkvo/all for the previous behavior, or vo/q/k/v/o for ablations."
+        ),
+    )
+    parser.add_argument(
+        "--top-targets", type=int, default=None,
+        help="How many response target tokens to scan per train sample.",
+    )
+    parser.add_argument(
+        "--top-k-source-per-target", type=int, default=None,
+        help="How many source tokens to keep for each train response target.",
     )
     args = parser.parse_args()
 
@@ -1112,6 +1299,10 @@ if __name__ == "__main__":
         SELECTED_TEST_SAMPLE_INDEX = args.test_index
     if args.token_index is not None:
         TOKEN_INDEX_TO_RETRIEVE = args.token_index
+    if args.top_targets is not None:
+        TOP_TARGETS = max(1, int(args.top_targets))
+    if args.top_k_source_per_target is not None:
+        TOP_K_SOURCE_PER_TARGET = max(1, int(args.top_k_source_per_target))
 
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
@@ -1126,4 +1317,7 @@ if __name__ == "__main__":
         max_gpu_memory=args.max_gpu_memory,
         corr_feature_mode=args.corr_feature_mode,
         prescreen_batch_size=args.prescreen_batch_size,
+        alti_grad_chunk_size=args.alti_grad_chunk_size,
+        alti_grad_max_seq_len=args.alti_grad_max_seq_len,
+        fine_match_proj=args.fine_match_proj,
     )

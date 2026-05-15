@@ -17,7 +17,7 @@ from accelerate import Accelerator
 
 from src.sft.inference import print_query_and_answer
 from .process_data import process_func_chatml, CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict
-from .loss import compute_answer_only_saliency_masked_loss, compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample
+from .loss import compute_alti_saliency_vector, compute_gradients, compute_loss_per_sample
 from .auto_annotate import annotate_samples
 
 from datasets import Dataset
@@ -682,15 +682,26 @@ class NewInferenceFunction:
         time_part_1_infer = time()
         print(f'Inferring single token costs {(time_part_1_infer - time_start):.3f}s')
 
-        if skip_saliency:
-            saliency_original = None
-        else:
-            _, _, saliency_original = compute_answer_only_saliency_masked_loss(
-                self.model,
-                batch,
-                self.device,
-                target_idx
-            )
+        def _alti_saliency_list(sal_batch, starts):
+            sal_input_ids = sal_batch["input_ids"].to(self.device)
+            sal_attention_mask = sal_batch["attention_mask"].to(self.device)
+            out = []
+            for i, start in enumerate(starts.tolist()):
+                sample_out = []
+                sample_len = int(sal_attention_mask[i].sum().item())
+                sample_batch = {
+                    "input_ids": sal_input_ids[i:i + 1, :sample_len],
+                    "attention_mask": sal_attention_mask[i:i + 1, :sample_len],
+                }
+                for t in range(max(int(start), 1), sample_len):
+                    sample_out.append({
+                        "index": t,
+                        "saliency": compute_alti_saliency_vector(self.model, sample_batch, t),
+                    })
+                out.append(sample_out)
+            return out
+
+        saliency_original = None if skip_saliency else _alti_saliency_list(batch, target_idx)
 
         time_part_1_saliency = time()
         print(f'Computing saliency of original sample costs {(time_part_1_saliency - time_part_1_infer):.3f}s')
@@ -774,15 +785,7 @@ class NewInferenceFunction:
             "attention_mask": gen_attention_mask,
             "labels": gen_labels,
         }
-        if skip_saliency:
-            saliency_generation = None
-        else:
-            _, _, saliency_generation = compute_answer_only_saliency_masked_loss(
-                self.model,
-                gen_batch,
-                self.device,
-                target_idx
-            )
+        saliency_generation = None if skip_saliency else _alti_saliency_list(gen_batch, target_idx)
 
         time_part_2_saliency = time()
         print(f'Computing saliency on the generation result costs {(time_part_2_saliency-time_part_2_generation):.3f}s')
@@ -923,8 +926,8 @@ class NewInferenceFunction:
             if loss_test_curr < loss_threshold:
                 break
 
-            grads, saliency = compute_gradients_selected_attention(
-                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, target_idx=torch.Tensor(target_idx)
+            grads = compute_gradients(
+                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids
             )
             self._apply_gradient_update(grads, lr=lr)
             self.model.zero_grad(set_to_none=True)
