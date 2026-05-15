@@ -2,13 +2,13 @@
 # =============================================================================
 # run_batch_experiments.sh
 #
-# Batch runner for Empirical-Influence-Function experiments.
-# For each (test_index, token_index) pair, runs:
-#   1) NIF.py   → saliency_test{N}_tok{tok}.json
-#   2) intervention_experiment.py → correlation_matching_results_test{N}_tok{tok}.json
+# Batch runner for all-token correlation matching experiments.
+# For each test_index, runs:
+#   intervention_experiment.py --all-tokens
+#     → correlation_matching_results_test{N}_all_tokens.json
 #
 # Usage:
-#   bash run_batch_experiments.sh [--nif-only | --intervention-only]
+#   bash run_batch_experiments.sh
 #
 # Edit the EXPERIMENTS array below to add / remove cases.
 # =============================================================================
@@ -16,28 +16,22 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# ★  EDIT THIS LIST to add your (test_index, token_index) pairs  ★
+# ★  EDIT THIS LIST to add your test indices  ★
 # ---------------------------------------------------------------------------
-# Format: "test_index:token_index"
+# Format: "test_index". Old "test_index:token_index" entries are also accepted;
+# the token part is ignored in all-tokens mode.
 EXPERIMENTS=(
-    "58:703"
-    "58:750"
-    "23:412"
-    # add more pairs here ...
+    "58"
+    "23"
+    # add more test indices here ...
 )
 # ---------------------------------------------------------------------------
-
-# Which stages to run: "both" | "nif" | "intervention"
-MODE="both"
-if [[ "${1:-}" == "--nif-only" ]];          then MODE="nif"; fi
-if [[ "${1:-}" == "--intervention-only" ]]; then MODE="intervention"; fi
 
 # Python interpreter — adjust if you use a venv / conda env
 PYTHON="${PYTHON:-python}"
 
 # Optional extra args, e.g.
-#   IE_EXTRA_ARGS="--alti-grad-chunk-size 32 --top-targets 8" bash run_batch_experiments.sh --intervention-only
-NIF_EXTRA_ARGS="${NIF_EXTRA_ARGS:-}"
+#   IE_EXTRA_ARGS="--alti-grad-chunk-size 32 --top-targets 8" bash run_batch_experiments.sh
 IE_EXTRA_ARGS="${IE_EXTRA_ARGS:-}"
 
 # Project root (directory containing this script)
@@ -49,7 +43,7 @@ mkdir -p "${LOG_DIR}"
 
 echo "================================================================="
 echo "  Batch Experiment Runner"
-echo "  Mode      : ${MODE}"
+echo "  Mode      : intervention --all-tokens"
 echo "  Experiments: ${#EXPERIMENTS[@]}"
 echo "  Log dir   : ${LOG_DIR}"
 echo "================================================================="
@@ -60,51 +54,25 @@ IDX=0
 for PAIR in "${EXPERIMENTS[@]}"; do
     IDX=$((IDX + 1))
     TEST_IDX="${PAIR%%:*}"
-    TOK_IDX="${PAIR##*:}"
 
     echo ""
     echo "-----------------------------------------------------------------"
-    echo "  [${IDX}/${TOTAL}]  test=${TEST_IDX}  tok=${TOK_IDX}"
+    echo "  [${IDX}/${TOTAL}]  test=${TEST_IDX}  all_tokens"
     echo "-----------------------------------------------------------------"
 
-    # ------------------------------------------------------------------
-    # Stage 1: NIF.py  (saliency)
-    # ------------------------------------------------------------------
-    SALIENCY_OUT="${ROOT_DIR}/saliency_test${TEST_IDX}_tok${TOK_IDX}.json"
+    CORR_OUT="${ROOT_DIR}/correlation_matching_results_test${TEST_IDX}_all_tokens.json"
 
-    if [[ "${MODE}" == "both" || "${MODE}" == "nif" ]]; then
-        if [[ -f "${SALIENCY_OUT}" ]]; then
-            echo "  [skip NIF]  ${SALIENCY_OUT} already exists."
-        else
-            NIF_LOG="${LOG_DIR}/nif_test${TEST_IDX}_tok${TOK_IDX}.log"
-            echo "  [NIF]  Running...  (log: ${NIF_LOG})"
-            "${PYTHON}" -m src.NIF \
-                --test-index  "${TEST_IDX}" \
-                --token-index "${TOK_IDX}" \
-                ${NIF_EXTRA_ARGS} \
-                2>&1 | tee "${NIF_LOG}"
-            echo "  [NIF]  Done → ${SALIENCY_OUT}"
-        fi
-    fi
-
-    # ------------------------------------------------------------------
-    # Stage 2: intervention_experiment.py  (correlation matching)
-    # ------------------------------------------------------------------
-    CORR_OUT="${ROOT_DIR}/correlation_matching_results_test${TEST_IDX}_tok${TOK_IDX}.json"
-
-    if [[ "${MODE}" == "both" || "${MODE}" == "intervention" ]]; then
-        if [[ -f "${CORR_OUT}" ]]; then
-            echo "  [skip IE]   ${CORR_OUT} already exists."
-        else
-            IE_LOG="${LOG_DIR}/intervention_test${TEST_IDX}_tok${TOK_IDX}.log"
-            echo "  [IE]   Running...  (log: ${IE_LOG})"
-            "${PYTHON}" -m src.intervention_experiment \
-                --test-index  "${TEST_IDX}" \
-                --token-index "${TOK_IDX}" \
-                ${IE_EXTRA_ARGS} \
-                2>&1 | tee "${IE_LOG}"
-            echo "  [IE]   Done → ${CORR_OUT}"
-        fi
+    if [[ -f "${CORR_OUT}" ]]; then
+        echo "  [skip IE]   ${CORR_OUT} already exists."
+    else
+        IE_LOG="${LOG_DIR}/intervention_test${TEST_IDX}_all_tokens.log"
+        echo "  [IE]   Running all-tokens...  (log: ${IE_LOG})"
+        "${PYTHON}" -m src.intervention_experiment \
+            --test-index "${TEST_IDX}" \
+            --all-tokens \
+            ${IE_EXTRA_ARGS} \
+            2>&1 | tee "${IE_LOG}"
+        echo "  [IE]   Done → ${CORR_OUT}"
     fi
 done
 
