@@ -49,6 +49,10 @@ ALTI_GRAD_MAX_SEQ_LEN="${ALTI_GRAD_MAX_SEQ_LEN:-}"  # empty = intervention defau
 FINE_MATCH_PROJ="${FINE_MATCH_PROJ:-}"  # empty = qk; use qkvo/all for previous behavior
 TOP_TARGETS="${TOP_TARGETS:-}"  # empty = intervention default
 TOP_K_SOURCE_PER_TARGET="${TOP_K_SOURCE_PER_TARGET:-}"  # empty = intervention default
+PRESCREEN_SKETCH_DIM="${PRESCREEN_SKETCH_DIM:-}"  # empty = intervention default; <=0 disables cache
+PRESCREEN_SKETCH_SEED="${PRESCREEN_SKETCH_SEED:-}"  # empty = intervention default
+PRESCREEN_SKETCH_CACHE_DIR="${PRESCREEN_SKETCH_CACHE_DIR:-}"  # empty = intervention default
+IE_EXTRA_ARGS="${IE_EXTRA_ARGS:-}"  # optional raw passthrough args
 PYTHON="${PYTHON:-python}"
 
 # ---------------------------------------------------------------------------
@@ -72,6 +76,9 @@ while [[ $# -gt 0 ]]; do
         --fine-match-proj) FINE_MATCH_PROJ="$2"; shift 2 ;;
         --top-targets) TOP_TARGETS="$2"; shift 2 ;;
         --top-k-source-per-target) TOP_K_SOURCE_PER_TARGET="$2"; shift 2 ;;
+        --prescreen-sketch-dim) PRESCREEN_SKETCH_DIM="$2"; shift 2 ;;
+        --prescreen-sketch-seed) PRESCREEN_SKETCH_SEED="$2"; shift 2 ;;
+        --prescreen-sketch-cache-dir) PRESCREEN_SKETCH_CACHE_DIR="$2"; shift 2 ;;
         *) echo "[batch] Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -137,6 +144,8 @@ echo "  max gpu memory: ${MAX_GPU_MEMORY:-auto}"
 echo "  fine match proj: ${FINE_MATCH_PROJ:-qk}"
 echo "  alti grad chunk: ${ALTI_GRAD_CHUNK_SIZE:-default}"
 echo "  prescreen batch size: ${PRESCREEN_BATCH_SIZE:-1}"
+echo "  prescreen sketch dim: ${PRESCREEN_SKETCH_DIM:-8192}"
+echo "  prescreen sketch cache: ${PRESCREEN_SKETCH_CACHE_DIR:-.cache/prescreen_sketch}"
 echo "  log dir   : ${LOG_DIR}"
 echo "================================================================="
 
@@ -181,6 +190,10 @@ for IDX in $(seq "$START_IDX" "$END_IDX"); do
         ${FINE_MATCH_PROJ:+--fine-match-proj "${FINE_MATCH_PROJ}"} \
         ${TOP_TARGETS:+--top-targets "${TOP_TARGETS}"} \
         ${TOP_K_SOURCE_PER_TARGET:+--top-k-source-per-target "${TOP_K_SOURCE_PER_TARGET}"} \
+        ${PRESCREEN_SKETCH_DIM:+--prescreen-sketch-dim "${PRESCREEN_SKETCH_DIM}"} \
+        ${PRESCREEN_SKETCH_SEED:+--prescreen-sketch-seed "${PRESCREEN_SKETCH_SEED}"} \
+        ${PRESCREEN_SKETCH_CACHE_DIR:+--prescreen-sketch-cache-dir "${PRESCREEN_SKETCH_CACHE_DIR}"} \
+        ${IE_EXTRA_ARGS} \
         2>&1 | tee "${LOG_FILE}"
 
     EXIT_CODE=${PIPESTATUS[0]}
