@@ -36,12 +36,12 @@ TOKEN_INDEX_TO_RETRIEVE = 703  # The "first wrong token" we are investigating (s
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
-TOP_TARGETS = 3                # How many response tokens to scan per train sample
+TOP_TARGETS = 8                # How many response tokens to scan per train sample
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 FINE_MATCH_LAST_N_LAYERS = 1   # ALTI-gradient matching params: last N layers
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
-ALTI_GRAD_CHUNK_SIZE = 4       # Pair-gradient starts fast and falls back on OOM
+ALTI_GRAD_CHUNK_SIZE = 32      # Pair-gradient starts fast and falls back on OOM
 ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables
 
 # All-tokens mode parameters
@@ -890,12 +890,24 @@ if __name__ == "__main__":
         "--alti-grad-max-seq-len", type=int, default=ALTI_GRAD_MAX_SEQ_LEN,
         help="Skip ALTI-gradient pairs whose target prefix is longer than this. Use <=0 to disable.",
     )
+    parser.add_argument(
+        "--top-targets", type=int, default=None,
+        help="How many response target tokens to scan per train sample.",
+    )
+    parser.add_argument(
+        "--top-k-source-per-target", type=int, default=None,
+        help="How many source tokens to keep for each train response target.",
+    )
     args = parser.parse_args()
 
     if args.test_index is not None:
         SELECTED_TEST_SAMPLE_INDEX = args.test_index
     if args.token_index is not None:
         TOKEN_INDEX_TO_RETRIEVE = args.token_index
+    if args.top_targets is not None:
+        TOP_TARGETS = max(1, int(args.top_targets))
+    if args.top_k_source_per_target is not None:
+        TOP_K_SOURCE_PER_TARGET = max(1, int(args.top_k_source_per_target))
 
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")

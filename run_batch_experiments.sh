@@ -35,6 +35,11 @@ if [[ "${1:-}" == "--intervention-only" ]]; then MODE="intervention"; fi
 # Python interpreter — adjust if you use a venv / conda env
 PYTHON="${PYTHON:-python}"
 
+# Optional extra args, e.g.
+#   IE_EXTRA_ARGS="--alti-grad-chunk-size 32 --top-targets 8" bash run_batch_experiments.sh --intervention-only
+NIF_EXTRA_ARGS="${NIF_EXTRA_ARGS:-}"
+IE_EXTRA_ARGS="${IE_EXTRA_ARGS:-}"
+
 # Project root (directory containing this script)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -76,6 +81,7 @@ for PAIR in "${EXPERIMENTS[@]}"; do
             "${PYTHON}" -m src.NIF \
                 --test-index  "${TEST_IDX}" \
                 --token-index "${TOK_IDX}" \
+                ${NIF_EXTRA_ARGS} \
                 2>&1 | tee "${NIF_LOG}"
             echo "  [NIF]  Done → ${SALIENCY_OUT}"
         fi
@@ -95,6 +101,7 @@ for PAIR in "${EXPERIMENTS[@]}"; do
             "${PYTHON}" -m src.intervention_experiment \
                 --test-index  "${TEST_IDX}" \
                 --token-index "${TOK_IDX}" \
+                ${IE_EXTRA_ARGS} \
                 2>&1 | tee "${IE_LOG}"
             echo "  [IE]   Done → ${CORR_OUT}"
         fi
