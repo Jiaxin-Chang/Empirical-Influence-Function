@@ -489,6 +489,9 @@ function TrainSampleGroup({
 
 export interface AllTokensExperimentMeta {
     testIdx: number;
+    suffix?: string;
+    label?: string;
+    fileName?: string;
 }
 
 interface Props {
@@ -522,7 +525,8 @@ export function NewView({ metas }: Props) {
         if (metas.length === 0 || selectedMetaIdx === null) return;
         const meta = metas[selectedMetaIdx];
         if (!meta) return;
-        const url  = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+        const fileName = meta.fileName ?? `correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+        const url  = `/data/${fileName}`;
 
         setLoading(true);
         setLoadError(false);
@@ -614,7 +618,8 @@ export function NewView({ metas }: Props) {
             const parts: string[] = [];
             for (const meta of metas) {
                 try {
-                    const url = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+                    const fileName = meta.fileName ?? `correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+                    const url = `/data/${fileName}`;
                     const resp = await fetch(url);
                     if (!resp.ok) continue;
                     const data: AllTokensReport = await resp.json();
@@ -644,6 +649,7 @@ export function NewView({ metas }: Props) {
                 No all-tokens experiment files found.<br />
                 Run <code>python -m src.intervention_experiment --all-tokens</code> to generate<br />
                 <code>correlation_matching_results_test&#123;N&#125;_all_tokens.json</code>.
+                Suffixed files like <code>correlation_matching_results_test&#123;N&#125;_all_tokens_new.json</code> are also supported.
             </div>
         );
     }
@@ -663,7 +669,7 @@ export function NewView({ metas }: Props) {
                             className={`${styles.metaBtn} ${i === selectedMetaIdx ? styles.metaBtnActive : ''}`}
                             onClick={() => setSelectedMetaIdx(i)}
                         >
-                            test={m.testIdx}
+                            test={m.label ?? m.testIdx}
                         </button>
                     ))}
                 </div>

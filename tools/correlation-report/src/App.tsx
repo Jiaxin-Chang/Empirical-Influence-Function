@@ -17,6 +17,9 @@ interface ExperimentMeta {
 
 interface AllTokensMeta {
     testIdx: number;
+    suffix?: string;
+    label?: string;
+    fileName?: string;
 }
 
 interface Manifest {

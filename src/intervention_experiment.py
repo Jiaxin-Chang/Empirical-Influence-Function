@@ -5,6 +5,7 @@ import json
 import torch
 import torch.nn.functional as F
 import hashlib
+import time
 from functools import partial
 from heapq import nlargest
 from accelerate import Accelerator
@@ -348,62 +349,96 @@ def _load_or_build_prescreen_sketch_cache(
         return torch.load(cache_path, map_location="cpu")
 
     os.makedirs(cache_dir, exist_ok=True)
-    print(f"Building prescreen sketch cache: {cache_path}")
-    print("  First run is expected to be slow; later test samples reuse this file.")
-    sample_ids = []
-    sketch_chunks = []
-    empty_ignored = torch.tensor([], device=accelerator.device)
-    skipped_long = 0
+    lock_path = cache_path + ".lock"
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"pid={os.getpid()}\n")
+            break
+        except FileExistsError:
+            if os.path.exists(cache_path):
+                print(f"Loading prescreen sketch cache: {cache_path}")
+                return torch.load(cache_path, map_location="cpu")
+            try:
+                lock_age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                continue
+            if lock_age > 6 * 60 * 60:
+                print(f"Removing stale prescreen sketch cache lock: {lock_path}", flush=True)
+                os.remove(lock_path)
+                continue
+            print(f"Waiting for prescreen sketch cache lock: {lock_path}", flush=True)
+            time.sleep(15)
 
-    for batch in tqdm(train_loader, desc="Build Prescreen Sketch Cache", leave=False):
-        train_indices = batch["sample_index"].view(-1).tolist()
-        keep_rows = []
-        for row, train_idx in enumerate(train_indices):
-            if max_seq_len is not None:
-                seq_len = int(batch["attention_mask"][row].sum().item())
-                if seq_len > max_seq_len:
-                    skipped_long += 1
-                    continue
-            keep_rows.append(row)
+    tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+    try:
+        if os.path.exists(cache_path):
+            print(f"Loading prescreen sketch cache: {cache_path}")
+            return torch.load(cache_path, map_location="cpu")
 
-        if not keep_rows:
-            continue
+        print(f"Building prescreen sketch cache: {cache_path}")
+        print("  First run is expected to be slow; later test samples reuse this file.")
+        sample_ids = []
+        sketch_chunks = []
+        empty_ignored = torch.tensor([], device=accelerator.device)
+        skipped_long = 0
 
-        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
-        batch_kept = {
-            k: v.index_select(0, rows).to(accelerator.device)
-            for k, v in batch.items()
-            if isinstance(v, torch.Tensor) and k != "sample_index"
+        for batch in tqdm(train_loader, desc="Build Prescreen Sketch Cache", leave=False):
+            train_indices = batch["sample_index"].view(-1).tolist()
+            keep_rows = []
+            for row, train_idx in enumerate(train_indices):
+                if max_seq_len is not None:
+                    seq_len = int(batch["attention_mask"][row].sum().item())
+                    if seq_len > max_seq_len:
+                        skipped_long += 1
+                        continue
+                keep_rows.append(row)
+
+            if not keep_rows:
+                continue
+
+            rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
+            batch_kept = {
+                k: v.index_select(0, rows).to(accelerator.device)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor) and k != "sample_index"
+            }
+            sketches = compute_lm_head_ce_gradient_sketches_no_backward(
+                model=model,
+                batch=batch_kept,
+                device=accelerator.device,
+                ignored_token_ids=empty_ignored,
+                sketch_dim=sketch_dim,
+                sketch_seed=sketch_seed,
+            ).detach().cpu().to(torch.float16)
+
+            sample_ids.extend(int(train_indices[row]) for row in keep_rows)
+            sketch_chunks.append(sketches)
+            del batch_kept, sketches, rows
+
+        if not sketch_chunks:
+            print("Prescreen sketch cache is empty; falling back to exact scanning.")
+            return None
+
+        cache = {
+            "sample_ids": torch.tensor(sample_ids, dtype=torch.long),
+            "sketches": torch.cat(sketch_chunks, dim=0).contiguous(),
+            "sketch_dim": int(sketch_dim),
+            "sketch_seed": int(sketch_seed),
+            "max_seq_len": max_seq_len,
         }
-        sketches = compute_lm_head_ce_gradient_sketches_no_backward(
-            model=model,
-            batch=batch_kept,
-            device=accelerator.device,
-            ignored_token_ids=empty_ignored,
-            sketch_dim=sketch_dim,
-            sketch_seed=sketch_seed,
-        ).detach().cpu().to(torch.float16)
-
-        sample_ids.extend(int(train_indices[row]) for row in keep_rows)
-        sketch_chunks.append(sketches)
-        del batch_kept, sketches, rows
-
-    if not sketch_chunks:
-        print("Prescreen sketch cache is empty; falling back to exact scanning.")
-        return None
-
-    cache = {
-        "sample_ids": torch.tensor(sample_ids, dtype=torch.long),
-        "sketches": torch.cat(sketch_chunks, dim=0).contiguous(),
-        "sketch_dim": int(sketch_dim),
-        "sketch_seed": int(sketch_seed),
-        "max_seq_len": max_seq_len,
-    }
-    torch.save(cache, cache_path)
-    if skipped_long:
-        print(f"  Sketch cache skipped {skipped_long} samples longer than {max_seq_len} tokens.")
-    print(f"  Saved {cache['sketches'].size(0)} train sketches.")
-    return cache
+        torch.save(cache, tmp_path)
+        os.replace(tmp_path, cache_path)
+        if skipped_long:
+            print(f"  Sketch cache skipped {skipped_long} samples longer than {max_seq_len} tokens.")
+        print(f"  Saved {cache['sketches'].size(0)} train sketches.")
+        return cache
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
 
 
 def _score_prescreen_sketch_cache(
@@ -439,6 +474,7 @@ def run_causal_intervention_experiment(
     prescreen_sketch_dim: int = PRESCREEN_SKETCH_DIM,
     prescreen_sketch_seed: int = PRESCREEN_SKETCH_SEED,
     prescreen_sketch_cache_dir: str = PRESCREEN_SKETCH_CACHE_DIR,
+    output_suffix: str = "",
 ):
     accelerator = Accelerator()
     set_seed(SEED)
@@ -451,6 +487,9 @@ def run_causal_intervention_experiment(
     if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
         alti_grad_max_seq_len = None
     prescreen_sketch_dim = int(prescreen_sketch_dim or 0)
+    output_suffix = str(output_suffix or "").strip()
+    output_suffix = "".join(ch for ch in output_suffix if ch.isalnum() or ch in {"_", "-"})
+    output_suffix = output_suffix.strip("_")
     fine_match_proj = (fine_match_proj or FINE_MATCH_PROJ).lower()
     fine_match_projection_names = _fine_match_projection_names(fine_match_proj)
 
@@ -937,7 +976,11 @@ def run_causal_intervention_experiment(
                   f"'{r['test_correlation']['target_token']}' "
                   f"| cos_sim={r['cos_sim']:.4f}")
 
-        report_filename = f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_tok{TOKEN_INDEX_TO_RETRIEVE}.json"
+        suffix = f"_{output_suffix}" if output_suffix else ""
+        report_filename = (
+            f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_"
+            f"tok{TOKEN_INDEX_TO_RETRIEVE}{suffix}.json"
+        )
 
     # ════════════════════════════════════════════════════════════════════════════
     # ── ALL-TOKENS MODE ──────────────────────────────────────────────────────
@@ -1149,7 +1192,8 @@ def run_causal_intervention_experiment(
             "train_sample_details": train_sample_details,
         }
 
-        report_filename = f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_all_tokens.json"
+        suffix = f"_{output_suffix}" if output_suffix else ""
+        report_filename = f"correlation_matching_results_test{SELECTED_TEST_SAMPLE_INDEX}_all_tokens{suffix}.json"
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
     if accelerator.is_main_process:
@@ -1204,6 +1248,10 @@ if __name__ == "__main__":
         help="Directory used to store/reuse train coarse sketch caches.",
     )
     parser.add_argument(
+        "--output-suffix", type=str, default="",
+        help="Optional suffix appended before .json, e.g. new -> *_all_tokens_new.json.",
+    )
+    parser.add_argument(
         "--alti-grad-chunk-size", type=int, default=ALTI_GRAD_CHUNK_SIZE,
         help="Initial query chunk size for ALTI-gradient matching; OOM retries use smaller chunks.",
     )
@@ -1250,4 +1298,5 @@ if __name__ == "__main__":
         prescreen_sketch_dim=args.prescreen_sketch_dim,
         prescreen_sketch_seed=args.prescreen_sketch_seed,
         prescreen_sketch_cache_dir=args.prescreen_sketch_cache_dir,
+        output_suffix=args.output_suffix,
     )

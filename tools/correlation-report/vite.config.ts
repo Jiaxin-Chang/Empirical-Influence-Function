@@ -26,7 +26,12 @@ function experimentDataPlugin(): Plugin {
       hasCorrelation: boolean
     }[] = []
 
-    const allTokensExperiments: { testIdx: number }[] = []
+    const allTokensExperiments: {
+      testIdx: number
+      suffix: string
+      label: string
+      fileName: string
+    }[] = []
 
     let files: string[] = []
     try { files = readdirSync(DATA_ROOT) } catch { /* data root not accessible */ }
@@ -47,15 +52,24 @@ function experimentDataPlugin(): Plugin {
         continue
       }
 
-      // All-tokens mode: correlation_matching_results_test{N}_all_tokens.json
-      const ma = f.match(/^correlation_matching_results_test(\d+)_all_tokens\.json$/)
+      // All-tokens mode:
+      //   correlation_matching_results_test{N}_all_tokens.json
+      //   correlation_matching_results_test{N}_all_tokens_{suffix}.json
+      const ma = f.match(/^correlation_matching_results_test(\d+)_all_tokens(?:_([A-Za-z0-9_-]+))?\.json$/)
       if (ma) {
-        allTokensExperiments.push({ testIdx: parseInt(ma[1], 10) })
+        const testIdx = parseInt(ma[1], 10)
+        const suffix = ma[2] ?? ''
+        allTokensExperiments.push({
+          testIdx,
+          suffix,
+          label: suffix ? `${testIdx}_${suffix}` : `${testIdx}`,
+          fileName: f,
+        })
       }
     }
 
     experiments.sort((a, b) => a.testIdx - b.testIdx || a.tokIdx - b.tokIdx)
-    allTokensExperiments.sort((a, b) => a.testIdx - b.testIdx)
+    allTokensExperiments.sort((a, b) => a.testIdx - b.testIdx || a.suffix.localeCompare(b.suffix))
 
     return {
       experiments,
@@ -70,7 +84,7 @@ function experimentDataPlugin(): Plugin {
     const safe = filename.replace(/[/\\]/g, '').replace(/\.\./g, '')
     const allowed =
       /^(saliency_test\d+_tok\d+|correlation_matching_results_test\d+_tok\d+|latest_saliency|correlation_matching_results)\.json$/.test(safe) ||
-      /^correlation_matching_results_test\d+_all_tokens\.json$/.test(safe) ||
+      /^correlation_matching_results_test\d+_all_tokens(?:_[A-Za-z0-9_-]+)?\.json$/.test(safe) ||
       /^marked_code_samples\.md$/.test(safe)
     if (!allowed) return null
     const filePath = join(DATA_ROOT, safe)
@@ -129,7 +143,7 @@ function experimentDataPlugin(): Plugin {
 
       // All-tokens experiment files
       for (const exp of manifest.allTokensExperiments) {
-        const name = `correlation_matching_results_test${exp.testIdx}_all_tokens.json`
+        const name = exp.fileName
         const content = readDataFile(name)
         if (content) this.emitFile({ type: 'asset', fileName: `data/${name}`, source: content })
       }
