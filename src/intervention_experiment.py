@@ -228,6 +228,7 @@ COARSE_POOL_SIZE = 100
 PRESCREEN_BATCH_SIZE = 1       # Increase via --prescreen-batch-size when GPU memory allows
 PRESCREEN_SAMPLE_LIMIT = None  # Limit coarse prescreen scan for quick/debug runs
 PRESCREEN_MAX_SEQ_LEN = 3000   # Skip longer train samples during prescreen/rerank; <=0 disables
+PRESCREEN_LENGTH_SWEEP = (3000, 2500, 2000)  # Report skipped counts before prescreen starts
 PRESCREEN_SKETCH_DIM = 8192    # <=0 disables cached TensorSketch coarse retrieval
 PRESCREEN_SKETCH_SEED = 42
 PRESCREEN_SKETCH_CACHE_DIR = ".cache/prescreen_sketch"
@@ -429,6 +430,79 @@ def _format_prescreen_skip(train_indices: list[int], seq_lens: list[int]) -> str
         for idx, seq_len in zip(train_indices, seq_lens)
     )
     return pairs or "<empty>"
+
+
+def _dataset_item_seq_len(item) -> int:
+    attention_mask = item.get("attention_mask")
+    if attention_mask is not None:
+        if isinstance(attention_mask, torch.Tensor):
+            return int(attention_mask.sum().item())
+        return int(sum(attention_mask))
+
+    input_ids = item["input_ids"]
+    if isinstance(input_ids, torch.Tensor):
+        return int(input_ids.numel())
+    return len(input_ids)
+
+
+def _prescreen_length_sweep_report(
+    train_ds,
+    thresholds: tuple[int, ...] | list[int] | None,
+    active_max_seq_len: int | None,
+    accelerator,
+) -> list[dict]:
+    """Print and return how many tokenized train samples each length limit excludes."""
+    if not thresholds:
+        return []
+    if not accelerator.is_main_process:
+        return []
+
+    normalized = []
+    for limit in thresholds:
+        limit = int(limit)
+        if limit > 0 and limit not in normalized:
+            normalized.append(limit)
+    if active_max_seq_len is not None and active_max_seq_len > 0 and active_max_seq_len not in normalized:
+        normalized.append(int(active_max_seq_len))
+    normalized.sort(reverse=True)
+    if not normalized:
+        return []
+
+    lengths = [_dataset_item_seq_len(train_ds[i]) for i in range(len(train_ds))]
+    total = len(lengths)
+    if total == 0:
+        print("[DEBUG] Prescreen length sweep: train set is empty.", flush=True)
+        return []
+
+    stats = []
+    previous_skipped = None
+    print("\n=== Prescreen length-limit sweep ===", flush=True)
+    print(f"  Tokenized train samples: {total}", flush=True)
+    for limit in normalized:
+        skipped = sum(1 for length in lengths if length > limit)
+        kept = total - skipped
+        skipped_pct = 100.0 * skipped / total
+        kept_pct = 100.0 * kept / total
+        extra = 0 if previous_skipped is None else skipped - previous_skipped
+        current = "  <-- active" if active_max_seq_len == limit else ""
+        print(
+            f"  max_seq_len={limit:>5}: keep {kept:>6}/{total} ({kept_pct:5.1f}%), "
+            f"skip {skipped:>6} ({skipped_pct:5.1f}%), "
+            f"extra_vs_prev {extra:>6}{current}",
+            flush=True,
+        )
+        stats.append({
+            "max_seq_len": int(limit),
+            "kept": int(kept),
+            "skipped": int(skipped),
+            "kept_pct": kept_pct,
+            "skipped_pct": skipped_pct,
+            "extra_skipped_vs_previous": int(extra),
+            "active": active_max_seq_len == limit,
+        })
+        previous_skipped = skipped
+    print("=====================================\n", flush=True)
+    return stats
 
 
 def _screen_training_set(
@@ -744,6 +818,7 @@ def run_causal_intervention_experiment(
     prescreen_sketch_dim: int = PRESCREEN_SKETCH_DIM,
     prescreen_sketch_seed: int = PRESCREEN_SKETCH_SEED,
     prescreen_sketch_cache_dir: str = PRESCREEN_SKETCH_CACHE_DIR,
+    prescreen_length_sweep: tuple[int, ...] | list[int] | None = PRESCREEN_LENGTH_SWEEP,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -805,6 +880,12 @@ def run_causal_intervention_experiment(
     print("[DEBUG] Building train dataset...", flush=True)
     train_ds = build_train_dataset(train_samples, convert_to_chatml)
     print(f"[DEBUG] Train dataset built: {len(train_ds)} samples.", flush=True)
+    prescreen_length_sweep_stats = _prescreen_length_sweep_report(
+        train_ds,
+        prescreen_length_sweep,
+        prescreen_max_seq_len,
+        accelerator,
+    )
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(train_ds), batch_size=prescreen_batch_size, collate_fn=collator,
     )
@@ -1238,6 +1319,7 @@ def run_causal_intervention_experiment(
                     "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
+                    "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
                     "PRESCREEN_SKETCH_DIM":   prescreen_sketch_dim,
                     "PRESCREEN_SKETCH_SEED":  prescreen_sketch_seed,
                     "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
@@ -1379,6 +1461,7 @@ def run_causal_intervention_experiment(
                     "PRESCREEN_BATCH_SIZE": prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN": prescreen_max_seq_len,
+                    "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
                     "PRESCREEN_SKETCH_DIM": prescreen_sketch_dim,
                     "PRESCREEN_SKETCH_SEED": prescreen_sketch_seed,
                     "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
@@ -1572,6 +1655,7 @@ def run_causal_intervention_experiment(
                     "PRESCREEN_BATCH_SIZE":    prescreen_batch_size,
                     "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
                     "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
+                    "PRESCREEN_LENGTH_SWEEP":  prescreen_length_sweep_stats,
                     "PRESCREEN_SKETCH_DIM":    prescreen_sketch_dim,
                     "PRESCREEN_SKETCH_SEED":   prescreen_sketch_seed,
                     "PRESCREEN_SKETCH_CACHE":  prescreen_sketch_cache is not None,
@@ -1649,6 +1733,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--prescreen-length-sweep", type=str, default=",".join(str(x) for x in PRESCREEN_LENGTH_SWEEP),
+        help=(
+            "Comma-separated length limits to report before prescreen, e.g. 3000,2500,2000. "
+            "Use an empty string to disable the report."
+        ),
+    )
+    parser.add_argument(
         "--max-gpu-memory", type=str, default=None,
         help=(
             "Per-GPU max_memory passed to from_pretrained, e.g. 26GiB. "
@@ -1712,6 +1803,14 @@ if __name__ == "__main__":
     if args.top_k_source_per_target is not None:
         TOP_K_SOURCE_PER_TARGET = max(1, int(args.top_k_source_per_target))
 
+    prescreen_length_sweep = []
+    if args.prescreen_length_sweep.strip():
+        prescreen_length_sweep = [
+            int(x.strip())
+            for x in args.prescreen_length_sweep.split(",")
+            if x.strip()
+        ]
+
     mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
     print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
     run_causal_intervention_experiment(
@@ -1731,4 +1830,5 @@ if __name__ == "__main__":
         prescreen_sketch_dim=args.prescreen_sketch_dim,
         prescreen_sketch_seed=args.prescreen_sketch_seed,
         prescreen_sketch_cache_dir=args.prescreen_sketch_cache_dir,
+        prescreen_length_sweep=prescreen_length_sweep,
     )
