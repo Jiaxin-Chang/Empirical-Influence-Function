@@ -408,6 +408,29 @@ def _gather_scores(
     ))
 
 
+def _is_cuda_alloc_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+        or "cublascreate" in msg
+        or "cuda error: cublas" in msg
+    )
+
+
+def _clear_cuda_after_oom():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _format_prescreen_skip(train_indices: list[int], seq_lens: list[int]) -> str:
+    pairs = ", ".join(
+        f"{int(idx)}(len={int(seq_len)})"
+        for idx, seq_len in zip(train_indices, seq_lens)
+    )
+    return pairs or "<empty>"
+
+
 def _screen_training_set(
     model,
     test_ce_grad: torch.Tensor,   # flat tensor already on lm_head_device
@@ -422,15 +445,16 @@ def _screen_training_set(
     sample_scores: list[tuple[int, float]] = []
     empty_ignored = torch.tensor([], device=accel_device)
     skipped_long = 0
+    skipped_oom = 0
 
     for batch in tqdm(train_loader, desc=desc, leave=False):
         train_indices = batch["sample_index"].view(-1).tolist()
         keep_rows = []
         for row, train_idx in enumerate(train_indices):
+            seq_len = int(batch["attention_mask"][row].sum().item())
             if allowed_indices is not None and train_idx not in allowed_indices:
                 continue
             if max_seq_len is not None:
-                seq_len = int(batch["attention_mask"][row].sum().item())
                 if seq_len > max_seq_len:
                     skipped_long += 1
                     continue
@@ -439,27 +463,56 @@ def _screen_training_set(
         if not keep_rows:
             continue
 
-        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
-        batch_kept = {
-            k: v.index_select(0, rows).to(accel_device)
-            for k, v in batch.items()
-            if isinstance(v, torch.Tensor) and k != "sample_index"
-        }
-        scores = compute_lm_head_ce_gradient_scores_no_backward(
-            model=model,
-            batch=batch_kept,
-            device=accel_device,
-            ignored_token_ids=empty_ignored,
-            test_ce_grad=test_ce_grad,
-            score_device=lm_head_device,
-        )
-        for row, score in zip(keep_rows, scores):
-            sample_scores.append((int(train_indices[row]), float(score)))
+        pending_groups = [keep_rows]
+        while pending_groups:
+            group_rows = pending_groups.pop()
+            rows = torch.tensor(group_rows, dtype=torch.long, device=batch["input_ids"].device)
+            batch_kept = {
+                k: v.index_select(0, rows).to(accel_device)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor) and k != "sample_index"
+            }
+            try:
+                scores = compute_lm_head_ce_gradient_scores_no_backward(
+                    model=model,
+                    batch=batch_kept,
+                    device=accel_device,
+                    ignored_token_ids=empty_ignored,
+                    test_ce_grad=test_ce_grad,
+                    score_device=lm_head_device,
+                )
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if not _is_cuda_alloc_error(exc):
+                    raise
+                del batch_kept, rows
+                _clear_cuda_after_oom()
+                if len(group_rows) > 1:
+                    pending_groups.extend([[row] for row in reversed(group_rows)])
+                    print(
+                        f"[WARN] {desc}: OOM on batch of {len(group_rows)} samples; "
+                        "retrying one sample at a time.",
+                        flush=True,
+                    )
+                    continue
 
-        del batch_kept, scores, rows
+                skipped_oom += 1
+                row = group_rows[0]
+                print(
+                    f"[WARN] {desc}: skipping train sample after OOM: "
+                    f"{_format_prescreen_skip([train_indices[row]], [int(batch['attention_mask'][row].sum().item())])}",
+                    flush=True,
+                )
+                continue
+
+            for row, score in zip(group_rows, scores):
+                sample_scores.append((int(train_indices[row]), float(score)))
+
+            del batch_kept, scores, rows
 
     if skipped_long:
         print(f"[DEBUG] {desc}: skipped {skipped_long} samples longer than {max_seq_len} tokens.", flush=True)
+    if skipped_oom:
+        print(f"[WARN] {desc}: skipped {skipped_oom} samples after CUDA OOM.", flush=True)
 
     return sample_scores
 
@@ -547,13 +600,14 @@ def _load_or_build_prescreen_sketch_cache(
     sketch_chunks = []
     empty_ignored = torch.tensor([], device=accelerator.device)
     skipped_long = 0
+    skipped_oom = 0
 
     for batch in tqdm(train_loader, desc="Build Prescreen Sketch Cache", leave=False):
         train_indices = batch["sample_index"].view(-1).tolist()
         keep_rows = []
         for row, train_idx in enumerate(train_indices):
+            seq_len = int(batch["attention_mask"][row].sum().item())
             if max_seq_len is not None:
-                seq_len = int(batch["attention_mask"][row].sum().item())
                 if seq_len > max_seq_len:
                     skipped_long += 1
                     continue
@@ -562,24 +616,50 @@ def _load_or_build_prescreen_sketch_cache(
         if not keep_rows:
             continue
 
-        rows = torch.tensor(keep_rows, dtype=torch.long, device=batch["input_ids"].device)
-        batch_kept = {
-            k: v.index_select(0, rows).to(accelerator.device)
-            for k, v in batch.items()
-            if isinstance(v, torch.Tensor) and k != "sample_index"
-        }
-        sketches = compute_lm_head_ce_gradient_sketches_no_backward(
-            model=model,
-            batch=batch_kept,
-            device=accelerator.device,
-            ignored_token_ids=empty_ignored,
-            sketch_dim=sketch_dim,
-            sketch_seed=sketch_seed,
-        ).detach().cpu().to(torch.float16)
+        pending_groups = [keep_rows]
+        while pending_groups:
+            group_rows = pending_groups.pop()
+            rows = torch.tensor(group_rows, dtype=torch.long, device=batch["input_ids"].device)
+            batch_kept = {
+                k: v.index_select(0, rows).to(accelerator.device)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor) and k != "sample_index"
+            }
+            try:
+                sketches = compute_lm_head_ce_gradient_sketches_no_backward(
+                    model=model,
+                    batch=batch_kept,
+                    device=accelerator.device,
+                    ignored_token_ids=empty_ignored,
+                    sketch_dim=sketch_dim,
+                    sketch_seed=sketch_seed,
+                ).detach().cpu().to(torch.float16)
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if not _is_cuda_alloc_error(exc):
+                    raise
+                del batch_kept, rows
+                _clear_cuda_after_oom()
+                if len(group_rows) > 1:
+                    pending_groups.extend([[row] for row in reversed(group_rows)])
+                    print(
+                        "[WARN] Build Prescreen Sketch Cache: OOM on batch of "
+                        f"{len(group_rows)} samples; retrying one sample at a time.",
+                        flush=True,
+                    )
+                    continue
 
-        sample_ids.extend(int(train_indices[row]) for row in keep_rows)
-        sketch_chunks.append(sketches)
-        del batch_kept, sketches, rows
+                skipped_oom += 1
+                row = group_rows[0]
+                print(
+                    "[WARN] Build Prescreen Sketch Cache: skipping train sample after OOM: "
+                    f"{_format_prescreen_skip([train_indices[row]], [int(batch['attention_mask'][row].sum().item())])}",
+                    flush=True,
+                )
+                continue
+
+            sample_ids.extend(int(train_indices[row]) for row in group_rows)
+            sketch_chunks.append(sketches)
+            del batch_kept, sketches, rows
 
     if not sketch_chunks:
         print("Prescreen sketch cache is empty; falling back to exact scanning.")
@@ -595,6 +675,8 @@ def _load_or_build_prescreen_sketch_cache(
     torch.save(cache, cache_path)
     if skipped_long:
         print(f"  Sketch cache skipped {skipped_long} samples longer than {max_seq_len} tokens.")
+    if skipped_oom:
+        print(f"  Sketch cache skipped {skipped_oom} samples after CUDA OOM.")
     print(f"  Saved {cache['sketches'].size(0)} train sketches.")
     return cache
 
@@ -605,6 +687,7 @@ def _score_prescreen_sketch_cache(
     device,
     *,
     allowed_indices: set[int] | None = None,
+    chunk_size: int = 4096,
 ) -> list[tuple[int, float]]:
     ids = cache["sample_ids"]
     sketches = cache["sketches"]
@@ -617,8 +700,31 @@ def _score_prescreen_sketch_cache(
         return []
 
     q = F.normalize(query_sketch.to(device=device, dtype=torch.float32), dim=0, eps=1e-12)
-    scores = sketches.to(device=device, dtype=torch.float32).matmul(q)
-    return list(zip(ids.cpu().tolist(), scores.detach().cpu().tolist()))
+    score_chunks = []
+    chunk_size = max(1, int(chunk_size))
+    start = 0
+    while start < sketches.size(0):
+        cur_chunk_size = min(chunk_size, sketches.size(0) - start)
+        while True:
+            try:
+                sketch_chunk = sketches[start:start + cur_chunk_size].to(device=device, dtype=torch.float32)
+                score_chunks.append(sketch_chunk.matmul(q).detach().cpu())
+                del sketch_chunk
+                break
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if not _is_cuda_alloc_error(exc) or cur_chunk_size == 1:
+                    raise
+                _clear_cuda_after_oom()
+                cur_chunk_size = max(1, cur_chunk_size // 2)
+                print(
+                    "[WARN] Prescreen sketch scoring OOM; "
+                    f"retrying with chunk_size={cur_chunk_size}.",
+                    flush=True,
+                )
+        start += cur_chunk_size
+    scores = torch.cat(score_chunks, dim=0)
+    del q, score_chunks
+    return list(zip(ids.cpu().tolist(), scores.tolist()))
 
 
 def run_causal_intervention_experiment(
@@ -769,15 +875,6 @@ def run_causal_intervention_experiment(
         if 1 not in chunks:
             chunks.append(1)
         return chunks
-
-    def _is_cuda_alloc_error(exc: BaseException) -> bool:
-        msg = str(exc).lower()
-        return (
-            "out of memory" in msg
-            or "cublas_status_alloc_failed" in msg
-            or "cublascreate" in msg
-            or "cuda error: cublas" in msg
-        )
 
     def _compute_alti_correlation_gradient_retry(**kwargs):
         target_idx = int(kwargs["target_idx_in_seq"])
