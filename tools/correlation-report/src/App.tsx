@@ -16,7 +16,7 @@ interface ExperimentMeta {
 }
 
 interface AllTokensMeta {
-    testIdx: number;
+    taskId: string;
 }
 
 interface Manifest {
