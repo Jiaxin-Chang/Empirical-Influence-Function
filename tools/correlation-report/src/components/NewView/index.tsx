@@ -330,6 +330,8 @@ function TrainSampleGroup({
 
 export interface AllTokensExperimentMeta {
     taskId: string;
+    label: string;
+    fileName: string;
 }
 
 interface Props {
@@ -355,7 +357,7 @@ export function NewView({ metas }: Props) {
     useEffect(() => {
         if (metas.length === 0) return;
         const meta = metas[selectedMetaIdx] ?? metas[0];
-        const url  = `/data/correlation_matching_results_${meta.taskId}_all_tokens.json`;
+        const url  = `/data/${meta.fileName}`;
 
         setLoading(true);
         setLoadError(false);
@@ -454,7 +456,7 @@ export function NewView({ metas }: Props) {
                             className={`${styles.metaBtn} ${i === selectedMetaIdx ? styles.metaBtnActive : ''}`}
                             onClick={() => setSelectedMetaIdx(i)}
                         >
-                            {m.taskId}
+                            {m.label}
                         </button>
                     ))}
                 </div>
