@@ -17,6 +17,8 @@ interface ExperimentMeta {
 
 interface AllTokensMeta {
     taskId: string;
+    label: string;
+    fileName: string;
 }
 
 interface Manifest {

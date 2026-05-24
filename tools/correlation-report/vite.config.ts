@@ -26,7 +26,7 @@ function experimentDataPlugin(): Plugin {
       hasCorrelation: boolean
     }[] = []
 
-    const allTokensExperiments: { taskId: string }[] = []
+    const allTokensExperiments: { taskId: string; label: string; fileName: string }[] = []
 
     let files: string[] = []
     try { files = readdirSync(DATA_ROOT) } catch { /* data root not accessible */ }
@@ -50,7 +50,7 @@ function experimentDataPlugin(): Plugin {
       // All-tokens mode: correlation_matching_results_{taskId}_all_tokens.json
       const ma = f.match(/^correlation_matching_results_(.+)_all_tokens\.json$/)
       if (ma) {
-        allTokensExperiments.push({ taskId: ma[1] })
+        allTokensExperiments.push({ taskId: ma[1], label: ma[1], fileName: f })
       }
     }
 
@@ -70,7 +70,7 @@ function experimentDataPlugin(): Plugin {
     const safe = filename.replace(/[/\\]/g, '').replace(/\.\./g, '')
     const allowed =
       /^(saliency_test\d+_tok\d+|correlation_matching_results_test\d+_tok\d+|latest_saliency|correlation_matching_results)\.json$/.test(safe) ||
-      /^correlation_matching_results_[\w\-.]+_all_tokens\.json$/.test(safe) ||
+      /^correlation_matching_results_.+_all_tokens\.json$/.test(safe) ||
       /^marked_code_samples\.md$/.test(safe)
     if (!allowed) return null
     const filePath = join(DATA_ROOT, safe)
@@ -129,9 +129,8 @@ function experimentDataPlugin(): Plugin {
 
       // All-tokens experiment files
       for (const exp of manifest.allTokensExperiments) {
-        const name = `correlation_matching_results_${exp.taskId}_all_tokens.json`
-        const content = readDataFile(name)
-        if (content) this.emitFile({ type: 'asset', fileName: `data/${name}`, source: content })
+        const content = readDataFile(exp.fileName)
+        if (content) this.emitFile({ type: 'asset', fileName: `data/${exp.fileName}`, source: content })
       }
 
       if (manifest.hasLegacySaliency) {
