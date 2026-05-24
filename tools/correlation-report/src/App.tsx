@@ -286,23 +286,8 @@ function App() {
         );
     }
 
-    if (manifest.experiments.length === 0 && !manifest.hasLegacySaliency) {
-        return (
-            <div className="app-root">
-                <header className="app-header"><h1>Attribution Analysis</h1></header>
-                <section className="analysis-section">
-                    <div className="section-header">
-                        <p className="no-data" style={{ marginTop: '16px' }}>
-                            No experiment files found. Run <code>NIF.py</code> to generate{' '}
-                            <code>saliency_test&#123;N&#125;_tok&#123;tok&#125;.json</code>.
-                        </p>
-                    </div>
-                </section>
-            </div>
-        );
-    }
-
     const allTokensMetas = manifest.allTokensExperiments ?? [];
+    const hasLegacyData = manifest.experiments.length > 0 || manifest.hasLegacySaliency;
 
     return (
         <div className="app-root">
@@ -331,37 +316,48 @@ function App() {
 
             {/* ── Legacy View ── */}
             {viewMode === 'legacy' && (
-                <>
-                    <ExperimentSelector
-                        metas={manifest.experiments}
-                        currentIndex={experimentIndex}
-                        loading={loadingExp}
-                        onChange={idx => setExperimentIndex(idx)}
-                    />
+                !hasLegacyData ? (
+                    <section className="analysis-section">
+                        <div className="section-header">
+                            <p className="no-data" style={{ marginTop: '16px' }}>
+                                No experiment files found. Run <code>NIF.py</code> to generate{' '}
+                                <code>saliency_test&#123;N&#125;_tok&#123;tok&#125;.json</code>.
+                            </p>
+                        </div>
+                    </section>
+                ) : (
+                    <>
+                        <ExperimentSelector
+                            metas={manifest.experiments}
+                            currentIndex={experimentIndex}
+                            loading={loadingExp}
+                            onChange={idx => setExperimentIndex(idx)}
+                        />
 
-                    {loadingExp && (
-                        <section className="analysis-section">
-                            <p className="no-data" style={{ marginTop: '16px' }}>Loading experiment data…</p>
-                        </section>
-                    )}
+                        {loadingExp && (
+                            <section className="analysis-section">
+                                <p className="no-data" style={{ marginTop: '16px' }}>Loading experiment data…</p>
+                            </section>
+                        )}
 
-                    {!loadingExp && experimentEntry && (() => {
-                        const expData = parseExperimentData(experimentEntry);
-                        return (
-                            <>
-                                <OverfitSection key={`overfit-${experimentIndex}`} expData={expData} />
-                                <TrainSampleSection
-                                    key={`train-${experimentIndex}`}
-                                    expData={expData}
-                                    gptBlocks={gptBlocks}
-                                />
-                                {expData.correlationData && (
-                                    <CausalInterventionSection reportData={expData.correlationData} />
-                                )}
-                            </>
-                        );
-                    })()}
-                </>
+                        {!loadingExp && experimentEntry && (() => {
+                            const expData = parseExperimentData(experimentEntry);
+                            return (
+                                <>
+                                    <OverfitSection key={`overfit-${experimentIndex}`} expData={expData} />
+                                    <TrainSampleSection
+                                        key={`train-${experimentIndex}`}
+                                        expData={expData}
+                                        gptBlocks={gptBlocks}
+                                    />
+                                    {expData.correlationData && (
+                                        <CausalInterventionSection reportData={expData.correlationData} />
+                                    )}
+                                </>
+                            );
+                        })()}
+                    </>
+                )
             )}
         </div>
     );

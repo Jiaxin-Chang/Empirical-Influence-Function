@@ -88,7 +88,7 @@ function experimentDataPlugin(): Plugin {
       }
       const m = (req.url as string)?.match(/^\/data\/([^?]+)/)
       if (m) {
-        const content = readDataFile(m[1])
+        const content = readDataFile(decodeURIComponent(m[1]))
         if (content !== null) {
           const isJson = m[1].endsWith('.json')
           res.setHeader('Content-Type', isJson ? 'application/json' : 'text/plain; charset=utf-8')
@@ -129,8 +129,9 @@ function experimentDataPlugin(): Plugin {
 
       // All-tokens experiment files
       for (const exp of manifest.allTokensExperiments) {
-        const content = readDataFile(exp.fileName)
-        if (content) this.emitFile({ type: 'asset', fileName: `data/${exp.fileName}`, source: content })
+        const name = exp.fileName
+        const content = readDataFile(name)
+        if (content) this.emitFile({ type: 'asset', fileName: `data/${name}`, source: content })
       }
 
       if (manifest.hasLegacySaliency) {
