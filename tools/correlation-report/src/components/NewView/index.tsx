@@ -329,7 +329,7 @@ function TrainSampleGroup({
 // ─── Main NewView Component ───────────────────────────────────────────────────
 
 export interface AllTokensExperimentMeta {
-    testIdx: number;
+    taskId: string;
 }
 
 interface Props {
@@ -355,7 +355,7 @@ export function NewView({ metas }: Props) {
     useEffect(() => {
         if (metas.length === 0) return;
         const meta = metas[selectedMetaIdx] ?? metas[0];
-        const url  = `/data/correlation_matching_results_test${meta.testIdx}_all_tokens.json`;
+        const url  = `/data/correlation_matching_results_${meta.taskId}_all_tokens.json`;
 
         setLoading(true);
         setLoadError(false);
@@ -454,7 +454,7 @@ export function NewView({ metas }: Props) {
                             className={`${styles.metaBtn} ${i === selectedMetaIdx ? styles.metaBtnActive : ''}`}
                             onClick={() => setSelectedMetaIdx(i)}
                         >
-                            test={m.testIdx}
+                            {m.taskId}
                         </button>
                     ))}
                 </div>
