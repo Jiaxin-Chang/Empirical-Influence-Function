@@ -3,6 +3,7 @@ import './App.css';
 import { SwitchTokenCodeBlock } from './components/SwitchTokenCodeBlock';
 import { CausalInterventionSection } from './components/CausalIntervention';
 import { NewView } from './components/NewView';
+import { LegacySaliencyView } from './components/LegacySaliencyView';
 
 /* ------------------------------------------------------------------ */
 /* Manifest types (matches vite.config.ts plugin output)              */
@@ -21,9 +22,14 @@ interface AllTokensMeta {
     fileName: string;
 }
 
+interface LegacySampleMeta {
+    sampleId: string;
+}
+
 interface Manifest {
     experiments: ExperimentMeta[];
     allTokensExperiments: AllTokensMeta[];
+    legacySamples: LegacySampleMeta[];
     hasLegacySaliency: boolean;
     hasLegacyCorrelation: boolean;
     hasMarkedCode: boolean;
@@ -168,7 +174,7 @@ function ExperimentSelector({
 /* App                                                                */
 /* ------------------------------------------------------------------ */
 
-type ViewMode = 'new' | 'legacy';
+type ViewMode = 'new' | 'legacy' | 'saliency';
 
 function App() {
     const [viewMode, setViewMode] = useState<ViewMode>('new');
@@ -306,6 +312,14 @@ function App() {
                     >
                         Legacy View
                     </button>
+                    {(manifest.legacySamples ?? []).length > 0 && (
+                        <button
+                            className={`view-toggle-btn${viewMode === 'saliency' ? ' active' : ''}`}
+                            onClick={() => setViewMode('saliency')}
+                        >
+                            Saliency
+                        </button>
+                    )}
                 </div>
             </header>
 
@@ -358,6 +372,11 @@ function App() {
                         })()}
                     </>
                 )
+            )}
+
+            {/* ── Saliency View ── */}
+            {viewMode === 'saliency' && (
+                <LegacySaliencyView samples={manifest.legacySamples ?? []} />
             )}
         </div>
     );

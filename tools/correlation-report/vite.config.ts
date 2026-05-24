@@ -4,7 +4,8 @@ import { readdirSync, existsSync, readFileSync } from 'fs'
 import { resolve, join } from 'path'
 
 // ── Repo root where JSON experiment files live ────────────────────────────────
-const DATA_ROOT = resolve(__dirname, '../../')
+const DATA_ROOT   = resolve(__dirname, '../../')
+const LEGACY_DIR  = resolve(DATA_ROOT, 'legacy_by_sample')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // experimentDataPlugin
@@ -27,6 +28,20 @@ function experimentDataPlugin(): Plugin {
     }[] = []
 
     const allTokensExperiments: { taskId: string; label: string; fileName: string }[] = []
+    const legacySamples: { sampleId: string }[] = []
+
+    // Read legacy_by_sample/manifest.json
+    const legacyManifestPath = join(LEGACY_DIR, 'manifest.json')
+    if (existsSync(legacyManifestPath)) {
+      try {
+        const lm = JSON.parse(readFileSync(legacyManifestPath, 'utf-8'))
+        for (const s of lm.samples ?? []) {
+          if (typeof s.sample_id === 'string' && /^[\w\-]+$/.test(s.sample_id)) {
+            legacySamples.push({ sampleId: s.sample_id })
+          }
+        }
+      } catch { /* ignore */ }
+    }
 
     let files: string[] = []
     try { files = readdirSync(DATA_ROOT) } catch { /* data root not accessible */ }
@@ -60,6 +75,7 @@ function experimentDataPlugin(): Plugin {
     return {
       experiments,
       allTokensExperiments,
+      legacySamples,
       hasLegacySaliency:    existsSync(join(DATA_ROOT, 'latest_saliency.json')),
       hasLegacyCorrelation: existsSync(join(DATA_ROOT, 'correlation_matching_results.json')),
       hasMarkedCode:        existsSync(join(DATA_ROOT, 'marked_code_samples.md')),
@@ -78,6 +94,13 @@ function experimentDataPlugin(): Plugin {
     return readFileSync(filePath, 'utf-8')
   }
 
+  function readLegacySaliency(sampleId: string): string | null {
+    if (!/^[\w\-]+$/.test(sampleId)) return null
+    const filePath = join(LEGACY_DIR, sampleId, 'latest_saliency.json')
+    if (!existsSync(filePath)) return null
+    return readFileSync(filePath, 'utf-8')
+  }
+
   function addMiddleware(server: { middlewares: { use: (fn: (req: any, res: any, next: () => void) => void) => void } }) {
     server.middlewares.use((req: any, res: any, next: () => void) => {
       if (req.url === '/data/index.json') {
@@ -85,6 +108,17 @@ function experimentDataPlugin(): Plugin {
         res.setHeader('Cache-Control', 'no-cache')
         res.end(JSON.stringify(buildManifest()))
         return
+      }
+      // Legacy saliency: /data/legacy/<sampleId>/latest_saliency.json
+      const legacyM = (req.url as string)?.match(/^\/data\/legacy\/([^/?]+)\/latest_saliency\.json/)
+      if (legacyM) {
+        const content = readLegacySaliency(decodeURIComponent(legacyM[1]))
+        if (content !== null) {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(content)
+          return
+        }
       }
       const m = (req.url as string)?.match(/^\/data\/([^?]+)/)
       if (m) {
@@ -145,6 +179,18 @@ function experimentDataPlugin(): Plugin {
       if (manifest.hasMarkedCode) {
         const c = readDataFile('marked_code_samples.md')
         if (c) this.emitFile({ type: 'asset', fileName: 'data/marked_code_samples.md', source: c })
+      }
+
+      // Legacy saliency files
+      for (const s of manifest.legacySamples) {
+        const content = readLegacySaliency(s.sampleId)
+        if (content) {
+          this.emitFile({
+            type: 'asset',
+            fileName: `data/legacy/${s.sampleId}/latest_saliency.json`,
+            source: content,
+          })
+        }
       }
     },
   }
