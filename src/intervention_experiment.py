@@ -1023,7 +1023,7 @@ def run_causal_intervention_experiment(
 
             response_start = find_first_valid_token_index(tokenizer, tr_batch["input_ids"], start_sys)
             tr_seq_len     = tr_batch["input_ids"].size(1)
-            full_tokens    = tokenizer.convert_ids_to_tokens(tr_batch["input_ids"][0].tolist())
+            full_tokens    = [tokenizer.decode([i]) for i in tr_batch["input_ids"][0].tolist()]
             target_saliencies: dict[int, list[float]] = {}
             candidate_pairs: list[tuple[float, int, int]] = []
 
@@ -1400,7 +1400,7 @@ def run_causal_intervention_experiment(
             valid_label_positions = torch.where(labels_1d.ne(-100))[0]
             answer_start = int(valid_label_positions[0].item()) if valid_label_positions.numel() else 0
             prescreen_train_details[str(int(train_idx))] = {
-                "full_tokens": tokenizer.convert_ids_to_tokens(ids_1d.tolist()),
+                "full_tokens": [tokenizer.decode([i]) for i in ids_1d.tolist()],
                 "answer_start_index": answer_start,
                 "coarse_cos_sim": float(coarse_score),
                 "saliencies_by_token": {},
