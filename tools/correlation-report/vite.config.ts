@@ -4,8 +4,9 @@ import { readdirSync, existsSync, readFileSync } from 'fs'
 import { resolve, join } from 'path'
 
 // ── Repo root where JSON experiment files live ────────────────────────────────
-const DATA_ROOT   = resolve(__dirname, '../../')
-const LEGACY_DIR  = resolve(DATA_ROOT, 'legacy_by_sample')
+const DATA_ROOT         = resolve(__dirname, '../../')
+const LEGACY_DIR        = resolve(DATA_ROOT, 'legacy_by_sample')
+const MODEL_COMPARE_DIR = resolve(DATA_ROOT, 'legacy_by_model_sample')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // experimentDataPlugin
@@ -29,6 +30,26 @@ function experimentDataPlugin(): Plugin {
 
     const allTokensExperiments: { taskId: string; label: string; fileName: string }[] = []
     const legacySamples: { sampleId: string }[] = []
+
+    // Read legacy_by_model_sample/manifest.json
+    interface ModelInfo { slug: string; name: string }
+    const modelCompare: { models: ModelInfo[]; sampleIds: string[]; oursSlug: string } | null = (() => {
+      const mp = join(MODEL_COMPARE_DIR, 'manifest.json')
+      if (!existsSync(mp)) return null
+      try {
+        const mm = JSON.parse(readFileSync(mp, 'utf-8'))
+        const models: ModelInfo[] = (mm.models ?? [])
+          .filter((m: any) => typeof m.model_slug === 'string' && /^[\w\-]+$/.test(m.model_slug))
+          .map((m: any) => ({ slug: m.model_slug as string, name: m.model_name as string }))
+        const oursSlug = models.find(m => m.slug === 'ours_graphsignal')?.slug ?? models[0]?.slug ?? ''
+        // Collect sample IDs from the ours directory
+        const oursDir = join(MODEL_COMPARE_DIR, oursSlug)
+        const sampleIds = existsSync(oursDir)
+          ? readdirSync(oursDir).filter(d => /^[\w\-]+$/.test(d))
+          : []
+        return models.length > 0 && sampleIds.length > 0 ? { models, sampleIds, oursSlug } : null
+      } catch { return null }
+    })()
 
     // Read legacy_by_sample/manifest.json
     const legacyManifestPath = join(LEGACY_DIR, 'manifest.json')
@@ -76,6 +97,7 @@ function experimentDataPlugin(): Plugin {
       experiments,
       allTokensExperiments,
       legacySamples,
+      modelCompare,
       hasLegacySaliency:    existsSync(join(DATA_ROOT, 'latest_saliency.json')),
       hasLegacyCorrelation: existsSync(join(DATA_ROOT, 'correlation_matching_results.json')),
       hasMarkedCode:        existsSync(join(DATA_ROOT, 'marked_code_samples.md')),
@@ -94,6 +116,13 @@ function experimentDataPlugin(): Plugin {
     return readFileSync(filePath, 'utf-8')
   }
 
+  function readModelSaliency(slug: string, sampleId: string): string | null {
+    if (!/^[\w\-]+$/.test(slug) || !/^[\w\-]+$/.test(sampleId)) return null
+    const filePath = join(MODEL_COMPARE_DIR, slug, sampleId, 'latest_saliency.json')
+    if (!existsSync(filePath)) return null
+    return readFileSync(filePath, 'utf-8')
+  }
+
   function readLegacySaliency(sampleId: string): string | null {
     if (!/^[\w\-]+$/.test(sampleId)) return null
     const filePath = join(LEGACY_DIR, sampleId, 'latest_saliency.json')
@@ -108,6 +137,17 @@ function experimentDataPlugin(): Plugin {
         res.setHeader('Cache-Control', 'no-cache')
         res.end(JSON.stringify(buildManifest()))
         return
+      }
+      // Model compare: /data/model-sample/<slug>/<sampleId>/latest_saliency.json
+      const modelM = (req.url as string)?.match(/^\/data\/model-sample\/([^/?]+)\/([^/?]+)\/latest_saliency\.json/)
+      if (modelM) {
+        const content = readModelSaliency(decodeURIComponent(modelM[1]), decodeURIComponent(modelM[2]))
+        if (content !== null) {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(content)
+          return
+        }
       }
       // Legacy saliency: /data/legacy/<sampleId>/latest_saliency.json
       const legacyM = (req.url as string)?.match(/^\/data\/legacy\/([^/?]+)\/latest_saliency\.json/)
@@ -179,6 +219,22 @@ function experimentDataPlugin(): Plugin {
       if (manifest.hasMarkedCode) {
         const c = readDataFile('marked_code_samples.md')
         if (c) this.emitFile({ type: 'asset', fileName: 'data/marked_code_samples.md', source: c })
+      }
+
+      // Model compare files
+      if (manifest.modelCompare) {
+        for (const model of manifest.modelCompare.models) {
+          for (const sampleId of manifest.modelCompare.sampleIds) {
+            const content = readModelSaliency(model.slug, sampleId)
+            if (content) {
+              this.emitFile({
+                type: 'asset',
+                fileName: `data/model-sample/${model.slug}/${sampleId}/latest_saliency.json`,
+                source: content,
+              })
+            }
+          }
+        }
       }
 
       // Legacy saliency files
