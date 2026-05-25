@@ -524,7 +524,7 @@ export function NewView({ metas }: Props) {
         if (metas.length === 0 || selectedMetaIdx === null) return;
         const meta = metas[selectedMetaIdx];
         if (!meta) return;
-        const url  = `/data/${meta.fileName}`;
+        const url  = `/data/results/${meta.fileName}`;
 
         setLoading(true);
         setLoadError(false);
@@ -616,7 +616,7 @@ export function NewView({ metas }: Props) {
             const parts: string[] = [];
             for (const meta of metas) {
                 try {
-                    const url = `/data/${meta.fileName}`;
+                    const url = `/data/results/${meta.fileName}`;
                     const resp = await fetch(url);
                     if (!resp.ok) continue;
                     const data: AllTokensReport = await resp.json();

@@ -4,15 +4,16 @@ import { readdirSync, existsSync, readFileSync } from 'fs'
 import { resolve, join } from 'path'
 
 // ── Repo root where JSON experiment files live ────────────────────────────────
-const DATA_ROOT         = resolve(__dirname, '../../')
-const MODEL_COMPARE_DIR = resolve(DATA_ROOT, 'legacy_by_model_sample')
+const DATA_ROOT          = resolve(__dirname, '../../')
+const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
+const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // experimentDataPlugin
 //
 // Dev / Preview server:
-//   GET /data/index.json                            → manifest
-//   GET /data/<filename>.json                       → all-tokens correlation files
+//   GET /data/index.json                             → manifest
+//   GET /data/results/<filename>.json                → correlation result files
 //   GET /data/model-sample/<slug>/<sampleId>/latest_saliency.json
 //
 // Build:
@@ -42,14 +43,14 @@ function experimentDataPlugin(): Plugin {
     })()
 
     let files: string[] = []
-    try { files = readdirSync(DATA_ROOT) } catch { /* data root not accessible */ }
+    try { files = readdirSync(CORR_RESULTS_DIR) } catch { /* directory not present */ }
 
     for (const f of files) {
-      // All-tokens mode: correlation_matching_results_{taskId}_all_tokens.json
-      const ma = f.match(/^correlation_matching_results_(.+)_all_tokens\.json$/)
-      if (ma) {
-        allTokensExperiments.push({ taskId: ma[1], label: ma[1], fileName: f })
-      }
+      if (!f.endsWith('.json')) continue
+      // Use stem as taskId; strip trailing _all_tokens if present for cleaner display
+      const stem = f.slice(0, -5)
+      const taskId = stem.endsWith('_all_tokens') ? stem.slice(0, -11) : stem
+      allTokensExperiments.push({ taskId, label: taskId, fileName: f })
     }
 
     allTokensExperiments.sort((a, b) => a.taskId.localeCompare(b.taskId))
@@ -59,8 +60,8 @@ function experimentDataPlugin(): Plugin {
 
   function readDataFile(filename: string): string | null {
     const safe = filename.replace(/[/\\]/g, '').replace(/\.\./g, '')
-    if (!/^correlation_matching_results_.+_all_tokens\.json$/.test(safe)) return null
-    const filePath = join(DATA_ROOT, safe)
+    if (!safe.endsWith('.json') || safe.includes('/') || safe.includes('\\')) return null
+    const filePath = join(CORR_RESULTS_DIR, safe)
     if (!existsSync(filePath)) return null
     return readFileSync(filePath, 'utf-8')
   }
@@ -91,10 +92,10 @@ function experimentDataPlugin(): Plugin {
           return
         }
       }
-      // All-tokens correlation files
-      const m = (req.url as string)?.match(/^\/data\/([^?]+)/)
-      if (m) {
-        const content = readDataFile(decodeURIComponent(m[1]))
+      // All-tokens correlation files: /data/results/<filename>.json
+      const resultsM = (req.url as string)?.match(/^\/data\/results\/([^/?]+\.json)/)
+      if (resultsM) {
+        const content = readDataFile(decodeURIComponent(resultsM[1]))
         if (content !== null) {
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Cache-Control', 'no-cache')
@@ -123,7 +124,7 @@ function experimentDataPlugin(): Plugin {
       // All-tokens experiment files
       for (const exp of manifest.allTokensExperiments) {
         const content = readDataFile(exp.fileName)
-        if (content) this.emitFile({ type: 'asset', fileName: `data/${exp.fileName}`, source: content })
+        if (content) this.emitFile({ type: 'asset', fileName: `data/results/${exp.fileName}`, source: content })
       }
 
       // Model compare files
