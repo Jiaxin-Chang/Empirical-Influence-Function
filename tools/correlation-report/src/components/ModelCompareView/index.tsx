@@ -212,7 +212,8 @@ export function ModelCompareView({ meta }: Props) {
 
     const [selectedSampleIdx, setSelectedSampleIdx] = useState(0);
     const [selectedBaselineSlug, setSelectedBaselineSlug] = useState(baselineModels[0]?.slug ?? '');
-    const [selectedTargetIdx, setSelectedTargetIdx] = useState<number | null>(null);
+    const [oursTargetIdx, setOursTargetIdx]   = useState<number | null>(null);
+    const [baseTargetIdx, setBaseTargetIdx]   = useState<number | null>(null);
 
     const [oursReport, setOursReport]         = useState<LegacyReport | null>(null);
     const [oursLoading, setOursLoading]       = useState(false);
@@ -227,7 +228,7 @@ export function ModelCompareView({ meta }: Props) {
     useEffect(() => {
         if (!sampleId || !meta.oursSlug) return;
         setOursLoading(true); setOursError(false); setOursReport(null);
-        setSelectedTargetIdx(null);
+        setOursTargetIdx(null);
         fetch(`/data/model-sample/${encodeURIComponent(meta.oursSlug)}/${encodeURIComponent(sampleId)}/latest_saliency.json`)
             .then(r => { if (!r.ok) throw new Error(); return r.json(); })
             .then((d: LegacyReport) => { setOursReport(d); setOursLoading(false); })
@@ -238,7 +239,7 @@ export function ModelCompareView({ meta }: Props) {
     useEffect(() => {
         if (!sampleId || !selectedBaselineSlug) return;
         setBaseLoading(true); setBaseError(false); setBaseReport(null);
-        setSelectedTargetIdx(null);
+        setBaseTargetIdx(null);
         fetch(`/data/model-sample/${encodeURIComponent(selectedBaselineSlug)}/${encodeURIComponent(sampleId)}/latest_saliency.json`)
             .then(r => { if (!r.ok) throw new Error(); return r.json(); })
             .then((d: LegacyReport) => { setBaseReport(d); setBaseLoading(false); })
@@ -275,26 +276,18 @@ export function ModelCompareView({ meta }: Props) {
                             <button
                                 key={m.slug}
                                 className={`${styles.methodBtn} ${m.slug === selectedBaselineSlug ? styles.methodBtnActive : ''}`}
-                                onClick={() => { setSelectedBaselineSlug(m.slug); setSelectedTargetIdx(null); }}
+                                onClick={() => { setSelectedBaselineSlug(m.slug); setBaseTargetIdx(null); }}
                             >
                                 {m.name}
                             </button>
                         ))}
                     </div>
                 </div>
-
-                {selectedTargetIdx !== null && (
-                    <div className={styles.controlGroup}>
-                        <button className={styles.clearBtn} onClick={() => setSelectedTargetIdx(null)}>
-                            Clear selection (idx {selectedTargetIdx})
-                        </button>
-                    </div>
-                )}
             </div>
 
             {/* ── Hint ── */}
             <div className={styles.hint}>
-                Click a <span style={{ color: '#a6e3a1', textDecoration: 'underline dashed' }}>response token</span> (underlined green) on either side — both panels sync to the same target.
+                Click a <span style={{ color: '#a6e3a1', textDecoration: 'underline dashed' }}>response token</span> (underlined green) to highlight source tokens. Each panel is independent.
             </div>
 
             {/* ── Two-column panels ── */}
@@ -305,8 +298,8 @@ export function ModelCompareView({ meta }: Props) {
                     report={baseReport}
                     loading={baseLoading}
                     loadError={baseError}
-                    selectedTargetIdx={selectedTargetIdx}
-                    onTargetSelect={setSelectedTargetIdx}
+                    selectedTargetIdx={baseTargetIdx}
+                    onTargetSelect={setBaseTargetIdx}
                 />
                 <SaliencyPanel
                     title={`${oursName} (Ours)`}
@@ -314,8 +307,8 @@ export function ModelCompareView({ meta }: Props) {
                     report={oursReport}
                     loading={oursLoading}
                     loadError={oursError}
-                    selectedTargetIdx={selectedTargetIdx}
-                    onTargetSelect={setSelectedTargetIdx}
+                    selectedTargetIdx={oursTargetIdx}
+                    onTargetSelect={setOursTargetIdx}
                 />
             </div>
         </div>
