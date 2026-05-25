@@ -148,7 +148,7 @@ function SaliencyPanel({
                             else if (isTarget) cls += ' ' + styles.tokenTarget;
                             else cls += ' ' + styles.tokenResponse;
 
-                            const style = (!isSelected && !isPrompt && !isTarget)
+                            const style = (activeScores && !isSelected)
                                 ? saliencyStyle(score) : undefined;
 
                             return (
