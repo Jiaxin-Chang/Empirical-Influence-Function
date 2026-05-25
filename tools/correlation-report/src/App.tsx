@@ -4,6 +4,7 @@ import { SwitchTokenCodeBlock } from './components/SwitchTokenCodeBlock';
 import { CausalInterventionSection } from './components/CausalIntervention';
 import { NewView } from './components/NewView';
 import { LegacySaliencyView } from './components/LegacySaliencyView';
+import { ModelCompareView } from './components/ModelCompareView';
 
 /* ------------------------------------------------------------------ */
 /* Manifest types (matches vite.config.ts plugin output)              */
@@ -26,10 +27,17 @@ interface LegacySampleMeta {
     sampleId: string;
 }
 
+interface ModelCompareMeta {
+    models: { slug: string; name: string }[];
+    sampleIds: string[];
+    oursSlug: string;
+}
+
 interface Manifest {
     experiments: ExperimentMeta[];
     allTokensExperiments: AllTokensMeta[];
     legacySamples: LegacySampleMeta[];
+    modelCompare: ModelCompareMeta | null;
     hasLegacySaliency: boolean;
     hasLegacyCorrelation: boolean;
     hasMarkedCode: boolean;
@@ -174,7 +182,7 @@ function ExperimentSelector({
 /* App                                                                */
 /* ------------------------------------------------------------------ */
 
-type ViewMode = 'new' | 'legacy' | 'saliency';
+type ViewMode = 'new' | 'legacy' | 'saliency' | 'compare';
 
 function App() {
     const [viewMode, setViewMode] = useState<ViewMode>('new');
@@ -320,6 +328,14 @@ function App() {
                             Saliency
                         </button>
                     )}
+                    {manifest.modelCompare && (
+                        <button
+                            className={`view-toggle-btn${viewMode === 'compare' ? ' active' : ''}`}
+                            onClick={() => setViewMode('compare')}
+                        >
+                            Compare
+                        </button>
+                    )}
                 </div>
             </header>
 
@@ -377,6 +393,11 @@ function App() {
             {/* ── Saliency View ── */}
             {viewMode === 'saliency' && (
                 <LegacySaliencyView samples={manifest.legacySamples ?? []} />
+            )}
+
+            {/* ── Compare View ── */}
+            {viewMode === 'compare' && manifest.modelCompare && (
+                <ModelCompareView meta={manifest.modelCompare} />
             )}
         </div>
     );
