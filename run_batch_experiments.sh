@@ -12,6 +12,7 @@
 #   --model-path  PATH   Path to the model checkpoint directory
 #   --train-data  FILE   Training JSONL  (default: sft_train.jsonl)
 #   --test-data   FILE   Test JSONL      (default: sft_test.jsonl)
+#   --indices     LIST   Comma/space-separated sample indices to run, e.g. 3,17,58
 #   --start-idx   N      Start from sample index N (default: 0, for resume)
 #   --end-idx     N      Stop after sample index N (inclusive, default: last)
 #
@@ -26,6 +27,11 @@
 #   bash run_batch_experiments.sh \
 #       --model-path /data/models/Qwen3-Coder-30B-Instruct \
 #       --start-idx 10
+#
+#   # Run only selected samples
+#   bash run_batch_experiments.sh \
+#       --model-path /data/models/Qwen3-Coder-30B-Instruct \
+#       --indices 3,17,58
 # =============================================================================
 
 set -uo pipefail   # -e intentionally omitted: one sample failing won't stop the batch
@@ -36,6 +42,7 @@ set -uo pipefail   # -e intentionally omitted: one sample failing won't stop the
 MODEL_PATH="${MODEL_PATH:-}"
 TRAIN_DATA="${TRAIN_DATA:-sft_train.jsonl}"
 TEST_DATA="${TEST_DATA:-sft_test.jsonl}"
+INDICES="${INDICES:-}"        # comma/space-separated explicit test sample indices
 START_IDX="${START_IDX:-0}"
 END_IDX="${END_IDX:-}"          # empty = auto-detect from file
 TRAIN_LIMIT="${TRAIN_LIMIT:-}"  # empty = use all training samples
@@ -63,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --model-path) MODEL_PATH="$2";  shift 2 ;;
         --train-data) TRAIN_DATA="$2";  shift 2 ;;
         --test-data)  TEST_DATA="$2";   shift 2 ;;
+        --indices)    INDICES="$2";     shift 2 ;;
         --start-idx)  START_IDX="$2";   shift 2 ;;
         --end-idx)    END_IDX="$2";     shift 2 ;;
         --train-limit) TRAIN_LIMIT="$2"; shift 2 ;;
@@ -124,6 +132,32 @@ if [[ -z "$END_IDX" ]]; then
     END_IDX=$((TOTAL - 1))
 fi
 
+if [[ -n "$INDICES" ]]; then
+    # Accept "3,17,58" or "3 17 58". Empty chunks are ignored.
+    IFS=', ' read -r -a RUN_INDICES <<< "$INDICES"
+else
+    mapfile -t RUN_INDICES < <(seq "$START_IDX" "$END_IDX")
+fi
+
+VALID_RUN_INDICES=()
+for IDX in "${RUN_INDICES[@]}"; do
+    [[ -z "$IDX" ]] && continue
+    if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then
+        echo "[batch] ERROR: invalid sample index: $IDX"
+        exit 1
+    fi
+    if (( IDX < 0 || IDX >= TOTAL )); then
+        echo "[batch] ERROR: sample index out of range: $IDX (valid: 0..$((TOTAL - 1)))"
+        exit 1
+    fi
+    VALID_RUN_INDICES+=("$IDX")
+done
+
+if [[ ${#VALID_RUN_INDICES[@]} -eq 0 ]]; then
+    echo "[batch] ERROR: no sample indices selected."
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Setup log directory
 # ---------------------------------------------------------------------------
@@ -136,7 +170,11 @@ echo "  Batch Experiment Runner  (all-tokens mode)"
 echo "  model     : ${MODEL_PATH}"
 echo "  train data: ${TRAIN_DATA}"
 echo "  test data : ${TEST_DATA}  (${TOTAL} samples)"
-echo "  range     : [${START_IDX}, ${END_IDX}]"
+if [[ -n "$INDICES" ]]; then
+    echo "  indices   : ${VALID_RUN_INDICES[*]}"
+else
+    echo "  range     : [${START_IDX}, ${END_IDX}]"
+fi
 echo "  train_limit: ${TRAIN_LIMIT:-all}"
 echo "  attention : ${ATTN_IMPLEMENTATION:-auto}"
 echo "  prescreen max seq len: ${PRESCREEN_MAX_SEQ_LEN:-default}"
@@ -157,7 +195,7 @@ N_SKIP=0
 N_FAIL=0
 FAILED_INDICES=()
 
-for IDX in $(seq "$START_IDX" "$END_IDX"); do
+for IDX in "${VALID_RUN_INDICES[@]}"; do
     TASK_ID="${TASK_IDS[$IDX]}"
     RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${TASK_ID}_all_tokens.json"
 
