@@ -754,7 +754,7 @@ class NewInferenceFunction:
         topk_map = [
             [
                 list(zip(
-                    self.tokenizer.convert_ids_to_tokens(ids.tolist()),
+                    [self.tokenizer.decode([i]) for i in ids.tolist()],
                     vals.tolist()
                 ))
                 for ids, vals in zip(step_ids, step_vals)
@@ -800,18 +800,18 @@ class NewInferenceFunction:
             full_gen_ids = gen_ids[i].tolist()
 
             pred_ids.append(continuation)
-            pred_tokens.append(self.tokenizer.convert_ids_to_tokens(continuation))
+            pred_tokens.append([self.tokenizer.decode([i]) for i in continuation])
             pred_text.append(self.tokenizer.decode(continuation))
 
-            pred_full_tokens.append(self.tokenizer.convert_ids_to_tokens(full_gen_ids))
+            pred_full_tokens.append([self.tokenizer.decode([i]) for i in full_gen_ids])
             pred_full_text.append(self.tokenizer.decode(full_gen_ids))
 
             valid_ids = input_ids[i, :int(attention_mask[i].sum().item())].tolist()
-            full_tokens.append(self.tokenizer.convert_ids_to_tokens(valid_ids))
+            full_tokens.append([self.tokenizer.decode([i]) for i in valid_ids])
             full_text.append(self.tokenizer.decode(valid_ids))
 
             ans_ids = input_ids[i, prompt_len:int(attention_mask[i].sum().item())].tolist()
-            answer_tokens.append(self.tokenizer.convert_ids_to_tokens(ans_ids))
+            answer_tokens.append([self.tokenizer.decode([i]) for i in ans_ids])
             answer_text.append(self.tokenizer.decode(ans_ids))
 
         return {
