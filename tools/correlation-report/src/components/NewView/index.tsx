@@ -1,5 +1,24 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import styles from './NewView.module.css';
+
+const TTAV_PREFS_KEY = 'eif:ttav-launch-prefs';
+const TTAV_PREPARED_BUNDLES_KEY = 'eif:ttav-prepared-bundles';
+const DEFAULT_TTAV_URL = 'http://1.94.115.154/';
+const DEFAULT_TTAV_CONTENT_PATH_TEMPLATE = '/root/project/Dataset/eif_bundles/{sampleId}';
+const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/home/yilu/workspace/Empirical-Influence-Function/ttav_bundles/{sampleId}';
+const DEFAULT_TTAV_METHOD = 'TimeVis';
+const DEFAULT_TTAV_VIS_ID = '1';
+function getDefaultEifApiUrl(): string {
+    if (typeof window === 'undefined') {
+        return 'http://127.0.0.1:8765/api/prepare-ttav-bundle';
+    }
+
+    const protocol = window.location.protocol || 'http:';
+    const hostname = window.location.hostname || '127.0.0.1';
+    return `${protocol}//${hostname}:8765/api/prepare-ttav-bundle`;
+}
+
+const DEFAULT_EIF_API_URL = getDefaultEifApiUrl();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -60,6 +79,247 @@ interface AllTokensReport {
     train_sample_details: Record<string, TrainSampleDetail>;
 }
 
+interface TtavLaunchPrefs {
+    ttavUrl: string;
+    contentPathTemplate: string;
+    eifBundleCacheTemplate: string;
+    visMethod: string;
+    visId: string;
+    eifApiUrl: string;
+}
+
+interface TtavJumpPayload {
+    source: 'eif';
+    sampleId: string;
+    contentPath: string;
+    visMethod: string;
+    visId: string;
+    dataType: 'Text';
+    taskType: 'Alignment';
+    selectedIndices: number[];
+    targetIndex?: number;
+    selectedSourceIndex?: number;
+    promptLen: number;
+}
+
+interface TtavStaticBundlePayload {
+    sample_id: string;
+    vis_method: string;
+    vis_id: string;
+    overwrite: boolean;
+    bundle: {
+        model: string;
+        classes: string[];
+        sample_index: number;
+        prompt_len: number;
+        labels: number[];
+        text_list: string[];
+        text_data: string[];
+        token_list: string[];
+        index: { train: number[]; test: number[] };
+        embeddings: number[][];
+        projection: number[][];
+    };
+}
+
+interface PreparedTtavBundleRecord {
+    sampleId: string;
+    contentPath: string;
+    visMethod: string;
+    visId: string;
+    preparedAt: number;
+}
+
+interface TtavHighlightUpdateMessage {
+    command: 'eifHighlightUpdate';
+    data: TtavJumpPayload;
+}
+
+interface TtavLoadVisualizationMessage {
+    command: 'loadVisualization';
+    data: {
+        contentPath: string;
+        visualizationMethod: string;
+        visualizationID: string;
+        dataType: 'Text';
+        taskType: 'Alignment';
+        visConfig: { gpu_id: number };
+    };
+}
+
+interface EifPrepareStatusPayload {
+    status: 'success';
+    sampleId: string;
+    stage: string;
+    message: string;
+    active: boolean;
+    error: boolean;
+    updatedAt: number;
+}
+
+function loadPreparedTtavBundles(): Record<string, PreparedTtavBundleRecord> {
+    if (typeof window === 'undefined') return {};
+
+    try {
+        const raw = window.localStorage.getItem(TTAV_PREPARED_BUNDLES_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw) as Record<string, PreparedTtavBundleRecord>;
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function savePreparedTtavBundle(record: PreparedTtavBundleRecord) {
+    if (typeof window === 'undefined') return;
+
+    const current = loadPreparedTtavBundles();
+    current[record.sampleId] = record;
+    window.localStorage.setItem(TTAV_PREPARED_BUNDLES_KEY, JSON.stringify(current));
+}
+
+function getPreparedTtavBundle(sampleId: string): PreparedTtavBundleRecord | null {
+    const current = loadPreparedTtavBundles();
+    return current[sampleId] ?? null;
+}
+
+async function loadPrecomputedRealBundle(sampleId: string, visMethod: string, visId: string): Promise<TtavStaticBundlePayload> {
+    const bundleResp = await fetch(`/data/real-bundles/${encodeURIComponent(sampleId)}/bundle_payload.json`, {
+        cache: 'no-store',
+    });
+
+    if (!bundleResp.ok) {
+        throw new Error(`Precomputed real bundle not found for ${sampleId} (HTTP ${bundleResp.status}).`);
+    }
+
+    const payload = await bundleResp.json() as TtavStaticBundlePayload;
+    return {
+        ...payload,
+        sample_id: sampleId,
+        vis_method: visMethod,
+        vis_id: visId,
+        overwrite: true,
+    };
+}
+
+function buildEifPrepareStatusUrl(apiUrl: string, sampleId: string): string {
+    const url = new URL(apiUrl.trim());
+    url.pathname = '/api/prepare-ttav-bundle-status';
+    url.search = '';
+    url.searchParams.set('sampleId', sampleId);
+    return url.toString();
+}
+
+async function fetchEifPrepareStatus(
+    apiUrl: string,
+    sampleId: string,
+    timeoutMs = 3000,
+): Promise<EifPrepareStatusPayload | null> {
+    if (!apiUrl.trim() || !sampleId) return null;
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const resp = await fetch(buildEifPrepareStatusUrl(apiUrl, sampleId), {
+            cache: 'no-store',
+            signal: controller.signal,
+        });
+        if (!resp.ok) return null;
+
+        const payload = await resp.json() as Partial<EifPrepareStatusPayload> & { status?: string };
+    if (payload.status !== 'success' || typeof payload.message !== 'string' || typeof payload.sampleId !== 'string') {
+        return null;
+    }
+
+        return {
+            status: 'success',
+            sampleId: payload.sampleId,
+            stage: typeof payload.stage === 'string' ? payload.stage : 'unknown',
+            message: payload.message,
+            active: payload.active === true,
+            error: payload.error === true,
+            updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : Date.now(),
+        };
+    } catch {
+        return null;
+    } finally {
+        window.clearTimeout(timeoutId);
+    }
+}
+
+function loadTtavLaunchPrefs(): TtavLaunchPrefs {
+    const fallbackPrefs: TtavLaunchPrefs = {
+        ttavUrl: DEFAULT_TTAV_URL,
+        contentPathTemplate: DEFAULT_TTAV_CONTENT_PATH_TEMPLATE,
+        eifBundleCacheTemplate: DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE,
+        visMethod: DEFAULT_TTAV_METHOD,
+        visId: DEFAULT_TTAV_VIS_ID,
+        eifApiUrl: DEFAULT_EIF_API_URL,
+    };
+
+    if (typeof window === 'undefined') {
+        return fallbackPrefs;
+    }
+
+    try {
+        const raw = window.localStorage.getItem(TTAV_PREFS_KEY);
+        if (!raw) throw new Error('missing prefs');
+        const parsed = JSON.parse(raw) as Partial<TtavLaunchPrefs>;
+
+        const legacyUrl = parsed.ttavUrl?.includes('localhost:5174');
+        const legacyMethod = parsed.visMethod?.trim().toUpperCase() === 'UMAP';
+        const legacyPath = parsed.contentPathTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/');
+        const legacyEifCachePath = parsed.eifBundleCacheTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/')
+            || parsed.eifBundleCacheTemplate?.includes('/root/project/Empirical-Influence-Function/ttav_bundles/');
+        const defaultApiHost = new URL(DEFAULT_EIF_API_URL).host;
+        const parsedApiHost = parsed.eifApiUrl ? (() => {
+            try {
+                return new URL(parsed.eifApiUrl).host;
+            } catch {
+                return '';
+            }
+        })() : '';
+        const legacyApiUrl = parsed.eifApiUrl?.includes('124.70.161.19:8765')
+            || parsed.eifApiUrl?.includes('0.0.0.0:8765')
+            || parsed.eifApiUrl?.includes('127.0.0.1:8765')
+            || parsed.eifApiUrl?.includes('localhost:8765')
+            || (parsedApiHost !== '' && parsedApiHost !== defaultApiHost);
+
+        return {
+            ttavUrl: legacyUrl ? DEFAULT_TTAV_URL : (parsed.ttavUrl || DEFAULT_TTAV_URL),
+            contentPathTemplate: legacyPath
+                ? DEFAULT_TTAV_CONTENT_PATH_TEMPLATE
+                : (parsed.contentPathTemplate || DEFAULT_TTAV_CONTENT_PATH_TEMPLATE),
+            eifBundleCacheTemplate: legacyEifCachePath
+                ? DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE
+                : (parsed.eifBundleCacheTemplate || DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE),
+            visMethod: legacyMethod ? DEFAULT_TTAV_METHOD : (parsed.visMethod || DEFAULT_TTAV_METHOD),
+            visId: parsed.visId || DEFAULT_TTAV_VIS_ID,
+            eifApiUrl: legacyApiUrl ? DEFAULT_EIF_API_URL : (parsed.eifApiUrl || DEFAULT_EIF_API_URL),
+        };
+    } catch {
+        return fallbackPrefs;
+    }
+}
+
+function resolveContentPath(template: string, sampleId: string): string {
+    return template
+        .replaceAll('{sampleId}', sampleId)
+        .replaceAll('{taskId}', sampleId);
+}
+
+function inferSampleIdFromMeta(meta: AllTokensExperimentMeta, report?: AllTokensReport | null): string {
+    const fileStem = meta.fileName.replace(/\.json$/i, '');
+    const match = fileStem.match(/^correlation_matching_results_(.+?)_all_tokens(?:_(.+))?$/);
+    if (match) {
+        const prefix = match[1];
+        const suffix = match[2];
+        return suffix ? `${prefix}_${suffix}` : prefix;
+    }
+    return meta.taskId || meta.label || (report ? `test${report.experiment_meta.test_sample_index}` : fileStem);
+}
+
 // ─── Token helpers ────────────────────────────────────────────────────────────
 
 function decodeToken(t: string): string {
@@ -85,6 +345,22 @@ function cosSimilarityColor(s: number): { bg: string; fg: string } {
     if (s > 0.3) return { bg: '#fef9c3', fg: '#854d0e' };
     return { bg: '#fee2e2', fg: '#b91c1c' };
 }
+
+function shouldFallbackToDirectPrepare(message: string): boolean {
+    const lower = message.toLowerCase();
+    return lower.includes('failed to fetch')
+        || lower.includes('networkerror')
+        || lower.includes('load failed')
+        || lower.includes('not found')
+        || lower.includes('http 404')
+        || lower.includes('http 500')
+        || lower.includes('http 502')
+        || lower.includes('http 503')
+        || lower.includes('http 504')
+        || lower.includes('eif local bundle cache not found')
+        || lower.includes('non-json response');
+}
+
 
 // ─── Export helpers ───────────────────────────────────────────────────────────
 
@@ -518,6 +794,20 @@ export function NewView({ metas }: Props) {
     const [rangeTo, setRangeTo] = useState(0);
     const [exportBatch, setExportBatch] = useState(false);
     const [exporting, setExporting] = useState(false);
+    const [ttavUrl, setTtavUrl] = useState(() => loadTtavLaunchPrefs().ttavUrl);
+    const [ttavContentPathTemplate] = useState(() => loadTtavLaunchPrefs().contentPathTemplate);
+    const [eifBundleCacheTemplate, setEifBundleCacheTemplate] = useState(() => loadTtavLaunchPrefs().eifBundleCacheTemplate);
+    const [ttavVisMethod, setTtavVisMethod] = useState(() => loadTtavLaunchPrefs().visMethod);
+    const [ttavVisId, setTtavVisId] = useState(() => loadTtavLaunchPrefs().visId);
+    const [eifApiUrl] = useState(() => loadTtavLaunchPrefs().eifApiUrl);
+    const [ttavLaunchError, setTtavLaunchError] = useState<string | null>(null);
+    const [ttavLaunchStatus, setTtavLaunchStatus] = useState<string | null>(null);
+    const [ttavPrepareDetail, setTtavPrepareDetail] = useState<string | null>(null);
+    const [preparingTtavBundle, setPreparingTtavBundle] = useState(false);
+    const [showAdvancedTtav, setShowAdvancedTtav] = useState(false);
+    const ttavWindowRef = useRef<Window | null>(null);
+    const ttavWindowOriginRef = useRef<string | null>(null);
+    const ttavWindowSampleIdRef = useRef<string | null>(null);
 
     // Load report when meta selection changes
     useEffect(() => {
@@ -541,9 +831,26 @@ export function NewView({ metas }: Props) {
     // Reset test correlation state when selected token changes
     useEffect(() => { setSelectedTestCorrIdx(null); }, [selectedTokIdx]);
 
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        window.localStorage.setItem(TTAV_PREFS_KEY, JSON.stringify({
+            ttavUrl,
+            contentPathTemplate: ttavContentPathTemplate,
+            eifBundleCacheTemplate,
+            visMethod: ttavVisMethod,
+            visId: ttavVisId,
+            eifApiUrl,
+        } satisfies TtavLaunchPrefs));
+    }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl]);
+
     const modelTokens   = useMemo(() => report ? decodeTokens(report.test_sample_baseline.full_tokens) : [], [report]);
     const correctTokens = useMemo(() => report ? decodeTokens(report.test_sample_baseline.correct_full_tokens ?? []) : [], [report]);
     const promptLen     = report?.test_sample_baseline.prompt_len ?? 0;
+    const selectedMeta  = selectedMetaIdx !== null ? metas[selectedMetaIdx] ?? null : null;
+    const selectedSampleId = selectedMeta ? inferSampleIdFromMeta(selectedMeta, report) : '';
+    const resolvedEifBundleCachePath = selectedSampleId
+        ? resolveContentPath(eifBundleCacheTemplate, selectedSampleId)
+        : '';
 
     // Map from token index → PerTokenResult for quick lookup
     const perTokenMap = useMemo(() => {
@@ -563,6 +870,13 @@ export function NewView({ metas }: Props) {
         if (selectedTestCorrIdx !== null) return new Set([selectedTestCorrIdx]);
         return new Set(selectedResult.top_correlations.map(c => c.source_token_index));
     }, [selectedResult, selectedTestCorrIdx]);
+
+    const ttavSelectedIndices = useMemo(() => {
+        const selected = new Set<number>();
+        if (selectedTokIdx !== null) selected.add(selectedTokIdx);
+        sourceHighlightIndices.forEach(idx => selected.add(idx));
+        return Array.from(selected).sort((a, b) => a - b);
+    }, [selectedTokIdx, sourceHighlightIndices]);
 
     // Pairs to show in the right panel
     const allDisplayPairs = useMemo(() => {
@@ -610,6 +924,78 @@ export function NewView({ metas }: Props) {
         }
     }, [report]);
 
+    const buildCurrentTtavPayload = (): TtavJumpPayload | null => {
+        if (!report || !selectedMeta) return null;
+
+        const sampleId = selectedSampleId;
+        const preparedBundle = getPreparedTtavBundle(sampleId);
+        const visMethod = preparedBundle?.visMethod || (ttavVisMethod.trim() || DEFAULT_TTAV_METHOD);
+        const visId = preparedBundle?.visId || (ttavVisId.trim() || DEFAULT_TTAV_VIS_ID);
+        const contentPath = preparedBundle?.contentPath || resolveContentPath(ttavContentPathTemplate, sampleId);
+
+        return {
+            source: 'eif',
+            sampleId,
+            contentPath,
+            visMethod,
+            visId,
+            dataType: 'Text',
+            taskType: 'Alignment',
+            selectedIndices: ttavSelectedIndices,
+            targetIndex: selectedTokIdx ?? undefined,
+            selectedSourceIndex: selectedTestCorrIdx ?? undefined,
+            promptLen,
+        };
+    };
+
+    const postTtavHighlightUpdate = (payload?: TtavJumpPayload | null) => {
+        const ttavWindow = ttavWindowRef.current;
+        const ttavOrigin = ttavWindowOriginRef.current;
+        const nextPayload = payload ?? buildCurrentTtavPayload();
+
+        if (!ttavWindow || !ttavOrigin || ttavWindow.closed || !nextPayload) {
+            return;
+        }
+
+        if (ttavWindowSampleIdRef.current && ttavWindowSampleIdRef.current !== nextPayload.sampleId) {
+            return;
+        }
+
+        const message: TtavHighlightUpdateMessage = {
+            command: 'eifHighlightUpdate',
+            data: nextPayload,
+        };
+        ttavWindow.postMessage(message, ttavOrigin);
+    };
+
+    const postTtavLoadVisualization = (payload: TtavJumpPayload): boolean => {
+        const ttavWindow = ttavWindowRef.current;
+        const ttavOrigin = ttavWindowOriginRef.current;
+
+        if (!ttavWindow || !ttavOrigin || ttavWindow.closed) {
+            return false;
+        }
+
+        const message: TtavLoadVisualizationMessage = {
+            command: 'loadVisualization',
+            data: {
+                contentPath: payload.contentPath,
+                visualizationMethod: payload.visMethod,
+                visualizationID: payload.visId,
+                dataType: payload.dataType,
+                taskType: payload.taskType,
+                visConfig: { gpu_id: -1 },
+            },
+        };
+        ttavWindow.postMessage(message, ttavOrigin);
+        ttavWindowSampleIdRef.current = payload.sampleId;
+        window.setTimeout(() => {
+            postTtavHighlightUpdate(payload);
+        }, 1200);
+        ttavWindow.focus();
+        return true;
+    };
+
     const handleExport = async () => {
         if (exportBatch && metas.length > 1) {
             setExporting(true);
@@ -635,6 +1021,355 @@ export function NewView({ metas }: Props) {
                 cosSimThreshold: threshold, hideZero,
             });
             downloadMarkdown(md, `attribution_report_test${report.experiment_meta.test_sample_index}.md`);
+        }
+    };
+
+    const reserveTtavWindow = (targetUrl: string): Window | null => {
+        const targetOrigin = new URL(targetUrl).origin;
+        const openedWindow = window.open('', '_blank');
+        if (!openedWindow) return null;
+
+        ttavWindowRef.current = openedWindow;
+        ttavWindowOriginRef.current = targetOrigin;
+        ttavWindowSampleIdRef.current = null;
+        return openedWindow;
+    };
+
+    const openTtavWithPayload = (payload: TtavJumpPayload) => {
+        const url = new URL(ttavUrl.trim());
+        url.searchParams.set('eif_jump', JSON.stringify(payload));
+
+        const existingWindow = ttavWindowRef.current;
+        const sameOriginWindow = existingWindow
+            && !existingWindow.closed
+            && ttavWindowOriginRef.current === url.origin;
+
+        if (sameOriginWindow) {
+            const existingHref = (() => {
+                try {
+                    return existingWindow.location.href;
+                } catch {
+                    return '';
+                }
+            })();
+            const isReservedBlankWindow = existingHref === 'about:blank';
+
+            if (isReservedBlankWindow) {
+                existingWindow.location.href = url.toString();
+                ttavWindowSampleIdRef.current = payload.sampleId;
+                window.setTimeout(() => {
+                    postTtavHighlightUpdate(payload);
+                }, 1200);
+                existingWindow.focus();
+                return;
+            }
+
+            if (postTtavLoadVisualization(payload)) {
+                return;
+            }
+        }
+
+        const openedWindow = window.open(url.toString(), '_blank');
+        if (!openedWindow) return;
+
+        ttavWindowRef.current = openedWindow;
+        ttavWindowOriginRef.current = url.origin;
+        ttavWindowSampleIdRef.current = payload.sampleId;
+
+        window.setTimeout(() => {
+            postTtavHighlightUpdate(payload);
+        }, 1200);
+    };
+
+    const callEifBundleApi = async (requireCached: boolean) => {
+        if (!report || !selectedMeta) return null;
+
+        const sampleId = selectedSampleId;
+        const trimmedApiUrl = eifApiUrl.trim();
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+
+        if (!trimmedApiUrl) {
+            throw new Error('EIF API URL is required.');
+        }
+
+        const apiResp = await fetch(trimmedApiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                reportFileName: selectedMeta.fileName,
+                sampleId,
+                testData: 'sft_test.jsonl',
+                modelPath: null,
+                ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
+                ttavUrl: trimmedUrl,
+                visMethod,
+                visId,
+                eifBundleCachePath: resolvedEifBundleCachePath,
+                selectedIndices: ttavSelectedIndices,
+                targetIndex: selectedTokIdx ?? undefined,
+                requireCached,
+            }),
+        });
+
+        const rawText = await apiResp.text();
+        let parsedJson: Record<string, unknown> | null = null;
+        if (rawText.trim()) {
+            try {
+                parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+            } catch {
+                throw new Error(
+                    `EIF API returned a non-JSON response (HTTP ${apiResp.status}). ` +
+                    `${rawText.slice(0, 240)}`
+                );
+            }
+        }
+
+        const apiJson = parsedJson ?? {};
+        if (!apiResp.ok || apiJson.status !== 'success') {
+            const baseMessage = 'EIF bundle API failed (HTTP ' + apiResp.status + ')';
+            const message = typeof apiJson.message === 'string'
+                ? baseMessage + ': ' + apiJson.message
+                : baseMessage;
+            throw new Error(message);
+        }
+
+        return {
+            sampleId: typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId,
+            contentPath: typeof apiJson.contentPath === 'string'
+                ? apiJson.contentPath
+                : resolveContentPath(ttavContentPathTemplate, sampleId),
+            visMethod: typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod,
+            visId: typeof apiJson.visId === 'string' ? apiJson.visId : visId,
+            eifBundleCachePath: typeof apiJson.eifBundleCachePath === 'string' ? apiJson.eifBundleCachePath : resolvedEifBundleCachePath,
+            eifCacheHit: apiJson.eifCacheHit === true,
+            ttavCached: typeof apiJson.uploadResult === 'object' && apiJson.uploadResult !== null && (apiJson.uploadResult as { cached?: boolean }).cached === true,
+        };
+    };
+
+    const handleOpenInTtav = () => {
+        if (!report || !selectedMeta) return;
+
+        const sampleId = selectedSampleId;
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+        if (!trimmedUrl) {
+            setTtavLaunchError('TTAV URL is required.');
+            return;
+        }
+
+        const reservedWindow = reserveTtavWindow(trimmedUrl);
+        if (!reservedWindow) {
+            setTtavLaunchError('Browser blocked the Visualizer window. Please allow pop-ups for this page.');
+            return;
+        }
+
+        void (async () => {
+            setTtavLaunchError(null);
+            setTtavLaunchStatus(null);
+            try {
+                new URL(trimmedUrl);
+                const apiResult = await callEifBundleApi(true);
+                if (!apiResult) return;
+                savePreparedTtavBundle({
+                    sampleId: apiResult.sampleId,
+                    contentPath: apiResult.contentPath,
+                    visMethod: apiResult.visMethod,
+                    visId: apiResult.visId,
+                    preparedAt: Date.now(),
+                });
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId: apiResult.sampleId,
+                    contentPath: apiResult.contentPath,
+                    visMethod: apiResult.visMethod,
+                    visId: apiResult.visId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: ttavSelectedIndices,
+                    targetIndex: selectedTokIdx ?? undefined,
+                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
+                    promptLen,
+                };
+                openTtavWithPayload(payload);
+                setTtavLaunchStatus(`Visualizer opened for ${apiResult.sampleId}.`);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Failed to open Visualizer';
+                if (!shouldFallbackToDirectPrepare(msg)) {
+                    setTtavLaunchError(msg);
+                    setTtavLaunchStatus(null);
+                    return;
+                }
+
+                const preparedBundle = getPreparedTtavBundle(sampleId);
+                const fallbackContentPath = preparedBundle?.contentPath || resolveContentPath(ttavContentPathTemplate, sampleId);
+                const fallbackVisMethod = preparedBundle?.visMethod || visMethod;
+                const fallbackVisId = preparedBundle?.visId || visId;
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId,
+                    contentPath: fallbackContentPath,
+                    visMethod: fallbackVisMethod,
+                    visId: fallbackVisId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: ttavSelectedIndices,
+                    targetIndex: selectedTokIdx ?? undefined,
+                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
+                    promptLen,
+                };
+                openTtavWithPayload(payload);
+                setTtavLaunchError(null);
+                setTtavLaunchStatus(preparedBundle
+                    ? `Visualizer opened for ${sampleId} using the most recently prepared TTAV bundle.`
+                    : `Visualizer opened for ${sampleId} using existing TTAV bundle.`);
+            }
+        })();
+    };
+
+    useEffect(() => {
+        if (!ttavWindowRef.current || ttavWindowRef.current.closed) return;
+        if (!selectedSampleId || ttavWindowSampleIdRef.current !== selectedSampleId) return;
+
+        postTtavHighlightUpdate();
+    }, [selectedSampleId, ttavSelectedIndices, selectedTokIdx, selectedTestCorrIdx, promptLen, ttavVisMethod, ttavVisId, ttavContentPathTemplate]);
+
+    const handlePrepareTtavBundle = async () => {
+        if (!report || !selectedMeta) return;
+
+        const sampleId = selectedSampleId;
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+
+        setPreparingTtavBundle(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(null);
+
+        const eifApiHost = (() => {
+            try {
+                return new URL(eifApiUrl).host;
+            } catch {
+                return eifApiUrl;
+            }
+        })();
+        setTtavPrepareDetail(`Connecting to EIF API (${eifApiHost})...`);
+
+        let statusPollTimer: number | null = null;
+        let statusPollActive = true;
+        const pollPrepareStatus = async () => {
+            if (!statusPollActive) return;
+            try {
+                const statusPayload = await fetchEifPrepareStatus(eifApiUrl, sampleId);
+                if (!statusPollActive || !statusPayload) return;
+                setTtavPrepareDetail(statusPayload.message);
+            } catch {
+                // Ignore status polling failures and let the main request decide fallback behavior.
+            }
+        };
+
+        try {
+            const initialStatus = await fetchEifPrepareStatus(eifApiUrl, sampleId, 2500);
+            if (!initialStatus) {
+                throw new Error(`Unable to reach EIF API at ${eifApiHost}`);
+            }
+
+            setTtavPrepareDetail(`Submitting prepare request to EIF API (${eifApiHost})...`);
+            void pollPrepareStatus();
+            statusPollTimer = window.setInterval(() => {
+                void pollPrepareStatus();
+            }, 1000);
+
+            const requestSubmittedTimer = window.setTimeout(() => {
+                setTtavPrepareDetail('EIF API request submitted. Waiting for server-side embedding computation...');
+            }, 1200);
+
+            const apiResult = await callEifBundleApi(false);
+            window.clearTimeout(requestSubmittedTimer);
+            if (!apiResult) return;
+            savePreparedTtavBundle({
+                sampleId: apiResult.sampleId,
+                contentPath: apiResult.contentPath,
+                visMethod: apiResult.visMethod,
+                visId: apiResult.visId,
+                preparedAt: Date.now(),
+            });
+            const eifMsg = apiResult.eifCacheHit
+                ? 'EIF cache reused'
+                : 'EIF cache created';
+            const ttavMsg = apiResult.ttavCached
+                ? 'TTAV cache reused'
+                : 'sent to TTAV';
+            setTtavLaunchStatus(`${apiResult.sampleId}: ${eifMsg}; ${ttavMsg}.`);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Failed to prepare TTAV bundle';
+            if (!shouldFallbackToDirectPrepare(msg) && !msg.toLowerCase().includes('unable to reach eif api')) {
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } else {
+                try {
+                    setTtavPrepareDetail(`EIF API unreachable; uploading precomputed real bundle to TTAV...`);
+                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
+                    const bundlePayload = await loadPrecomputedRealBundle(sampleId, visMethod, visId);
+                    const uploadResp = await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(bundlePayload),
+                    });
+                    const rawText = await uploadResp.text();
+                    let parsedJson: Record<string, unknown> | null = null;
+                    if (rawText.trim()) {
+                        try {
+                            parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+                        } catch {
+                            throw new Error(
+                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
+                                `${rawText.slice(0, 240)}`
+                            );
+                        }
+                    }
+                    const apiJson = parsedJson ?? {};
+                    if (!uploadResp.ok || apiJson.status !== 'success') {
+                        const message = typeof apiJson.message === 'string'
+                            ? apiJson.message
+                            : `Failed to register TTAV bundle (HTTP ${uploadResp.status})`;
+                        throw new Error(message);
+                    }
+                    const returnedSampleId = typeof apiJson.sample_id === 'string'
+                        ? apiJson.sample_id
+                        : (typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId);
+                    const returnedContentPath = typeof apiJson.content_path === 'string'
+                        ? apiJson.content_path
+                        : (typeof apiJson.contentPath === 'string'
+                            ? apiJson.contentPath
+                            : resolveContentPath(ttavContentPathTemplate, returnedSampleId));
+                    savePreparedTtavBundle({
+                        sampleId: returnedSampleId,
+                        contentPath: returnedContentPath,
+                        visMethod,
+                        visId,
+                        preparedAt: Date.now(),
+                    });
+                    const ttavMsg = apiJson.cached === true ? 'TTAV cache reused' : 'sent to TTAV';
+                    setTtavLaunchError(null);
+                    setTtavLaunchStatus(`${returnedSampleId}: precomputed real bundle used; ${ttavMsg}.`);
+                } catch (fallbackError) {
+                    const fallbackMsg = fallbackError instanceof Error
+                        ? fallbackError.message
+                        : 'Failed to prepare TTAV bundle';
+                    setTtavLaunchError(fallbackMsg);
+                    setTtavLaunchStatus(null);
+                }
+            }
+        } finally {
+            statusPollActive = false;
+            if (statusPollTimer !== null) {
+                window.clearInterval(statusPollTimer);
+            }
+            setTtavPrepareDetail(null);
+            setPreparingTtavBundle(false);
         }
     };
 
@@ -830,6 +1565,154 @@ export function NewView({ metas }: Props) {
                                         >
                                             {exporting ? 'Exporting…' : 'Export Markdown'}
                                         </button>
+                                    </div>
+                                    <div style={{
+                                        marginTop: 8, paddingTop: 8,
+                                        borderTop: '1px solid #e5e7eb',
+                                        display: 'grid', gap: 8,
+                                    }}>
+                                        <div style={{
+                                            display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center',
+                                            justifyContent: 'space-between',
+                                            fontSize: 12,
+                                        }}>
+                                                <div style={{ display: 'grid', gap: 4 }}>
+                                                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                                                        <span style={{ fontWeight: 700, color: '#374151' }}>TTAV Jump</span>
+                                                        <span style={{
+                                                            padding: '2px 8px',
+                                                        borderRadius: 999,
+                                                        background: '#eff6ff',
+                                                        color: '#1d4ed8',
+                                                        fontSize: 11,
+                                                        fontWeight: 600,
+                                                        }}>
+                                                            {ttavVisMethod}
+                                                        </span>
+                                                    </div>
+                                                    <div style={{ color: '#6b7280' }}>
+                                                        TTAV URL: <span>{ttavUrl}</span>
+                                                    </div>
+                                                    <div style={{ color: '#374151' }}>
+                                                        当前 sample: <code>{selectedSampleId || '未选择 sample'}</code>
+                                                    </div>
+                                                    {resolvedEifBundleCachePath && (
+                                                        <div style={{ color: '#374151' }}>
+                                                            EIF Bundle Cache Path: <code>{resolvedEifBundleCachePath}</code>
+                                                        </div>
+                                                    )}
+                                                    <div style={{ color: '#6b7280' }}>
+                                                        先准备当前 sample 的 TTAV bundle，再打开 TTAV 查看并高亮当前 target token 和 attribution token。
+                                                    </div>
+                                                </div>
+                                            <button
+                                                onClick={() => setShowAdvancedTtav(v => !v)}
+                                                style={{
+                                                    padding: '4px 10px', borderRadius: 6,
+                                                    border: '1px solid #cbd5e1', background: '#fff', color: '#475569',
+                                                    fontSize: 12, cursor: 'pointer',
+                                                }}
+                                            >
+                                                {showAdvancedTtav ? 'Hide advanced' : 'Advanced settings'}
+                                            </button>
+                                        </div>
+                                        {showAdvancedTtav && (
+                                            <div style={{ display: 'grid', gap: 8, fontSize: 12 }}>
+                                                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                                                    <label style={{ display: 'grid', gap: 4 }}>
+                                                        <span style={{ fontWeight: 600, color: '#374151' }}>EIF Bundle Cache Path</span>
+                                                        <input
+                                                            value={eifBundleCacheTemplate}
+                                                            onChange={e => setEifBundleCacheTemplate(e.target.value)}
+                                                            placeholder={DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE}
+                                                            style={{
+                                                                minWidth: 320, padding: '4px 8px',
+                                                                border: '1px solid #d1d5db', borderRadius: 6,
+                                                            }}
+                                                        />
+                                                        <span style={{ color: '#6b7280' }}>
+                                                            EIF 服务器上的本地 bundle 缓存模板；会按当前 sample 自动展开。
+                                                        </span>
+                                                    </label>
+                                                </div>
+                                                <label style={{ display: 'grid', gap: 4 }}>
+                                                    <span style={{ fontWeight: 600, color: '#374151' }}>TTAV URL</span>
+                                                    <input
+                                                        value={ttavUrl}
+                                                        onChange={e => setTtavUrl(e.target.value)}
+                                                        placeholder={DEFAULT_TTAV_URL}
+                                                        style={{
+                                                            minWidth: 220, padding: '4px 8px',
+                                                            border: '1px solid #d1d5db', borderRadius: 6,
+                                                        }}
+                                                    />
+                                                </label>
+                                                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                                                    <label style={{ display: 'grid', gap: 4 }}>
+                                                        <span style={{ fontWeight: 600, color: '#374151' }}>Method</span>
+                                                        <input
+                                                            value={ttavVisMethod}
+                                                            onChange={e => setTtavVisMethod(e.target.value)}
+                                                            placeholder={DEFAULT_TTAV_METHOD}
+                                                            style={{
+                                                                width: 110, padding: '4px 8px',
+                                                                border: '1px solid #d1d5db', borderRadius: 6,
+                                                            }}
+                                                        />
+                                                    </label>
+                                                    <label style={{ display: 'grid', gap: 4 }}>
+                                                        <span style={{ fontWeight: 600, color: '#374151' }}>Vis ID</span>
+                                                        <input
+                                                            value={ttavVisId}
+                                                            onChange={e => setTtavVisId(e.target.value)}
+                                                            placeholder={DEFAULT_TTAV_VIS_ID}
+                                                            style={{
+                                                                width: 84, padding: '4px 8px',
+                                                                border: '1px solid #d1d5db', borderRadius: 6,
+                                                            }}
+                                                        />
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div style={{
+                                            display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center',
+                                            fontSize: 12,
+                                        }}>
+                                            <button
+                                                onClick={handlePrepareTtavBundle}
+                                                disabled={preparingTtavBundle}
+                                                style={{
+                                                    padding: '4px 16px', borderRadius: 6,
+                                                    border: '1px solid #0f766e', background: '#ecfeff', color: '#0f766e',
+                                                    fontWeight: 600, fontSize: 13, cursor: preparingTtavBundle ? 'wait' : 'pointer',
+                                                }}
+                                            >
+                                                {preparingTtavBundle
+                                                    ? 'Preparing sample...'
+                                                    : 'Prepare sample'}
+                                            </button>
+                                            <button
+                                                onClick={handleOpenInTtav}
+                                                style={{
+                                                    padding: '4px 12px', borderRadius: 6,
+                                                    border: '1px solid #94a3b8', background: '#fff', color: '#475569',
+                                                    fontWeight: 500, fontSize: 13, cursor: 'pointer',
+                                                }}
+                                            >
+                                                Open Visualizer
+                                            </button>
+                                        </div>
+                                        <div style={{ fontSize: 11, color: ttavLaunchError ? '#b91c1c' : '#6b7280' }}>
+                                            {ttavLaunchError
+                                                ? ttavLaunchError
+                                                : (ttavLaunchStatus ?? '默认配置已经指向公网 TTAV。通常先点 “Prepare sample”，再点 “Open TTAV”。')}
+                                        </div>
+                                        {preparingTtavBundle && ttavPrepareDetail && (
+                                            <div style={{ fontSize: 11, color: '#0f766e' }}>
+                                                {ttavPrepareDetail}
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
 

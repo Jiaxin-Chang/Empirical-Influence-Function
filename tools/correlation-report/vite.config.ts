@@ -7,6 +7,7 @@ import { resolve, join } from 'path'
 const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
+const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // experimentDataPlugin
@@ -73,6 +74,13 @@ function experimentDataPlugin(): Plugin {
     return readFileSync(filePath, 'utf-8')
   }
 
+  function readRealBundlePayload(sampleId: string): string | null {
+    if (!/^[\w\-]+$/.test(sampleId)) return null
+    const filePath = join(REAL_BUNDLE_DIR, sampleId, 'bundle_payload.json')
+    if (!existsSync(filePath)) return null
+    return readFileSync(filePath, 'utf-8')
+  }
+
   function addMiddleware(server: { middlewares: { use: (fn: (req: any, res: any, next: () => void) => void) => void } }) {
     server.middlewares.use((req: any, res: any, next: () => void) => {
       if (req.url === '/data/index.json') {
@@ -103,6 +111,16 @@ function experimentDataPlugin(): Plugin {
           return
         }
       }
+      const realBundleM = (req.url as string)?.match(/^\/data\/real-bundles\/([^/?]+)\/bundle_payload\.json/)
+      if (realBundleM) {
+        const content = readRealBundlePayload(decodeURIComponent(realBundleM[1]))
+        if (content !== null) {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(content)
+          return
+        }
+      }
       next()
     })
   }
@@ -125,6 +143,20 @@ function experimentDataPlugin(): Plugin {
       for (const exp of manifest.allTokensExperiments) {
         const content = readDataFile(exp.fileName)
         if (content) this.emitFile({ type: 'asset', fileName: `data/results/${exp.fileName}`, source: content })
+      }
+
+      const realBundleIds = existsSync(REAL_BUNDLE_DIR)
+        ? readdirSync(REAL_BUNDLE_DIR).filter(d => /^[\w\-]+$/.test(d))
+        : []
+      for (const sampleId of realBundleIds) {
+        const content = readRealBundlePayload(sampleId)
+        if (content) {
+          this.emitFile({
+            type: 'asset',
+            fileName: `data/real-bundles/${sampleId}/bundle_payload.json`,
+            source: content,
+          })
+        }
       }
 
       // Model compare files
