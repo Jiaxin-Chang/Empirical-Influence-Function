@@ -214,16 +214,6 @@ def _cache_response_hidden(
     return hidden_rows, labels_cpu, base_losses
 
 
-def _make_delta_from_grad(model, grad: torch.Tensor, *, lr: float, normalize: bool) -> torch.Tensor:
-    lm_head = model.get_output_embeddings()
-    if lm_head is None:
-        raise RuntimeError("Model does not expose output embeddings.")
-    delta = grad.to(device=lm_head.weight.device, dtype=torch.float32)
-    if normalize:
-        delta = delta / delta.norm().clamp_min(1e-12)
-    return (float(lr) * delta).to(dtype=lm_head.weight.dtype)
-
-
 def _write_coarse_checkpoint(state: TestOracleState, tokenizer) -> None:
     checkpoint = {
         "experiment_meta": {
@@ -464,36 +454,40 @@ def _run_batched_oracle(
             continue
 
         if oracle_mode == "hidden":
-            delta = _make_delta_from_grad(
-                model,
-                grad,
-                lr=unlearn_lr,
-                normalize=normalize_unlearn_grad,
-            )
-            for state in affected_states:
-                try:
-                    changed_losses = _cached_hidden_losses_retry(
-                        model,
-                        state.hidden_cpu,
-                        state.labels_cpu,
-                        delta=delta,
-                        device=delta.device,
-                        chunk_size=logit_chunk_size,
-                    )
-                except (torch.OutOfMemoryError, RuntimeError) as exc:
-                    if not _is_cuda_alloc_error(exc):
-                        raise
-                    _clear_cuda_after_oom()
-                    state.skipped_oracle_oom.append(int(train_idx))
-                    print(
-                        f"[WARN] Batched data oracle: skipping train sample {int(train_idx)} "
-                        f"for test {state.task_id} after CUDA OOM while scoring cached hidden effect.",
-                        flush=True,
-                    )
-                    continue
-                _record_effect(state, int(train_idx), changed_losses, effect_reduction)
-                del changed_losses
-            del delta
+            delta = None
+            try:
+                delta = _apply_lm_head_ascent_update(
+                    model,
+                    grad,
+                    lr=unlearn_lr,
+                    normalize=normalize_unlearn_grad,
+                )
+                for state in affected_states:
+                    try:
+                        changed_losses = _cached_hidden_losses_retry(
+                            model,
+                            state.hidden_cpu,
+                            state.labels_cpu,
+                            delta=None,
+                            device=delta.device,
+                            chunk_size=logit_chunk_size,
+                        )
+                    except (torch.OutOfMemoryError, RuntimeError) as exc:
+                        if not _is_cuda_alloc_error(exc):
+                            raise
+                        _clear_cuda_after_oom()
+                        state.skipped_oracle_oom.append(int(train_idx))
+                        print(
+                            f"[WARN] Batched data oracle: skipping train sample {int(train_idx)} "
+                            f"for test {state.task_id} after CUDA OOM while scoring cached hidden effect.",
+                            flush=True,
+                        )
+                        continue
+                    _record_effect(state, int(train_idx), changed_losses, effect_reduction)
+                    del changed_losses
+            finally:
+                if delta is not None:
+                    _restore_lm_head_ascent_update(model, delta)
         else:
             delta = None
             try:
