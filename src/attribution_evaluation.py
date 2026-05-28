@@ -26,12 +26,14 @@ from src.NIF import (
 from src.intervention_experiment import (
     ALTI_CHUNK_SIZE,
     SEED,
+    _clear_cuda_after_oom,
     is_trivial_token,
     lm_head_filter,
     load_model_and_tokenizer,
     load_samples,
     top_nontrivial_saliency_sources,
     _gather_scores,
+    _is_cuda_alloc_error,
     _screen_training_set,
 )
 from src.loss import (
@@ -477,6 +479,7 @@ def _evaluate_data_coarse_unit(
 
     oracle_effects: dict[int, float] = {}
     oracle_token_effects: dict[int, list[float]] = {}
+    skipped_oracle_oom: list[int] = []
 
     print(
         f"[data:{unit_name}] one-step unlearning oracle over "
@@ -484,19 +487,34 @@ def _evaluate_data_coarse_unit(
         flush=True,
     )
     for train_idx in tqdm(oracle_universe, desc=f"Data unlearning oracle ({unit_name})", leave=False):
-        train_batch = _single_train_batch_from_dataset(
-            train_ds,
-            collator,
-            train_idx,
-            idx_to_row,
-            accelerator.device,
-        )
-        grad = compute_lm_head_ce_gradient_no_backward(
-            model=model,
-            batch=train_batch,
-            device=accelerator.device,
-            ignored_token_ids=torch.tensor([], device=accelerator.device),
-        )
+        train_batch = None
+        grad = None
+        try:
+            train_batch = _single_train_batch_from_dataset(
+                train_ds,
+                collator,
+                train_idx,
+                idx_to_row,
+                accelerator.device,
+            )
+            grad = compute_lm_head_ce_gradient_no_backward(
+                model=model,
+                batch=train_batch,
+                device=accelerator.device,
+                ignored_token_ids=torch.tensor([], device=accelerator.device),
+            )
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_cuda_alloc_error(exc):
+                raise
+            skipped_oracle_oom.append(int(train_idx))
+            _clear_cuda_after_oom()
+            print(
+                f"[WARN] Data unlearning oracle ({unit_name}): "
+                f"skipping train sample {int(train_idx)} after CUDA OOM while computing train gradient.",
+                flush=True,
+            )
+            del train_batch, grad
+            continue
 
         delta = None
         try:
@@ -507,6 +525,18 @@ def _evaluate_data_coarse_unit(
                 normalize=normalize_unlearn_grad,
             )
             changed_losses = _target_token_losses(model, test_batch, target_positions, accelerator.device)
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_cuda_alloc_error(exc):
+                raise
+            skipped_oracle_oom.append(int(train_idx))
+            _clear_cuda_after_oom()
+            print(
+                f"[WARN] Data unlearning oracle ({unit_name}): "
+                f"skipping train sample {int(train_idx)} after CUDA OOM while scoring test effect.",
+                flush=True,
+            )
+            del train_batch, grad
+            continue
         finally:
             if delta is not None:
                 _restore_lm_head_ascent_update(model, delta)
@@ -526,6 +556,18 @@ def _evaluate_data_coarse_unit(
 
         del train_batch, grad, changed_losses, token_effects
         torch.cuda.empty_cache()
+
+    if skipped_oracle_oom:
+        print(
+            f"[WARN] Data unlearning oracle ({unit_name}): skipped "
+            f"{len(skipped_oracle_oom)} samples after CUDA OOM.",
+            flush=True,
+        )
+    if not oracle_effects:
+        raise RuntimeError(
+            f"Data unlearning oracle ({unit_name}) produced no scores. "
+            "Try freeing GPU memory, lowering --prescreen-max-seq-len, or setting --data-oracle-limit."
+        )
 
     method_ranked = [
         int(idx)
@@ -563,6 +605,9 @@ def _evaluate_data_coarse_unit(
             "normalize_train_gradient": bool(normalize_unlearn_grad),
             "effect_reduction": effect_reduction,
             "candidate_universe_size": len(oracle_universe),
+            "scored_candidate_count": len(oracle_effects),
+            "skipped_oom_count": len(skipped_oracle_oom),
+            "skipped_oom_train_sample_ids": skipped_oracle_oom[:50],
             "loss_scope": (
                 "single target token"
                 if unit_type == "sample_to_token"
@@ -741,6 +786,16 @@ def parse_int_tuple(raw: str) -> tuple[int, ...]:
     return tuple(int(x.strip()) for x in raw.split(",") if x.strip())
 
 
+def _default_output_path(task_id: str, target_positions: list[int]) -> str:
+    token_part = f"tok{target_positions[0]}" if len(target_positions) == 1 else "tokens"
+    return f"attribution_eval_{task_id}_{token_part}.json"
+
+
+def _stage_output_path(output_path: str, stage_name: str) -> str:
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_{stage_name}{ext or '.json'}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate feature and data attribution with intervention-based ranking metrics."
@@ -792,6 +847,12 @@ def main() -> None:
     parser.add_argument("--data-effect-reduction", choices=["mean", "sum", "max"], default="mean")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--feature-output",
+        type=str,
+        default=None,
+        help="Optional path for the feature-attribution checkpoint report.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -850,15 +911,6 @@ def main() -> None:
 
     train_ds = None
     train_loader = None
-    if not args.skip_data:
-        print("[eval] building train dataset...", flush=True)
-        train_ds = build_train_dataset(train_samples, convert_to_chatml)
-        train_loader = torch.utils.data.DataLoader(
-            DatasetWrapper(train_ds),
-            batch_size=max(1, int(args.prescreen_batch_size)),
-            collate_fn=collator,
-        )
-        train_loader = accelerator.prepare(train_loader)
 
     replacement_token_id = args.replacement_token_id
     if replacement_token_id is None:
@@ -867,6 +919,9 @@ def main() -> None:
         replacement_token_id = tokenizer.eos_token_id
     if replacement_token_id is None:
         raise RuntimeError("No replacement token id available; pass --replacement-token-id.")
+
+    output_path = args.output or _default_output_path(task_id, target_positions)
+    feature_output_path = args.feature_output or _stage_output_path(output_path, "feature")
 
     report = {
         "experiment_meta": {
@@ -918,8 +973,28 @@ def main() -> None:
             replacement_token_id=int(replacement_token_id),
             max_feature_sources=args.max_feature_sources,
         )
+        feature_report = {
+            "experiment_meta": {
+                **report["experiment_meta"],
+                "stage": "feature_attribution",
+                "is_checkpoint": True,
+            },
+            "test_sample_baseline": report["test_sample_baseline"],
+            "feature_attribution": report["feature_attribution"],
+        }
+        _write_json(feature_output_path, feature_report)
+        print(f"\n[eval] wrote feature checkpoint {feature_output_path}", flush=True)
 
     if not args.skip_data:
+        print("[eval] building train dataset...", flush=True)
+        train_ds = build_train_dataset(train_samples, convert_to_chatml)
+        train_loader = torch.utils.data.DataLoader(
+            DatasetWrapper(train_ds),
+            batch_size=max(1, int(args.prescreen_batch_size)),
+            collate_fn=collator,
+        )
+        train_loader = accelerator.prepare(train_loader)
+
         report["data_coarse_attribution"] = evaluate_data_coarse_attribution(
             model,
             tokenizer,
@@ -941,10 +1016,6 @@ def main() -> None:
             seed=int(args.seed),
         )
 
-    output_path = args.output
-    if output_path is None:
-        token_part = f"tok{target_positions[0]}" if len(target_positions) == 1 else "tokens"
-        output_path = f"attribution_eval_{task_id}_{token_part}.json"
     _write_json(output_path, report)
     print(f"\n[eval] wrote {output_path}", flush=True)
 
