@@ -130,6 +130,14 @@ def _target_batch_with_labels(batch: dict, target_positions: Iterable[int]) -> d
     }
 
 
+def _response_label_positions(batch: dict) -> list[int]:
+    labels = batch.get("labels")
+    if labels is None:
+        raise KeyError("sample-to-sample data evaluation requires test_batch['labels'].")
+    valid = torch.where(labels[0].ne(-100))[0]
+    return [int(pos.item()) for pos in valid if int(pos.item()) > 0]
+
+
 def _lm_head_grad_for_positions(model, batch: dict, target_positions: Iterable[int], device) -> torch.Tensor:
     labeled = _target_batch_with_labels(batch, target_positions)
     grad = compute_lm_head_ce_gradient_no_backward(
@@ -410,7 +418,7 @@ def _restore_lm_head_ascent_update(model, delta: torch.Tensor) -> None:
     lm_head.weight.data.sub_(delta.to(device=lm_head.weight.device, dtype=lm_head.weight.dtype))
 
 
-def evaluate_data_coarse_attribution(
+def _evaluate_data_coarse_unit(
     model,
     tokenizer,
     test_batch: dict,
@@ -420,6 +428,8 @@ def evaluate_data_coarse_attribution(
     target_positions: list[int],
     accelerator,
     *,
+    unit_type: str,
+    unit_name: str,
     prescreen_max_seq_len: int | None,
     method_top_ks: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
@@ -436,7 +446,7 @@ def evaluate_data_coarse_attribution(
     filtered_params = [p for n, p in model.named_parameters() if lm_head_filter(n, p)]
     lm_head_device = filtered_params[0].device if filtered_params else accelerator.device
 
-    print("\n[data] computing CE-gradient coarse ranking...", flush=True)
+    print(f"\n[data:{unit_name}] computing CE-gradient coarse ranking...", flush=True)
     test_grad = _lm_head_grad_for_positions(model, test_batch, target_positions, accelerator.device)
     test_grad_flat = test_grad.reshape(-1).to(lm_head_device).detach()
     local_scores = _screen_training_set(
@@ -445,7 +455,7 @@ def evaluate_data_coarse_attribution(
         train_loader,
         accelerator.device,
         lm_head_device,
-        desc="Data coarse scoring",
+        desc=f"Data coarse scoring ({unit_name})",
         max_seq_len=prescreen_max_seq_len,
     )
     coarse_scores = _gather_scores(accelerator, local_scores, accelerator.device)
@@ -468,8 +478,12 @@ def evaluate_data_coarse_attribution(
     oracle_effects: dict[int, float] = {}
     oracle_token_effects: dict[int, list[float]] = {}
 
-    print(f"[data] one-step unlearning oracle over {len(oracle_universe)} train samples...", flush=True)
-    for train_idx in tqdm(oracle_universe, desc="Data unlearning oracle", leave=False):
+    print(
+        f"[data:{unit_name}] one-step unlearning oracle over "
+        f"{len(oracle_universe)} train samples...",
+        flush=True,
+    )
+    for train_idx in tqdm(oracle_universe, desc=f"Data unlearning oracle ({unit_name})", leave=False):
         train_batch = _single_train_batch_from_dataset(
             train_ds,
             collator,
@@ -534,6 +548,8 @@ def evaluate_data_coarse_attribution(
 
     top_n = max(max(method_top_ks), max(oracle_top_ms))
     return {
+        "unit_type": unit_type,
+        "unit_name": unit_name,
         "target_token_indices": [int(x) for x in target_positions],
         "target_tokens": [
             _decode_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
@@ -547,6 +563,11 @@ def evaluate_data_coarse_attribution(
             "normalize_train_gradient": bool(normalize_unlearn_grad),
             "effect_reduction": effect_reduction,
             "candidate_universe_size": len(oracle_universe),
+            "loss_scope": (
+                "single target token"
+                if unit_type == "sample_to_token"
+                else "all labeled response tokens in the test sample"
+            ),
             "base_target_losses": [float(x) for x in base_losses.tolist()],
         },
         "metrics": metrics,
@@ -570,6 +591,92 @@ def evaluate_data_coarse_attribution(
             for rank, idx in enumerate(oracle_ranked[:top_n], start=1)
         ],
     }
+
+
+def evaluate_data_coarse_attribution(
+    model,
+    tokenizer,
+    test_batch: dict,
+    train_ds,
+    train_loader,
+    collator,
+    target_positions: list[int],
+    accelerator,
+    *,
+    granularity: str,
+    prescreen_max_seq_len: int | None,
+    method_top_ks: tuple[int, ...],
+    oracle_top_ms: tuple[int, ...],
+    oracle_limit: int | None,
+    oracle_include_method_top: int,
+    unlearn_lr: float,
+    normalize_unlearn_grad: bool,
+    effect_reduction: str,
+    seed: int,
+) -> dict:
+    if granularity not in {"sample_to_token", "sample_to_sample", "both"}:
+        raise ValueError(
+            "granularity must be one of: sample_to_token, sample_to_sample, both"
+        )
+
+    result = {
+        "granularity": granularity,
+        "sample_to_token": [],
+        "sample_to_sample": None,
+    }
+
+    if granularity in {"sample_to_token", "both"}:
+        for target_idx in target_positions:
+            unit = _evaluate_data_coarse_unit(
+                model,
+                tokenizer,
+                test_batch,
+                train_ds,
+                train_loader,
+                collator,
+                [int(target_idx)],
+                accelerator,
+                unit_type="sample_to_token",
+                unit_name=f"token_{int(target_idx)}",
+                prescreen_max_seq_len=prescreen_max_seq_len,
+                method_top_ks=method_top_ks,
+                oracle_top_ms=oracle_top_ms,
+                oracle_limit=oracle_limit,
+                oracle_include_method_top=oracle_include_method_top,
+                unlearn_lr=unlearn_lr,
+                normalize_unlearn_grad=normalize_unlearn_grad,
+                effect_reduction=effect_reduction,
+                seed=seed,
+            )
+            result["sample_to_token"].append(unit)
+
+    if granularity in {"sample_to_sample", "both"}:
+        response_positions = _response_label_positions(test_batch)
+        if not response_positions:
+            raise RuntimeError("No labeled response tokens found for sample-to-sample evaluation.")
+        result["sample_to_sample"] = _evaluate_data_coarse_unit(
+            model,
+            tokenizer,
+            test_batch,
+            train_ds,
+            train_loader,
+            collator,
+            response_positions,
+            accelerator,
+            unit_type="sample_to_sample",
+            unit_name="full_response",
+            prescreen_max_seq_len=prescreen_max_seq_len,
+            method_top_ks=method_top_ks,
+            oracle_top_ms=oracle_top_ms,
+            oracle_limit=oracle_limit,
+            oracle_include_method_top=oracle_include_method_top,
+            unlearn_lr=unlearn_lr,
+            normalize_unlearn_grad=normalize_unlearn_grad,
+            effect_reduction=effect_reduction,
+            seed=seed,
+        )
+
+    return result
 
 
 def build_test_batch(
@@ -662,6 +769,16 @@ def main() -> None:
     parser.add_argument("--data-oracle-m-values", type=str, default="10,20,50")
     parser.add_argument("--data-oracle-limit", type=int, default=None)
     parser.add_argument("--data-oracle-include-method-top", type=int, default=100)
+    parser.add_argument(
+        "--data-granularity",
+        choices=["sample_to_token", "sample_to_sample", "both"],
+        default="sample_to_sample",
+        help=(
+            "Data attribution evaluation scope. sample_to_token evaluates each target "
+            "token separately; sample_to_sample evaluates the whole labeled response. "
+            "Default: sample_to_sample."
+        ),
+    )
     parser.add_argument(
         "--unlearn-lr",
         type=float,
@@ -765,6 +882,8 @@ def main() -> None:
             "evaluation_protocol": {
                 "feature_oracle": "leave-one-source-token-out target CE increase",
                 "data_oracle": "one-step gradient-ascent unlearning target CE increase",
+                "data_sample_to_token": "rank train samples by effect on each target token CE",
+                "data_sample_to_sample": "rank train samples by effect on whole response CE",
                 "data_unlearning_param_space": "lm_head.weight",
                 "data_unlearning_direction": "theta <- theta + eta * grad_train_loss",
             },
@@ -776,6 +895,7 @@ def main() -> None:
                 "data_oracle_m_values": parse_int_tuple(args.data_oracle_m_values),
                 "data_oracle_limit": args.data_oracle_limit,
                 "data_oracle_include_method_top": args.data_oracle_include_method_top,
+                "data_granularity": args.data_granularity,
                 "unlearn_lr": args.unlearn_lr,
                 "normalize_unlearn_grad": not args.no_normalize_unlearn_grad,
                 "data_effect_reduction": args.data_effect_reduction,
@@ -809,6 +929,7 @@ def main() -> None:
             collator,
             target_positions,
             accelerator,
+            granularity=args.data_granularity,
             prescreen_max_seq_len=None if args.prescreen_max_seq_len <= 0 else int(args.prescreen_max_seq_len),
             method_top_ks=parse_int_tuple(args.data_method_k_values) or DEFAULT_DATA_METHOD_K,
             oracle_top_ms=parse_int_tuple(args.data_oracle_m_values) or DEFAULT_DATA_ORACLE_M,
