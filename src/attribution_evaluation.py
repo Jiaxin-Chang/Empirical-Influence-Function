@@ -25,6 +25,9 @@ from src.NIF import (
 )
 from src.intervention_experiment import (
     ALTI_CHUNK_SIZE,
+    PRESCREEN_SKETCH_CACHE_DIR,
+    PRESCREEN_SKETCH_DIM,
+    PRESCREEN_SKETCH_SEED,
     SEED,
     _clear_cuda_after_oom,
     is_trivial_token,
@@ -34,11 +37,14 @@ from src.intervention_experiment import (
     top_nontrivial_saliency_sources,
     _gather_scores,
     _is_cuda_alloc_error,
+    _load_or_build_prescreen_sketch_cache,
     _screen_training_set,
+    _score_prescreen_sketch_cache,
 )
 from src.loss import (
     compute_alti_saliency_vector,
     compute_lm_head_ce_gradient_no_backward,
+    compute_lm_head_ce_gradient_sketches_no_backward,
 )
 from src.process_data import process_func_chatml
 
@@ -149,6 +155,27 @@ def _lm_head_grad_for_positions(model, batch: dict, target_positions: Iterable[i
         ignored_token_ids=torch.tensor([], device=device),
     )
     return grad
+
+
+def _lm_head_sketch_for_positions(
+    model,
+    batch: dict,
+    target_positions: Iterable[int],
+    device,
+    *,
+    sketch_dim: int,
+    sketch_seed: int,
+) -> torch.Tensor:
+    labeled = _target_batch_with_labels(batch, target_positions)
+    sketches = compute_lm_head_ce_gradient_sketches_no_backward(
+        model=model,
+        batch=labeled,
+        device=device,
+        ignored_token_ids=torch.tensor([], device=device),
+        sketch_dim=int(sketch_dim),
+        sketch_seed=int(sketch_seed),
+    )
+    return sketches[0].detach()
 
 
 def _ranking_ndcg(ranked_ids: list[int], relevance: dict[int, float], k: int) -> float:
@@ -433,6 +460,9 @@ def _evaluate_data_coarse_unit(
     unit_type: str,
     unit_name: str,
     prescreen_max_seq_len: int | None,
+    prescreen_sketch_cache,
+    prescreen_sketch_dim: int,
+    prescreen_sketch_seed: int,
     method_top_ks: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
     oracle_limit: int | None,
@@ -441,6 +471,7 @@ def _evaluate_data_coarse_unit(
     normalize_unlearn_grad: bool,
     effect_reduction: str,
     seed: int,
+    coarse_output_path: str | None,
 ) -> dict:
     if accelerator.num_processes != 1:
         raise RuntimeError("Data oracle unlearning currently expects a single Accelerator process.")
@@ -449,20 +480,77 @@ def _evaluate_data_coarse_unit(
     lm_head_device = filtered_params[0].device if filtered_params else accelerator.device
 
     print(f"\n[data:{unit_name}] computing CE-gradient coarse ranking...", flush=True)
-    test_grad = _lm_head_grad_for_positions(model, test_batch, target_positions, accelerator.device)
-    test_grad_flat = test_grad.reshape(-1).to(lm_head_device).detach()
-    local_scores = _screen_training_set(
-        model,
-        test_grad_flat,
-        train_loader,
-        accelerator.device,
-        lm_head_device,
-        desc=f"Data coarse scoring ({unit_name})",
-        max_seq_len=prescreen_max_seq_len,
-    )
-    coarse_scores = _gather_scores(accelerator, local_scores, accelerator.device)
+    coarse_scoring = "exact_lm_head_gradient"
+    if prescreen_sketch_cache is not None:
+        coarse_scoring = "cached_lm_head_tensor_sketch"
+        print(
+            f"[data:{unit_name}] using cached TensorSketch coarse retrieval "
+            f"(dim={prescreen_sketch_dim}, seed={prescreen_sketch_seed}).",
+            flush=True,
+        )
+        test_sketch = _lm_head_sketch_for_positions(
+            model,
+            test_batch,
+            target_positions,
+            accelerator.device,
+            sketch_dim=prescreen_sketch_dim,
+            sketch_seed=prescreen_sketch_seed,
+        )
+        coarse_scores = _score_prescreen_sketch_cache(
+            test_sketch,
+            prescreen_sketch_cache,
+            accelerator.device,
+        )
+        del test_sketch
+    else:
+        test_grad = _lm_head_grad_for_positions(model, test_batch, target_positions, accelerator.device)
+        test_grad_flat = test_grad.reshape(-1).to(lm_head_device).detach()
+        local_scores = _screen_training_set(
+            model,
+            test_grad_flat,
+            train_loader,
+            accelerator.device,
+            lm_head_device,
+            desc=f"Data coarse scoring ({unit_name})",
+            max_seq_len=prescreen_max_seq_len,
+        )
+        coarse_scores = _gather_scores(accelerator, local_scores, accelerator.device)
+        del test_grad, test_grad_flat
+    if not coarse_scores:
+        raise RuntimeError(
+            f"Data coarse scoring ({unit_name}) produced no scores. "
+            "Check the train set, cache, and --prescreen-max-seq-len."
+        )
     coarse_ranked = nlargest(len(coarse_scores), coarse_scores, key=lambda x: x[1])
     method_score_by_id = {int(idx): float(score) for idx, score in coarse_ranked}
+    if coarse_output_path is not None:
+        coarse_checkpoint = {
+            "experiment_meta": {
+                "stage": "data_coarse_attribution",
+                "is_checkpoint": True,
+                "unit_type": unit_type,
+                "unit_name": unit_name,
+                "target_token_indices": [int(x) for x in target_positions],
+                "target_tokens": [
+                    _decode_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
+                    for t in target_positions
+                ],
+                "coarse_scoring": coarse_scoring,
+                "prescreen_max_seq_len": prescreen_max_seq_len,
+                "prescreen_sketch_dim": int(prescreen_sketch_dim) if prescreen_sketch_cache is not None else 0,
+                "prescreen_sketch_seed": int(prescreen_sketch_seed) if prescreen_sketch_cache is not None else None,
+            },
+            "coarse_ranking": [
+                {
+                    "rank": rank,
+                    "train_sample_id": int(idx),
+                    "coarse_cos_sim": float(score),
+                }
+                for rank, (idx, score) in enumerate(coarse_ranked, start=1)
+            ],
+        }
+        _write_json(coarse_output_path, coarse_checkpoint)
+        print(f"[data:{unit_name}] wrote coarse checkpoint {coarse_output_path}", flush=True)
 
     oracle_universe = _select_oracle_universe(
         coarse_ranked,
@@ -613,6 +701,9 @@ def _evaluate_data_coarse_unit(
                 if unit_type == "sample_to_token"
                 else "all labeled response tokens in the test sample"
             ),
+            "coarse_scoring": coarse_scoring,
+            "prescreen_sketch_dim": int(prescreen_sketch_dim) if prescreen_sketch_cache is not None else 0,
+            "prescreen_sketch_seed": int(prescreen_sketch_seed) if prescreen_sketch_cache is not None else None,
             "base_target_losses": [float(x) for x in base_losses.tolist()],
         },
         "metrics": metrics,
@@ -650,6 +741,9 @@ def evaluate_data_coarse_attribution(
     *,
     granularity: str,
     prescreen_max_seq_len: int | None,
+    prescreen_sketch_cache=None,
+    prescreen_sketch_dim: int = 0,
+    prescreen_sketch_seed: int = SEED,
     method_top_ks: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
     oracle_limit: int | None,
@@ -658,6 +752,7 @@ def evaluate_data_coarse_attribution(
     normalize_unlearn_grad: bool,
     effect_reduction: str,
     seed: int,
+    coarse_output_path: str | None = None,
 ) -> dict:
     if granularity not in {"sample_to_token", "sample_to_sample", "both"}:
         raise ValueError(
@@ -684,6 +779,9 @@ def evaluate_data_coarse_attribution(
                 unit_type="sample_to_token",
                 unit_name=f"token_{int(target_idx)}",
                 prescreen_max_seq_len=prescreen_max_seq_len,
+                prescreen_sketch_cache=prescreen_sketch_cache,
+                prescreen_sketch_dim=prescreen_sketch_dim,
+                prescreen_sketch_seed=prescreen_sketch_seed,
                 method_top_ks=method_top_ks,
                 oracle_top_ms=oracle_top_ms,
                 oracle_limit=oracle_limit,
@@ -692,6 +790,7 @@ def evaluate_data_coarse_attribution(
                 normalize_unlearn_grad=normalize_unlearn_grad,
                 effect_reduction=effect_reduction,
                 seed=seed,
+                coarse_output_path=_unit_stage_output_path(coarse_output_path, f"token_{int(target_idx)}"),
             )
             result["sample_to_token"].append(unit)
 
@@ -711,6 +810,9 @@ def evaluate_data_coarse_attribution(
             unit_type="sample_to_sample",
             unit_name="full_response",
             prescreen_max_seq_len=prescreen_max_seq_len,
+            prescreen_sketch_cache=prescreen_sketch_cache,
+            prescreen_sketch_dim=prescreen_sketch_dim,
+            prescreen_sketch_seed=prescreen_sketch_seed,
             method_top_ks=method_top_ks,
             oracle_top_ms=oracle_top_ms,
             oracle_limit=oracle_limit,
@@ -719,6 +821,7 @@ def evaluate_data_coarse_attribution(
             normalize_unlearn_grad=normalize_unlearn_grad,
             effect_reduction=effect_reduction,
             seed=seed,
+            coarse_output_path=_unit_stage_output_path(coarse_output_path, "full_response"),
         )
 
     return result
@@ -796,7 +899,16 @@ def _stage_output_path(output_path: str, stage_name: str) -> str:
     return f"{root}_{stage_name}{ext or '.json'}"
 
 
-def main() -> None:
+def _unit_stage_output_path(output_path: str | None, unit_name: str) -> str | None:
+    if output_path is None:
+        return None
+    if unit_name == "full_response":
+        return output_path
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_{unit_name}{ext or '.json'}"
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate feature and data attribution with intervention-based ranking metrics."
     )
@@ -811,6 +923,14 @@ def main() -> None:
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--prescreen-batch-size", type=int, default=1)
     parser.add_argument("--prescreen-max-seq-len", type=int, default=3000)
+    parser.add_argument("--prescreen-sketch-dim", type=int, default=PRESCREEN_SKETCH_DIM)
+    parser.add_argument("--prescreen-sketch-seed", type=int, default=PRESCREEN_SKETCH_SEED)
+    parser.add_argument("--prescreen-sketch-cache-dir", type=str, default=PRESCREEN_SKETCH_CACHE_DIR)
+    parser.add_argument(
+        "--no-prescreen-sketch-cache",
+        action="store_true",
+        help="Disable cached TensorSketch coarse retrieval and use exact LM-head gradients.",
+    )
     parser.add_argument("--max-gpu-memory", type=str, default=None)
     parser.add_argument("--attn-implementation", type=str, default="eager")
     parser.add_argument("--skip-feature", action="store_true")
@@ -853,7 +973,13 @@ def main() -> None:
         default=None,
         help="Optional path for the feature-attribution checkpoint report.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--data-coarse-output",
+        type=str,
+        default=None,
+        help="Optional path for the data coarse-ranking checkpoint report.",
+    )
+    args = parser.parse_args(argv)
 
     set_seed(args.seed)
     random.seed(args.seed)
@@ -868,9 +994,11 @@ def main() -> None:
     )
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
-    train_samples = load_samples(args.train_data)
+    train_samples = []
+    if not args.skip_data:
+        train_samples = load_samples(args.train_data)
     test_samples = load_samples(args.test_data)
-    if args.train_limit is not None:
+    if args.train_limit is not None and train_samples:
         train_samples = train_samples[: int(args.train_limit)]
     test_sample = test_samples[int(args.test_index)]
     task_id = test_sample.get("task_id") or f"test{args.test_index}"
@@ -911,6 +1039,7 @@ def main() -> None:
 
     train_ds = None
     train_loader = None
+    prescreen_sketch_cache = None
 
     replacement_token_id = args.replacement_token_id
     if replacement_token_id is None:
@@ -922,6 +1051,7 @@ def main() -> None:
 
     output_path = args.output or _default_output_path(task_id, target_positions)
     feature_output_path = args.feature_output or _stage_output_path(output_path, "feature")
+    data_coarse_output_path = args.data_coarse_output or _stage_output_path(output_path, "data_coarse")
 
     report = {
         "experiment_meta": {
@@ -933,7 +1063,7 @@ def main() -> None:
                 for t in target_positions
             ],
             "prompt_len": int(prompt_len),
-            "train_size": len(train_samples),
+            "train_size": len(train_samples) if not args.skip_data else None,
             "evaluation_protocol": {
                 "feature_oracle": "leave-one-source-token-out target CE increase",
                 "data_oracle": "one-step gradient-ascent unlearning target CE increase",
@@ -955,6 +1085,9 @@ def main() -> None:
                 "normalize_unlearn_grad": not args.no_normalize_unlearn_grad,
                 "data_effect_reduction": args.data_effect_reduction,
                 "prescreen_max_seq_len": args.prescreen_max_seq_len,
+                "prescreen_sketch_dim": 0 if args.no_prescreen_sketch_cache else args.prescreen_sketch_dim,
+                "prescreen_sketch_seed": args.prescreen_sketch_seed,
+                "prescreen_sketch_cache_dir": args.prescreen_sketch_cache_dir,
             },
         },
         "test_sample_baseline": test_meta,
@@ -994,6 +1127,18 @@ def main() -> None:
             collate_fn=collator,
         )
         train_loader = accelerator.prepare(train_loader)
+        prescreen_sketch_dim = 0 if args.no_prescreen_sketch_cache else int(args.prescreen_sketch_dim or 0)
+        if prescreen_sketch_dim > 0:
+            prescreen_sketch_cache = _load_or_build_prescreen_sketch_cache(
+                model,
+                train_ds,
+                train_loader,
+                accelerator,
+                max_seq_len=None if args.prescreen_max_seq_len <= 0 else int(args.prescreen_max_seq_len),
+                sketch_dim=prescreen_sketch_dim,
+                sketch_seed=int(args.prescreen_sketch_seed),
+                cache_dir=args.prescreen_sketch_cache_dir,
+            )
 
         report["data_coarse_attribution"] = evaluate_data_coarse_attribution(
             model,
@@ -1006,6 +1151,9 @@ def main() -> None:
             accelerator,
             granularity=args.data_granularity,
             prescreen_max_seq_len=None if args.prescreen_max_seq_len <= 0 else int(args.prescreen_max_seq_len),
+            prescreen_sketch_cache=prescreen_sketch_cache,
+            prescreen_sketch_dim=prescreen_sketch_dim,
+            prescreen_sketch_seed=int(args.prescreen_sketch_seed),
             method_top_ks=parse_int_tuple(args.data_method_k_values) or DEFAULT_DATA_METHOD_K,
             oracle_top_ms=parse_int_tuple(args.data_oracle_m_values) or DEFAULT_DATA_ORACLE_M,
             oracle_limit=args.data_oracle_limit,
@@ -1014,6 +1162,7 @@ def main() -> None:
             normalize_unlearn_grad=not args.no_normalize_unlearn_grad,
             effect_reduction=args.data_effect_reduction,
             seed=int(args.seed),
+            coarse_output_path=data_coarse_output_path,
         )
 
     _write_json(output_path, report)
