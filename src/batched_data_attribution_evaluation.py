@@ -779,32 +779,58 @@ def main() -> None:
     for group in _chunks(test_indices, int(args.test_batch_size)):
         states = []
         for test_index in group:
-            state = _prepare_test_state(
-                test_index=int(test_index),
-                test_sample=test_samples[int(test_index)],
-                model=model,
-                tokenizer=tokenizer,
-                convert_to_chatml=convert_to_chatml,
-                base_collator=base_collator,
-                accelerator=accelerator,
-                train_loader=train_loader,
-                prescreen_sketch_cache=prescreen_sketch_cache,
-                lm_head_device=lm_head_device,
-                idx_to_row=idx_to_row,
-                output_dir=args.output_dir,
-                use_generated_response=not args.use_ground_truth_response,
-                generation_limit=int(args.generation_limit),
-                max_output_tokens=int(args.max_output_tokens),
-                prescreen_max_seq_len=prescreen_max_seq_len,
-                prescreen_sketch_dim=prescreen_sketch_dim,
-                prescreen_sketch_seed=int(args.prescreen_sketch_seed),
-                oracle_limit=args.data_oracle_limit,
-                oracle_include_method_top=int(args.data_oracle_include_method_top),
-                seed=int(args.seed),
-                oracle_mode=oracle_mode,
-                logit_chunk_size=int(args.logit_chunk_size),
-            )
+            test_sample = test_samples[int(test_index)]
+            task_id = test_sample.get("task_id") or f"test{test_index}"
+            try:
+                state = _prepare_test_state(
+                    test_index=int(test_index),
+                    test_sample=test_sample,
+                    model=model,
+                    tokenizer=tokenizer,
+                    convert_to_chatml=convert_to_chatml,
+                    base_collator=base_collator,
+                    accelerator=accelerator,
+                    train_loader=train_loader,
+                    prescreen_sketch_cache=prescreen_sketch_cache,
+                    lm_head_device=lm_head_device,
+                    idx_to_row=idx_to_row,
+                    output_dir=args.output_dir,
+                    use_generated_response=not args.use_ground_truth_response,
+                    generation_limit=int(args.generation_limit),
+                    max_output_tokens=int(args.max_output_tokens),
+                    prescreen_max_seq_len=prescreen_max_seq_len,
+                    prescreen_sketch_dim=prescreen_sketch_dim,
+                    prescreen_sketch_seed=int(args.prescreen_sketch_seed),
+                    oracle_limit=args.data_oracle_limit,
+                    oracle_include_method_top=int(args.data_oracle_include_method_top),
+                    seed=int(args.seed),
+                    oracle_mode=oracle_mode,
+                    logit_chunk_size=int(args.logit_chunk_size),
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if (
+                    "No labeled response tokens found" not in message
+                    and "marker sequence not found" not in message
+                ):
+                    raise
+                output_path = os.path.abspath(
+                    os.path.join(args.output_dir, "data", f"{task_id}_data.json")
+                )
+                print(
+                    f"[WARN] Skipping test {int(test_index)} ({task_id}): {message}",
+                    flush=True,
+                )
+                with open(status_path, "a", encoding="utf-8") as status_f:
+                    status_f.write(
+                        f"{int(test_index)}\t{task_id}\tdata\tskipped\t0\t{output_path}\t\n"
+                    )
+                continue
             states.append(state)
+
+        if not states:
+            torch.cuda.empty_cache()
+            continue
 
         _run_batched_oracle(
             states=states,
