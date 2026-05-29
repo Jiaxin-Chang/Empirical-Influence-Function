@@ -841,6 +841,13 @@ def build_test_batch(
     test_ds = build_single_sample_dataset(test_sample, convert_to_chatml)
     raw_batch = base_collator([test_ds[0]])
     raw_batch = _tensor_batch_to_device(raw_batch, accelerator.device)
+    label_positions = torch.nonzero(raw_batch["labels"][0] != -100, as_tuple=False).flatten()
+    if label_positions.numel() == 0:
+        raise ValueError(
+            "No labeled response tokens found in the test sample. "
+            "The sample was likely truncated before the assistant response."
+        )
+    prompt_len = int(label_positions[0].item())
 
     infer = NewInferenceFunction(
         model=model,
@@ -850,8 +857,12 @@ def build_test_batch(
         param_filter_fn=lm_head_filter,
         top_k=20,
     )
-    gen_result = infer.infer(raw_batch, gen_limit=generation_limit, skip_saliency=True)
-    prompt_len = int(gen_result["target_idx"][0])
+    gen_result = infer.infer(
+        raw_batch,
+        target_idx=[prompt_len],
+        gen_limit=generation_limit,
+        skip_saliency=True,
+    )
 
     if use_generated_response:
         prompt_ids = raw_batch["input_ids"][0, :prompt_len]
