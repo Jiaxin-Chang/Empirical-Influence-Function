@@ -289,6 +289,7 @@ def _feature_effectiveness_metrics(
     k_values: tuple[int, ...],
     thresholds: tuple[float, ...],
     effect_metric: str,
+    group_effects: dict[int, dict] | None = None,
 ) -> dict[str, float]:
     metrics = {}
     for k in k_values:
@@ -310,6 +311,20 @@ def _feature_effectiveness_metrics(
             suffix = _format_threshold(threshold)
             count = sum(1 for value in metric_values if value >= float(threshold))
             metrics[f"effectiveness_{effect_metric}@{kk}_tau{suffix}"] = count / kk
+        if group_effects is not None and kk in group_effects:
+            group = group_effects[kk]
+            group_logprob_drop = float(group["logprob_drop"])
+            group_prob_drop = float(group["prob_drop"])
+            group_metric_value = (
+                group_logprob_drop if effect_metric == "logprob_drop" else group_prob_drop
+            )
+            metrics[f"group_logprob_drop@{kk}"] = group_logprob_drop
+            metrics[f"group_prob_drop@{kk}"] = group_prob_drop
+            for threshold in thresholds:
+                suffix = _format_threshold(threshold)
+                metrics[f"group_effectiveness_{effect_metric}@{kk}_tau{suffix}"] = (
+                    1.0 if group_metric_value >= float(threshold) else 0.0
+                )
     return metrics
 
 
@@ -362,6 +377,7 @@ def evaluate_feature_attribution(
         base_prob = math.exp(-base_loss)
         oracle_effects: dict[int, float] = {}
         source_effects: list[dict] = []
+        group_effects: dict[int, dict] = {}
         if evaluation_mode == "effectiveness":
             evaluated_sources = method_ranked[:max(k_values)]
         elif evaluation_mode == "full":
@@ -390,12 +406,35 @@ def evaluate_feature_attribution(
                 })
             del perturbed, perturbed_loss
 
+        for k in k_values:
+            kk = min(int(k), len(method_ranked))
+            if kk <= 0:
+                continue
+            selected_sources = method_ranked[:kk]
+            perturbed = _perturb_sources(
+                test_batch,
+                selected_sources,
+                mode=perturb_mode,
+                replacement_token_id=replacement_token_id,
+            )
+            perturbed_loss = _target_token_losses(model, perturbed, [target_idx], device)
+            if perturbed_loss.numel() > 0:
+                loss_value = float(perturbed_loss[0].item())
+                group_effects[kk] = {
+                    "source_token_indices": [int(x) for x in selected_sources],
+                    "perturbed_ce_loss": loss_value,
+                    "logprob_drop": loss_value - base_loss,
+                    "prob_drop": base_prob - math.exp(-loss_value),
+                }
+            del perturbed, perturbed_loss
+
         effect_by_id = {item["source_token_index"]: item for item in source_effects}
         metrics = _feature_effectiveness_metrics(
             source_effects,
             k_values=k_values,
             thresholds=effect_thresholds,
             effect_metric=effect_metric,
+            group_effects=group_effects,
         )
 
         oracle_ranked = sorted(oracle_effects, key=lambda x: oracle_effects[x], reverse=True)
@@ -432,6 +471,20 @@ def evaluate_feature_attribution(
                 "thresholds": [float(x) for x in effect_thresholds],
                 "evaluated_source_count": len(source_effects),
             },
+            "group_effects": [
+                {
+                    "k": int(k),
+                    "source_token_indices": group["source_token_indices"],
+                    "source_tokens": [
+                        _decode_token(tokenizer, int(ids_1d[idx].item()))
+                        for idx in group["source_token_indices"]
+                    ],
+                    "perturbed_ce_loss": float(group["perturbed_ce_loss"]),
+                    "logprob_drop": float(group["logprob_drop"]),
+                    "prob_drop": float(group["prob_drop"]),
+                }
+                for k, group in sorted(group_effects.items())
+            ],
             "perturbation": {
                 "mode": perturb_mode,
                 "replacement_token_id": int(replacement_token_id),

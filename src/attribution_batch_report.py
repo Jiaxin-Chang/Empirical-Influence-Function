@@ -137,8 +137,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         f"- Data files: {report['summary']['data_file_count']}",
         f"- Status records: {report['summary']['status_record_count']}",
         "",
-        "| index | task_id | feature targets | feature eff@10 | feature logdrop@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data scored | OOM skipped |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| index | task_id | feature targets | group eff@3 | group logdrop@3 | feature eff@10 | feature logdrop@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data scored | OOM skipped |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for sample in samples:
         feature = sample.get("feature") or {}
@@ -153,6 +153,18 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                     _fmt(sample.get("sample_index")),
                     _fmt(sample.get("task_id")),
                     _fmt(feature.get("target_count")),
+                    _fmt(
+                        _first_metric(
+                            feature_metrics,
+                            (
+                                "group_effectiveness_logprob_drop@3_tau0.5",
+                                "group_effectiveness_logprob_drop@3_tau0.2",
+                                "group_effectiveness_prob_drop@3_tau0.2",
+                                "group_effectiveness_logprob_drop@5_tau0.5",
+                            ),
+                        )
+                    ),
+                    _fmt(_first_metric(feature_metrics, ("group_logprob_drop@3", "group_logprob_drop@5"))),
                     _fmt(
                         _first_metric(
                             feature_metrics,
