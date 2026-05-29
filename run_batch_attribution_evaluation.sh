@@ -50,6 +50,9 @@ FEATURE_K_VALUES="${FEATURE_K_VALUES:-}"
 FEATURE_PERTURB_MODE="${FEATURE_PERTURB_MODE:-}"
 REPLACEMENT_TOKEN_ID="${REPLACEMENT_TOKEN_ID:-}"
 MAX_FEATURE_SOURCES="${MAX_FEATURE_SOURCES:-}"
+FEATURE_EVALUATION_MODE="${FEATURE_EVALUATION_MODE:-}"
+FEATURE_EFFECT_THRESHOLDS="${FEATURE_EFFECT_THRESHOLDS:-}"
+FEATURE_EFFECT_METRIC="${FEATURE_EFFECT_METRIC:-}"
 
 PRESCREEN_BATCH_SIZE="${PRESCREEN_BATCH_SIZE:-}"
 PRESCREEN_MAX_SEQ_LEN="${PRESCREEN_MAX_SEQ_LEN:-}"
@@ -90,6 +93,9 @@ while [[ $# -gt 0 ]]; do
         --feature-perturb-mode) FEATURE_PERTURB_MODE="$2"; shift 2 ;;
         --replacement-token-id) REPLACEMENT_TOKEN_ID="$2"; shift 2 ;;
         --max-feature-sources) MAX_FEATURE_SOURCES="$2"; shift 2 ;;
+        --feature-evaluation-mode) FEATURE_EVALUATION_MODE="$2"; shift 2 ;;
+        --feature-effect-thresholds) FEATURE_EFFECT_THRESHOLDS="$2"; shift 2 ;;
+        --feature-effect-metric) FEATURE_EFFECT_METRIC="$2"; shift 2 ;;
         --prescreen-batch-size) PRESCREEN_BATCH_SIZE="$2"; shift 2 ;;
         --prescreen-max-seq-len) PRESCREEN_MAX_SEQ_LEN="$2"; shift 2 ;;
         --prescreen-sketch-dim) PRESCREEN_SKETCH_DIM="$2"; shift 2 ;;
@@ -201,6 +207,9 @@ FEATURE_ARGS=()
 [[ -n "$FEATURE_PERTURB_MODE" ]] && FEATURE_ARGS+=(--feature-perturb-mode "$FEATURE_PERTURB_MODE")
 [[ -n "$REPLACEMENT_TOKEN_ID" ]] && FEATURE_ARGS+=(--replacement-token-id "$REPLACEMENT_TOKEN_ID")
 [[ -n "$MAX_FEATURE_SOURCES" ]] && FEATURE_ARGS+=(--max-feature-sources "$MAX_FEATURE_SOURCES")
+[[ -n "$FEATURE_EVALUATION_MODE" ]] && FEATURE_ARGS+=(--feature-evaluation-mode "$FEATURE_EVALUATION_MODE")
+[[ -n "$FEATURE_EFFECT_THRESHOLDS" ]] && FEATURE_ARGS+=(--feature-effect-thresholds "$FEATURE_EFFECT_THRESHOLDS")
+[[ -n "$FEATURE_EFFECT_METRIC" ]] && FEATURE_ARGS+=(--feature-effect-metric "$FEATURE_EFFECT_METRIC")
 
 DATA_ARGS=()
 [[ -n "$PRESCREEN_BATCH_SIZE" ]] && DATA_ARGS+=(--prescreen-batch-size "$PRESCREEN_BATCH_SIZE")

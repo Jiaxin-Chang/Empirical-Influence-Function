@@ -52,6 +52,7 @@ from src.process_data import process_func_chatml
 DEFAULT_K_VALUES = (5, 10, 20)
 DEFAULT_DATA_METHOD_K = (10, 50, 100)
 DEFAULT_DATA_ORACLE_M = (10, 20, 50)
+DEFAULT_FEATURE_EFFECT_THRESHOLDS = (0.1, 0.2, 0.5)
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -69,6 +70,10 @@ def _tensor_batch_to_device(batch: dict, device) -> dict:
 
 def _decode_token(tokenizer, token_id: int) -> str:
     return tokenizer.decode([int(token_id)])
+
+
+def _format_threshold(value: float) -> str:
+    return f"{float(value):g}"
 
 
 def _valid_target_positions(tokenizer, input_ids_1d: torch.Tensor, prompt_len: int, max_tokens: int) -> list[int]:
@@ -278,6 +283,36 @@ def _feature_aopc(
     return 0.0 if not effects else sum(effects) / len(effects)
 
 
+def _feature_effectiveness_metrics(
+    source_effects: list[dict],
+    *,
+    k_values: tuple[int, ...],
+    thresholds: tuple[float, ...],
+    effect_metric: str,
+) -> dict[str, float]:
+    metrics = {}
+    for k in k_values:
+        kk = min(int(k), len(source_effects))
+        if kk <= 0:
+            continue
+        top_effects = source_effects[:kk]
+        logprob_drops = [float(item["logprob_drop"]) for item in top_effects]
+        prob_drops = [float(item["prob_drop"]) for item in top_effects]
+        metric_values = (
+            logprob_drops if effect_metric == "logprob_drop" else prob_drops
+        )
+        metrics[f"mean_logprob_drop@{kk}"] = sum(logprob_drops) / kk
+        metrics[f"mean_prob_drop@{kk}"] = sum(prob_drops) / kk
+        metrics[f"positive_rate_logprob_drop@{kk}"] = (
+            sum(1 for value in logprob_drops if value > 0.0) / kk
+        )
+        for threshold in thresholds:
+            suffix = _format_threshold(threshold)
+            count = sum(1 for value in metric_values if value >= float(threshold))
+            metrics[f"effectiveness_{effect_metric}@{kk}_tau{suffix}"] = count / kk
+    return metrics
+
+
 def evaluate_feature_attribution(
     model,
     tokenizer,
@@ -290,6 +325,9 @@ def evaluate_feature_attribution(
     perturb_mode: str,
     replacement_token_id: int,
     max_feature_sources: int | None,
+    evaluation_mode: str,
+    effect_thresholds: tuple[float, ...],
+    effect_metric: str,
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
@@ -321,8 +359,17 @@ def evaluate_feature_attribution(
         method_scores = {idx: score for idx, score in attr_pairs}
 
         base_loss = float(_target_token_losses(model, test_batch, [target_idx], device)[0].item())
+        base_prob = math.exp(-base_loss)
         oracle_effects: dict[int, float] = {}
-        for src_idx in tqdm(method_ranked, desc=f"Feature oracle t={target_idx}", leave=False):
+        source_effects: list[dict] = []
+        if evaluation_mode == "effectiveness":
+            evaluated_sources = method_ranked[:max(k_values)]
+        elif evaluation_mode == "full":
+            evaluated_sources = method_ranked
+        else:
+            raise ValueError(f"Unsupported feature evaluation mode: {evaluation_mode}")
+
+        for src_idx in tqdm(evaluated_sources, desc=f"Feature effects t={target_idx}", leave=False):
             perturbed = _perturb_sources(
                 test_batch,
                 [src_idx],
@@ -331,36 +378,60 @@ def evaluate_feature_attribution(
             )
             perturbed_loss = _target_token_losses(model, perturbed, [target_idx], device)
             if perturbed_loss.numel() > 0:
-                oracle_effects[int(src_idx)] = float(perturbed_loss[0].item()) - base_loss
+                loss_value = float(perturbed_loss[0].item())
+                logprob_drop = loss_value - base_loss
+                prob_drop = base_prob - math.exp(-loss_value)
+                oracle_effects[int(src_idx)] = logprob_drop
+                source_effects.append({
+                    "source_token_index": int(src_idx),
+                    "perturbed_ce_loss": loss_value,
+                    "logprob_drop": logprob_drop,
+                    "prob_drop": prob_drop,
+                })
             del perturbed, perturbed_loss
 
-        oracle_ranked = sorted(oracle_effects, key=lambda x: oracle_effects[x], reverse=True)
+        effect_by_id = {item["source_token_index"]: item for item in source_effects}
+        metrics = _feature_effectiveness_metrics(
+            source_effects,
+            k_values=k_values,
+            thresholds=effect_thresholds,
+            effect_metric=effect_metric,
+        )
 
-        metrics = {}
-        for k in k_values:
-            kk = min(int(k), len(method_ranked), len(oracle_ranked))
-            if kk <= 0:
-                continue
-            metrics[f"recall@{kk}"] = _recall_at(method_ranked, oracle_ranked, kk, kk)
-            metrics[f"ndcg@{kk}"] = _ranking_ndcg(method_ranked, oracle_effects, kk)
-            metrics[f"spearman_top{kk}"] = _spearman_top_overlap(method_ranked, oracle_ranked, kk)
-            metrics[f"aopc@{kk}"] = _feature_aopc(
-                model,
-                tokenizer,
-                test_batch,
-                target_idx,
-                method_ranked,
-                base_loss,
-                device=device,
-                k=kk,
-                perturb_mode=perturb_mode,
-                replacement_token_id=replacement_token_id,
-            )
+        oracle_ranked = sorted(oracle_effects, key=lambda x: oracle_effects[x], reverse=True)
+        if evaluation_mode == "full":
+            for k in k_values:
+                kk = min(int(k), len(method_ranked), len(oracle_ranked))
+                if kk <= 0:
+                    continue
+                metrics[f"recall@{kk}"] = _recall_at(method_ranked, oracle_ranked, kk, kk)
+                metrics[f"ndcg@{kk}"] = _ranking_ndcg(method_ranked, oracle_effects, kk)
+                metrics[f"spearman_top{kk}"] = _spearman_top_overlap(method_ranked, oracle_ranked, kk)
+                metrics[f"aopc@{kk}"] = _feature_aopc(
+                    model,
+                    tokenizer,
+                    test_batch,
+                    target_idx,
+                    method_ranked,
+                    base_loss,
+                    device=device,
+                    k=kk,
+                    perturb_mode=perturb_mode,
+                    replacement_token_id=replacement_token_id,
+                )
 
         results.append({
             "target_token_index": target_idx,
             "target_token": target_text,
             "base_ce_loss": base_loss,
+            "base_logprob": -base_loss,
+            "base_prob": base_prob,
+            "feature_evaluation_mode": evaluation_mode,
+            "effectiveness": {
+                "effect_metric": effect_metric,
+                "thresholds": [float(x) for x in effect_thresholds],
+                "evaluated_source_count": len(source_effects),
+            },
             "perturbation": {
                 "mode": perturb_mode,
                 "replacement_token_id": int(replacement_token_id),
@@ -374,8 +445,21 @@ def evaluate_feature_attribution(
                     "source_token": _decode_token(tokenizer, int(ids_1d[idx].item())),
                     "alti_saliency": float(method_scores[idx]),
                     "oracle_effect": float(oracle_effects.get(idx, 0.0)),
+                    "logprob_drop": float(effect_by_id.get(idx, {}).get("logprob_drop", 0.0)),
+                    "prob_drop": float(effect_by_id.get(idx, {}).get("prob_drop", 0.0)),
                 }
                 for rank, idx in enumerate(method_ranked[:max(k_values)], start=1)
+            ],
+            "effect_top": [
+                {
+                    "rank": rank,
+                    "source_token_index": int(idx),
+                    "source_token": _decode_token(tokenizer, int(ids_1d[idx].item())),
+                    "logprob_drop": float(oracle_effects[idx]),
+                    "prob_drop": float(effect_by_id.get(idx, {}).get("prob_drop", 0.0)),
+                    "alti_saliency": float(method_scores.get(idx, 0.0)),
+                }
+                for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
             ],
             "oracle_top": [
                 {
@@ -386,7 +470,7 @@ def evaluate_feature_attribution(
                     "alti_saliency": float(method_scores.get(idx, 0.0)),
                 }
                 for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
-            ],
+            ] if evaluation_mode == "full" else [],
         })
 
     return results
@@ -900,6 +984,12 @@ def parse_int_tuple(raw: str) -> tuple[int, ...]:
     return tuple(int(x.strip()) for x in raw.split(",") if x.strip())
 
 
+def parse_float_tuple(raw: str) -> tuple[float, ...]:
+    if not raw.strip():
+        return ()
+    return tuple(float(x.strip()) for x in raw.split(",") if x.strip())
+
+
 def _default_output_path(task_id: str, target_positions: list[int]) -> str:
     token_part = f"tok{target_positions[0]}" if len(target_positions) == 1 else "tokens"
     return f"attribution_eval_{task_id}_{token_part}.json"
@@ -951,6 +1041,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--feature-perturb-mode", choices=["replace", "zero_attention"], default="replace")
     parser.add_argument("--replacement-token-id", type=int, default=None)
     parser.add_argument("--max-feature-sources", type=int, default=None)
+    parser.add_argument(
+        "--feature-evaluation-mode",
+        choices=["effectiveness", "full"],
+        default="effectiveness",
+        help=(
+            "effectiveness only perturbs method top-k source tokens and reports "
+            "drop-threshold effectiveness; full also computes the old oracle ranking "
+            "metrics such as Recall/NDCG/AOPC."
+        ),
+    )
+    parser.add_argument("--feature-effect-thresholds", type=str, default="0.1,0.2,0.5")
+    parser.add_argument(
+        "--feature-effect-metric",
+        choices=["logprob_drop", "prob_drop"],
+        default="logprob_drop",
+    )
     parser.add_argument("--data-method-k-values", type=str, default="10,50,100")
     parser.add_argument("--data-oracle-m-values", type=str, default="10,20,50")
     parser.add_argument("--data-oracle-limit", type=int, default=None)
@@ -1087,6 +1193,10 @@ def main(argv: list[str] | None = None) -> None:
                 "feature_k_values": parse_int_tuple(args.feature_k_values),
                 "feature_perturb_mode": args.feature_perturb_mode,
                 "max_feature_sources": args.max_feature_sources,
+                "feature_evaluation_mode": args.feature_evaluation_mode,
+                "feature_effect_thresholds": parse_float_tuple(args.feature_effect_thresholds)
+                or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
+                "feature_effect_metric": args.feature_effect_metric,
                 "data_method_k_values": parse_int_tuple(args.data_method_k_values),
                 "data_oracle_m_values": parse_int_tuple(args.data_oracle_m_values),
                 "data_oracle_limit": args.data_oracle_limit,
@@ -1116,6 +1226,10 @@ def main(argv: list[str] | None = None) -> None:
             perturb_mode=args.feature_perturb_mode,
             replacement_token_id=int(replacement_token_id),
             max_feature_sources=args.max_feature_sources,
+            evaluation_mode=args.feature_evaluation_mode,
+            effect_thresholds=parse_float_tuple(args.feature_effect_thresholds)
+            or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
+            effect_metric=args.feature_effect_metric,
         )
         feature_report = {
             "experiment_meta": {
