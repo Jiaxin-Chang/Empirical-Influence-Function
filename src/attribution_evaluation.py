@@ -232,17 +232,46 @@ def _perturb_sources(
     *,
     mode: str,
     replacement_token_id: int,
+    random_token_ids: dict[int, int] | None = None,
 ) -> dict:
+    seq_len = int(batch["input_ids"].size(1))
+    source_indices = [
+        int(idx)
+        for idx in dict.fromkeys(int(x) for x in source_indices)
+        if 0 <= int(idx) < seq_len
+    ]
+    if mode == "delete":
+        delete_set = set(source_indices)
+        keep_indices = [
+            idx for idx in range(seq_len)
+            if idx not in delete_set
+        ]
+        keep = torch.tensor(keep_indices, dtype=torch.long)
+        perturbed = {}
+        for key, value in batch.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dim() >= 2
+                and value.size(1) == seq_len
+            ):
+                perturbed[key] = value.index_select(1, keep.to(value.device)).clone()
+            elif isinstance(value, torch.Tensor):
+                perturbed[key] = value.clone()
+            else:
+                perturbed[key] = value
+        return perturbed
+
     perturbed = {
         k: v.clone() if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
     for idx in source_indices:
-        idx = int(idx)
-        if idx < 0 or idx >= perturbed["input_ids"].size(1):
-            continue
         if mode == "replace":
             perturbed["input_ids"][0, idx] = int(replacement_token_id)
+        elif mode == "random_replace":
+            if random_token_ids is None or idx not in random_token_ids:
+                raise ValueError("random_replace perturbation requires random_token_ids.")
+            perturbed["input_ids"][0, idx] = int(random_token_ids[idx])
         elif mode == "zero_attention":
             if "attention_mask" not in perturbed:
                 raise ValueError("zero_attention perturbation requires attention_mask.")
@@ -250,6 +279,98 @@ def _perturb_sources(
         else:
             raise ValueError(f"Unknown feature perturbation mode: {mode}")
     return perturbed
+
+
+def _shift_target_positions_after_delete(
+    target_positions: Iterable[int],
+    source_indices: Iterable[int],
+    *,
+    mode: str,
+) -> list[int]:
+    positions = [int(pos) for pos in target_positions]
+    if mode != "delete":
+        return positions
+
+    deleted = sorted(set(int(idx) for idx in source_indices))
+    shifted = []
+    for pos in positions:
+        if pos in deleted:
+            continue
+        shifted.append(pos - sum(1 for idx in deleted if idx < pos))
+    return shifted
+
+
+def _sample_random_token_id(
+    *,
+    vocab_size: int,
+    excluded_token_ids: set[int],
+) -> int:
+    for _ in range(100):
+        token_id = random.randrange(max(1, int(vocab_size)))
+        if token_id not in excluded_token_ids:
+            return token_id
+    return random.randrange(max(1, int(vocab_size)))
+
+
+def _perturbed_target_loss_summary(
+    model,
+    batch: dict,
+    source_indices: Iterable[int],
+    target_idx: int,
+    *,
+    device,
+    perturb_mode: str,
+    replacement_token_id: int,
+    random_trials: int,
+    vocab_size: int,
+    random_excluded_token_ids: set[int],
+) -> dict[str, float | int | list[float]]:
+    source_indices = [int(idx) for idx in source_indices]
+    target_positions = _shift_target_positions_after_delete(
+        [target_idx],
+        source_indices,
+        mode=perturb_mode,
+    )
+    if not target_positions:
+        return {"trial_count": 0, "loss_mean": 0.0, "loss_std": 0.0, "losses": []}
+
+    trial_count = max(1, int(random_trials)) if perturb_mode == "random_replace" else 1
+    losses: list[float] = []
+    input_ids = batch["input_ids"][0]
+    for _ in range(trial_count):
+        random_token_ids = None
+        if perturb_mode == "random_replace":
+            random_token_ids = {}
+            for idx in source_indices:
+                if 0 <= idx < input_ids.numel():
+                    excluded = set(random_excluded_token_ids)
+                    excluded.add(int(input_ids[idx].item()))
+                    random_token_ids[int(idx)] = _sample_random_token_id(
+                        vocab_size=vocab_size,
+                        excluded_token_ids=excluded,
+                    )
+        perturbed = _perturb_sources(
+            batch,
+            source_indices,
+            mode=perturb_mode,
+            replacement_token_id=replacement_token_id,
+            random_token_ids=random_token_ids,
+        )
+        loss = _target_token_losses(model, perturbed, target_positions, device)
+        if loss.numel() > 0:
+            losses.append(float(loss[0].item()))
+        del perturbed, loss
+
+    if not losses:
+        return {"trial_count": 0, "loss_mean": 0.0, "loss_std": 0.0, "losses": []}
+    loss_mean = sum(losses) / len(losses)
+    variance = sum((value - loss_mean) ** 2 for value in losses) / len(losses)
+    return {
+        "trial_count": len(losses),
+        "loss_mean": loss_mean,
+        "loss_std": math.sqrt(variance),
+        "losses": losses,
+    }
 
 
 def _feature_aopc(
@@ -264,22 +385,29 @@ def _feature_aopc(
     k: int,
     perturb_mode: str,
     replacement_token_id: int,
+    random_trials: int,
+    vocab_size: int,
+    random_excluded_token_ids: set[int],
 ) -> float:
     effects = []
     selected = []
     for src_idx in ranked_sources[:k]:
         selected.append(int(src_idx))
-        perturbed = _perturb_sources(
+        loss_summary = _perturbed_target_loss_summary(
+            model,
             batch,
             selected,
-            mode=perturb_mode,
+            target_idx,
+            device=device,
+            perturb_mode=perturb_mode,
             replacement_token_id=replacement_token_id,
+            random_trials=random_trials,
+            vocab_size=vocab_size,
+            random_excluded_token_ids=random_excluded_token_ids,
         )
-        loss = _target_token_losses(model, perturbed, [target_idx], device)
-        if loss.numel() == 0:
+        if int(loss_summary["trial_count"]) <= 0:
             continue
-        effects.append(float(loss[0].item()) - base_loss)
-        del perturbed, loss
+        effects.append(float(loss_summary["loss_mean"]) - base_loss)
     return 0.0 if not effects else sum(effects) / len(effects)
 
 
@@ -343,6 +471,9 @@ def evaluate_feature_attribution(
     evaluation_mode: str,
     effect_thresholds: tuple[float, ...],
     effect_metric: str,
+    random_trials: int,
+    vocab_size: int,
+    random_excluded_token_ids: set[int],
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
@@ -386,47 +517,59 @@ def evaluate_feature_attribution(
             raise ValueError(f"Unsupported feature evaluation mode: {evaluation_mode}")
 
         for src_idx in tqdm(evaluated_sources, desc=f"Feature effects t={target_idx}", leave=False):
-            perturbed = _perturb_sources(
+            loss_summary = _perturbed_target_loss_summary(
+                model,
                 test_batch,
                 [src_idx],
-                mode=perturb_mode,
+                target_idx,
+                device=device,
+                perturb_mode=perturb_mode,
                 replacement_token_id=replacement_token_id,
+                random_trials=random_trials,
+                vocab_size=vocab_size,
+                random_excluded_token_ids=random_excluded_token_ids,
             )
-            perturbed_loss = _target_token_losses(model, perturbed, [target_idx], device)
-            if perturbed_loss.numel() > 0:
-                loss_value = float(perturbed_loss[0].item())
+            if int(loss_summary["trial_count"]) > 0:
+                loss_value = float(loss_summary["loss_mean"])
                 logprob_drop = loss_value - base_loss
                 prob_drop = base_prob - math.exp(-loss_value)
                 oracle_effects[int(src_idx)] = logprob_drop
                 source_effects.append({
                     "source_token_index": int(src_idx),
                     "perturbed_ce_loss": loss_value,
+                    "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
+                    "perturbation_trials": int(loss_summary["trial_count"]),
                     "logprob_drop": logprob_drop,
                     "prob_drop": prob_drop,
                 })
-            del perturbed, perturbed_loss
 
         for k in k_values:
             kk = min(int(k), len(method_ranked))
             if kk <= 0:
                 continue
             selected_sources = method_ranked[:kk]
-            perturbed = _perturb_sources(
+            loss_summary = _perturbed_target_loss_summary(
+                model,
                 test_batch,
                 selected_sources,
-                mode=perturb_mode,
+                target_idx,
+                device=device,
+                perturb_mode=perturb_mode,
                 replacement_token_id=replacement_token_id,
+                random_trials=random_trials,
+                vocab_size=vocab_size,
+                random_excluded_token_ids=random_excluded_token_ids,
             )
-            perturbed_loss = _target_token_losses(model, perturbed, [target_idx], device)
-            if perturbed_loss.numel() > 0:
-                loss_value = float(perturbed_loss[0].item())
+            if int(loss_summary["trial_count"]) > 0:
+                loss_value = float(loss_summary["loss_mean"])
                 group_effects[kk] = {
                     "source_token_indices": [int(x) for x in selected_sources],
                     "perturbed_ce_loss": loss_value,
+                    "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
+                    "perturbation_trials": int(loss_summary["trial_count"]),
                     "logprob_drop": loss_value - base_loss,
                     "prob_drop": base_prob - math.exp(-loss_value),
                 }
-            del perturbed, perturbed_loss
 
         effect_by_id = {item["source_token_index"]: item for item in source_effects}
         metrics = _feature_effectiveness_metrics(
@@ -457,6 +600,9 @@ def evaluate_feature_attribution(
                     k=kk,
                     perturb_mode=perturb_mode,
                     replacement_token_id=replacement_token_id,
+                    random_trials=random_trials,
+                    vocab_size=vocab_size,
+                    random_excluded_token_ids=random_excluded_token_ids,
                 )
 
         results.append({
@@ -480,6 +626,8 @@ def evaluate_feature_attribution(
                         for idx in group["source_token_indices"]
                     ],
                     "perturbed_ce_loss": float(group["perturbed_ce_loss"]),
+                    "perturbed_ce_loss_std": float(group["perturbed_ce_loss_std"]),
+                    "perturbation_trials": int(group["perturbation_trials"]),
                     "logprob_drop": float(group["logprob_drop"]),
                     "prob_drop": float(group["prob_drop"]),
                 }
@@ -489,6 +637,7 @@ def evaluate_feature_attribution(
                 "mode": perturb_mode,
                 "replacement_token_id": int(replacement_token_id),
                 "replacement_token": _decode_token(tokenizer, int(replacement_token_id)),
+                "random_trials": int(random_trials) if perturb_mode == "random_replace" else 1,
             },
             "metrics": metrics,
             "method_top": [
@@ -1091,7 +1240,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--skip-data", action="store_true")
     parser.add_argument("--top-k-prompt-tokens", type=int, default=20)
     parser.add_argument("--feature-k-values", type=str, default="5,10,20")
-    parser.add_argument("--feature-perturb-mode", choices=["replace", "zero_attention"], default="replace")
+    parser.add_argument(
+        "--feature-perturb-mode",
+        choices=["replace", "random_replace", "delete", "zero_attention"],
+        default="replace",
+        help=(
+            "Feature perturbation strategy. replace uses one fixed token; "
+            "random_replace averages random replacements; delete removes source tokens "
+            "and shifts target positions."
+        ),
+    )
+    parser.add_argument(
+        "--feature-random-trials",
+        type=int,
+        default=5,
+        help="Number of random replacement trials when --feature-perturb-mode=random_replace.",
+    )
     parser.add_argument("--replacement-token-id", type=int, default=None)
     parser.add_argument("--max-feature-sources", type=int, default=None)
     parser.add_argument(
@@ -1245,6 +1409,7 @@ def main(argv: list[str] | None = None) -> None:
             "config": {
                 "feature_k_values": parse_int_tuple(args.feature_k_values),
                 "feature_perturb_mode": args.feature_perturb_mode,
+                "feature_random_trials": max(1, int(args.feature_random_trials)),
                 "max_feature_sources": args.max_feature_sources,
                 "feature_evaluation_mode": args.feature_evaluation_mode,
                 "feature_effect_thresholds": parse_float_tuple(args.feature_effect_thresholds)
@@ -1283,6 +1448,11 @@ def main(argv: list[str] | None = None) -> None:
             effect_thresholds=parse_float_tuple(args.feature_effect_thresholds)
             or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
             effect_metric=args.feature_effect_metric,
+            random_trials=max(1, int(args.feature_random_trials)),
+            vocab_size=len(tokenizer),
+            random_excluded_token_ids=set(
+                int(x) for x in (getattr(tokenizer, "all_special_ids", []) or [])
+            ),
         )
         feature_report = {
             "experiment_meta": {
