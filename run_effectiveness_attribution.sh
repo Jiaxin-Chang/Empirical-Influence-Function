@@ -35,6 +35,8 @@ FEATURE_THRESHOLDS="${FEATURE_THRESHOLDS:-0.2,0.5,1.0}"
 FEATURE_EFFECT_METRIC="${FEATURE_EFFECT_METRIC:-logprob_drop}"
 FEATURE_PERTURB_MODE="${FEATURE_PERTURB_MODE:-replace}"
 FEATURE_RANDOM_TRIALS="${FEATURE_RANDOM_TRIALS:-5}"
+FEATURE_PERTURB_BATCH_SIZE="${FEATURE_PERTURB_BATCH_SIZE:-1}"
+FEATURE_GROUP_ONLY="${FEATURE_GROUP_ONLY:-0}"
 
 DATA_K_VALUES="${DATA_K_VALUES:-10,50,100}"
 DATA_TOP_K="${DATA_TOP_K:-100}"
@@ -65,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         --feature-effect-metric) FEATURE_EFFECT_METRIC="$2"; shift 2 ;;
         --feature-perturb-mode) FEATURE_PERTURB_MODE="$2"; shift 2 ;;
         --feature-random-trials) FEATURE_RANDOM_TRIALS="$2"; shift 2 ;;
+        --feature-perturb-batch-size) FEATURE_PERTURB_BATCH_SIZE="$2"; shift 2 ;;
+        --feature-group-only) FEATURE_GROUP_ONLY=1; shift ;;
         --data-k-values|--data-method-k-values) DATA_K_VALUES="$2"; shift 2 ;;
         --data-top-k) DATA_TOP_K="$2"; shift 2 ;;
         --data-thresholds|--data-effect-thresholds) DATA_THRESHOLDS="$2"; shift 2 ;;
@@ -104,13 +108,13 @@ echo "================================================================="
 echo "  Effectiveness Attribution Evaluation"
 echo "  stages    : ${STAGES}"
 echo "  output dir: ${OUTPUT_DIR_ABS}"
-echo "  feature k : ${FEATURE_K_VALUES}, thresholds=${FEATURE_THRESHOLDS}, perturb=${FEATURE_PERTURB_MODE}, random-trials=${FEATURE_RANDOM_TRIALS}"
+echo "  feature k : ${FEATURE_K_VALUES}, thresholds=${FEATURE_THRESHOLDS}, perturb=${FEATURE_PERTURB_MODE}, random-trials=${FEATURE_RANDOM_TRIALS}, perturb-batch-size=${FEATURE_PERTURB_BATCH_SIZE}, group-only=${FEATURE_GROUP_ONLY}"
 echo "  data k    : ${DATA_K_VALUES}, top-k-unlearn=${DATA_TOP_K}, test-batch-size=${DATA_TEST_BATCH_SIZE}, thresholds=${DATA_THRESHOLDS}"
 echo "================================================================="
 
 if [[ "$STAGES" == "feature" || "$STAGES" == "both" ]]; then
-    bash "$ROOT_DIR/run_batch_attribution_evaluation.sh" \
-        --stages feature \
+    FEATURE_ARGS=(
+        --stages feature
         --train-data "$TRAIN_DATA" \
         --test-data "$TEST_DATA" \
         --output-dir "$OUTPUT_DIR_ABS" \
@@ -121,9 +125,13 @@ if [[ "$STAGES" == "feature" || "$STAGES" == "both" ]]; then
         --feature-k-values "$FEATURE_K_VALUES" \
         --feature-perturb-mode "$FEATURE_PERTURB_MODE" \
         --feature-random-trials "$FEATURE_RANDOM_TRIALS" \
+        --feature-perturb-batch-size "$FEATURE_PERTURB_BATCH_SIZE" \
         --feature-evaluation-mode effectiveness \
         --feature-effect-thresholds "$FEATURE_THRESHOLDS" \
         --feature-effect-metric "$FEATURE_EFFECT_METRIC"
+    )
+    [[ "$FEATURE_GROUP_ONLY" == "1" ]] && FEATURE_ARGS+=(--feature-group-only)
+    bash "$ROOT_DIR/run_batch_attribution_evaluation.sh" "${FEATURE_ARGS[@]}"
 fi
 
 if [[ "$STAGES" == "data" || "$STAGES" == "both" ]]; then
