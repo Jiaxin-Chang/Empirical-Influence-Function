@@ -18,6 +18,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-}"
 TRAIN_DATA="${TRAIN_DATA:-sft_train.jsonl}"
 TEST_DATA="${TEST_DATA:-sft_test.jsonl}"
+TRAIN_LIMIT="${TRAIN_LIMIT:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-attribution_results_effectiveness}"
 STAGES="${STAGES:-both}"
 INDICES="${INDICES:-}"
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --model-path) MODEL_PATH="$2"; shift 2 ;;
         --train-data) TRAIN_DATA="$2"; shift 2 ;;
         --test-data) TEST_DATA="$2"; shift 2 ;;
+        --train-limit) TRAIN_LIMIT="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --stages|--stage) STAGES="$2"; shift 2 ;;
         --indices) INDICES="$2"; shift 2 ;;
@@ -104,10 +106,14 @@ COMMON_MODEL_ARGS=()
 [[ -n "$ATTN_IMPLEMENTATION" ]] && COMMON_MODEL_ARGS+=(--attn-implementation "$ATTN_IMPLEMENTATION")
 [[ -n "$MAX_GPU_MEMORY" ]] && COMMON_MODEL_ARGS+=(--max-gpu-memory "$MAX_GPU_MEMORY")
 
+COMMON_DATA_ARGS=()
+[[ -n "$TRAIN_LIMIT" ]] && COMMON_DATA_ARGS+=(--train-limit "$TRAIN_LIMIT")
+
 echo "================================================================="
 echo "  Effectiveness Attribution Evaluation"
 echo "  stages    : ${STAGES}"
 echo "  output dir: ${OUTPUT_DIR_ABS}"
+echo "  train lim : ${TRAIN_LIMIT:-none}"
 echo "  feature k : ${FEATURE_K_VALUES}, thresholds=${FEATURE_THRESHOLDS}, perturb=${FEATURE_PERTURB_MODE}, random-trials=${FEATURE_RANDOM_TRIALS}, perturb-batch-size=${FEATURE_PERTURB_BATCH_SIZE}, group-only=${FEATURE_GROUP_ONLY}"
 echo "  data k    : ${DATA_K_VALUES}, top-k-unlearn=${DATA_TOP_K}, test-batch-size=${DATA_TEST_BATCH_SIZE}, thresholds=${DATA_THRESHOLDS}"
 echo "================================================================="
@@ -118,6 +124,7 @@ if [[ "$STAGES" == "feature" || "$STAGES" == "both" ]]; then
         --train-data "$TRAIN_DATA" \
         --test-data "$TEST_DATA" \
         --output-dir "$OUTPUT_DIR_ABS" \
+        "${COMMON_DATA_ARGS[@]}" \
         "${COMMON_RANGE_ARGS[@]}" \
         "${COMMON_MODEL_ARGS[@]}" \
         --max-output-tokens "$MAX_OUTPUT_TOKENS" \
@@ -139,6 +146,7 @@ if [[ "$STAGES" == "data" || "$STAGES" == "both" ]]; then
         --train-data "$TRAIN_DATA"
         --test-data "$TEST_DATA"
         --output-dir "$OUTPUT_DIR_ABS"
+        "${COMMON_DATA_ARGS[@]}"
         "${COMMON_RANGE_ARGS[@]}"
         "${COMMON_MODEL_ARGS[@]}"
         --max-output-tokens "$MAX_OUTPUT_TOKENS"
