@@ -42,7 +42,7 @@ from src.intervention_experiment import (
     _score_prescreen_sketch_cache,
 )
 from src.loss import (
-    compute_alti_saliency_vector,
+    compute_alti_saliency_vectors,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_sketches_no_backward,
 )
@@ -561,18 +561,30 @@ def evaluate_feature_attribution(
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
+    target_positions = [int(t) for t in target_positions]
+    print(
+        f"[feature] computing ALTI saliency once for {len(target_positions)} target tokens "
+        f"(max prefix={max(target_positions) if target_positions else 0})",
+        flush=True,
+    )
+    saliency_by_target = compute_alti_saliency_vectors(
+        model,
+        test_batch,
+        target_positions,
+        chunk_size=ALTI_CHUNK_SIZE,
+    )
+    base_loss_values = _target_token_losses(model, test_batch, target_positions, device)
+    base_loss_by_target = {
+        int(pos): float(loss)
+        for pos, loss in zip(target_positions, base_loss_values.tolist())
+    }
 
     for target_idx in target_positions:
         target_idx = int(target_idx)
         target_text = _decode_token(tokenizer, int(ids_1d[target_idx].item()))
         print(f"\n[feature] target {target_idx}: {target_text!r}", flush=True)
 
-        saliency = compute_alti_saliency_vector(
-            model,
-            test_batch,
-            target_idx,
-            chunk_size=ALTI_CHUNK_SIZE,
-        )
+        saliency = saliency_by_target[target_idx]
         attr_pairs = [
             (int(idx), float(score))
             for idx, score in top_nontrivial_saliency_sources(
@@ -588,7 +600,7 @@ def evaluate_feature_attribution(
         method_ranked = [idx for idx, _ in attr_pairs]
         method_scores = {idx: score for idx, score in attr_pairs}
 
-        base_loss = float(_target_token_losses(model, test_batch, [target_idx], device)[0].item())
+        base_loss = base_loss_by_target[target_idx]
         base_prob = math.exp(-base_loss)
         oracle_effects: dict[int, float] = {}
         source_effects: list[dict] = []
