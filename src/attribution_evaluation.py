@@ -130,6 +130,54 @@ def _target_token_losses(
     return losses.detach().cpu()
 
 
+@torch.no_grad()
+def _target_token_losses_by_row(
+    model,
+    batch: dict,
+    target_positions: Iterable[int],
+    device,
+) -> torch.Tensor:
+    """Return one CE loss per batch row for row-specific absolute positions."""
+    positions = [int(p) for p in target_positions]
+    if not positions:
+        return torch.empty(0, dtype=torch.float32)
+
+    input_ids = batch["input_ids"].to(device)
+    if input_ids.size(0) != len(positions):
+        raise ValueError(
+            f"Expected {input_ids.size(0)} target positions, got {len(positions)}."
+        )
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    logits = outputs.logits.float()
+    rows = []
+    labels = []
+    for row_idx, pos in enumerate(positions):
+        if 0 < pos < input_ids.size(1):
+            rows.append(logits[row_idx, pos - 1])
+            labels.append(int(input_ids[row_idx, pos].item()))
+
+    if not rows:
+        del outputs, logits, rows
+        torch.cuda.empty_cache()
+        return torch.empty(0, dtype=torch.float32)
+
+    label_tensor = torch.tensor(labels, dtype=torch.long, device=logits.device)
+    losses = F.cross_entropy(torch.stack(rows, dim=0), label_tensor, reduction="none")
+
+    del outputs, logits, rows, label_tensor
+    torch.cuda.empty_cache()
+    return losses.detach().cpu()
+
+
 def _target_batch_with_labels(batch: dict, target_positions: Iterable[int]) -> dict:
     labels = torch.full_like(batch["input_ids"], -100)
     for pos in target_positions:
@@ -281,6 +329,20 @@ def _perturb_sources(
     return perturbed
 
 
+def _concat_feature_batches(batches: list[dict]) -> dict:
+    if not batches:
+        raise ValueError("No feature perturbation batches to concatenate.")
+
+    combined = {}
+    first = batches[0]
+    for key, value in first.items():
+        if isinstance(value, torch.Tensor):
+            combined[key] = torch.cat([batch[key] for batch in batches], dim=0)
+        else:
+            combined[key] = value
+    return combined
+
+
 def _shift_target_positions_after_delete(
     target_positions: Iterable[int],
     source_indices: Iterable[int],
@@ -324,6 +386,7 @@ def _perturbed_target_loss_summary(
     random_trials: int,
     vocab_size: int,
     random_excluded_token_ids: set[int],
+    perturb_batch_size: int,
 ) -> dict[str, float | int | list[float]]:
     source_indices = [int(idx) for idx in source_indices]
     target_positions = _shift_target_positions_after_delete(
@@ -335,31 +398,47 @@ def _perturbed_target_loss_summary(
         return {"trial_count": 0, "loss_mean": 0.0, "loss_std": 0.0, "losses": []}
 
     trial_count = max(1, int(random_trials)) if perturb_mode == "random_replace" else 1
+    perturb_batch_size = max(1, int(perturb_batch_size))
     losses: list[float] = []
     input_ids = batch["input_ids"][0]
-    for _ in range(trial_count):
-        random_token_ids = None
-        if perturb_mode == "random_replace":
-            random_token_ids = {}
-            for idx in source_indices:
-                if 0 <= idx < input_ids.numel():
-                    excluded = set(random_excluded_token_ids)
-                    excluded.add(int(input_ids[idx].item()))
-                    random_token_ids[int(idx)] = _sample_random_token_id(
-                        vocab_size=vocab_size,
-                        excluded_token_ids=excluded,
-                    )
-        perturbed = _perturb_sources(
-            batch,
-            source_indices,
-            mode=perturb_mode,
-            replacement_token_id=replacement_token_id,
-            random_token_ids=random_token_ids,
+    for start in range(0, trial_count, perturb_batch_size):
+        cur_trials = min(perturb_batch_size, trial_count - start)
+        perturbed_batches = []
+        for _ in range(cur_trials):
+            random_token_ids = None
+            if perturb_mode == "random_replace":
+                random_token_ids = {}
+                for idx in source_indices:
+                    if 0 <= idx < input_ids.numel():
+                        excluded = set(random_excluded_token_ids)
+                        excluded.add(int(input_ids[idx].item()))
+                        random_token_ids[int(idx)] = _sample_random_token_id(
+                            vocab_size=vocab_size,
+                            excluded_token_ids=excluded,
+                        )
+            perturbed_batches.append(
+                _perturb_sources(
+                    batch,
+                    source_indices,
+                    mode=perturb_mode,
+                    replacement_token_id=replacement_token_id,
+                    random_token_ids=random_token_ids,
+                )
+            )
+
+        perturbed = (
+            perturbed_batches[0]
+            if len(perturbed_batches) == 1
+            else _concat_feature_batches(perturbed_batches)
         )
-        loss = _target_token_losses(model, perturbed, target_positions, device)
-        if loss.numel() > 0:
-            losses.append(float(loss[0].item()))
-        del perturbed, loss
+        loss = _target_token_losses_by_row(
+            model,
+            perturbed,
+            target_positions * len(perturbed_batches),
+            device,
+        )
+        losses.extend(float(value) for value in loss.tolist())
+        del perturbed, perturbed_batches, loss
 
     if not losses:
         return {"trial_count": 0, "loss_mean": 0.0, "loss_std": 0.0, "losses": []}
@@ -388,6 +467,7 @@ def _feature_aopc(
     random_trials: int,
     vocab_size: int,
     random_excluded_token_ids: set[int],
+    perturb_batch_size: int,
 ) -> float:
     effects = []
     selected = []
@@ -404,6 +484,7 @@ def _feature_aopc(
             random_trials=random_trials,
             vocab_size=vocab_size,
             random_excluded_token_ids=random_excluded_token_ids,
+            perturb_batch_size=perturb_batch_size,
         )
         if int(loss_summary["trial_count"]) <= 0:
             continue
@@ -421,36 +502,37 @@ def _feature_effectiveness_metrics(
 ) -> dict[str, float]:
     metrics = {}
     for k in k_values:
-        kk = min(int(k), len(source_effects))
-        if kk <= 0:
-            continue
-        top_effects = source_effects[:kk]
-        logprob_drops = [float(item["logprob_drop"]) for item in top_effects]
-        prob_drops = [float(item["prob_drop"]) for item in top_effects]
-        metric_values = (
-            logprob_drops if effect_metric == "logprob_drop" else prob_drops
-        )
-        metrics[f"mean_logprob_drop@{kk}"] = sum(logprob_drops) / kk
-        metrics[f"mean_prob_drop@{kk}"] = sum(prob_drops) / kk
-        metrics[f"positive_rate_logprob_drop@{kk}"] = (
-            sum(1 for value in logprob_drops if value > 0.0) / kk
-        )
-        for threshold in thresholds:
-            suffix = _format_threshold(threshold)
-            count = sum(1 for value in metric_values if value >= float(threshold))
-            metrics[f"effectiveness_{effect_metric}@{kk}_tau{suffix}"] = count / kk
-        if group_effects is not None and kk in group_effects:
-            group = group_effects[kk]
+        requested_k = int(k)
+        if source_effects:
+            kk = min(requested_k, len(source_effects))
+            if kk > 0:
+                top_effects = source_effects[:kk]
+                logprob_drops = [float(item["logprob_drop"]) for item in top_effects]
+                prob_drops = [float(item["prob_drop"]) for item in top_effects]
+                metric_values = (
+                    logprob_drops if effect_metric == "logprob_drop" else prob_drops
+                )
+                metrics[f"mean_logprob_drop@{kk}"] = sum(logprob_drops) / kk
+                metrics[f"mean_prob_drop@{kk}"] = sum(prob_drops) / kk
+                metrics[f"positive_rate_logprob_drop@{kk}"] = (
+                    sum(1 for value in logprob_drops if value > 0.0) / kk
+                )
+                for threshold in thresholds:
+                    suffix = _format_threshold(threshold)
+                    count = sum(1 for value in metric_values if value >= float(threshold))
+                    metrics[f"effectiveness_{effect_metric}@{kk}_tau{suffix}"] = count / kk
+        if group_effects is not None and requested_k in group_effects:
+            group = group_effects[requested_k]
             group_logprob_drop = float(group["logprob_drop"])
             group_prob_drop = float(group["prob_drop"])
             group_metric_value = (
                 group_logprob_drop if effect_metric == "logprob_drop" else group_prob_drop
             )
-            metrics[f"group_logprob_drop@{kk}"] = group_logprob_drop
-            metrics[f"group_prob_drop@{kk}"] = group_prob_drop
+            metrics[f"group_logprob_drop@{requested_k}"] = group_logprob_drop
+            metrics[f"group_prob_drop@{requested_k}"] = group_prob_drop
             for threshold in thresholds:
                 suffix = _format_threshold(threshold)
-                metrics[f"group_effectiveness_{effect_metric}@{kk}_tau{suffix}"] = (
+                metrics[f"group_effectiveness_{effect_metric}@{requested_k}_tau{suffix}"] = (
                     1.0 if group_metric_value >= float(threshold) else 0.0
                 )
     return metrics
@@ -474,6 +556,8 @@ def evaluate_feature_attribution(
     random_trials: int,
     vocab_size: int,
     random_excluded_token_ids: set[int],
+    group_only: bool,
+    perturb_batch_size: int,
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
@@ -509,7 +593,11 @@ def evaluate_feature_attribution(
         oracle_effects: dict[int, float] = {}
         source_effects: list[dict] = []
         group_effects: dict[int, dict] = {}
-        if evaluation_mode == "effectiveness":
+        if group_only and evaluation_mode != "effectiveness":
+            raise ValueError("--feature-group-only is only supported in effectiveness mode.")
+        if group_only:
+            evaluated_sources = []
+        elif evaluation_mode == "effectiveness":
             evaluated_sources = method_ranked[:max(k_values)]
         elif evaluation_mode == "full":
             evaluated_sources = method_ranked
@@ -528,6 +616,7 @@ def evaluate_feature_attribution(
                 random_trials=random_trials,
                 vocab_size=vocab_size,
                 random_excluded_token_ids=random_excluded_token_ids,
+                perturb_batch_size=perturb_batch_size,
             )
             if int(loss_summary["trial_count"]) > 0:
                 loss_value = float(loss_summary["loss_mean"])
@@ -559,6 +648,7 @@ def evaluate_feature_attribution(
                 random_trials=random_trials,
                 vocab_size=vocab_size,
                 random_excluded_token_ids=random_excluded_token_ids,
+                perturb_batch_size=perturb_batch_size,
             )
             if int(loss_summary["trial_count"]) > 0:
                 loss_value = float(loss_summary["loss_mean"])
@@ -603,6 +693,7 @@ def evaluate_feature_attribution(
                     random_trials=random_trials,
                     vocab_size=vocab_size,
                     random_excluded_token_ids=random_excluded_token_ids,
+                    perturb_batch_size=perturb_batch_size,
                 )
 
         results.append({
@@ -638,6 +729,7 @@ def evaluate_feature_attribution(
                 "replacement_token_id": int(replacement_token_id),
                 "replacement_token": _decode_token(tokenizer, int(replacement_token_id)),
                 "random_trials": int(random_trials) if perturb_mode == "random_replace" else 1,
+                "perturb_batch_size": int(perturb_batch_size),
             },
             "metrics": metrics,
             "method_top": [
@@ -1256,8 +1348,25 @@ def main(argv: list[str] | None = None) -> None:
         default=5,
         help="Number of random replacement trials when --feature-perturb-mode=random_replace.",
     )
+    parser.add_argument(
+        "--feature-perturb-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Batch size for feature perturbation forwards. Increase this when GPU "
+            "memory has headroom to run random replacement trials in parallel."
+        ),
+    )
     parser.add_argument("--replacement-token-id", type=int, default=None)
     parser.add_argument("--max-feature-sources", type=int, default=None)
+    parser.add_argument(
+        "--feature-group-only",
+        action="store_true",
+        help=(
+            "Only compute grouped top-k feature perturbations. This skips individual "
+            "source-token effects and is much faster for effectiveness reports."
+        ),
+    )
     parser.add_argument(
         "--feature-evaluation-mode",
         choices=["effectiveness", "full"],
@@ -1410,6 +1519,8 @@ def main(argv: list[str] | None = None) -> None:
                 "feature_k_values": parse_int_tuple(args.feature_k_values),
                 "feature_perturb_mode": args.feature_perturb_mode,
                 "feature_random_trials": max(1, int(args.feature_random_trials)),
+                "feature_perturb_batch_size": max(1, int(args.feature_perturb_batch_size)),
+                "feature_group_only": bool(args.feature_group_only),
                 "max_feature_sources": args.max_feature_sources,
                 "feature_evaluation_mode": args.feature_evaluation_mode,
                 "feature_effect_thresholds": parse_float_tuple(args.feature_effect_thresholds)
@@ -1453,6 +1564,8 @@ def main(argv: list[str] | None = None) -> None:
             random_excluded_token_ids=set(
                 int(x) for x in (getattr(tokenizer, "all_special_ids", []) or [])
             ),
+            group_only=bool(args.feature_group_only),
+            perturb_batch_size=max(1, int(args.feature_perturb_batch_size)),
         )
         feature_report = {
             "experiment_meta": {
