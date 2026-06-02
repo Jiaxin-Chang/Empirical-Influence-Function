@@ -1,61 +1,61 @@
-# Attribution Evaluation Notes
+# 归因评测笔记
 
-## Goal
+## 目标
 
-Evaluate whether the attribution method finds sources that are actually effective for the current prediction.
+评测归因方法找到的 source 是否真的会影响当前预测。
 
 ## Feature Attribution
 
-Current primary metric is effectiveness:
+当前主要看 effectiveness 指标：
 
-- Rank source units by the feature attribution method.
-- Perturb the method top-k source units.
-- If the target token logprob drops by at least tau, count the attribution as effective.
-- Report group effectiveness such as Group@5 / Group@10 and positive-rate variants.
+- 先用归因方法给 source unit 排序。
+- 扰动方法找到的 top-k source unit。
+- 如果扰动后 target token 的 logprob 下降超过阈值 tau，就认为这次归因是有效的。
+- 汇总 Group@5 / Group@10 effectiveness、positive rate 和 reverse rate。
 
-## Ranking Variants
+## 排序方案
 
-Baseline ranking is plain ALTI saliency:
+baseline 是原始 ALTI saliency：
 
 ```text
 score(source) = ALTI_saliency(source -> target)
 ```
 
-Signed ranking adds a target-direction check. For target token y, use the LM head output embedding W_y as the direction that increases y's logit. For each source contextual hidden state h_i, compute:
+signed ranking 会额外判断 source 是否支持当前 target token。对 target token y，用 LM head 中 y 对应的输出 embedding `W_y` 表示“提高 y 的 logit 的方向”。对每个 source 的 contextual hidden state `h_i`，计算：
 
 ```text
 direction(i, y) = cosine(h_i, W_y)
 ```
 
-`signed_clip` ranks by:
+`signed_clip` 的排序分数是：
 
 ```text
 score(i) = ALTI_saliency(i -> y) * max(0, direction(i, y))
 ```
 
-Interpretation:
+直觉解释：
 
-- ALTI measures how much the source flows to the target position.
-- The direction score estimates whether that source supports the specific target token.
-- Negative-direction sources are clipped to zero, so high-flow but target-opposing tokens are demoted.
+- ALTI 表示 source 有多少信息流向 target 位置。
+- direction score 估计这个 source 是否支持具体的 target token。
+- 如果 direction 为负，说明它可能是反向/抑制作用；`signed_clip` 会把这部分裁成 0，让高 ALTI 但反向的 token 降权。
 
-## Source Unit Variants
+## Source Unit 方案
 
-Token mode ranks individual non-trivial BPE tokens.
+token 模式：按单个非 trivial BPE token 排序。
 
-Span mode merges adjacent lexical BPE fragments into one source unit, then perturbs the whole span. This is meant to reduce cases where a meaningful identifier/function name is split across tokens.
+span 模式：把相邻的词法 BPE 片段合成一个 source unit，然后整体扰动这个 span。这个设计是为了减少标识符、函数名等语义单元被 BPE 切碎后导致的解释噪声。
 
-## Removed Idea
+## 已移除方案
 
-The saliency threshold / cumulative-mass cutoff idea is removed from the main experiment. Raw ALTI values are often small, and this extra cutoff makes the evaluation harder to explain. The current plan keeps all non-trivial source units and only changes ranking or source granularity.
+saliency threshold / cumulative-mass cutoff 已经从主实验中移除。原因是 raw ALTI 数值通常很小，额外阈值会让实验口径变复杂，也容易误解。当前方案保留所有非 trivial source unit，只比较排序方式和 source 粒度。
 
-## What To Compare
+## 建议对比
 
-Run the same sample set under:
+在同一批样本上比较：
 
 - `feature-ranking-mode=alti`, `feature-source-unit=token`
 - `feature-ranking-mode=signed_clip`, `feature-source-unit=token`
 - `feature-ranking-mode=alti`, `feature-source-unit=span`
 - `feature-ranking-mode=signed_clip`, `feature-source-unit=span`
 
-Compare Group@5 / Group@10 effectiveness, positive rate, and reverse rate.
+重点看 Group@5 / Group@10 effectiveness、positive rate 和 reverse rate。
