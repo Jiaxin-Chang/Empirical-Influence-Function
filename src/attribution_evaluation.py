@@ -34,7 +34,6 @@ from src.intervention_experiment import (
     lm_head_filter,
     load_model_and_tokenizer,
     load_samples,
-    top_nontrivial_saliency_sources,
     _gather_scores,
     _is_cuda_alloc_error,
     _load_or_build_prescreen_sketch_cache,
@@ -74,6 +73,24 @@ def _decode_token(tokenizer, token_id: int) -> str:
 
 def _format_threshold(value: float) -> str:
     return f"{float(value):g}"
+
+
+def _token_has_lexical_content(token: str) -> bool:
+    stripped = token.strip()
+    return bool(stripped) and any(
+        ch.isalnum() or ch == "_" or "\u4e00" <= ch <= "\u9fff"
+        for ch in stripped
+    )
+
+
+def _continues_lexical_span(prev_token: str, token: str) -> bool:
+    if not token or token[0].isspace():
+        return False
+    if not _token_has_lexical_content(token):
+        return False
+    if not _token_has_lexical_content(prev_token):
+        return False
+    return True
 
 
 def _valid_target_positions(tokenizer, input_ids_1d: torch.Tensor, prompt_len: int, max_tokens: int) -> list[int]:
@@ -128,6 +145,28 @@ def _target_token_losses(
     del outputs, logits, rows, label_tensor
     torch.cuda.empty_cache()
     return losses.detach().cpu()
+
+
+@torch.no_grad()
+def _contextual_hidden_rows(model, batch: dict, device) -> torch.Tensor:
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    base_model = getattr(model, "model", None)
+    if base_model is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with .model.")
+
+    outputs = base_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = outputs.last_hidden_state[0].detach()
+    del outputs
+    return hidden
 
 
 @torch.no_grad()
@@ -272,6 +311,217 @@ def _spearman_top_overlap(method_ranked: list[int], oracle_ranked: list[int], k:
     ys = ys - ys.mean()
     denom = xs.norm() * ys.norm()
     return 0.0 if float(denom) == 0.0 else float(torch.dot(xs, ys) / denom)
+
+
+def _aggregate(values: list[float], mode: str) -> float:
+    if not values:
+        return 0.0
+    if mode == "sum":
+        return float(sum(values))
+    if mode == "max":
+        return float(max(values))
+    if mode == "mean":
+        return float(sum(values) / len(values))
+    raise ValueError(f"Unsupported aggregation mode: {mode}")
+
+
+def _feature_unit_direction(
+    direction_by_idx: dict[int, float],
+    source_indices: list[int],
+    saliency_scores: list[float],
+) -> float:
+    weighted = 0.0
+    total = 0.0
+    for idx, score in zip(source_indices, saliency_scores):
+        weight = max(float(score), 0.0)
+        weighted += weight * float(direction_by_idx.get(int(idx), 0.0))
+        total += weight
+    if total <= 0.0:
+        return 0.0
+    return weighted / total
+
+
+def _feature_rank_score(
+    *,
+    alti_score: float,
+    direction_score: float,
+    ranking_mode: str,
+) -> float:
+    if ranking_mode == "alti":
+        return float(alti_score)
+    if ranking_mode == "signed":
+        return float(alti_score) * float(direction_score)
+    if ranking_mode == "signed_clip":
+        return float(alti_score) * max(0.0, float(direction_score))
+    raise ValueError(f"Unsupported feature ranking mode: {ranking_mode}")
+
+
+def _source_direction_scores(
+    model,
+    tokenizer,
+    batch: dict,
+    source_indices: Iterable[int],
+    target_idx: int,
+    *,
+    device,
+    enabled: bool,
+    contextual_hidden: torch.Tensor | None = None,
+) -> dict[int, float]:
+    if not enabled:
+        return {}
+    source_indices = sorted({int(idx) for idx in source_indices})
+    if not source_indices:
+        return {}
+
+    hidden = contextual_hidden
+    if hidden is None:
+        hidden = _contextual_hidden_rows(model, batch, device)
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("Model does not expose output embeddings.")
+
+    target_token_id = int(batch["input_ids"][0, target_idx].item())
+    head_device = lm_head.weight.device
+    target_vec = lm_head.weight[target_token_id].detach().to(device=head_device, dtype=torch.float32)
+    target_norm = target_vec.norm().clamp_min(1e-12)
+
+    result = {}
+    for idx in source_indices:
+        if 0 <= idx < hidden.size(0):
+            source_vec = hidden[idx].to(device=head_device, dtype=torch.float32)
+            score = torch.dot(source_vec, target_vec) / (source_vec.norm().clamp_min(1e-12) * target_norm)
+            result[int(idx)] = float(score.item())
+    del target_vec
+    return result
+
+
+def _build_feature_source_units(
+    model,
+    tokenizer,
+    batch: dict,
+    ids_1d: torch.Tensor,
+    saliency: list[float],
+    target_idx: int,
+    *,
+    device,
+    source_unit: str,
+    span_score: str,
+    ranking_mode: str,
+    max_units: int | None,
+    contextual_hidden: torch.Tensor | None = None,
+) -> list[dict]:
+    source_items = []
+    source_limit = min(int(target_idx), len(saliency), int(ids_1d.numel()))
+    for idx in range(source_limit):
+        token_id = int(ids_1d[idx].item())
+        if is_trivial_token(tokenizer, token_id):
+            continue
+        score = float(saliency[idx])
+        source_items.append({
+            "idx": int(idx),
+            "token": _decode_token(tokenizer, token_id),
+            "score": score,
+        })
+
+    direction_by_idx = _source_direction_scores(
+        model,
+        tokenizer,
+        batch,
+        [item["idx"] for item in source_items],
+        target_idx,
+        device=device,
+        enabled=ranking_mode in {"signed", "signed_clip"},
+        contextual_hidden=contextual_hidden,
+    )
+
+    units = []
+    if source_unit == "token":
+        for item in source_items:
+            indices = [int(item["idx"])]
+            scores = [float(item["score"])]
+            alti_score = _aggregate(scores, "sum")
+            direction_score = _feature_unit_direction(direction_by_idx, indices, scores)
+            units.append({
+                "source_token_index": indices[0],
+                "source_token_indices": indices,
+                "source_tokens": [item["token"]],
+                "source_text": item["token"],
+                "alti_saliency": alti_score,
+                "direction_score": direction_score,
+                "rank_score": _feature_rank_score(
+                    alti_score=alti_score,
+                    direction_score=direction_score,
+                    ranking_mode=ranking_mode,
+                ),
+            })
+    elif source_unit == "span":
+        current: list[dict] = []
+        prev_idx = None
+        prev_token = ""
+        for item in source_items:
+            starts_new = (
+                not current
+                or prev_idx is None
+                or int(item["idx"]) != int(prev_idx) + 1
+                or not _continues_lexical_span(prev_token, item["token"])
+            )
+            if starts_new and current:
+                indices = [int(x["idx"]) for x in current]
+                scores = [float(x["score"]) for x in current]
+                alti_score = _aggregate(scores, span_score)
+                direction_score = _feature_unit_direction(direction_by_idx, indices, scores)
+                source_tokens = [str(x["token"]) for x in current]
+                units.append({
+                    "source_token_index": indices[0],
+                    "source_token_indices": indices,
+                    "source_tokens": source_tokens,
+                    "source_text": "".join(source_tokens),
+                    "alti_saliency": alti_score,
+                    "direction_score": direction_score,
+                    "rank_score": _feature_rank_score(
+                        alti_score=alti_score,
+                        direction_score=direction_score,
+                        ranking_mode=ranking_mode,
+                    ),
+                })
+                current = []
+            current.append(item)
+            prev_idx = int(item["idx"])
+            prev_token = item["token"]
+        if current:
+            indices = [int(x["idx"]) for x in current]
+            scores = [float(x["score"]) for x in current]
+            alti_score = _aggregate(scores, span_score)
+            direction_score = _feature_unit_direction(direction_by_idx, indices, scores)
+            source_tokens = [str(x["token"]) for x in current]
+            units.append({
+                "source_token_index": indices[0],
+                "source_token_indices": indices,
+                "source_tokens": source_tokens,
+                "source_text": "".join(source_tokens),
+                "alti_saliency": alti_score,
+                "direction_score": direction_score,
+                "rank_score": _feature_rank_score(
+                    alti_score=alti_score,
+                    direction_score=direction_score,
+                    ranking_mode=ranking_mode,
+                ),
+            })
+    else:
+        raise ValueError(f"Unsupported feature source unit: {source_unit}")
+
+    units.sort(
+        key=lambda item: (
+            float(item["rank_score"]),
+            float(item["alti_saliency"]),
+            -int(item["source_token_index"]),
+        ),
+        reverse=True,
+    )
+
+    if max_units is not None and max_units > 0:
+        units = units[: int(max_units)]
+    return units
 
 
 def _perturb_sources(
@@ -452,12 +702,11 @@ def _perturbed_target_loss_summary(
     }
 
 
-def _feature_aopc(
+def _feature_aopc_units(
     model,
-    tokenizer,
     batch: dict,
     target_idx: int,
-    ranked_sources: list[int],
+    ranked_units: list[dict],
     base_loss: float,
     *,
     device,
@@ -470,9 +719,10 @@ def _feature_aopc(
     perturb_batch_size: int,
 ) -> float:
     effects = []
-    selected = []
-    for src_idx in ranked_sources[:k]:
-        selected.append(int(src_idx))
+    selected: list[int] = []
+    for unit in ranked_units[:k]:
+        selected.extend(int(idx) for idx in unit["source_token_indices"])
+        selected = list(dict.fromkeys(selected))
         loss_summary = _perturbed_target_loss_summary(
             model,
             batch,
@@ -558,6 +808,9 @@ def evaluate_feature_attribution(
     random_excluded_token_ids: set[int],
     group_only: bool,
     perturb_batch_size: int,
+    ranking_mode: str,
+    source_unit: str,
+    span_score: str,
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
@@ -573,6 +826,11 @@ def evaluate_feature_attribution(
         target_positions,
         chunk_size=ALTI_CHUNK_SIZE,
     )
+    contextual_hidden = (
+        _contextual_hidden_rows(model, test_batch, device)
+        if ranking_mode in {"signed", "signed_clip"}
+        else None
+    )
     base_loss_values = _target_token_losses(model, test_batch, target_positions, device)
     base_loss_by_target = {
         int(pos): float(loss)
@@ -585,20 +843,29 @@ def evaluate_feature_attribution(
         print(f"\n[feature] target {target_idx}: {target_text!r}", flush=True)
 
         saliency = saliency_by_target[target_idx]
-        attr_pairs = [
-            (int(idx), float(score))
-            for idx, score in top_nontrivial_saliency_sources(
-                tokenizer,
-                ids_1d,
-                saliency,
-                k=max(target_idx, top_k_prompt_tokens),
-            )
-        ]
-        if max_feature_sources is not None and max_feature_sources > 0:
-            attr_pairs = attr_pairs[:max_feature_sources]
-
-        method_ranked = [idx for idx, _ in attr_pairs]
-        method_scores = {idx: score for idx, score in attr_pairs}
+        method_units = _build_feature_source_units(
+            model,
+            tokenizer,
+            test_batch,
+            ids_1d,
+            saliency,
+            target_idx,
+            device=device,
+            source_unit=source_unit,
+            span_score=span_score,
+            ranking_mode=ranking_mode,
+            max_units=max_feature_sources,
+            contextual_hidden=contextual_hidden,
+        )
+        method_ranked = [int(unit["source_token_index"]) for unit in method_units]
+        unit_by_primary_id = {
+            int(unit["source_token_index"]): unit
+            for unit in method_units
+        }
+        method_scores = {
+            int(unit["source_token_index"]): float(unit["alti_saliency"])
+            for unit in method_units
+        }
 
         base_loss = base_loss_by_target[target_idx]
         base_prob = math.exp(-base_loss)
@@ -608,19 +875,21 @@ def evaluate_feature_attribution(
         if group_only and evaluation_mode != "effectiveness":
             raise ValueError("--feature-group-only is only supported in effectiveness mode.")
         if group_only:
-            evaluated_sources = []
+            evaluated_units = []
         elif evaluation_mode == "effectiveness":
-            evaluated_sources = method_ranked[:max(k_values)]
+            evaluated_units = method_units[:max(k_values)]
         elif evaluation_mode == "full":
-            evaluated_sources = method_ranked
+            evaluated_units = method_units
         else:
             raise ValueError(f"Unsupported feature evaluation mode: {evaluation_mode}")
 
-        for src_idx in tqdm(evaluated_sources, desc=f"Feature effects t={target_idx}", leave=False):
+        for unit in tqdm(evaluated_units, desc=f"Feature effects t={target_idx}", leave=False):
+            unit_id = int(unit["source_token_index"])
+            unit_sources = [int(x) for x in unit["source_token_indices"]]
             loss_summary = _perturbed_target_loss_summary(
                 model,
                 test_batch,
-                [src_idx],
+                unit_sources,
                 target_idx,
                 device=device,
                 perturb_mode=perturb_mode,
@@ -634,9 +903,11 @@ def evaluate_feature_attribution(
                 loss_value = float(loss_summary["loss_mean"])
                 logprob_drop = loss_value - base_loss
                 prob_drop = base_prob - math.exp(-loss_value)
-                oracle_effects[int(src_idx)] = logprob_drop
+                oracle_effects[unit_id] = logprob_drop
                 source_effects.append({
-                    "source_token_index": int(src_idx),
+                    "source_token_index": unit_id,
+                    "source_token_indices": unit_sources,
+                    "source_text": unit["source_text"],
                     "perturbed_ce_loss": loss_value,
                     "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
                     "perturbation_trials": int(loss_summary["trial_count"]),
@@ -645,10 +916,17 @@ def evaluate_feature_attribution(
                 })
 
         for k in k_values:
-            kk = min(int(k), len(method_ranked))
+            requested_k = int(k)
+            kk = min(requested_k, len(method_units))
             if kk <= 0:
                 continue
-            selected_sources = method_ranked[:kk]
+            selected_units = method_units[:kk]
+            selected_sources = [
+                int(idx)
+                for unit in selected_units
+                for idx in unit["source_token_indices"]
+            ]
+            selected_sources = list(dict.fromkeys(selected_sources))
             loss_summary = _perturbed_target_loss_summary(
                 model,
                 test_batch,
@@ -664,7 +942,8 @@ def evaluate_feature_attribution(
             )
             if int(loss_summary["trial_count"]) > 0:
                 loss_value = float(loss_summary["loss_mean"])
-                group_effects[kk] = {
+                group_effects[requested_k] = {
+                    "source_unit_count": int(kk),
                     "source_token_indices": [int(x) for x in selected_sources],
                     "perturbed_ce_loss": loss_value,
                     "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
@@ -691,12 +970,11 @@ def evaluate_feature_attribution(
                 metrics[f"recall@{kk}"] = _recall_at(method_ranked, oracle_ranked, kk, kk)
                 metrics[f"ndcg@{kk}"] = _ranking_ndcg(method_ranked, oracle_effects, kk)
                 metrics[f"spearman_top{kk}"] = _spearman_top_overlap(method_ranked, oracle_ranked, kk)
-                metrics[f"aopc@{kk}"] = _feature_aopc(
+                metrics[f"aopc@{kk}"] = _feature_aopc_units(
                     model,
-                    tokenizer,
                     test_batch,
                     target_idx,
-                    method_ranked,
+                    method_units,
                     base_loss,
                     device=device,
                     k=kk,
@@ -719,10 +997,15 @@ def evaluate_feature_attribution(
                 "effect_metric": effect_metric,
                 "thresholds": [float(x) for x in effect_thresholds],
                 "evaluated_source_count": len(source_effects),
+                "ranking_mode": ranking_mode,
+                "source_unit": source_unit,
+                "span_score": span_score,
+                "ranked_unit_count": len(method_units),
             },
             "group_effects": [
                 {
                     "k": int(k),
+                    "source_unit_count": int(group.get("source_unit_count", k)),
                     "source_token_indices": group["source_token_indices"],
                     "source_tokens": [
                         _decode_token(tokenizer, int(ids_1d[idx].item()))
@@ -743,27 +1026,46 @@ def evaluate_feature_attribution(
                 "random_trials": int(random_trials) if perturb_mode == "random_replace" else 1,
                 "perturb_batch_size": int(perturb_batch_size),
             },
+            "feature_ranking": {
+                "mode": ranking_mode,
+                "source_unit": source_unit,
+                "span_score": span_score,
+                "ranked_unit_count": len(method_units),
+            },
             "metrics": metrics,
             "method_top": [
                 {
                     "rank": rank,
-                    "source_token_index": int(idx),
-                    "source_token": _decode_token(tokenizer, int(ids_1d[idx].item())),
-                    "alti_saliency": float(method_scores[idx]),
-                    "oracle_effect": float(oracle_effects.get(idx, 0.0)),
-                    "logprob_drop": float(effect_by_id.get(idx, {}).get("logprob_drop", 0.0)),
-                    "prob_drop": float(effect_by_id.get(idx, {}).get("prob_drop", 0.0)),
+                    "source_token_index": int(unit["source_token_index"]),
+                    "source_token_indices": [int(x) for x in unit["source_token_indices"]],
+                    "source_token": unit["source_text"],
+                    "source_tokens": unit["source_tokens"],
+                    "alti_saliency": float(unit["alti_saliency"]),
+                    "rank_score": float(unit["rank_score"]),
+                    "direction_score": float(unit["direction_score"]),
+                    "oracle_effect": float(oracle_effects.get(int(unit["source_token_index"]), 0.0)),
+                    "logprob_drop": float(effect_by_id.get(int(unit["source_token_index"]), {}).get("logprob_drop", 0.0)),
+                    "prob_drop": float(effect_by_id.get(int(unit["source_token_index"]), {}).get("prob_drop", 0.0)),
                 }
-                for rank, idx in enumerate(method_ranked[:max(k_values)], start=1)
+                for rank, unit in enumerate(method_units[:max(k_values)], start=1)
             ],
             "effect_top": [
                 {
                     "rank": rank,
                     "source_token_index": int(idx),
-                    "source_token": _decode_token(tokenizer, int(ids_1d[idx].item())),
+                    "source_token_indices": [
+                        int(x)
+                        for x in unit_by_primary_id.get(idx, {}).get("source_token_indices", [idx])
+                    ],
+                    "source_token": unit_by_primary_id.get(idx, {}).get(
+                        "source_text",
+                        _decode_token(tokenizer, int(ids_1d[idx].item())),
+                    ),
                     "logprob_drop": float(oracle_effects[idx]),
                     "prob_drop": float(effect_by_id.get(idx, {}).get("prob_drop", 0.0)),
                     "alti_saliency": float(method_scores.get(idx, 0.0)),
+                    "rank_score": float(unit_by_primary_id.get(idx, {}).get("rank_score", 0.0)),
+                    "direction_score": float(unit_by_primary_id.get(idx, {}).get("direction_score", 0.0)),
                 }
                 for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
             ],
@@ -771,9 +1073,18 @@ def evaluate_feature_attribution(
                 {
                     "rank": rank,
                     "source_token_index": int(idx),
-                    "source_token": _decode_token(tokenizer, int(ids_1d[idx].item())),
+                    "source_token_indices": [
+                        int(x)
+                        for x in unit_by_primary_id.get(idx, {}).get("source_token_indices", [idx])
+                    ],
+                    "source_token": unit_by_primary_id.get(idx, {}).get(
+                        "source_text",
+                        _decode_token(tokenizer, int(ids_1d[idx].item())),
+                    ),
                     "oracle_effect": float(oracle_effects[idx]),
                     "alti_saliency": float(method_scores.get(idx, 0.0)),
+                    "rank_score": float(unit_by_primary_id.get(idx, {}).get("rank_score", 0.0)),
+                    "direction_score": float(unit_by_primary_id.get(idx, {}).get("direction_score", 0.0)),
                 }
                 for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
             ] if evaluation_mode == "full" else [],
@@ -1395,6 +1706,28 @@ def main(argv: list[str] | None = None) -> None:
         choices=["logprob_drop", "prob_drop"],
         default="logprob_drop",
     )
+    parser.add_argument(
+        "--feature-ranking-mode",
+        choices=["alti", "signed", "signed_clip"],
+        default="alti",
+        help=(
+            "How to rank ALTI source units. alti keeps the original saliency rank; "
+            "signed multiplies saliency by contextual-hidden/target-logit cosine; "
+            "signed_clip demotes negative-direction units by clipping that cosine at zero."
+        ),
+    )
+    parser.add_argument(
+        "--feature-source-unit",
+        choices=["token", "span"],
+        default="token",
+        help="Rank individual tokens or lexical spans built from adjacent non-trivial tokens.",
+    )
+    parser.add_argument(
+        "--feature-span-score",
+        choices=["sum", "max", "mean"],
+        default="sum",
+        help="How to aggregate token saliency inside a lexical span.",
+    )
     parser.add_argument("--data-method-k-values", type=str, default="10,50,100")
     parser.add_argument("--data-oracle-m-values", type=str, default="10,20,50")
     parser.add_argument("--data-oracle-limit", type=int, default=None)
@@ -1538,6 +1871,9 @@ def main(argv: list[str] | None = None) -> None:
                 "feature_effect_thresholds": parse_float_tuple(args.feature_effect_thresholds)
                 or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
                 "feature_effect_metric": args.feature_effect_metric,
+                "feature_ranking_mode": args.feature_ranking_mode,
+                "feature_source_unit": args.feature_source_unit,
+                "feature_span_score": args.feature_span_score,
                 "data_method_k_values": parse_int_tuple(args.data_method_k_values),
                 "data_oracle_m_values": parse_int_tuple(args.data_oracle_m_values),
                 "data_oracle_limit": args.data_oracle_limit,
@@ -1578,6 +1914,9 @@ def main(argv: list[str] | None = None) -> None:
             ),
             group_only=bool(args.feature_group_only),
             perturb_batch_size=max(1, int(args.feature_perturb_batch_size)),
+            ranking_mode=args.feature_ranking_mode,
+            source_unit=args.feature_source_unit,
+            span_score=args.feature_span_score,
         )
         feature_report = {
             "experiment_meta": {

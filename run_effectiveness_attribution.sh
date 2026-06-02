@@ -38,6 +38,9 @@ FEATURE_PERTURB_MODE="${FEATURE_PERTURB_MODE:-replace}"
 FEATURE_RANDOM_TRIALS="${FEATURE_RANDOM_TRIALS:-5}"
 FEATURE_PERTURB_BATCH_SIZE="${FEATURE_PERTURB_BATCH_SIZE:-1}"
 FEATURE_GROUP_ONLY="${FEATURE_GROUP_ONLY:-0}"
+FEATURE_RANKING_MODE="${FEATURE_RANKING_MODE:-alti}"
+FEATURE_SOURCE_UNIT="${FEATURE_SOURCE_UNIT:-token}"
+FEATURE_SPAN_SCORE="${FEATURE_SPAN_SCORE:-sum}"
 
 DATA_K_VALUES="${DATA_K_VALUES:-10,50,100}"
 DATA_TOP_K="${DATA_TOP_K:-100}"
@@ -71,6 +74,9 @@ while [[ $# -gt 0 ]]; do
         --feature-random-trials) FEATURE_RANDOM_TRIALS="$2"; shift 2 ;;
         --feature-perturb-batch-size) FEATURE_PERTURB_BATCH_SIZE="$2"; shift 2 ;;
         --feature-group-only) FEATURE_GROUP_ONLY=1; shift ;;
+        --feature-ranking-mode) FEATURE_RANKING_MODE="$2"; shift 2 ;;
+        --feature-source-unit) FEATURE_SOURCE_UNIT="$2"; shift 2 ;;
+        --feature-span-score) FEATURE_SPAN_SCORE="$2"; shift 2 ;;
         --data-k-values|--data-method-k-values) DATA_K_VALUES="$2"; shift 2 ;;
         --data-top-k) DATA_TOP_K="$2"; shift 2 ;;
         --data-thresholds|--data-effect-thresholds) DATA_THRESHOLDS="$2"; shift 2 ;;
@@ -115,6 +121,7 @@ echo "  stages    : ${STAGES}"
 echo "  output dir: ${OUTPUT_DIR_ABS}"
 echo "  train lim : ${TRAIN_LIMIT:-none}"
 echo "  feature k : ${FEATURE_K_VALUES}, thresholds=${FEATURE_THRESHOLDS}, perturb=${FEATURE_PERTURB_MODE}, random-trials=${FEATURE_RANDOM_TRIALS}, perturb-batch-size=${FEATURE_PERTURB_BATCH_SIZE}, group-only=${FEATURE_GROUP_ONLY}"
+echo "  feature rank: mode=${FEATURE_RANKING_MODE}, unit=${FEATURE_SOURCE_UNIT}, span-score=${FEATURE_SPAN_SCORE}"
 echo "  data k    : ${DATA_K_VALUES}, top-k-unlearn=${DATA_TOP_K}, test-batch-size=${DATA_TEST_BATCH_SIZE}, thresholds=${DATA_THRESHOLDS}"
 echo "================================================================="
 
@@ -135,7 +142,10 @@ if [[ "$STAGES" == "feature" || "$STAGES" == "both" ]]; then
         --feature-perturb-batch-size "$FEATURE_PERTURB_BATCH_SIZE" \
         --feature-evaluation-mode effectiveness \
         --feature-effect-thresholds "$FEATURE_THRESHOLDS" \
-        --feature-effect-metric "$FEATURE_EFFECT_METRIC"
+        --feature-effect-metric "$FEATURE_EFFECT_METRIC" \
+        --feature-ranking-mode "$FEATURE_RANKING_MODE" \
+        --feature-source-unit "$FEATURE_SOURCE_UNIT" \
+        --feature-span-score "$FEATURE_SPAN_SCORE"
     )
     [[ "$FEATURE_GROUP_ONLY" == "1" ]] && FEATURE_ARGS+=(--feature-group-only)
     bash "$ROOT_DIR/run_batch_attribution_evaluation.sh" "${FEATURE_ARGS[@]}"
