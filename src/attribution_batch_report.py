@@ -119,6 +119,13 @@ def _first_metric(metrics: dict[str, Any], names: tuple[str, ...]) -> Any:
     return None
 
 
+def _first_metric_with_prefix(metrics: dict[str, Any], prefix: str) -> Any:
+    for name in sorted(metrics):
+        if name.startswith(prefix):
+            return metrics[name]
+    return None
+
+
 def _fmt(value: Any) -> str:
     if value is None:
         return ""
@@ -137,8 +144,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         f"- Data files: {report['summary']['data_file_count']}",
         f"- Status records: {report['summary']['status_record_count']}",
         "",
-        "| index | task_id | feature targets | group eff@3 | group logdrop@3 | feature eff@10 | feature logdrop@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data scored | OOM skipped |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| index | task_id | feature targets | group eff@3 | group logdrop@3 | group reverse@5 | group tokens@5 | mass logdrop | mass reverse | mass tokens | feature eff@10 | feature logdrop@10 | feature reverse@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data scored | OOM skipped |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for sample in samples:
         feature = sample.get("feature") or {}
@@ -165,6 +172,11 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                         )
                     ),
                     _fmt(_first_metric(feature_metrics, ("group_logprob_drop@3", "group_logprob_drop@5"))),
+                    _fmt(_first_metric(feature_metrics, ("group_reverse_logprob_drop@5", "group_reverse_logprob_drop@10"))),
+                    _fmt(_first_metric(feature_metrics, ("group_source_token_count@5", "group_source_token_count@10"))),
+                    _fmt(_first_metric_with_prefix(feature_metrics, "group_mass_logprob_drop@")),
+                    _fmt(_first_metric_with_prefix(feature_metrics, "group_mass_reverse_logprob_drop@")),
+                    _fmt(_first_metric_with_prefix(feature_metrics, "group_mass_source_token_count@")),
                     _fmt(
                         _first_metric(
                             feature_metrics,
@@ -177,6 +189,7 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                         )
                     ),
                     _fmt(_first_metric(feature_metrics, ("mean_logprob_drop@10", "mean_logprob_drop@5"))),
+                    _fmt(_first_metric(feature_metrics, ("reverse_rate_logprob_drop@10", "reverse_rate_logprob_drop@5"))),
                     _fmt(_first_metric(feature_metrics, ("ndcg@10", "ndcg@20", "ndcg@5"))),
                     _fmt(_first_metric(feature_metrics, ("recall@10", "recall@20", "recall@5"))),
                     _fmt(_first_metric(feature_metrics, ("aopc@10", "aopc@20", "aopc@5"))),

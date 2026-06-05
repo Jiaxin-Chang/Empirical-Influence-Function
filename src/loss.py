@@ -719,6 +719,110 @@ def _compute_qwen_alti_layer_target_relevance(
 
 
 @torch.no_grad()
+def compute_alti_last_layer_source_vectors(
+    model,
+    batch,
+    target_indices_in_seq,
+) -> dict[int, Tensor]:
+    """
+    Return final attention-block ALTI source contribution vectors per target.
+
+    For target token position t, the model predicts it from query position
+    t - 1. The returned tensor has shape [t, hidden_dim]; row j is the vector
+    contribution from source position j to the last layer's attention/residual
+    output at query position t - 1. This is the vector form that is reduced to
+    scalar ALTI importance inside `_normalize_alti_importance`.
+    """
+    targets = sorted({int(t) for t in target_indices_in_seq})
+    if not targets:
+        return {}
+    if targets[0] <= 0:
+        raise ValueError("target indices must be > 0 because they denote next-token positions.")
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("ALTI source vectors currently expect a Qwen-style model.model.layers stack.")
+
+    max_target = max(targets)
+    model.eval()
+    device = model.device
+
+    input_ids = batch["input_ids"][:, :max_target].to(device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :max_target].to(device)
+
+    outputs = model(
+        **inputs,
+        output_hidden_states=True,
+        output_attentions=True,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    hidden_states = outputs.hidden_states
+    attentions = outputs.attentions
+    if hidden_states is None or attentions is None:
+        raise RuntimeError(
+            "Model did not return hidden_states/attentions. Ensure output_hidden_states and "
+            "output_attentions are supported; Qwen may need attn_implementation='eager'."
+        )
+    if not attentions or attentions[-1] is None:
+        raise RuntimeError("Encountered None attention tensor; use eager attention when computing ALTI.")
+
+    layer_idx = len(attentions) - 1
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+    hidden = hidden_states[layer_idx].to(device)
+    attention_probs = attentions[layer_idx].to(device)
+
+    bsz, seq_len, _ = hidden.shape
+    if bsz != 1:
+        raise ValueError("ALTI source vectors currently support batch_size=1.")
+
+    num_heads, head_dim, num_kv_heads = _infer_qwen_attention_layout(
+        model,
+        self_attn,
+        attention_probs,
+    )
+    normed_states = layer.input_layernorm(hidden)
+    value_states = self_attn.v_proj(normed_states)
+    value_states = value_states.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = _repeat_kv_for_alti(value_states, num_heads)
+
+    out_weight = self_attn.o_proj.weight.to(device)
+    out_dim, in_dim = out_weight.shape
+    if in_dim != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj shape {tuple(out_weight.shape)} for {num_heads} heads × {head_dim}."
+        )
+    out_weight_by_head = out_weight.view(out_dim, num_heads, head_dim)
+
+    transformed_values = torch.einsum(
+        "bhsd,ohd->bhso",
+        value_states,
+        out_weight_by_head,
+    )[0].float()
+    attention_probs = attention_probs[0].float()
+    residual_states = hidden[0].float()
+
+    result: dict[int, Tensor] = {}
+    for target_idx in targets:
+        query_idx = int(target_idx) - 1
+        attn_row = attention_probs[:, query_idx, :]
+        source_vectors = torch.einsum(
+            "hs,hso->so",
+            attn_row,
+            transformed_values,
+        )
+        source_vectors[query_idx, :] += residual_states[query_idx]
+        result[int(target_idx)] = source_vectors[:target_idx].detach().cpu()
+
+    del outputs, hidden_states, attentions, hidden, attention_probs
+    del value_states, transformed_values, residual_states
+    torch.cuda.empty_cache()
+    return result
+
+
+@torch.no_grad()
 def _compute_alti_rollout_matrix(
     model,
     batch,
