@@ -51,6 +51,7 @@ from src.process_data import process_func_chatml
 
 DEFAULT_K_VALUES = (5, 10, 20)
 DEFAULT_DATA_METHOD_K = (10, 50, 100)
+DEFAULT_DATA_GROUP_K: tuple[int, ...] = ()
 DEFAULT_DATA_ORACLE_M = (10, 20, 50)
 DEFAULT_FEATURE_EFFECT_THRESHOLDS = (0.1, 0.2, 0.5)
 DEFAULT_FEATURE_SALIENCY_MASS_THRESHOLDS: tuple[float, ...] = ()
@@ -1398,6 +1399,135 @@ def _restore_lm_head_ascent_update(model, delta: torch.Tensor) -> None:
     lm_head.weight.data.sub_(delta.to(device=lm_head.weight.device, dtype=lm_head.weight.dtype))
 
 
+def _reduce_data_token_effects(token_effects: torch.Tensor, effect_reduction: str) -> float:
+    if effect_reduction == "sum":
+        return float(token_effects.sum().item())
+    if effect_reduction == "max":
+        return float(token_effects.max().item())
+    if effect_reduction == "mean":
+        return float(token_effects.mean().item())
+    raise ValueError(f"Unsupported effect reduction: {effect_reduction}")
+
+
+def _evaluate_data_group_unlearning_effects(
+    model,
+    test_batch: dict,
+    train_ds,
+    collator,
+    idx_to_row: dict[int, int],
+    target_positions: list[int],
+    method_ranked: list[int],
+    group_k_values: tuple[int, ...],
+    base_losses: torch.Tensor,
+    device,
+    *,
+    unlearn_lr: float,
+    normalize_unlearn_grad: bool,
+    effect_reduction: str,
+) -> list[dict]:
+    requested_ks = sorted({int(k) for k in group_k_values if int(k) > 0})
+    if not requested_ks or not method_ranked:
+        return []
+
+    max_k = min(max(requested_ks), len(method_ranked))
+    requested_set = {k for k in requested_ks if k <= len(method_ranked)}
+    group_grad = None
+    selected_ids: list[int] = []
+    skipped_ids: list[int] = []
+    group_effects: list[dict] = []
+
+    for rank, train_idx in enumerate(method_ranked[:max_k], start=1):
+        train_idx = int(train_idx)
+        train_batch = None
+        grad = None
+        try:
+            train_batch = _single_train_batch_from_dataset(
+                train_ds,
+                collator,
+                train_idx,
+                idx_to_row,
+                device,
+            )
+            grad = compute_lm_head_ce_gradient_no_backward(
+                model=model,
+                batch=train_batch,
+                device=device,
+                ignored_token_ids=torch.tensor([], device=device),
+            )
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_cuda_alloc_error(exc):
+                raise
+            skipped_ids.append(train_idx)
+            _clear_cuda_after_oom()
+            print(
+                "[WARN] Data group unlearning: skipping train sample "
+                f"{train_idx} after CUDA OOM while computing group gradient.",
+                flush=True,
+            )
+            del train_batch, grad
+            continue
+
+        if group_grad is None:
+            group_grad = grad.detach()
+        else:
+            group_grad.add_(grad)
+        selected_ids.append(train_idx)
+        del train_batch, grad
+
+        if rank not in requested_set or group_grad is None or not selected_ids:
+            continue
+
+        update_grad = group_grad
+        if not normalize_unlearn_grad:
+            update_grad = group_grad / max(1, len(selected_ids))
+
+        delta = None
+        try:
+            delta = _apply_lm_head_ascent_update(
+                model,
+                update_grad,
+                lr=unlearn_lr,
+                normalize=normalize_unlearn_grad,
+            )
+            changed_losses = _target_token_losses(model, test_batch, target_positions, device)
+        except (torch.OutOfMemoryError, RuntimeError) as exc:
+            if not _is_cuda_alloc_error(exc):
+                raise
+            _clear_cuda_after_oom()
+            print(
+                "[WARN] Data group unlearning: skipping group "
+                f"top-{rank} after CUDA OOM while scoring test effect.",
+                flush=True,
+            )
+            continue
+        finally:
+            if delta is not None:
+                _restore_lm_head_ascent_update(model, delta)
+
+        token_effects = changed_losses - base_losses
+        effect = _reduce_data_token_effects(token_effects, effect_reduction)
+        group_effects.append(
+            {
+                "k": int(rank),
+                "train_sample_ids": [int(x) for x in selected_ids],
+                "train_sample_count": len(selected_ids),
+                "requested_train_sample_count": int(rank),
+                "skipped_train_sample_ids": [int(x) for x in skipped_ids],
+                "unlearning_gradient_aggregation": "mean_train_gradient",
+                "perturbed_ce_loss": float(changed_losses.mean().item()),
+                "base_ce_loss": float(base_losses.mean().item()),
+                "data_effect": float(effect),
+                "token_effects": [float(x) for x in token_effects.tolist()],
+            }
+        )
+        del changed_losses, token_effects
+        torch.cuda.empty_cache()
+
+    del group_grad
+    torch.cuda.empty_cache()
+    return group_effects
+
+
 def _evaluate_data_coarse_unit(
     model,
     tokenizer,
@@ -1415,6 +1545,7 @@ def _evaluate_data_coarse_unit(
     prescreen_sketch_dim: int,
     prescreen_sketch_seed: int,
     method_top_ks: tuple[int, ...],
+    group_k_values: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
     oracle_limit: int | None,
     oracle_include_method_top: int,
@@ -1581,14 +1712,7 @@ def _evaluate_data_coarse_unit(
                 _restore_lm_head_ascent_update(model, delta)
 
         token_effects = changed_losses - base_losses
-        if effect_reduction == "sum":
-            effect = float(token_effects.sum().item())
-        elif effect_reduction == "max":
-            effect = float(token_effects.max().item())
-        elif effect_reduction == "mean":
-            effect = float(token_effects.mean().item())
-        else:
-            raise ValueError(f"Unsupported effect reduction: {effect_reduction}")
+        effect = _reduce_data_token_effects(token_effects, effect_reduction)
 
         oracle_effects[int(train_idx)] = effect
         oracle_token_effects[int(train_idx)] = [float(x) for x in token_effects.tolist()]
@@ -1614,6 +1738,21 @@ def _evaluate_data_coarse_unit(
         if int(idx) in oracle_effects
     ]
     oracle_ranked = sorted(oracle_effects, key=lambda x: oracle_effects[x], reverse=True)
+    group_effects = _evaluate_data_group_unlearning_effects(
+        model,
+        test_batch,
+        train_ds,
+        collator,
+        idx_to_row,
+        target_positions,
+        method_ranked,
+        group_k_values,
+        base_losses,
+        accelerator.device,
+        unlearn_lr=unlearn_lr,
+        normalize_unlearn_grad=normalize_unlearn_grad,
+        effect_reduction=effect_reduction,
+    )
 
     metrics = {}
     for method_k in method_top_ks:
@@ -1626,8 +1765,13 @@ def _evaluate_data_coarse_unit(
             if mm <= 0:
                 continue
             metrics[f"recall@{kk}_oracle_top{mm}"] = _recall_at(method_ranked, oracle_ranked, kk, mm)
+    for group in group_effects:
+        k = int(group["k"])
+        effect = float(group["data_effect"])
+        metrics[f"group_data_effect@{k}"] = effect
+        metrics[f"group_positive_data_effect@{k}"] = 1.0 if effect > 0.0 else 0.0
 
-    top_n = max(max(method_top_ks), max(oracle_top_ms))
+    top_n = max(max(method_top_ks), max(oracle_top_ms), max(group_k_values or (0,)))
     return {
         "unit_type": unit_type,
         "unit_name": unit_name,
@@ -1658,6 +1802,7 @@ def _evaluate_data_coarse_unit(
             "base_target_losses": [float(x) for x in base_losses.tolist()],
         },
         "metrics": metrics,
+        "group_effects": group_effects,
         "method_top": [
             {
                 "rank": rank,
@@ -1696,6 +1841,7 @@ def evaluate_data_coarse_attribution(
     prescreen_sketch_dim: int = 0,
     prescreen_sketch_seed: int = SEED,
     method_top_ks: tuple[int, ...],
+    group_k_values: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
     oracle_limit: int | None,
     oracle_include_method_top: int,
@@ -1734,6 +1880,7 @@ def evaluate_data_coarse_attribution(
                 prescreen_sketch_dim=prescreen_sketch_dim,
                 prescreen_sketch_seed=prescreen_sketch_seed,
                 method_top_ks=method_top_ks,
+                group_k_values=group_k_values,
                 oracle_top_ms=oracle_top_ms,
                 oracle_limit=oracle_limit,
                 oracle_include_method_top=oracle_include_method_top,
@@ -1765,6 +1912,7 @@ def evaluate_data_coarse_attribution(
             prescreen_sketch_dim=prescreen_sketch_dim,
             prescreen_sketch_seed=prescreen_sketch_seed,
             method_top_ks=method_top_ks,
+            group_k_values=group_k_values,
             oracle_top_ms=oracle_top_ms,
             oracle_limit=oracle_limit,
             oracle_include_method_top=oracle_include_method_top,
@@ -1922,7 +2070,7 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Comma-separated cumulative ALTI saliency mass fractions in (0, 1], "
             "for dynamic grouped feature perturbation. Example: 0.2,0.5 selects "
-            "the smallest ranked source-unit prefix covering at least 20%/50% of "
+            "the smallest ranked source-unit prefix covering at least 20%%/50%% of "
             "the non-trivial source ALTI mass for each target."
         ),
     )
@@ -2020,6 +2168,15 @@ def main(argv: list[str] | None = None) -> None:
         help="How to aggregate token saliency inside a lexical span.",
     )
     parser.add_argument("--data-method-k-values", type=str, default="10,50,100")
+    parser.add_argument(
+        "--data-group-k-values",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated method top-k prefixes to unlearn as a group for data "
+            "attribution effectiveness, e.g. 1,3,5,10."
+        ),
+    )
     parser.add_argument("--data-oracle-m-values", type=str, default="10,20,50")
     parser.add_argument("--data-oracle-limit", type=int, default=None)
     parser.add_argument("--data-oracle-include-method-top", type=int, default=100)
@@ -2177,6 +2334,8 @@ def main(argv: list[str] | None = None) -> None:
                 "feature_source_unit": args.feature_source_unit,
                 "feature_span_score": args.feature_span_score,
                 "data_method_k_values": parse_int_tuple(args.data_method_k_values),
+                "data_group_k_values": parse_int_tuple(args.data_group_k_values)
+                or DEFAULT_DATA_GROUP_K,
                 "data_oracle_m_values": parse_int_tuple(args.data_oracle_m_values),
                 "data_oracle_limit": args.data_oracle_limit,
                 "data_oracle_include_method_top": args.data_oracle_include_method_top,
@@ -2271,6 +2430,7 @@ def main(argv: list[str] | None = None) -> None:
             prescreen_sketch_dim=prescreen_sketch_dim,
             prescreen_sketch_seed=int(args.prescreen_sketch_seed),
             method_top_ks=parse_int_tuple(args.data_method_k_values) or DEFAULT_DATA_METHOD_K,
+            group_k_values=parse_int_tuple(args.data_group_k_values) or DEFAULT_DATA_GROUP_K,
             oracle_top_ms=parse_int_tuple(args.data_oracle_m_values) or DEFAULT_DATA_ORACLE_M,
             oracle_limit=args.data_oracle_limit,
             oracle_include_method_top=args.data_oracle_include_method_top,

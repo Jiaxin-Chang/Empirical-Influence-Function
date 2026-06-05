@@ -144,8 +144,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         f"- Data files: {report['summary']['data_file_count']}",
         f"- Status records: {report['summary']['status_record_count']}",
         "",
-        "| index | task_id | feature targets | group eff@3 | group logdrop@3 | group reverse@5 | group tokens@5 | mass logdrop | mass reverse | mass tokens | feature eff@10 | feature logdrop@10 | feature reverse@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data scored | OOM skipped |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| index | task_id | feature targets | group eff@3 | group logdrop@3 | group reverse@5 | group tokens@5 | mass logdrop | mass reverse | mass tokens | feature eff@10 | feature logdrop@10 | feature reverse@10 | feature ndcg@10 | feature recall@10 | feature aopc@10 | data ndcg@100 | data recall@100/top50 | data group effect@10 | data group positive@10 | data scored | OOM skipped |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for sample in samples:
         feature = sample.get("feature") or {}
@@ -205,6 +205,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                             ),
                         )
                     ),
+                    _fmt(_first_metric(data_metrics, ("group_data_effect@10", "group_data_effect@5", "group_data_effect@3"))),
+                    _fmt(_first_metric(data_metrics, ("group_positive_data_effect@10", "group_positive_data_effect@5", "group_positive_data_effect@3"))),
                     _fmt(oracle.get("scored_candidate_count")),
                     _fmt(oracle.get("skipped_oom_count")),
                 ]
