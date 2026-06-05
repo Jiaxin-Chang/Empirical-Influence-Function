@@ -164,6 +164,11 @@ def analyze_feature_results(
     configs = Counter()
     base_losses: list[float] = []
     group_effects_by_k: dict[int, list[float]] = defaultdict(list)
+    group_source_token_counts_by_k: dict[int, list[float]] = defaultdict(list)
+    mass_group_effects_by_threshold: dict[float, list[float]] = defaultdict(list)
+    mass_group_source_token_counts_by_threshold: dict[float, list[float]] = defaultdict(list)
+    mass_group_source_unit_counts_by_threshold: dict[float, list[float]] = defaultdict(list)
+    mass_group_coverages_by_threshold: dict[float, list[float]] = defaultdict(list)
     individual_effects_by_rank: dict[int, list[float]] = defaultdict(list)
     reverse_individual: list[dict[str, Any]] = []
     reverse_groups: list[dict[str, Any]] = []
@@ -191,8 +196,11 @@ def analyze_feature_results(
                     "feature_group_only",
                     "feature_perturb_mode",
                     "feature_k_values",
+                    "feature_saliency_mass_thresholds",
                     "feature_random_trials",
                     "feature_ranking_mode",
+                    "feature_direction_mode",
+                    "feature_direction_score",
                     "feature_source_unit",
                     "feature_span_score",
                 )
@@ -259,6 +267,10 @@ def analyze_feature_results(
                     continue
                 effect = float(effect)
                 group_effects_by_k[k].append(effect)
+                source_token_count = group.get("source_token_count")
+                if not isinstance(source_token_count, (int, float)):
+                    source_token_count = len(group.get("source_token_indices") or [])
+                group_source_token_counts_by_k[k].append(float(source_token_count))
                 if k == method_k and effect < -effect_eps:
                     source_tokens = group.get("source_tokens") or []
                     for token in source_tokens:
@@ -273,6 +285,56 @@ def analyze_feature_results(
                             "target_category": _token_category(str(target or "")),
                             "base_ce_loss": base_ce,
                             "k": k,
+                            "source_token_indices": group.get("source_token_indices"),
+                            "source_tokens": source_tokens,
+                            "source_contexts": [
+                                _context(tokens, source_idx)
+                                for source_idx in (group.get("source_token_indices") or [])
+                            ],
+                            "source_categories": [_token_category(str(token)) for token in source_tokens],
+                            "logprob_drop": effect,
+                            "prob_drop": group.get("prob_drop"),
+                        }
+                    )
+
+            for group in row.get("saliency_mass_group_effects") or []:
+                mass_threshold = group.get("mass_threshold")
+                effect = group.get("logprob_drop")
+                if not isinstance(mass_threshold, (int, float)) or not isinstance(effect, (int, float)):
+                    continue
+                mass_threshold = float(mass_threshold)
+                effect = float(effect)
+                mass_group_effects_by_threshold[mass_threshold].append(effect)
+                source_token_count = group.get("source_token_count")
+                if not isinstance(source_token_count, (int, float)):
+                    source_token_count = len(group.get("source_token_indices") or [])
+                mass_group_source_token_counts_by_threshold[mass_threshold].append(
+                    float(source_token_count)
+                )
+                source_unit_count = group.get("source_unit_count")
+                if isinstance(source_unit_count, (int, float)):
+                    mass_group_source_unit_counts_by_threshold[mass_threshold].append(
+                        float(source_unit_count)
+                    )
+                coverage = group.get("saliency_mass_coverage")
+                if isinstance(coverage, (int, float)):
+                    mass_group_coverages_by_threshold[mass_threshold].append(float(coverage))
+                if effect < -effect_eps:
+                    source_tokens = group.get("source_tokens") or []
+                    for token in source_tokens:
+                        token_category_counts["reverse_group_sources"][_token_category(str(token))] += 1
+                    reverse_groups.append(
+                        {
+                            "file": os.path.basename(path),
+                            "sample": sample,
+                            "target_token_index": target_idx,
+                            "target_token": target,
+                            "target_context": _context(tokens, target_idx),
+                            "target_category": _token_category(str(target or "")),
+                            "base_ce_loss": base_ce,
+                            "group_type": "saliency_mass",
+                            "mass_threshold": mass_threshold,
+                            "saliency_mass_coverage": group.get("saliency_mass_coverage"),
                             "source_token_indices": group.get("source_token_indices"),
                             "source_tokens": source_tokens,
                             "source_contexts": [
@@ -331,6 +393,7 @@ def analyze_feature_results(
     group_summaries = {
         f"group@{k}": {
             **_summarize(values),
+            "source_token_count": _summarize(group_source_token_counts_by_k.get(k, [])),
             "positive_rate": (
                 sum(1 for value in values if value > effect_eps) / len(values)
                 if values else 0.0
@@ -341,6 +404,29 @@ def analyze_feature_results(
             ),
         }
         for k, values in sorted(group_effects_by_k.items())
+    }
+    mass_group_summaries = {
+        f"mass@{threshold:g}": {
+            **_summarize(values),
+            "source_token_count": _summarize(
+                mass_group_source_token_counts_by_threshold.get(threshold, [])
+            ),
+            "source_unit_count": _summarize(
+                mass_group_source_unit_counts_by_threshold.get(threshold, [])
+            ),
+            "saliency_mass_coverage": _summarize(
+                mass_group_coverages_by_threshold.get(threshold, [])
+            ),
+            "positive_rate": (
+                sum(1 for value in values if value > effect_eps) / len(values)
+                if values else 0.0
+            ),
+            "reverse_rate": (
+                sum(1 for value in values if value < -effect_eps) / len(values)
+                if values else 0.0
+            ),
+        }
+        for threshold, values in sorted(mass_group_effects_by_threshold.items())
     }
 
     return {
@@ -362,6 +448,7 @@ def analyze_feature_results(
         "effect_summaries": {
             "individual_by_rank": top_rank_effects,
             "group_by_k": group_summaries,
+            "group_by_saliency_mass": mass_group_summaries,
         },
         "category_counts": {
             name: dict(counter.most_common())
@@ -415,8 +502,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         "",
         "## Group Effects",
         "",
-        "| metric | n | mean drop | median drop | positive | reverse |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| metric | n | mean drop | median drop | positive | reverse | mean source tokens |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for key, stats in report["effect_summaries"]["group_by_k"].items():
         lines.append(
@@ -429,10 +516,41 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                     f"{float(stats.get('median', 0.0)):.4f}",
                     _fmt_pct(float(stats.get("positive_rate", 0.0))),
                     _fmt_pct(float(stats.get("reverse_rate", 0.0))),
+                    f"{float((stats.get('source_token_count') or {}).get('mean', 0.0)):.2f}",
                 ]
             )
             + " |"
         )
+
+    mass_groups = report["effect_summaries"].get("group_by_saliency_mass") or {}
+    if mass_groups:
+        lines.extend(
+            [
+                "",
+                "## Saliency Mass Group Effects",
+                "",
+                "| metric | n | mean drop | median drop | positive | reverse | mean source units | mean source tokens | mean mass coverage |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for key, stats in mass_groups.items():
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        key,
+                        str(stats.get("n", 0)),
+                        f"{float(stats.get('mean', 0.0)):.4f}",
+                        f"{float(stats.get('median', 0.0)):.4f}",
+                        _fmt_pct(float(stats.get("positive_rate", 0.0))),
+                        _fmt_pct(float(stats.get("reverse_rate", 0.0))),
+                        f"{float((stats.get('source_unit_count') or {}).get('mean', 0.0)):.2f}",
+                        f"{float((stats.get('source_token_count') or {}).get('mean', 0.0)):.2f}",
+                        f"{float((stats.get('saliency_mass_coverage') or {}).get('mean', 0.0)):.4f}",
+                    ]
+                )
+                + " |"
+            )
 
     lines.extend(
         [
@@ -483,13 +601,17 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
             "",
             "## Reverse Group Examples",
             "",
-            "| sample | target | base CE | k | effect | source tokens | categories |",
-            "| --- | --- | ---: | ---: | ---: | --- | --- |",
+            "| sample | target | base CE | group | effect | source tokens | categories |",
+            "| --- | --- | ---: | --- | ---: | --- | --- |",
         ]
     )
     for row in report["reverse_group_examples"]:
         source_tokens = ", ".join(repr(token) for token in row.get("source_tokens") or [])
         categories = ", ".join(str(cat) for cat in row.get("source_categories") or [])
+        if row.get("group_type") == "saliency_mass":
+            group_label = f"mass@{float(row.get('mass_threshold') or 0.0):g}"
+        else:
+            group_label = f"@{row.get('k', '')}"
         lines.append(
             "| "
             + " | ".join(
@@ -497,7 +619,7 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                     str(row.get("sample", "")),
                     repr(row.get("target_token", "")),
                     f"{float(row.get('base_ce_loss') or 0.0):.4f}",
-                    str(row.get("k", "")),
+                    group_label,
                     f"{float(row.get('logprob_drop') or 0.0):.4f}",
                     source_tokens,
                     categories,

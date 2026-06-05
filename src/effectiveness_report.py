@@ -216,6 +216,20 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         value = (summary.get(key) or {}).get("mean")
         return "" if value is None else f"{float(value):.4f}"
 
+    def get_first(summary: dict[str, Any], prefix: str) -> str:
+        for key in sorted(summary):
+            if key.startswith(prefix):
+                value = (summary.get(key) or {}).get("mean")
+                return "" if value is None else f"{float(value):.4f}"
+        return ""
+
+    def metric_first(metrics: dict[str, Any], prefix: str) -> float:
+        for key in sorted(metrics):
+            if key.startswith(prefix):
+                value = metrics.get(key)
+                return float(value) if isinstance(value, (int, float)) else 0.0
+        return 0.0
+
     lines = [
         "# Effectiveness Attribution Report",
         "",
@@ -230,14 +244,19 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         f"| feature group effectiveness@5 tau0.5 | {get(feature_summary, 'group_effectiveness_logprob_drop@5_tau0.5')} |",
         f"| feature group effectiveness@10 tau1 | {get(feature_summary, 'group_effectiveness_logprob_drop@10_tau1')} |",
         f"| feature group logprob drop@5 | {get(feature_summary, 'group_logprob_drop@5')} |",
+        f"| feature group reverse@5 | {get(feature_summary, 'group_reverse_logprob_drop@5')} |",
+        f"| feature group source tokens@5 | {get(feature_summary, 'group_source_token_count@5')} |",
+        f"| feature mass group logprob drop | {get_first(feature_summary, 'group_mass_logprob_drop@')} |",
+        f"| feature mass group reverse | {get_first(feature_summary, 'group_mass_reverse_logprob_drop@')} |",
+        f"| feature mass group source tokens | {get_first(feature_summary, 'group_mass_source_token_count@')} |",
         f"| data effectiveness@10 tau0.001 | {get(data_summary, 'data_effectiveness@10_tau0.001')} |",
         f"| data hit@10 tau0.001 | {get(data_summary, 'data_hit@10_tau0.001')} |",
         f"| data mean effect@10 | {get(data_summary, 'mean_data_effect@10')} |",
         "",
         "## Feature Samples",
         "",
-        "| index | task_id | targets | group eff@5 tau0.5 | group eff@10 tau1 | group drop@5 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: |",
+        "| index | task_id | targets | group eff@5 tau0.5 | group eff@10 tau1 | group drop@5 | group reverse@5 | group tokens@5 | mass drop | mass tokens |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in report["feature"].get("samples") or []:
         metrics = row.get("metric_means") or {}
@@ -250,6 +269,10 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                 f"{float(metrics.get('group_effectiveness_logprob_drop@5_tau0.5', 0.0)):.4f}",
                 f"{float(metrics.get('group_effectiveness_logprob_drop@10_tau1', 0.0)):.4f}",
                 f"{float(metrics.get('group_logprob_drop@5', 0.0)):.4f}",
+                f"{float(metrics.get('group_reverse_logprob_drop@5', 0.0)):.4f}",
+                f"{float(metrics.get('group_source_token_count@5', 0.0)):.2f}",
+                f"{metric_first(metrics, 'group_mass_logprob_drop@'):.4f}",
+                f"{metric_first(metrics, 'group_mass_source_token_count@'):.2f}",
             ])
             + " |"
         )

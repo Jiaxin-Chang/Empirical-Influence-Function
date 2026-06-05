@@ -47,6 +47,8 @@ SEED="${SEED:-}"
 
 TOP_K_PROMPT_TOKENS="${TOP_K_PROMPT_TOKENS:-}"
 FEATURE_K_VALUES="${FEATURE_K_VALUES:-}"
+FEATURE_K_VALUES_WAS_SET=0
+FEATURE_SALIENCY_MASS_THRESHOLDS="${FEATURE_SALIENCY_MASS_THRESHOLDS:-}"
 FEATURE_PERTURB_MODE="${FEATURE_PERTURB_MODE:-}"
 FEATURE_RANDOM_TRIALS="${FEATURE_RANDOM_TRIALS:-}"
 FEATURE_PERTURB_BATCH_SIZE="${FEATURE_PERTURB_BATCH_SIZE:-}"
@@ -57,6 +59,8 @@ FEATURE_EFFECT_THRESHOLDS="${FEATURE_EFFECT_THRESHOLDS:-}"
 FEATURE_EFFECT_METRIC="${FEATURE_EFFECT_METRIC:-}"
 FEATURE_GROUP_ONLY="${FEATURE_GROUP_ONLY:-0}"
 FEATURE_RANKING_MODE="${FEATURE_RANKING_MODE:-}"
+FEATURE_DIRECTION_MODE="${FEATURE_DIRECTION_MODE:-}"
+FEATURE_DIRECTION_SCORE="${FEATURE_DIRECTION_SCORE:-}"
 FEATURE_SOURCE_UNIT="${FEATURE_SOURCE_UNIT:-}"
 FEATURE_SPAN_SCORE="${FEATURE_SPAN_SCORE:-}"
 
@@ -95,7 +99,8 @@ while [[ $# -gt 0 ]]; do
         --max-gpu-memory) MAX_GPU_MEMORY="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --top-k-prompt-tokens) TOP_K_PROMPT_TOKENS="$2"; shift 2 ;;
-        --feature-k-values) FEATURE_K_VALUES="$2"; shift 2 ;;
+        --feature-k-values) FEATURE_K_VALUES="$2"; FEATURE_K_VALUES_WAS_SET=1; shift 2 ;;
+        --feature-saliency-mass-thresholds) FEATURE_SALIENCY_MASS_THRESHOLDS="$2"; shift 2 ;;
         --feature-perturb-mode) FEATURE_PERTURB_MODE="$2"; shift 2 ;;
         --feature-random-trials) FEATURE_RANDOM_TRIALS="$2"; shift 2 ;;
         --feature-perturb-batch-size) FEATURE_PERTURB_BATCH_SIZE="$2"; shift 2 ;;
@@ -106,6 +111,8 @@ while [[ $# -gt 0 ]]; do
         --feature-effect-metric) FEATURE_EFFECT_METRIC="$2"; shift 2 ;;
         --feature-group-only) FEATURE_GROUP_ONLY=1; shift ;;
         --feature-ranking-mode) FEATURE_RANKING_MODE="$2"; shift 2 ;;
+        --feature-direction-mode) FEATURE_DIRECTION_MODE="$2"; shift 2 ;;
+        --feature-direction-score) FEATURE_DIRECTION_SCORE="$2"; shift 2 ;;
         --feature-source-unit) FEATURE_SOURCE_UNIT="$2"; shift 2 ;;
         --feature-span-score) FEATURE_SPAN_SCORE="$2"; shift 2 ;;
         --prescreen-batch-size) PRESCREEN_BATCH_SIZE="$2"; shift 2 ;;
@@ -215,7 +222,10 @@ COMMON_ARGS=(--train-data "$TRAIN_DATA" --test-data "$TEST_DATA")
 
 FEATURE_ARGS=()
 [[ -n "$TOP_K_PROMPT_TOKENS" ]] && FEATURE_ARGS+=(--top-k-prompt-tokens "$TOP_K_PROMPT_TOKENS")
-[[ -n "$FEATURE_K_VALUES" ]] && FEATURE_ARGS+=(--feature-k-values "$FEATURE_K_VALUES")
+if [[ "$FEATURE_K_VALUES_WAS_SET" == "1" || -n "$FEATURE_K_VALUES" ]]; then
+    FEATURE_ARGS+=(--feature-k-values "$FEATURE_K_VALUES")
+fi
+[[ -n "$FEATURE_SALIENCY_MASS_THRESHOLDS" ]] && FEATURE_ARGS+=(--feature-saliency-mass-thresholds "$FEATURE_SALIENCY_MASS_THRESHOLDS")
 [[ -n "$FEATURE_PERTURB_MODE" ]] && FEATURE_ARGS+=(--feature-perturb-mode "$FEATURE_PERTURB_MODE")
 [[ -n "$FEATURE_RANDOM_TRIALS" ]] && FEATURE_ARGS+=(--feature-random-trials "$FEATURE_RANDOM_TRIALS")
 [[ -n "$FEATURE_PERTURB_BATCH_SIZE" ]] && FEATURE_ARGS+=(--feature-perturb-batch-size "$FEATURE_PERTURB_BATCH_SIZE")
@@ -226,6 +236,8 @@ FEATURE_ARGS=()
 [[ -n "$FEATURE_EFFECT_METRIC" ]] && FEATURE_ARGS+=(--feature-effect-metric "$FEATURE_EFFECT_METRIC")
 [[ "$FEATURE_GROUP_ONLY" == "1" ]] && FEATURE_ARGS+=(--feature-group-only)
 [[ -n "$FEATURE_RANKING_MODE" ]] && FEATURE_ARGS+=(--feature-ranking-mode "$FEATURE_RANKING_MODE")
+[[ -n "$FEATURE_DIRECTION_MODE" ]] && FEATURE_ARGS+=(--feature-direction-mode "$FEATURE_DIRECTION_MODE")
+[[ -n "$FEATURE_DIRECTION_SCORE" ]] && FEATURE_ARGS+=(--feature-direction-score "$FEATURE_DIRECTION_SCORE")
 [[ -n "$FEATURE_SOURCE_UNIT" ]] && FEATURE_ARGS+=(--feature-source-unit "$FEATURE_SOURCE_UNIT")
 [[ -n "$FEATURE_SPAN_SCORE" ]] && FEATURE_ARGS+=(--feature-span-score "$FEATURE_SPAN_SCORE")
 

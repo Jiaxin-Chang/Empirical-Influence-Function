@@ -41,6 +41,7 @@ from src.intervention_experiment import (
     _score_prescreen_sketch_cache,
 )
 from src.loss import (
+    compute_alti_last_layer_source_vectors,
     compute_alti_saliency_vectors,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_sketches_no_backward,
@@ -52,6 +53,7 @@ DEFAULT_K_VALUES = (5, 10, 20)
 DEFAULT_DATA_METHOD_K = (10, 50, 100)
 DEFAULT_DATA_ORACLE_M = (10, 20, 50)
 DEFAULT_FEATURE_EFFECT_THRESHOLDS = (0.1, 0.2, 0.5)
+DEFAULT_FEATURE_SALIENCY_MASS_THRESHOLDS: tuple[float, ...] = ()
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -365,17 +367,21 @@ def _source_direction_scores(
     *,
     device,
     enabled: bool,
+    direction_mode: str,
+    direction_score: str,
     contextual_hidden: torch.Tensor | None = None,
+    alti_source_vectors: torch.Tensor | None = None,
 ) -> dict[int, float]:
     if not enabled:
         return {}
+    if direction_mode not in {"hidden", "alti_last"}:
+        raise ValueError(f"Unsupported feature direction mode: {direction_mode}")
+    if direction_score not in {"cosine", "projection"}:
+        raise ValueError(f"Unsupported feature direction score: {direction_score}")
     source_indices = sorted({int(idx) for idx in source_indices})
     if not source_indices:
         return {}
 
-    hidden = contextual_hidden
-    if hidden is None:
-        hidden = _contextual_hidden_rows(model, batch, device)
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise RuntimeError("Model does not expose output embeddings.")
@@ -385,11 +391,40 @@ def _source_direction_scores(
     target_vec = lm_head.weight[target_token_id].detach().to(device=head_device, dtype=torch.float32)
     target_norm = target_vec.norm().clamp_min(1e-12)
 
+    if direction_mode == "alti_last":
+        if alti_source_vectors is None:
+            alti_source_vectors = compute_alti_last_layer_source_vectors(
+                model,
+                batch,
+                [target_idx],
+            )[int(target_idx)]
+        result = {}
+        vectors = alti_source_vectors.to(device=head_device, dtype=torch.float32)
+        for idx in source_indices:
+            if 0 <= idx < vectors.size(0):
+                source_vec = vectors[idx]
+                dot = torch.dot(source_vec, target_vec)
+                if direction_score == "projection":
+                    score = dot / target_norm
+                else:
+                    score = dot / (source_vec.norm().clamp_min(1e-12) * target_norm)
+                result[int(idx)] = float(score.item())
+        del vectors, target_vec
+        return result
+
+    hidden = contextual_hidden
+    if hidden is None:
+        hidden = _contextual_hidden_rows(model, batch, device)
+
     result = {}
     for idx in source_indices:
         if 0 <= idx < hidden.size(0):
             source_vec = hidden[idx].to(device=head_device, dtype=torch.float32)
-            score = torch.dot(source_vec, target_vec) / (source_vec.norm().clamp_min(1e-12) * target_norm)
+            dot = torch.dot(source_vec, target_vec)
+            if direction_score == "projection":
+                score = dot / target_norm
+            else:
+                score = dot / (source_vec.norm().clamp_min(1e-12) * target_norm)
             result[int(idx)] = float(score.item())
     del target_vec
     return result
@@ -407,8 +442,11 @@ def _build_feature_source_units(
     source_unit: str,
     span_score: str,
     ranking_mode: str,
+    direction_mode: str,
+    direction_score: str,
     max_units: int | None,
     contextual_hidden: torch.Tensor | None = None,
+    alti_source_vectors: torch.Tensor | None = None,
 ) -> list[dict]:
     source_items = []
     source_limit = min(int(target_idx), len(saliency), int(ids_1d.numel()))
@@ -431,7 +469,10 @@ def _build_feature_source_units(
         target_idx,
         device=device,
         enabled=ranking_mode in {"signed", "signed_clip"},
+        direction_mode=direction_mode,
+        direction_score=direction_score,
         contextual_hidden=contextual_hidden,
+        alti_source_vectors=alti_source_vectors,
     )
 
     units = []
@@ -749,6 +790,7 @@ def _feature_effectiveness_metrics(
     thresholds: tuple[float, ...],
     effect_metric: str,
     group_effects: dict[int, dict] | None = None,
+    saliency_mass_group_effects: dict[float, dict] | None = None,
 ) -> dict[str, float]:
     metrics = {}
     for k in k_values:
@@ -762,10 +804,21 @@ def _feature_effectiveness_metrics(
                 metric_values = (
                     logprob_drops if effect_metric == "logprob_drop" else prob_drops
                 )
+                source_token_counts = [
+                    int(item.get("source_token_count", len(item.get("source_token_indices", [])) or 1))
+                    for item in top_effects
+                ]
                 metrics[f"mean_logprob_drop@{kk}"] = sum(logprob_drops) / kk
                 metrics[f"mean_prob_drop@{kk}"] = sum(prob_drops) / kk
+                metrics[f"mean_source_token_count@{kk}"] = sum(source_token_counts) / kk
                 metrics[f"positive_rate_logprob_drop@{kk}"] = (
                     sum(1 for value in logprob_drops if value > 0.0) / kk
+                )
+                metrics[f"reverse_rate_logprob_drop@{kk}"] = (
+                    sum(1 for value in logprob_drops if value < 0.0) / kk
+                )
+                metrics[f"reverse_rate_prob_drop@{kk}"] = (
+                    sum(1 for value in prob_drops if value < 0.0) / kk
                 )
                 for threshold in thresholds:
                     suffix = _format_threshold(threshold)
@@ -780,12 +833,88 @@ def _feature_effectiveness_metrics(
             )
             metrics[f"group_logprob_drop@{requested_k}"] = group_logprob_drop
             metrics[f"group_prob_drop@{requested_k}"] = group_prob_drop
+            metrics[f"group_positive_logprob_drop@{requested_k}"] = (
+                1.0 if group_logprob_drop > 0.0 else 0.0
+            )
+            metrics[f"group_reverse_logprob_drop@{requested_k}"] = (
+                1.0 if group_logprob_drop < 0.0 else 0.0
+            )
+            metrics[f"group_source_unit_count@{requested_k}"] = float(
+                group.get("source_unit_count", requested_k)
+            )
+            metrics[f"group_source_token_count@{requested_k}"] = float(
+                group.get("source_token_count", len(group.get("source_token_indices", [])))
+            )
             for threshold in thresholds:
                 suffix = _format_threshold(threshold)
                 metrics[f"group_effectiveness_{effect_metric}@{requested_k}_tau{suffix}"] = (
                     1.0 if group_metric_value >= float(threshold) else 0.0
                 )
+    if saliency_mass_group_effects is not None:
+        for mass_threshold, group in sorted(saliency_mass_group_effects.items()):
+            mass_suffix = _format_threshold(mass_threshold)
+            group_logprob_drop = float(group["logprob_drop"])
+            group_prob_drop = float(group["prob_drop"])
+            group_metric_value = (
+                group_logprob_drop if effect_metric == "logprob_drop" else group_prob_drop
+            )
+            metrics[f"group_mass_logprob_drop@{mass_suffix}"] = group_logprob_drop
+            metrics[f"group_mass_prob_drop@{mass_suffix}"] = group_prob_drop
+            metrics[f"group_mass_positive_logprob_drop@{mass_suffix}"] = (
+                1.0 if group_logprob_drop > 0.0 else 0.0
+            )
+            metrics[f"group_mass_reverse_logprob_drop@{mass_suffix}"] = (
+                1.0 if group_logprob_drop < 0.0 else 0.0
+            )
+            metrics[f"group_mass_source_unit_count@{mass_suffix}"] = float(
+                group.get("source_unit_count", 0)
+            )
+            metrics[f"group_mass_source_token_count@{mass_suffix}"] = float(
+                group.get("source_token_count", len(group.get("source_token_indices", [])))
+            )
+            metrics[f"group_mass_saliency_coverage@{mass_suffix}"] = float(
+                group.get("saliency_mass_coverage", 0.0)
+            )
+            metrics[f"group_mass_selected_saliency@{mass_suffix}"] = float(
+                group.get("selected_saliency", 0.0)
+            )
+            metrics[f"group_mass_total_saliency@{mass_suffix}"] = float(
+                group.get("total_saliency", 0.0)
+            )
+            for threshold in thresholds:
+                effect_suffix = _format_threshold(threshold)
+                metrics[
+                    f"group_mass_effectiveness_{effect_metric}@{mass_suffix}_tau{effect_suffix}"
+                ] = 1.0 if group_metric_value >= float(threshold) else 0.0
     return metrics
+
+
+def _select_units_by_saliency_mass(
+    ranked_units: list[dict],
+    mass_threshold: float,
+) -> tuple[list[dict], float, float, float]:
+    threshold = float(mass_threshold)
+    if threshold <= 0.0 or threshold > 1.0:
+        raise ValueError(
+            "--feature-saliency-mass-thresholds values must be fractions in (0, 1]."
+        )
+    total_saliency = sum(
+        max(0.0, float(unit.get("alti_saliency", 0.0)))
+        for unit in ranked_units
+    )
+    if total_saliency <= 0.0:
+        return [], 0.0, 0.0, 0.0
+
+    selected: list[dict] = []
+    selected_saliency = 0.0
+    for unit in ranked_units:
+        selected.append(unit)
+        selected_saliency += max(0.0, float(unit.get("alti_saliency", 0.0)))
+        if selected_saliency / total_saliency >= threshold:
+            break
+
+    coverage = selected_saliency / total_saliency if total_saliency > 0.0 else 0.0
+    return selected, coverage, selected_saliency, total_saliency
 
 
 def evaluate_feature_attribution(
@@ -809,8 +938,11 @@ def evaluate_feature_attribution(
     group_only: bool,
     perturb_batch_size: int,
     ranking_mode: str,
+    direction_mode: str,
+    direction_score: str,
     source_unit: str,
     span_score: str,
+    saliency_mass_thresholds: tuple[float, ...],
 ) -> list[dict]:
     results = []
     ids_1d = test_batch["input_ids"][0]
@@ -828,8 +960,13 @@ def evaluate_feature_attribution(
     )
     contextual_hidden = (
         _contextual_hidden_rows(model, test_batch, device)
-        if ranking_mode in {"signed", "signed_clip"}
+        if ranking_mode in {"signed", "signed_clip"} and direction_mode == "hidden"
         else None
+    )
+    alti_source_vectors_by_target = (
+        compute_alti_last_layer_source_vectors(model, test_batch, target_positions)
+        if ranking_mode in {"signed", "signed_clip"} and direction_mode == "alti_last"
+        else {}
     )
     base_loss_values = _target_token_losses(model, test_batch, target_positions, device)
     base_loss_by_target = {
@@ -854,8 +991,11 @@ def evaluate_feature_attribution(
             source_unit=source_unit,
             span_score=span_score,
             ranking_mode=ranking_mode,
+            direction_mode=direction_mode,
+            direction_score=direction_score,
             max_units=max_feature_sources,
             contextual_hidden=contextual_hidden,
+            alti_source_vectors=alti_source_vectors_by_target.get(target_idx),
         )
         method_ranked = [int(unit["source_token_index"]) for unit in method_units]
         unit_by_primary_id = {
@@ -866,18 +1006,35 @@ def evaluate_feature_attribution(
             int(unit["source_token_index"]): float(unit["alti_saliency"])
             for unit in method_units
         }
+        saliency_mass_group_specs: list[tuple[float, list[dict], float, float, float]] = []
+        for mass_threshold in saliency_mass_thresholds:
+            selected_units, coverage, selected_saliency, total_saliency = (
+                _select_units_by_saliency_mass(method_units, float(mass_threshold))
+            )
+            if selected_units:
+                saliency_mass_group_specs.append(
+                    (
+                        float(mass_threshold),
+                        selected_units,
+                        coverage,
+                        selected_saliency,
+                        total_saliency,
+                    )
+                )
 
         base_loss = base_loss_by_target[target_idx]
         base_prob = math.exp(-base_loss)
         oracle_effects: dict[int, float] = {}
         source_effects: list[dict] = []
         group_effects: dict[int, dict] = {}
+        saliency_mass_group_effects: dict[float, dict] = {}
+        max_k_value = max(k_values) if k_values else 0
         if group_only and evaluation_mode != "effectiveness":
             raise ValueError("--feature-group-only is only supported in effectiveness mode.")
         if group_only:
             evaluated_units = []
         elif evaluation_mode == "effectiveness":
-            evaluated_units = method_units[:max(k_values)]
+            evaluated_units = method_units[:max_k_value]
         elif evaluation_mode == "full":
             evaluated_units = method_units
         else:
@@ -907,6 +1064,7 @@ def evaluate_feature_attribution(
                 source_effects.append({
                     "source_token_index": unit_id,
                     "source_token_indices": unit_sources,
+                    "source_token_count": len(unit_sources),
                     "source_text": unit["source_text"],
                     "perturbed_ce_loss": loss_value,
                     "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
@@ -945,6 +1103,52 @@ def evaluate_feature_attribution(
                 group_effects[requested_k] = {
                     "source_unit_count": int(kk),
                     "source_token_indices": [int(x) for x in selected_sources],
+                    "source_token_count": len(selected_sources),
+                    "perturbed_ce_loss": loss_value,
+                    "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
+                    "perturbation_trials": int(loss_summary["trial_count"]),
+                    "logprob_drop": loss_value - base_loss,
+                    "prob_drop": base_prob - math.exp(-loss_value),
+                }
+
+        for (
+            mass_threshold,
+            selected_units,
+            coverage,
+            selected_saliency,
+            total_saliency,
+        ) in saliency_mass_group_specs:
+            selected_sources = [
+                int(idx)
+                for unit in selected_units
+                for idx in unit["source_token_indices"]
+            ]
+            selected_sources = list(dict.fromkeys(selected_sources))
+            if not selected_sources:
+                continue
+            loss_summary = _perturbed_target_loss_summary(
+                model,
+                test_batch,
+                selected_sources,
+                target_idx,
+                device=device,
+                perturb_mode=perturb_mode,
+                replacement_token_id=replacement_token_id,
+                random_trials=random_trials,
+                vocab_size=vocab_size,
+                random_excluded_token_ids=random_excluded_token_ids,
+                perturb_batch_size=perturb_batch_size,
+            )
+            if int(loss_summary["trial_count"]) > 0:
+                loss_value = float(loss_summary["loss_mean"])
+                saliency_mass_group_effects[float(mass_threshold)] = {
+                    "mass_threshold": float(mass_threshold),
+                    "saliency_mass_coverage": float(coverage),
+                    "selected_saliency": float(selected_saliency),
+                    "total_saliency": float(total_saliency),
+                    "source_unit_count": len(selected_units),
+                    "source_token_indices": [int(x) for x in selected_sources],
+                    "source_token_count": len(selected_sources),
                     "perturbed_ce_loss": loss_value,
                     "perturbed_ce_loss_std": float(loss_summary["loss_std"]),
                     "perturbation_trials": int(loss_summary["trial_count"]),
@@ -959,6 +1163,7 @@ def evaluate_feature_attribution(
             thresholds=effect_thresholds,
             effect_metric=effect_metric,
             group_effects=group_effects,
+            saliency_mass_group_effects=saliency_mass_group_effects,
         )
 
         oracle_ranked = sorted(oracle_effects, key=lambda x: oracle_effects[x], reverse=True)
@@ -986,6 +1191,14 @@ def evaluate_feature_attribution(
                     perturb_batch_size=perturb_batch_size,
                 )
 
+        top_display_count = max(
+            max_k_value,
+            max(
+                (len(units) for _, units, _, _, _ in saliency_mass_group_specs),
+                default=0,
+            ),
+        )
+
         results.append({
             "target_token_index": target_idx,
             "target_token": target_text,
@@ -998,15 +1211,23 @@ def evaluate_feature_attribution(
                 "thresholds": [float(x) for x in effect_thresholds],
                 "evaluated_source_count": len(source_effects),
                 "ranking_mode": ranking_mode,
+                "direction_mode": direction_mode,
+                "direction_score": direction_score,
                 "source_unit": source_unit,
                 "span_score": span_score,
                 "ranked_unit_count": len(method_units),
+                "saliency_mass_thresholds": [
+                    float(x) for x in saliency_mass_thresholds
+                ],
             },
             "group_effects": [
                 {
                     "k": int(k),
                     "source_unit_count": int(group.get("source_unit_count", k)),
                     "source_token_indices": group["source_token_indices"],
+                    "source_token_count": int(
+                        group.get("source_token_count", len(group["source_token_indices"]))
+                    ),
                     "source_tokens": [
                         _decode_token(tokenizer, int(ids_1d[idx].item()))
                         for idx in group["source_token_indices"]
@@ -1019,6 +1240,29 @@ def evaluate_feature_attribution(
                 }
                 for k, group in sorted(group_effects.items())
             ],
+            "saliency_mass_group_effects": [
+                {
+                    "mass_threshold": float(mass_threshold),
+                    "saliency_mass_coverage": float(group["saliency_mass_coverage"]),
+                    "selected_saliency": float(group["selected_saliency"]),
+                    "total_saliency": float(group["total_saliency"]),
+                    "source_unit_count": int(group["source_unit_count"]),
+                    "source_token_indices": group["source_token_indices"],
+                    "source_token_count": int(
+                        group.get("source_token_count", len(group["source_token_indices"]))
+                    ),
+                    "source_tokens": [
+                        _decode_token(tokenizer, int(ids_1d[idx].item()))
+                        for idx in group["source_token_indices"]
+                    ],
+                    "perturbed_ce_loss": float(group["perturbed_ce_loss"]),
+                    "perturbed_ce_loss_std": float(group["perturbed_ce_loss_std"]),
+                    "perturbation_trials": int(group["perturbation_trials"]),
+                    "logprob_drop": float(group["logprob_drop"]),
+                    "prob_drop": float(group["prob_drop"]),
+                }
+                for mass_threshold, group in sorted(saliency_mass_group_effects.items())
+            ],
             "perturbation": {
                 "mode": perturb_mode,
                 "replacement_token_id": int(replacement_token_id),
@@ -1028,9 +1272,14 @@ def evaluate_feature_attribution(
             },
             "feature_ranking": {
                 "mode": ranking_mode,
+                "direction_mode": direction_mode,
+                "direction_score": direction_score,
                 "source_unit": source_unit,
                 "span_score": span_score,
                 "ranked_unit_count": len(method_units),
+                "saliency_mass_thresholds": [
+                    float(x) for x in saliency_mass_thresholds
+                ],
             },
             "metrics": metrics,
             "method_top": [
@@ -1038,6 +1287,7 @@ def evaluate_feature_attribution(
                     "rank": rank,
                     "source_token_index": int(unit["source_token_index"]),
                     "source_token_indices": [int(x) for x in unit["source_token_indices"]],
+                    "source_token_count": len(unit["source_token_indices"]),
                     "source_token": unit["source_text"],
                     "source_tokens": unit["source_tokens"],
                     "alti_saliency": float(unit["alti_saliency"]),
@@ -1047,7 +1297,7 @@ def evaluate_feature_attribution(
                     "logprob_drop": float(effect_by_id.get(int(unit["source_token_index"]), {}).get("logprob_drop", 0.0)),
                     "prob_drop": float(effect_by_id.get(int(unit["source_token_index"]), {}).get("prob_drop", 0.0)),
                 }
-                for rank, unit in enumerate(method_units[:max(k_values)], start=1)
+                for rank, unit in enumerate(method_units[:top_display_count], start=1)
             ],
             "effect_top": [
                 {
@@ -1067,7 +1317,7 @@ def evaluate_feature_attribution(
                     "rank_score": float(unit_by_primary_id.get(idx, {}).get("rank_score", 0.0)),
                     "direction_score": float(unit_by_primary_id.get(idx, {}).get("direction_score", 0.0)),
                 }
-                for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
+                for rank, idx in enumerate(oracle_ranked[:max_k_value], start=1)
             ],
             "oracle_top": [
                 {
@@ -1086,7 +1336,7 @@ def evaluate_feature_attribution(
                     "rank_score": float(unit_by_primary_id.get(idx, {}).get("rank_score", 0.0)),
                     "direction_score": float(unit_by_primary_id.get(idx, {}).get("direction_score", 0.0)),
                 }
-                for rank, idx in enumerate(oracle_ranked[:max(k_values)], start=1)
+                for rank, idx in enumerate(oracle_ranked[:max_k_value], start=1)
             ] if evaluation_mode == "full" else [],
         })
 
@@ -1607,6 +1857,16 @@ def parse_float_tuple(raw: str) -> tuple[float, ...]:
     return tuple(float(x.strip()) for x in raw.split(",") if x.strip())
 
 
+def parse_saliency_mass_thresholds(raw: str) -> tuple[float, ...]:
+    thresholds = parse_float_tuple(raw)
+    for threshold in thresholds:
+        if threshold <= 0.0 or threshold > 1.0:
+            raise ValueError(
+                "--feature-saliency-mass-thresholds values must be fractions in (0, 1]."
+            )
+    return tuple(dict.fromkeys(float(x) for x in thresholds))
+
+
 def _default_output_path(task_id: str, target_positions: list[int]) -> str:
     token_part = f"tok{target_positions[0]}" if len(target_positions) == 1 else "tokens"
     return f"attribution_eval_{task_id}_{token_part}.json"
@@ -1655,6 +1915,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--skip-data", action="store_true")
     parser.add_argument("--top-k-prompt-tokens", type=int, default=20)
     parser.add_argument("--feature-k-values", type=str, default="5,10,20")
+    parser.add_argument(
+        "--feature-saliency-mass-thresholds",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated cumulative ALTI saliency mass fractions in (0, 1], "
+            "for dynamic grouped feature perturbation. Example: 0.2,0.5 selects "
+            "the smallest ranked source-unit prefix covering at least 20%/50% of "
+            "the non-trivial source ALTI mass for each target."
+        ),
+    )
     parser.add_argument(
         "--feature-perturb-mode",
         choices=["replace", "random_replace", "delete", "zero_attention"],
@@ -1714,6 +1985,26 @@ def main(argv: list[str] | None = None) -> None:
             "How to rank ALTI source units. alti keeps the original saliency rank; "
             "signed multiplies saliency by contextual-hidden/target-logit cosine; "
             "signed_clip demotes negative-direction units by clipping that cosine at zero."
+        ),
+    )
+    parser.add_argument(
+        "--feature-direction-mode",
+        choices=["hidden", "alti_last"],
+        default="hidden",
+        help=(
+            "Vector used by signed feature ranking modes. hidden uses the source "
+            "contextual hidden state; alti_last uses the last-layer ALTI source "
+            "contribution vector into the target query position."
+        ),
+    )
+    parser.add_argument(
+        "--feature-direction-score",
+        choices=["cosine", "projection"],
+        default="cosine",
+        help=(
+            "Scalar direction score for signed feature ranking. cosine uses angle "
+            "similarity; projection preserves the source vector magnitude along the "
+            "target-logit direction."
         ),
     )
     parser.add_argument(
@@ -1840,6 +2131,15 @@ def main(argv: list[str] | None = None) -> None:
     output_path = args.output or _default_output_path(task_id, target_positions)
     feature_output_path = args.feature_output or _stage_output_path(output_path, "feature")
     data_coarse_output_path = args.data_coarse_output or _stage_output_path(output_path, "data_coarse")
+    feature_k_values = parse_int_tuple(args.feature_k_values)
+    feature_effect_thresholds = (
+        parse_float_tuple(args.feature_effect_thresholds)
+        or DEFAULT_FEATURE_EFFECT_THRESHOLDS
+    )
+    feature_saliency_mass_thresholds = (
+        parse_saliency_mass_thresholds(args.feature_saliency_mass_thresholds)
+        or DEFAULT_FEATURE_SALIENCY_MASS_THRESHOLDS
+    )
 
     report = {
         "experiment_meta": {
@@ -1861,17 +2161,19 @@ def main(argv: list[str] | None = None) -> None:
                 "data_unlearning_direction": "theta <- theta + eta * grad_train_loss",
             },
             "config": {
-                "feature_k_values": parse_int_tuple(args.feature_k_values),
+                "feature_k_values": feature_k_values,
+                "feature_saliency_mass_thresholds": feature_saliency_mass_thresholds,
                 "feature_perturb_mode": args.feature_perturb_mode,
                 "feature_random_trials": max(1, int(args.feature_random_trials)),
                 "feature_perturb_batch_size": max(1, int(args.feature_perturb_batch_size)),
                 "feature_group_only": bool(args.feature_group_only),
                 "max_feature_sources": args.max_feature_sources,
                 "feature_evaluation_mode": args.feature_evaluation_mode,
-                "feature_effect_thresholds": parse_float_tuple(args.feature_effect_thresholds)
-                or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
+                "feature_effect_thresholds": feature_effect_thresholds,
                 "feature_effect_metric": args.feature_effect_metric,
                 "feature_ranking_mode": args.feature_ranking_mode,
+                "feature_direction_mode": args.feature_direction_mode,
+                "feature_direction_score": args.feature_direction_score,
                 "feature_source_unit": args.feature_source_unit,
                 "feature_span_score": args.feature_span_score,
                 "data_method_k_values": parse_int_tuple(args.data_method_k_values),
@@ -1899,13 +2201,12 @@ def main(argv: list[str] | None = None) -> None:
             target_positions,
             device=accelerator.device,
             top_k_prompt_tokens=max(1, int(args.top_k_prompt_tokens)),
-            k_values=parse_int_tuple(args.feature_k_values) or DEFAULT_K_VALUES,
+            k_values=feature_k_values,
             perturb_mode=args.feature_perturb_mode,
             replacement_token_id=int(replacement_token_id),
             max_feature_sources=args.max_feature_sources,
             evaluation_mode=args.feature_evaluation_mode,
-            effect_thresholds=parse_float_tuple(args.feature_effect_thresholds)
-            or DEFAULT_FEATURE_EFFECT_THRESHOLDS,
+            effect_thresholds=feature_effect_thresholds,
             effect_metric=args.feature_effect_metric,
             random_trials=max(1, int(args.feature_random_trials)),
             vocab_size=len(tokenizer),
@@ -1915,8 +2216,11 @@ def main(argv: list[str] | None = None) -> None:
             group_only=bool(args.feature_group_only),
             perturb_batch_size=max(1, int(args.feature_perturb_batch_size)),
             ranking_mode=args.feature_ranking_mode,
+            direction_mode=args.feature_direction_mode,
+            direction_score=args.feature_direction_score,
             source_unit=args.feature_source_unit,
             span_score=args.feature_span_score,
+            saliency_mass_thresholds=feature_saliency_mass_thresholds,
         )
         feature_report = {
             "experiment_meta": {
