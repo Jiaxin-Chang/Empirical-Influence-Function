@@ -72,6 +72,7 @@ PRESCREEN_SKETCH_CACHE_DIR="${PRESCREEN_SKETCH_CACHE_DIR:-}"
 NO_PRESCREEN_SKETCH_CACHE="${NO_PRESCREEN_SKETCH_CACHE:-0}"
 DATA_GRANULARITY="${DATA_GRANULARITY:-}"
 DATA_METHOD_K_VALUES="${DATA_METHOD_K_VALUES:-}"
+DATA_GROUP_K_VALUES="${DATA_GROUP_K_VALUES:-}"
 DATA_ORACLE_M_VALUES="${DATA_ORACLE_M_VALUES:-}"
 DATA_ORACLE_LIMIT="${DATA_ORACLE_LIMIT:-}"
 DATA_ORACLE_INCLUDE_METHOD_TOP="${DATA_ORACLE_INCLUDE_METHOD_TOP:-}"
@@ -123,6 +124,7 @@ while [[ $# -gt 0 ]]; do
         --no-prescreen-sketch-cache) NO_PRESCREEN_SKETCH_CACHE=1; shift ;;
         --data-granularity) DATA_GRANULARITY="$2"; shift 2 ;;
         --data-method-k-values) DATA_METHOD_K_VALUES="$2"; shift 2 ;;
+        --data-group-k-values) DATA_GROUP_K_VALUES="$2"; shift 2 ;;
         --data-oracle-m-values) DATA_ORACLE_M_VALUES="$2"; shift 2 ;;
         --data-oracle-limit) DATA_ORACLE_LIMIT="$2"; shift 2 ;;
         --data-oracle-include-method-top) DATA_ORACLE_INCLUDE_METHOD_TOP="$2"; shift 2 ;;
@@ -250,6 +252,7 @@ DATA_ARGS=()
 [[ "$NO_PRESCREEN_SKETCH_CACHE" == "1" ]] && DATA_ARGS+=(--no-prescreen-sketch-cache)
 [[ -n "$DATA_GRANULARITY" ]] && DATA_ARGS+=(--data-granularity "$DATA_GRANULARITY")
 [[ -n "$DATA_METHOD_K_VALUES" ]] && DATA_ARGS+=(--data-method-k-values "$DATA_METHOD_K_VALUES")
+[[ -n "$DATA_GROUP_K_VALUES" ]] && DATA_ARGS+=(--data-group-k-values "$DATA_GROUP_K_VALUES")
 [[ -n "$DATA_ORACLE_M_VALUES" ]] && DATA_ARGS+=(--data-oracle-m-values "$DATA_ORACLE_M_VALUES")
 [[ -n "$DATA_ORACLE_LIMIT" ]] && DATA_ARGS+=(--data-oracle-limit "$DATA_ORACLE_LIMIT")
 [[ -n "$DATA_ORACLE_INCLUDE_METHOD_TOP" ]] && DATA_ARGS+=(--data-oracle-include-method-top "$DATA_ORACLE_INCLUDE_METHOD_TOP")

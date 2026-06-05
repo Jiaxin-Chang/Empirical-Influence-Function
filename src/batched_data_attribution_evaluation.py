@@ -17,10 +17,12 @@ from transformers import DataCollatorForSeq2Seq, set_seed
 from src.NIF import CustomCollator, DatasetWrapper, build_train_dataset
 from src.attribution_batch_report import build_report, _write_json as write_report_json, _write_markdown
 from src.attribution_evaluation import (
+    DEFAULT_DATA_GROUP_K,
     DEFAULT_DATA_METHOD_K,
     DEFAULT_DATA_ORACLE_M,
     _apply_lm_head_ascent_update,
     _decode_token,
+    _evaluate_data_group_unlearning_effects,
     _lm_head_grad_for_positions,
     _lm_head_sketch_for_positions,
     _ranking_ndcg,
@@ -529,9 +531,15 @@ def _run_batched_oracle(
 def _finalize_state_report(
     *,
     state: TestOracleState,
+    model,
     tokenizer,
+    train_ds,
+    collator,
+    idx_to_row: dict[int, int],
+    accelerator,
     train_size: int,
     method_top_ks: tuple[int, ...],
+    group_k_values: tuple[int, ...],
     oracle_top_ms: tuple[int, ...],
     unlearn_lr: float,
     normalize_unlearn_grad: bool,
@@ -551,6 +559,21 @@ def _finalize_state_report(
         if int(idx) in state.oracle_effects
     ]
     oracle_ranked = sorted(state.oracle_effects, key=lambda x: state.oracle_effects[x], reverse=True)
+    group_effects = _evaluate_data_group_unlearning_effects(
+        model,
+        state.test_batch,
+        train_ds,
+        collator,
+        idx_to_row,
+        state.response_positions,
+        method_ranked,
+        group_k_values,
+        state.base_losses,
+        accelerator.device,
+        unlearn_lr=unlearn_lr,
+        normalize_unlearn_grad=normalize_unlearn_grad,
+        effect_reduction=effect_reduction,
+    )
     metrics = {}
     for method_k in method_top_ks:
         kk = min(int(method_k), len(method_ranked))
@@ -562,8 +585,13 @@ def _finalize_state_report(
             if mm <= 0:
                 continue
             metrics[f"recall@{kk}_oracle_top{mm}"] = _recall_at(method_ranked, oracle_ranked, kk, mm)
+    for group in group_effects:
+        k = int(group["k"])
+        effect = float(group["data_effect"])
+        metrics[f"group_data_effect@{k}"] = effect
+        metrics[f"group_positive_data_effect@{k}"] = 1.0 if effect > 0.0 else 0.0
 
-    top_n = max(max(method_top_ks), max(oracle_top_ms))
+    top_n = max(max(method_top_ks), max(oracle_top_ms), max(group_k_values or (0,)))
     sample_to_sample = {
         "unit_type": "sample_to_sample",
         "unit_name": "full_response",
@@ -595,6 +623,7 @@ def _finalize_state_report(
             "base_target_losses": [float(x) for x in state.base_losses.tolist()],
         },
         "metrics": metrics,
+        "group_effects": group_effects,
         "method_top": [
             {
                 "rank": rank,
@@ -636,6 +665,7 @@ def _finalize_state_report(
             },
             "config": {
                 "data_method_k_values": method_top_ks,
+                "data_group_k_values": group_k_values,
                 "data_oracle_m_values": oracle_top_ms,
                 "data_oracle_limit": len(state.oracle_universe),
                 "data_oracle_include_method_top": None,
@@ -684,6 +714,12 @@ def main() -> None:
     parser.add_argument("--prescreen-sketch-cache-dir", type=str, default=PRESCREEN_SKETCH_CACHE_DIR)
     parser.add_argument("--no-prescreen-sketch-cache", action="store_true")
     parser.add_argument("--data-method-k-values", type=str, default="10,50,100")
+    parser.add_argument(
+        "--data-group-k-values",
+        type=str,
+        default="",
+        help="Comma-separated method top-k prefixes to unlearn as a group, e.g. 1,3,5,10.",
+    )
     parser.add_argument("--data-oracle-m-values", type=str, default="10,20,50")
     parser.add_argument("--data-oracle-limit", type=int, default=None)
     parser.add_argument("--data-oracle-include-method-top", type=int, default=100)
@@ -771,6 +807,7 @@ def main() -> None:
     )
 
     method_top_ks = parse_int_tuple(args.data_method_k_values) or DEFAULT_DATA_METHOD_K
+    group_k_values = parse_int_tuple(args.data_group_k_values) or DEFAULT_DATA_GROUP_K
     oracle_top_ms = parse_int_tuple(args.data_oracle_m_values) or DEFAULT_DATA_ORACLE_M
     status_path = os.path.join(args.output_dir, "reports", "batch_status.tsv")
     with open(status_path, "w", encoding="utf-8") as f:
@@ -850,9 +887,15 @@ def main() -> None:
             for state in states:
                 _finalize_state_report(
                     state=state,
+                    model=model,
                     tokenizer=tokenizer,
+                    train_ds=train_ds,
+                    collator=collator,
+                    idx_to_row=idx_to_row,
+                    accelerator=accelerator,
                     train_size=len(train_samples),
                     method_top_ks=method_top_ks,
+                    group_k_values=group_k_values,
                     oracle_top_ms=oracle_top_ms,
                     unlearn_lr=float(args.unlearn_lr),
                     normalize_unlearn_grad=not args.no_normalize_unlearn_grad,

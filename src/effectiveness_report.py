@@ -132,6 +132,7 @@ def _summarize_feature(results_dir: str) -> dict[str, Any]:
 
 def _data_effectiveness_for_sample(
     method_top: list[dict[str, Any]],
+    group_effects: list[dict[str, Any]],
     *,
     k_values: tuple[int, ...],
     thresholds: tuple[float, ...],
@@ -152,6 +153,19 @@ def _data_effectiveness_for_sample(
             count = sum(1 for value in top_effects if value >= float(threshold))
             metrics[f"data_effectiveness@{kk}_tau{suffix}"] = count / kk
             metrics[f"data_hit@{kk}_tau{suffix}"] = 1.0 if count > 0 else 0.0
+    for group in group_effects:
+        k = group.get("k")
+        effect = group.get("data_effect")
+        if not isinstance(k, int) or not isinstance(effect, (int, float)):
+            continue
+        effect = float(effect)
+        metrics[f"data_group_effect@{k}"] = effect
+        metrics[f"data_group_positive@{k}"] = 1.0 if effect > 0.0 else 0.0
+        for threshold in thresholds:
+            suffix = _fmt_tau(threshold)
+            metrics[f"data_group_effectiveness@{k}_tau{suffix}"] = (
+                1.0 if effect >= float(threshold) else 0.0
+            )
     return metrics
 
 
@@ -170,9 +184,11 @@ def _summarize_data(
             (payload.get("data_coarse_attribution") or {}).get("sample_to_sample") or {}
         )
         method_top = sample_to_sample.get("method_top") or []
+        group_effects = sample_to_sample.get("group_effects") or []
         oracle = sample_to_sample.get("oracle") or {}
         metrics = _data_effectiveness_for_sample(
             method_top,
+            group_effects,
             k_values=k_values,
             thresholds=thresholds,
         )
@@ -180,6 +196,7 @@ def _summarize_data(
             "sample_index": meta.get("test_sample_index"),
             "task_id": meta.get("task_id"),
             "method_top_count": len(method_top),
+            "group_effect_count": len(group_effects),
             "oracle": {
                 "candidate_universe_size": oracle.get("candidate_universe_size"),
                 "scored_candidate_count": oracle.get("scored_candidate_count"),
@@ -252,6 +269,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         f"| data effectiveness@10 tau0.001 | {get(data_summary, 'data_effectiveness@10_tau0.001')} |",
         f"| data hit@10 tau0.001 | {get(data_summary, 'data_hit@10_tau0.001')} |",
         f"| data mean effect@10 | {get(data_summary, 'mean_data_effect@10')} |",
+        f"| data group effectiveness@10 tau0.001 | {get(data_summary, 'data_group_effectiveness@10_tau0.001')} |",
+        f"| data group effect@10 | {get(data_summary, 'data_group_effect@10')} |",
         "",
         "## Feature Samples",
         "",
@@ -280,8 +299,8 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
         "",
         "## Data Samples",
         "",
-        "| index | task_id | top count | data eff@10 tau0.001 | data hit@10 tau0.001 | mean effect@10 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: |",
+        "| index | task_id | top count | groups | data eff@10 tau0.001 | data hit@10 tau0.001 | mean effect@10 | group eff@10 tau0.001 | group effect@10 |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for row in report["data"].get("samples") or []:
         metrics = row.get("metrics") or {}
@@ -291,9 +310,12 @@ def _write_markdown(path: str, report: dict[str, Any]) -> None:
                 str(row.get("sample_index", "")),
                 str(row.get("task_id", "")),
                 str(row.get("method_top_count", "")),
+                str(row.get("group_effect_count", "")),
                 f"{float(metrics.get('data_effectiveness@10_tau0.001', 0.0)):.4f}",
                 f"{float(metrics.get('data_hit@10_tau0.001', 0.0)):.4f}",
                 f"{float(metrics.get('mean_data_effect@10', 0.0)):.6f}",
+                f"{float(metrics.get('data_group_effectiveness@10_tau0.001', 0.0)):.4f}",
+                f"{float(metrics.get('data_group_effect@10', 0.0)):.6f}",
             ])
             + " |"
         )
