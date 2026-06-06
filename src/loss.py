@@ -743,12 +743,12 @@ def compute_alti_last_layer_source_vectors(
 
     max_target = max(targets)
     model.eval()
-    device = model.device
+    forward_device = model.device
 
-    input_ids = batch["input_ids"][:, :max_target].to(device)
+    input_ids = batch["input_ids"][:, :max_target].to(forward_device)
     inputs = {"input_ids": input_ids}
     if "attention_mask" in batch:
-        inputs["attention_mask"] = batch["attention_mask"][:, :max_target].to(device)
+        inputs["attention_mask"] = batch["attention_mask"][:, :max_target].to(forward_device)
 
     outputs = model(
         **inputs,
@@ -771,6 +771,7 @@ def compute_alti_last_layer_source_vectors(
     layer_idx = len(attentions) - 1
     layer = model.model.layers[layer_idx]
     self_attn = layer.self_attn
+    device = self_attn.v_proj.weight.device
     hidden = hidden_states[layer_idx].to(device)
     attention_probs = attentions[layer_idx].to(device)
 
