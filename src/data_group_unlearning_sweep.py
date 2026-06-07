@@ -95,31 +95,131 @@ def _parse_configs(raw: str) -> list[SweepConfig]:
 
 
 def _source_json_path(source_results_dir: Path, test_index: int) -> Path:
-    direct = source_results_dir / "data" / f"test{test_index}_data.json"
+    data_dir = source_results_dir / "data"
+    if not data_dir.is_dir():
+        raise FileNotFoundError(
+            f"Cannot find source data directory: {data_dir}. "
+            "--source-results-dir must point to the data_standard results root."
+        )
+
+    direct = data_dir / f"test{test_index}_data.json"
     if direct.exists():
         return direct
-    matches = sorted((source_results_dir / "data").glob(f"*{test_index}*_data.json"))
+
+    matches = sorted(data_dir.glob(f"*{test_index}*_data.json"))
     if len(matches) == 1:
         return matches[0]
+
+    indexed_matches: list[Path] = []
+    for path in sorted(data_dir.glob("*_data.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if _payload_matches_test_index(payload, test_index):
+            indexed_matches.append(path)
+
+    if len(indexed_matches) == 1:
+        return indexed_matches[0]
+    if len(indexed_matches) > 1:
+        raise FileExistsError(
+            f"Found multiple source data JSON files for test index {test_index}: "
+            + ", ".join(str(p) for p in indexed_matches[:5])
+        )
     raise FileNotFoundError(f"Cannot find source data JSON for test index {test_index}.")
 
 
+def _payload_matches_test_index(payload: dict, test_index: int) -> bool:
+    raw_index = payload.get("experiment_meta", {}).get("test_sample_index")
+    if raw_index is None:
+        return False
+    try:
+        return int(raw_index) == int(test_index)
+    except (TypeError, ValueError):
+        return False
+
+
+def _coarse_json_path(source_results_dir: Path, test_index: int) -> Path:
+    coarse_dir = source_results_dir / "data_coarse"
+    if not coarse_dir.is_dir():
+        raise FileNotFoundError(
+            f"Cannot find source coarse directory: {coarse_dir}. "
+            "--source-results-dir must point to the data_standard results root."
+        )
+
+    direct = coarse_dir / f"test{test_index}_data_coarse.json"
+    if direct.exists():
+        return direct
+
+    matches = sorted(coarse_dir.glob(f"*{test_index}*_data_coarse.json"))
+    if len(matches) == 1:
+        return matches[0]
+
+    indexed_matches: list[Path] = []
+    for path in sorted(coarse_dir.glob("*_data_coarse.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if _payload_matches_test_index(payload, test_index):
+            indexed_matches.append(path)
+
+    if len(indexed_matches) == 1:
+        return indexed_matches[0]
+    if len(indexed_matches) > 1:
+        raise FileExistsError(
+            f"Found multiple source coarse JSON files for test index {test_index}: "
+            + ", ".join(str(p) for p in indexed_matches[:5])
+        )
+    raise FileNotFoundError(f"Cannot find source coarse JSON for test index {test_index}.")
+
+
+def _coarse_payload_as_source_payload(coarse_payload: dict) -> dict:
+    meta = coarse_payload.get("experiment_meta", {})
+    return {
+        "experiment_meta": meta,
+        "test_sample_baseline": {"response_source": None},
+        "data_coarse_attribution": {
+            "granularity": "sample_to_sample",
+            "sample_to_token": [],
+            "sample_to_sample": {
+                "target_token_indices": meta.get("target_token_indices", []),
+                "target_tokens": meta.get("target_tokens", []),
+                "method_top": [],
+            },
+        },
+    }
+
+
 def _load_method_ranked(source_results_dir: Path, test_index: int, max_k: int) -> tuple[list[int], dict]:
-    source_path = _source_json_path(source_results_dir, test_index)
-    payload = json.loads(source_path.read_text(encoding="utf-8"))
-    sample_to_sample = payload["data_coarse_attribution"]["sample_to_sample"]
-    method_top = sample_to_sample.get("method_top") or []
+    payload = None
+    try:
+        source_path = _source_json_path(source_results_dir, test_index)
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+
+    if payload is not None:
+        sample_to_sample = payload["data_coarse_attribution"]["sample_to_sample"]
+        method_top = sample_to_sample.get("method_top") or []
+    else:
+        method_top = []
+
     if method_top:
         ranked = [int(row["train_sample_id"]) for row in method_top[:max_k]]
     else:
-        coarse_path = source_results_dir / "data_coarse" / f"test{test_index}_data_coarse.json"
+        coarse_path = _coarse_json_path(source_results_dir, test_index)
         coarse_payload = json.loads(coarse_path.read_text(encoding="utf-8"))
+        if payload is None:
+            payload = _coarse_payload_as_source_payload(coarse_payload)
         ranked = [
             int(row["train_sample_id"])
             for row in coarse_payload.get("coarse_ranking", [])[:max_k]
         ]
     if not ranked:
         raise ValueError(f"No method ranking found for test index {test_index}.")
+    if payload is None:
+        raise ValueError(f"No source payload found for test index {test_index}.")
     return ranked, payload
 
 
