@@ -719,6 +719,178 @@ def _compute_qwen_alti_layer_target_relevance(
 
 
 @torch.no_grad()
+def compute_alti_last_layer_source_vectors(
+    model,
+    batch,
+    target_indices_in_seq,
+) -> dict[int, Tensor]:
+    """
+    Return final attention-block ALTI source contribution vectors per target.
+
+    For target token position t, the model predicts it from query position
+    t - 1. The returned tensor has shape [t, hidden_dim]; row j is the vector
+    contribution from source position j to the last layer's attention/residual
+    output at query position t - 1. This is the vector form that is reduced to
+    scalar ALTI importance inside `_normalize_alti_importance`.
+    """
+    targets = sorted({int(t) for t in target_indices_in_seq})
+    if not targets:
+        return {}
+    if targets[0] <= 0:
+        raise ValueError("target indices must be > 0 because they denote next-token positions.")
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("ALTI source vectors currently expect a Qwen-style model.model.layers stack.")
+
+    max_target = max(targets)
+    model.eval()
+    forward_device = model.device
+
+    input_ids = batch["input_ids"][:, :max_target].to(forward_device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :max_target].to(forward_device)
+
+    outputs = model(
+        **inputs,
+        output_hidden_states=True,
+        output_attentions=True,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    hidden_states = outputs.hidden_states
+    attentions = outputs.attentions
+    if hidden_states is None or attentions is None:
+        raise RuntimeError(
+            "Model did not return hidden_states/attentions. Ensure output_hidden_states and "
+            "output_attentions are supported; Qwen may need attn_implementation='eager'."
+        )
+    if not attentions or attentions[-1] is None:
+        raise RuntimeError("Encountered None attention tensor; use eager attention when computing ALTI.")
+
+    layer_idx = len(attentions) - 1
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+    device = self_attn.v_proj.weight.device
+    hidden = hidden_states[layer_idx].to(device)
+    attention_probs = attentions[layer_idx].to(device)
+
+    bsz, seq_len, _ = hidden.shape
+    if bsz != 1:
+        raise ValueError("ALTI source vectors currently support batch_size=1.")
+
+    num_heads, head_dim, num_kv_heads = _infer_qwen_attention_layout(
+        model,
+        self_attn,
+        attention_probs,
+    )
+    normed_states = layer.input_layernorm(hidden)
+    value_states = self_attn.v_proj(normed_states)
+    value_states = value_states.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = _repeat_kv_for_alti(value_states, num_heads)
+
+    out_weight = self_attn.o_proj.weight.to(device)
+    out_dim, in_dim = out_weight.shape
+    if in_dim != num_heads * head_dim:
+        raise ValueError(
+            f"Unexpected o_proj shape {tuple(out_weight.shape)} for {num_heads} heads × {head_dim}."
+        )
+    out_weight_by_head = out_weight.view(out_dim, num_heads, head_dim)
+
+    transformed_values = torch.einsum(
+        "bhsd,ohd->bhso",
+        value_states,
+        out_weight_by_head,
+    )[0].float()
+    attention_probs = attention_probs[0].float()
+    residual_states = hidden[0].float()
+
+    result: dict[int, Tensor] = {}
+    for target_idx in targets:
+        query_idx = int(target_idx) - 1
+        attn_row = attention_probs[:, query_idx, :]
+        source_vectors = torch.einsum(
+            "hs,hso->so",
+            attn_row,
+            transformed_values,
+        )
+        source_vectors[query_idx, :] += residual_states[query_idx]
+        result[int(target_idx)] = source_vectors[:target_idx].detach().cpu()
+
+    del outputs, hidden_states, attentions, hidden, attention_probs
+    del value_states, transformed_values, residual_states
+    torch.cuda.empty_cache()
+    return result
+
+
+@torch.no_grad()
+def _compute_alti_rollout_matrix(
+    model,
+    batch,
+    prefix_len: int,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
+) -> Tensor:
+    if prefix_len <= 0:
+        raise ValueError("prefix_len must be > 0.")
+
+    model.eval()
+    device = model.device
+
+    input_ids = batch["input_ids"][:, :prefix_len].to(device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :prefix_len].to(device)
+
+    outputs = model(
+        **inputs,
+        output_hidden_states=True,
+        output_attentions=True,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    hidden_states = outputs.hidden_states
+    attentions = outputs.attentions
+    if hidden_states is None or attentions is None:
+        raise RuntimeError(
+            "Model did not return hidden_states/attentions. Ensure output_hidden_states and "
+            "output_attentions are supported; Qwen may need attn_implementation='eager'."
+        )
+
+    hidden_states = list(hidden_states)
+    attentions = list(attentions)
+    del outputs
+
+    rollout = None
+    num_layers = len(attentions)
+    for layer_idx in range(num_layers):
+        if attentions[layer_idx] is None:
+            raise RuntimeError("Encountered None attention tensor; use eager attention when computing ALTI.")
+
+        layer_contrib = _compute_qwen_alti_layer_matrix(
+            model,
+            layer_idx,
+            hidden_states[layer_idx],
+            attentions[layer_idx],
+            p=p,
+            chunk_size=chunk_size,
+        )
+        rollout = layer_contrib if rollout is None else torch.matmul(layer_contrib, rollout.to(layer_contrib.device))
+
+        del layer_contrib
+        hidden_states[layer_idx] = None
+        attentions[layer_idx] = None
+
+    if rollout is None:
+        raise RuntimeError("No transformer layers were found while computing ALTI saliency.")
+
+    del hidden_states, attentions
+    return rollout
+
+
+@torch.no_grad()
 def compute_alti_saliency_vector(
     model,
     batch,
@@ -744,58 +916,63 @@ def compute_alti_saliency_vector(
     if target_idx_in_seq <= 0:
         raise ValueError("target_idx_in_seq must be > 0 because it denotes the next token to predict.")
 
-    model.eval()
-    device = model.device
-
-    input_ids = batch["input_ids"][:, :target_idx_in_seq].to(device)
-    inputs = {"input_ids": input_ids}
-    if "attention_mask" in batch:
-        inputs["attention_mask"] = batch["attention_mask"][:, :target_idx_in_seq].to(device)
-
-    outputs = model(
-        **inputs,
-        output_hidden_states=True,
-        output_attentions=True,
-        use_cache=False,
-        return_dict=True,
+    rollout = _compute_alti_rollout_matrix(
+        model,
+        batch,
+        target_idx_in_seq,
+        p=p,
+        chunk_size=chunk_size,
     )
-
-    hidden_states = outputs.hidden_states
-    attentions = outputs.attentions
-    if hidden_states is None or attentions is None:
-        raise RuntimeError(
-            "Model did not return hidden_states/attentions. Ensure output_hidden_states and "
-            "output_attentions are supported; Qwen may need attn_implementation='eager'."
-        )
-
-    rollout = None
-    num_layers = len(attentions)
-    for layer_idx in range(num_layers):
-        if attentions[layer_idx] is None:
-            raise RuntimeError("Encountered None attention tensor; use eager attention when computing ALTI.")
-
-        layer_contrib = _compute_qwen_alti_layer_matrix(
-            model,
-            layer_idx,
-            hidden_states[layer_idx],
-            attentions[layer_idx],
-            p=p,
-            chunk_size=chunk_size,
-        )
-        rollout = layer_contrib if rollout is None else torch.matmul(layer_contrib, rollout.to(layer_contrib.device))
-
-        del layer_contrib
-
-    if rollout is None:
-        raise RuntimeError("No transformer layers were found while computing ALTI saliency.")
-
     query_pos = target_idx_in_seq - 1
     result = rollout[query_pos, :target_idx_in_seq].detach().cpu().tolist()
 
-    del outputs, hidden_states, attentions, rollout
+    del rollout
     torch.cuda.empty_cache()
 
     return result
+
+
+@torch.no_grad()
+def compute_alti_saliency_vectors(
+    model,
+    batch,
+    target_indices_in_seq,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
+) -> dict[int, list[float]]:
+    """
+    Compute ALTI saliency vectors for multiple target-token positions using one
+    causal prefix rollout up to the maximum target position.
+
+    For decoder-only causal LMs, the rollout row for query position t - 1 is
+    identical whether the model is run on prefix length t or on a longer prefix:
+    future tokens are masked and cannot affect earlier hidden states or ALTI
+    contribution rows. This reuses that equivalence for feature evaluation.
+    """
+    targets = sorted({int(t) for t in target_indices_in_seq})
+    if not targets:
+        return {}
+    if targets[0] <= 0:
+        raise ValueError("target indices must be > 0 because they denote next-token positions.")
+
+    max_target = max(targets)
+    rollout = _compute_alti_rollout_matrix(
+        model,
+        batch,
+        max_target,
+        p=p,
+        chunk_size=chunk_size,
+    )
+
+    results = {
+        target_idx: rollout[target_idx - 1, :target_idx].detach().cpu().tolist()
+        for target_idx in targets
+    }
+
+    del rollout
+    torch.cuda.empty_cache()
+    return results
 
 
 def _selected_layer_start_from_filter(model, param_filter_fn) -> int:

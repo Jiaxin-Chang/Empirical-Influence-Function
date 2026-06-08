@@ -204,7 +204,6 @@ def load_model_and_tokenizer(
 # ====== CONFIGURATION ======
 SEED = 42
 SELECTED_TEST_SAMPLE_INDEX = 58
-TOKEN_INDEX_TO_RETRIEVE = 703  # The "first wrong token" we are investigating (single-token mode)
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
@@ -802,7 +801,6 @@ def _score_prescreen_sketch_cache(
 
 
 def run_causal_intervention_experiment(
-    all_tokens: bool = False,
     model_path: str | None = None,
     train_data: str = "sft_train.jsonl",
     test_data: str = "sft_test.jsonl",
@@ -1209,47 +1207,205 @@ def run_causal_intervention_experiment(
         )[0].detach()
 
     # ════════════════════════════════════════════════════════════════════════════
-    # ── SINGLE-TOKEN MODE ────────────────────────────────────────────────────
+    # ── ALL-TOKENS MODE ──────────────────────────────────────────────────────
     # ════════════════════════════════════════════════════════════════════════════
-    if not all_tokens:
-        print("\n=== Stage 1: Extracting test correlation features ===")
+    max_end = min(prompt_len + MAX_OUTPUT_TOKENS, seq_len)
+    valid_test_tokens = [
+        t for t in range(prompt_len, max_end)
+        if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
+    ]
+    print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
+          f"(from {max_end - prompt_len} response tokens, trivial skipped)")
 
-        target_tok_id   = test_batch["input_ids"][0, TOKEN_INDEX_TO_RETRIEVE].item()
-        target_tok_text = tokenizer.decode([target_tok_id])
-        baseline_saliency = compute_alti_saliency_vector(
-            model,
-            test_batch,
-            TOKEN_INDEX_TO_RETRIEVE,
-            chunk_size=ALTI_CHUNK_SIZE,
+    # ── Stage 0: Global coarse pre-screen (one pass over the full training set) ──
+    # Aggregate CE loss over all response tokens → single gradient vector G_test.
+    # Cost: 1 × N_train  (vs. N_tokens × N_train in the old per-token approach)
+    print(f"\n=== Global Pre-Screen: full training set → Top-{COARSE_POOL_SIZE} pool ===")
+    if prescreen_sketch_cache is not None:
+        full_response_ce_sketch = _test_ce_sketch_full_response()
+        all_pool_scores = _score_prescreen_sketch_cache(
+            full_response_ce_sketch,
+            prescreen_sketch_cache,
+            accelerator.device,
         )
+        del full_response_ce_sketch
+    else:
+        full_response_ce_grad = _test_ce_grad_full_response()
+        local_pool_scores = _screen_training_set(
+            model, full_response_ce_grad, train_loader,
+            accelerator.device, lm_head_device, desc="Global Pre-Screen",
+            max_seq_len=prescreen_max_seq_len,
+        )
+        all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
+        del full_response_ce_grad
+    coarse_pool_ranked = nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
+    coarse_pool: set[int] = {idx for idx, _ in coarse_pool_ranked}
+    print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
 
+    prescreen_train_details = {}
+    idx_to_row  = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
+    for train_idx, coarse_score in coarse_pool_ranked:
+        row = idx_to_row.get(int(train_idx))
+        if row is None:
+            continue
+        item = train_ds[row]
+        ids_1d = item["input_ids"]
+        labels_1d = item["labels"]
+        valid_label_positions = torch.where(labels_1d.ne(-100))[0]
+        answer_start = int(valid_label_positions[0].item()) if valid_label_positions.numel() else 0
+        prescreen_train_details[str(int(train_idx))] = {
+            "full_tokens": [tokenizer.decode([i]) for i in ids_1d.tolist()],
+            "answer_start_index": answer_start,
+            "coarse_cos_sim": float(coarse_score),
+            "saliencies_by_token": {},
+            "prescreen_only": True,
+        }
+
+    prescreen_per_token_results = []
+    for t in valid_test_tokens:
+        target_tok_text = tokenizer.decode([int(test_batch["input_ids"][0, t].item())])
+        placeholder_pairs = []
+        for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1):
+            placeholder_pairs.append({
+                "id": f"prescreen_t{t}_{rank:04d}",
+                "cos_sim": 0.0,
+                "coarse_cos_sim": float(coarse_score),
+                "train_sample_id": int(train_idx),
+                "test_correlation": {
+                    "source_token": "",
+                    "source_token_index": -1,
+                    "target_token": target_tok_text,
+                    "target_token_index": int(t),
+                    "saliency_score": 0.0,
+                },
+                "train_correlation": {
+                    "source_token": "",
+                    "source_token_index": -1,
+                    "target_token": "",
+                    "target_token_index": -1,
+                    "saliency_score": 0.0,
+                    "response_token_offset": -1,
+                },
+                "train_context": {
+                    "source_context": [],
+                    "target_context": [],
+                },
+                "annotation": None,
+            })
+        prescreen_per_token_results.append({
+            "target_token_index": int(t),
+            "target_token": target_tok_text,
+            "top_correlations": [],
+            "correlation_pairs": placeholder_pairs,
+        })
+
+    prescreen_report_json = {
+        "experiment_meta": {
+            "test_sample_index": SELECTED_TEST_SAMPLE_INDEX,
+            "mode": "all_tokens",
+            "stage": "global_prescreen",
+            "is_checkpoint": True,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "tokens_analyzed": len(prescreen_per_token_results),
+            "screening": "global_pool_only",
+            "config": {
+                "COARSE_POOL_SIZE": COARSE_POOL_SIZE,
+                "prescreen_max_seq_len": prescreen_max_seq_len,
+                "prescreen_batch_size": prescreen_batch_size,
+                "PRESCREEN_BATCH_SIZE": prescreen_batch_size,
+                "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
+                "PRESCREEN_MAX_SEQ_LEN": prescreen_max_seq_len,
+                "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
+                "PRESCREEN_SKETCH_DIM": prescreen_sketch_dim,
+                "PRESCREEN_SKETCH_SEED": prescreen_sketch_seed,
+                "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
+                "SALIENCY_METHOD": "alti",
+                "MATCHING_METHOD": f"alti_gradient_{fine_match_proj}",
+                "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                "FINE_MATCH_PROJ": fine_match_proj,
+                "ALTI_CHUNK_SIZE": ALTI_CHUNK_SIZE,
+                "ALTI_GRAD_CHUNK_SIZE": alti_grad_chunk_size,
+                "ALTI_GRAD_MAX_SEQ_LEN": alti_grad_max_seq_len,
+            },
+        },
+        "test_sample_baseline": {
+            "full_tokens": gen_result["pred_full_tokens"][0],
+            "correct_full_tokens": gen_result["full_tokens"][0],
+            "prompt_len": prompt_len,
+        },
+        "coarse_pool_samples": [
+            {
+                "rank": rank,
+                "train_sample_id": int(train_idx),
+                "coarse_cos_sim": float(coarse_score),
+                "correlation": 0.0,
+            }
+            for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1)
+        ],
+        "per_token_results": prescreen_per_token_results,
+        "train_sample_details": prescreen_train_details,
+    }
+    prescreen_filename = f"correlation_matching_results_{_task_id}_all_tokens_prescreen.json"
+    prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
+    if prescreen_path is not None:
+        print(f"  Prescreen checkpoint saved → {prescreen_path}", flush=True)
+
+    # Materialise pool as a dedicated DataLoader so per-token Stage 2 truly iterates
+    # only COARSE_POOL_SIZE times (not N_train times with skip logic).
+    pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
+    pool_ds     = train_ds.select(pool_rows)
+    pool_loader = torch.utils.data.DataLoader(
+        DatasetWrapper(pool_ds), batch_size=prescreen_batch_size, collate_fn=collator,
+    )
+    pool_loader = accelerator.prepare(pool_loader)
+    print(f"  pool_loader built: {len(pool_rows)} samples")
+
+    # ── Per-token loop: re-rank within pool_loader, then run Stage 3 ──
+    per_token_results: list  = []
+    train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
+    pair_id_counter = 0
+
+    for t in tqdm(valid_test_tokens, desc="Test tokens",
+                  disable=not accelerator.is_local_main_process):
+        target_tok_id   = int(test_batch["input_ids"][0, t].item())
+        target_tok_text = tokenizer.decode([target_tok_id])
+        print(f"\n=== Token {t}: '{target_tok_text}' ===")
+
+        # Stage 1a: cheap saliency at t
+        with torch.inference_mode(False):
+            sal_vec = compute_alti_saliency_vector(
+                model,
+                test_batch,
+                t,
+                chunk_size=ALTI_CHUNK_SIZE,
+            )
         top_test_corr = top_nontrivial_saliency_sources(
             tokenizer,
             test_batch["input_ids"][0],
-            baseline_saliency,
+            sal_vec,
             TOP_K_PROMPT_TOKENS,
         )
         top_test_correlations = [
             {
                 "source_token_index": idx,
-                "source_token":       tokenizer.decode([test_batch["input_ids"][0, idx].item()]),
-                "target_token_index": TOKEN_INDEX_TO_RETRIEVE,
+                "source_token":       tokenizer.decode([int(test_batch["input_ids"][0, idx].item())]),
+                "target_token_index": t,
                 "target_token":       target_tok_text,
                 "saliency_score":     float(score),
             }
             for idx, score in top_test_corr
         ]
 
-        print("Computing ALTI-gradient test features...")
+        # Stage 1b: ALTI-gradient test features (freed after this token)
+        print(f"  Computing {len(top_test_correlations)} test ALTI-gradient features...")
         test_corr_features: dict = {}
         with torch.inference_mode(False):
             for item in top_test_correlations:
                 p_idx = item["source_token_index"]
-                print(f"  '{item['source_token']}' -> '{item['target_token']}' (sal={item['saliency_score']:.4f})")
                 feat = _compute_alti_correlation_gradient_retry(
                     model=model,
                     batch=test_batch,
-                    target_idx_in_seq=TOKEN_INDEX_TO_RETRIEVE,
+                    target_idx_in_seq=t,
                     source_idx_in_seq=p_idx,
                     param_filter_fn=fine_param_filter,
                     device=accelerator.device,
@@ -1258,419 +1414,117 @@ def run_causal_intervention_experiment(
                     continue
                 test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
 
-        print(f"\n=== Stage 2: Coarse screening (single token {TOKEN_INDEX_TO_RETRIEVE}) ===")
-        if prescreen_sketch_cache is not None:
-            test_ce_sketch = _test_ce_sketch_for_token(TOKEN_INDEX_TO_RETRIEVE)
-            sample_scores = _score_prescreen_sketch_cache(
-                test_ce_sketch,
-                prescreen_sketch_cache,
-                accelerator.device,
-            )
-        else:
-            test_ce_grad  = _test_ce_grad_for_token(TOKEN_INDEX_TO_RETRIEVE)
-            local_scores  = _screen_training_set(
-                model, test_ce_grad, train_loader,
-                accelerator.device, lm_head_device, desc="Stage 2",
-                max_seq_len=prescreen_max_seq_len,
-            )
-            sample_scores  = _gather_scores(accelerator, local_scores, accelerator.device)
-        related_samples = nlargest(TOP_K_TRAIN_SAMPLES, sample_scores, key=lambda x: x[1])
-        print(f"  Top-{TOP_K_TRAIN_SAMPLES} selected: {[(i, round(s,4)) for i,s in related_samples]}")
-
-        print("\n=== Stage 3: Fine-grained correlation matching ===")
-        all_pair_records: list = []
-        train_sample_details: dict = {}
-        pair_id_counter = 0
-
-        for rank, (train_idx, coarse_score) in enumerate(related_samples):
-            print(f"\n--- Train {train_idx}  (rank={rank+1}, coarse={coarse_score:.4f}) ---")
-            detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                train_idx, coarse_score, test_corr_features,
-                target_tok_text, TOKEN_INDEX_TO_RETRIEVE,
-                "pair", pair_id_counter,
-                cached_detail=train_sample_details.get(str(train_idx)),
-            )
-            if detail is not None:
-                train_sample_details[str(train_idx)] = detail
-                all_pair_records.extend(pairs)
-
-        all_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
-
-        report_json = {
-            "experiment_meta": {
-                "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
-                "target_token_index": TOKEN_INDEX_TO_RETRIEVE,
-                "mode":               "single_token",
-                "config": {
-                    "TOP_K_PROMPT_TOKENS":    TOP_K_PROMPT_TOKENS,
-                    "TOP_K_TRAIN_SAMPLES":    TOP_K_TRAIN_SAMPLES,
-                    "TOP_TARGETS":            TOP_TARGETS,
-                    "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
-                    "CONTEXT_WINDOW_SIZE":    CONTEXT_WINDOW_SIZE,
-                    "SALIENCY_METHOD":        "alti",
-                    "MATCHING_METHOD":        f"alti_gradient_{fine_match_proj}",
-                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
-                    "FINE_MATCH_PROJ":        fine_match_proj,
-                    "ALTI_CHUNK_SIZE":        ALTI_CHUNK_SIZE,
-                    "ALTI_GRAD_CHUNK_SIZE":   alti_grad_chunk_size,
-                    "ALTI_GRAD_MAX_SEQ_LEN":  alti_grad_max_seq_len,
-                    "prescreen_max_seq_len":  prescreen_max_seq_len,
-                    "prescreen_batch_size":   prescreen_batch_size,
-                    "PRESCREEN_BATCH_SIZE":   prescreen_batch_size,
-                    "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
-                    "PRESCREEN_MAX_SEQ_LEN":  prescreen_max_seq_len,
-                    "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
-                    "PRESCREEN_SKETCH_DIM":   prescreen_sketch_dim,
-                    "PRESCREEN_SKETCH_SEED":  prescreen_sketch_seed,
-                    "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
-                },
-            },
-            "test_sample_baseline": {
-                "target_token":        target_tok_text,
-                "target_token_index":  TOKEN_INDEX_TO_RETRIEVE,
-                "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output
-                "correct_full_tokens": gen_result["full_tokens"][0],    # prompt + ground truth answer
-                "top_correlations":    top_test_correlations,
-            },
-            "correlation_pairs": all_pair_records,
-            "train_sample_details": {
-                k: {fk: fv for fk, fv in v.items() if not fk.startswith("_")}
-                for k, v in train_sample_details.items()
-            },
-        }
-
-        total = len(all_pair_records)
-        print(f"\nTotal pairs: {total}  (top-10 by cos_sim below)")
-        for r in all_pair_records[:10]:
-            print(f"  [{r['id']}] train#{r['train_sample_id']:3d} "
-                  f"'{r['train_correlation']['source_token']}'->"
-                  f"'{r['train_correlation']['target_token']}' "
-                  f"| test '{r['test_correlation']['source_token']}'->"
-                  f"'{r['test_correlation']['target_token']}' "
-                  f"| cos_sim={r['cos_sim']:.4f}")
-
-        report_filename = f"correlation_matching_results_{_task_id}_tok{TOKEN_INDEX_TO_RETRIEVE}.json"
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # ── ALL-TOKENS MODE ──────────────────────────────────────────────────────
-    # ════════════════════════════════════════════════════════════════════════════
-    else:
-        max_end = min(prompt_len + MAX_OUTPUT_TOKENS, seq_len)
-        valid_test_tokens = [
-            t for t in range(prompt_len, max_end)
-            if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
-        ]
-        print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
-              f"(from {max_end - prompt_len} response tokens, trivial skipped)")
-
-        # ── Stage 0: Global coarse pre-screen (one pass over the full training set) ──
-        # Aggregate CE loss over all response tokens → single gradient vector G_test.
-        # Cost: 1 × N_train  (vs. N_tokens × N_train in the old per-token approach)
-        print(f"\n=== Global Pre-Screen: full training set → Top-{COARSE_POOL_SIZE} pool ===")
-        if prescreen_sketch_cache is not None:
-            full_response_ce_sketch = _test_ce_sketch_full_response()
-            all_pool_scores = _score_prescreen_sketch_cache(
-                full_response_ce_sketch,
-                prescreen_sketch_cache,
-                accelerator.device,
-            )
-            del full_response_ce_sketch
-        else:
-            full_response_ce_grad = _test_ce_grad_full_response()
-            local_pool_scores = _screen_training_set(
-                model, full_response_ce_grad, train_loader,
-                accelerator.device, lm_head_device, desc="Global Pre-Screen",
-                max_seq_len=prescreen_max_seq_len,
-            )
-            all_pool_scores = _gather_scores(accelerator, local_pool_scores, accelerator.device)
-            del full_response_ce_grad
-        coarse_pool_ranked = nlargest(COARSE_POOL_SIZE, all_pool_scores, key=lambda x: x[1])
-        coarse_pool: set[int] = {idx for idx, _ in coarse_pool_ranked}
-        print(f"  Coarse pool ({len(coarse_pool)} samples): {sorted(coarse_pool)}")
-
-        prescreen_train_details = {}
-        idx_to_row  = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
-        for train_idx, coarse_score in coarse_pool_ranked:
-            row = idx_to_row.get(int(train_idx))
-            if row is None:
-                continue
-            item = train_ds[row]
-            ids_1d = item["input_ids"]
-            labels_1d = item["labels"]
-            valid_label_positions = torch.where(labels_1d.ne(-100))[0]
-            answer_start = int(valid_label_positions[0].item()) if valid_label_positions.numel() else 0
-            prescreen_train_details[str(int(train_idx))] = {
-                "full_tokens": [tokenizer.decode([i]) for i in ids_1d.tolist()],
-                "answer_start_index": answer_start,
-                "coarse_cos_sim": float(coarse_score),
-                "saliencies_by_token": {},
-                "prescreen_only": True,
-            }
-
-        prescreen_per_token_results = []
-        for t in valid_test_tokens:
-            target_tok_text = tokenizer.decode([int(test_batch["input_ids"][0, t].item())])
-            placeholder_pairs = []
-            for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1):
-                placeholder_pairs.append({
-                    "id": f"prescreen_t{t}_{rank:04d}",
-                    "cos_sim": 0.0,
-                    "coarse_cos_sim": float(coarse_score),
-                    "train_sample_id": int(train_idx),
-                    "test_correlation": {
-                        "source_token": "",
-                        "source_token_index": -1,
-                        "target_token": target_tok_text,
-                        "target_token_index": int(t),
-                        "saliency_score": 0.0,
-                    },
-                    "train_correlation": {
-                        "source_token": "",
-                        "source_token_index": -1,
-                        "target_token": "",
-                        "target_token_index": -1,
-                        "saliency_score": 0.0,
-                        "response_token_offset": -1,
-                    },
-                    "train_context": {
-                        "source_context": [],
-                        "target_context": [],
-                    },
-                    "annotation": None,
-                })
-            prescreen_per_token_results.append({
-                "target_token_index": int(t),
-                "target_token": target_tok_text,
-                "top_correlations": [],
-                "correlation_pairs": placeholder_pairs,
-            })
-
-        prescreen_report_json = {
-            "experiment_meta": {
-                "test_sample_index": SELECTED_TEST_SAMPLE_INDEX,
-                "mode": "all_tokens",
-                "stage": "global_prescreen",
-                "is_checkpoint": True,
-                "max_output_tokens": MAX_OUTPUT_TOKENS,
-                "tokens_analyzed": len(prescreen_per_token_results),
-                "screening": "global_pool_only",
-                "config": {
-                    "COARSE_POOL_SIZE": COARSE_POOL_SIZE,
-                    "prescreen_max_seq_len": prescreen_max_seq_len,
-                    "prescreen_batch_size": prescreen_batch_size,
-                    "PRESCREEN_BATCH_SIZE": prescreen_batch_size,
-                    "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
-                    "PRESCREEN_MAX_SEQ_LEN": prescreen_max_seq_len,
-                    "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
-                    "PRESCREEN_SKETCH_DIM": prescreen_sketch_dim,
-                    "PRESCREEN_SKETCH_SEED": prescreen_sketch_seed,
-                    "PRESCREEN_SKETCH_CACHE": prescreen_sketch_cache is not None,
-                    "SALIENCY_METHOD": "alti",
-                    "MATCHING_METHOD": f"alti_gradient_{fine_match_proj}",
-                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
-                    "FINE_MATCH_PROJ": fine_match_proj,
-                    "ALTI_CHUNK_SIZE": ALTI_CHUNK_SIZE,
-                    "ALTI_GRAD_CHUNK_SIZE": alti_grad_chunk_size,
-                    "ALTI_GRAD_MAX_SEQ_LEN": alti_grad_max_seq_len,
-                },
-            },
-            "test_sample_baseline": {
-                "full_tokens": gen_result["pred_full_tokens"][0],
-                "correct_full_tokens": gen_result["full_tokens"][0],
-                "prompt_len": prompt_len,
-            },
-            "coarse_pool_samples": [
-                {
-                    "rank": rank,
-                    "train_sample_id": int(train_idx),
-                    "coarse_cos_sim": float(coarse_score),
-                    "correlation": 0.0,
-                }
-                for rank, (train_idx, coarse_score) in enumerate(coarse_pool_ranked, start=1)
-            ],
-            "per_token_results": prescreen_per_token_results,
-            "train_sample_details": prescreen_train_details,
-        }
-        prescreen_filename = f"correlation_matching_results_{_task_id}_all_tokens_prescreen.json"
-        prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
-        if prescreen_path is not None:
-            print(f"  Prescreen checkpoint saved → {prescreen_path}", flush=True)
-
-        # Materialise pool as a dedicated DataLoader so per-token Stage 2 truly iterates
-        # only COARSE_POOL_SIZE times (not N_train times with skip logic).
-        pool_rows   = sorted(idx_to_row[idx] for idx in coarse_pool if idx in idx_to_row)
-        pool_ds     = train_ds.select(pool_rows)
-        pool_loader = torch.utils.data.DataLoader(
-            DatasetWrapper(pool_ds), batch_size=prescreen_batch_size, collate_fn=collator,
-        )
-        pool_loader = accelerator.prepare(pool_loader)
-        print(f"  pool_loader built: {len(pool_rows)} samples")
-
-        # ── Per-token loop: re-rank within pool_loader, then run Stage 3 ──
-        per_token_results: list  = []
-        train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
-        pair_id_counter = 0
-
-        for t in tqdm(valid_test_tokens, desc="Test tokens",
-                      disable=not accelerator.is_local_main_process):
-            target_tok_id   = int(test_batch["input_ids"][0, t].item())
-            target_tok_text = tokenizer.decode([target_tok_id])
-            print(f"\n=== Token {t}: '{target_tok_text}' ===")
-
-            # Stage 1a: cheap saliency at t
-            with torch.inference_mode(False):
-                sal_vec = compute_alti_saliency_vector(
-                    model,
-                    test_batch,
-                    t,
-                    chunk_size=ALTI_CHUNK_SIZE,
-                )
-            top_test_corr = top_nontrivial_saliency_sources(
-                tokenizer,
-                test_batch["input_ids"][0],
-                sal_vec,
-                TOP_K_PROMPT_TOKENS,
-            )
-            top_test_correlations = [
-                {
-                    "source_token_index": idx,
-                    "source_token":       tokenizer.decode([int(test_batch["input_ids"][0, idx].item())]),
-                    "target_token_index": t,
-                    "target_token":       target_tok_text,
-                    "saliency_score":     float(score),
-                }
-                for idx, score in top_test_corr
-            ]
-
-            # Stage 1b: ALTI-gradient test features (freed after this token)
-            print(f"  Computing {len(top_test_correlations)} test ALTI-gradient features...")
-            test_corr_features: dict = {}
-            with torch.inference_mode(False):
-                for item in top_test_correlations:
-                    p_idx = item["source_token_index"]
-                    feat = _compute_alti_correlation_gradient_retry(
-                        model=model,
-                        batch=test_batch,
-                        target_idx_in_seq=t,
-                        source_idx_in_seq=p_idx,
-                        param_filter_fn=fine_param_filter,
-                        device=accelerator.device,
-                    )
-                    if feat is None:
-                        continue
-                    test_corr_features[p_idx] = (feat, item["source_token"], item["saliency_score"])
-
-            if not test_corr_features:
-                print(f"  No ALTI-gradient test features survived for token {t}; skipping Stage 2/3.")
-                per_token_results.append({
-                    "target_token_index": t,
-                    "target_token":       target_tok_text,
-                    "top_correlations":   top_test_correlations,
-                    "correlation_pairs":  [],
-                })
-                torch.cuda.empty_cache()
-                continue
-
-            # Stage 2: per-token CE grad → re-rank within pool_loader only
-            # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
-            if prescreen_sketch_cache is not None:
-                token_ce_sketch = _test_ce_sketch_for_token(t)
-                all_scores = _score_prescreen_sketch_cache(
-                    token_ce_sketch,
-                    prescreen_sketch_cache,
-                    accelerator.device,
-                    allowed_indices=coarse_pool,
-                )
-                del token_ce_sketch
-            else:
-                token_ce_grad  = _test_ce_grad_for_token(t)
-                local_scores   = _screen_training_set(
-                    model, token_ce_grad, pool_loader,
-                    accelerator.device, lm_head_device,
-                    desc=f"Stage2 t={t}",
-                    max_seq_len=prescreen_max_seq_len,
-                )
-                all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
-                del token_ce_grad
-            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
-            print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
-                  f"{[(i, round(s,4)) for i,s in related_samples]}")
-
-            # Stage 3: fine-grained matching for this token's top train samples
-            token_pair_records: list = []
-            for rank, (train_idx, coarse_score) in enumerate(related_samples):
-                print(f"\n  --- Train {train_idx} (rank={rank+1}, coarse={coarse_score:.4f}) ---")
-                cached = train_sample_cache.get(str(train_idx))
-                detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                    train_idx, coarse_score, test_corr_features,
-                    target_tok_text, t,
-                    f"t{t}", pair_id_counter,
-                    cached_detail=cached,
-                )
-                if detail is not None:
-                    train_sample_cache[str(train_idx)] = detail
-                    token_pair_records.extend(pairs)
-
-            token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
+        if not test_corr_features:
+            print(f"  No ALTI-gradient test features survived for token {t}; skipping Stage 2/3.")
             per_token_results.append({
                 "target_token_index": t,
                 "target_token":       target_tok_text,
                 "top_correlations":   top_test_correlations,
-                "correlation_pairs":  token_pair_records,
+                "correlation_pairs":  [],
             })
-
-            # Free test-side features before next token
-            del test_corr_features
             torch.cuda.empty_cache()
+            continue
 
-        # Clean internal cache keys before saving
-        train_sample_details = {
-            k: {fk: fv for fk, fv in v.items() if not fk.startswith("_")}
-            for k, v in train_sample_cache.items()
-        }
+        # Stage 2: per-token CE grad → re-rank within pool_loader only
+        # pool_loader contains exactly COARSE_POOL_SIZE samples — no skip logic needed.
+        if prescreen_sketch_cache is not None:
+            token_ce_sketch = _test_ce_sketch_for_token(t)
+            all_scores = _score_prescreen_sketch_cache(
+                token_ce_sketch,
+                prescreen_sketch_cache,
+                accelerator.device,
+                allowed_indices=coarse_pool,
+            )
+            del token_ce_sketch
+        else:
+            token_ce_grad  = _test_ce_grad_for_token(t)
+            local_scores   = _screen_training_set(
+                model, token_ce_grad, pool_loader,
+                accelerator.device, lm_head_device,
+                desc=f"Stage2 t={t}",
+                max_seq_len=prescreen_max_seq_len,
+            )
+            all_scores     = _gather_scores(accelerator, local_scores, accelerator.device)
+            del token_ce_grad
+        related_samples = nlargest(TOP_K_TRAIN_SAMPLES, all_scores, key=lambda x: x[1])
+        print(f"  Top-{TOP_K_TRAIN_SAMPLES} from pool: "
+              f"{[(i, round(s,4)) for i,s in related_samples]}")
 
-        report_json = {
-            "experiment_meta": {
-                "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
-                "mode":               "all_tokens",
-                "max_output_tokens":  MAX_OUTPUT_TOKENS,
-                "tokens_analyzed":    len(per_token_results),
-                "screening":          "global_pool_then_per_token_rerank",
-                "config": {
-                    "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
-                    "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
-                    "COARSE_POOL_SIZE":        COARSE_POOL_SIZE,
-                    "TOP_TARGETS":             TOP_TARGETS,
-                    "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
-                    "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
-                    "SALIENCY_METHOD":         "alti",
-                    "MATCHING_METHOD":         f"alti_gradient_{fine_match_proj}",
-                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
-                    "FINE_MATCH_PROJ":         fine_match_proj,
-                    "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
-                    "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
-                    "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
-                    "prescreen_max_seq_len":   prescreen_max_seq_len,
-                    "prescreen_batch_size":    prescreen_batch_size,
-                    "PRESCREEN_BATCH_SIZE":    prescreen_batch_size,
-                    "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
-                    "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
-                    "PRESCREEN_LENGTH_SWEEP":  prescreen_length_sweep_stats,
-                    "PRESCREEN_SKETCH_DIM":    prescreen_sketch_dim,
-                    "PRESCREEN_SKETCH_SEED":   prescreen_sketch_seed,
-                    "PRESCREEN_SKETCH_CACHE":  prescreen_sketch_cache is not None,
-                },
+        # Stage 3: fine-grained matching for this token's top train samples
+        token_pair_records: list = []
+        for rank, (train_idx, coarse_score) in enumerate(related_samples):
+            print(f"\n  --- Train {train_idx} (rank={rank+1}, coarse={coarse_score:.4f}) ---")
+            cached = train_sample_cache.get(str(train_idx))
+            detail, pairs, pair_id_counter = _process_train_sample_stage3(
+                train_idx, coarse_score, test_corr_features,
+                target_tok_text, t,
+                f"t{t}", pair_id_counter,
+                cached_detail=cached,
+            )
+            if detail is not None:
+                train_sample_cache[str(train_idx)] = detail
+                token_pair_records.extend(pairs)
+
+        token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
+        per_token_results.append({
+            "target_token_index": t,
+            "target_token":       target_tok_text,
+            "top_correlations":   top_test_correlations,
+            "correlation_pairs":  token_pair_records,
+        })
+
+        # Free test-side features before next token
+        del test_corr_features
+        torch.cuda.empty_cache()
+
+    # Clean internal cache keys before saving
+    train_sample_details = {
+        k: {fk: fv for fk, fv in v.items() if not fk.startswith("_")}
+        for k, v in train_sample_cache.items()
+    }
+
+    report_json = {
+        "experiment_meta": {
+            "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
+            "mode":               "all_tokens",
+            "max_output_tokens":  MAX_OUTPUT_TOKENS,
+            "tokens_analyzed":    len(per_token_results),
+            "screening":          "global_pool_then_per_token_rerank",
+            "config": {
+                "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
+                "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
+                "COARSE_POOL_SIZE":        COARSE_POOL_SIZE,
+                "TOP_TARGETS":             TOP_TARGETS,
+                "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
+                "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
+                "SALIENCY_METHOD":         "alti",
+                "MATCHING_METHOD":         f"alti_gradient_{fine_match_proj}",
+                "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                "FINE_MATCH_PROJ":         fine_match_proj,
+                "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
+                "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
+                "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
+                "prescreen_max_seq_len":   prescreen_max_seq_len,
+                "prescreen_batch_size":    prescreen_batch_size,
+                "PRESCREEN_BATCH_SIZE":    prescreen_batch_size,
+                "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
+                "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
+                "PRESCREEN_LENGTH_SWEEP":  prescreen_length_sweep_stats,
+                "PRESCREEN_SKETCH_DIM":    prescreen_sketch_dim,
+                "PRESCREEN_SKETCH_SEED":   prescreen_sketch_seed,
+                "PRESCREEN_SKETCH_CACHE":  prescreen_sketch_cache is not None,
             },
-            "test_sample_baseline": {
-                "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output (clickable)
-                "correct_full_tokens": gen_result["full_tokens"][0],       # prompt + ground truth answer
-                "prompt_len":          prompt_len,
-            },
-            "per_token_results":    per_token_results,
-            "train_sample_details": train_sample_details,
-        }
+        },
+        "test_sample_baseline": {
+            "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output (clickable)
+            "correct_full_tokens": gen_result["full_tokens"][0],       # prompt + ground truth answer
+            "prompt_len":          prompt_len,
+        },
+        "per_token_results":    per_token_results,
+        "train_sample_details": train_sample_details,
+    }
 
-        report_filename = f"correlation_matching_results_{_task_id}_all_tokens.json"
+    report_filename = f"correlation_matching_results_{_task_id}_all_tokens.json"
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
     report_path = _write_json_report(report_json, report_filename, accelerator)
@@ -1682,19 +1536,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Run causal intervention experiment for a single test sample + token."
+        description="Run causal intervention experiment for all semantic output tokens."
     )
     parser.add_argument(
         "--test-index", type=int, default=None,
         help="Index of the test sample to analyse (overrides SELECTED_TEST_SAMPLE_INDEX).",
-    )
-    parser.add_argument(
-        "--token-index", type=int, default=None,
-        help="Token position to investigate (overrides TOKEN_INDEX_TO_RETRIEVE). Single-token mode only.",
-    )
-    parser.add_argument(
-        "--all-tokens", action="store_true",
-        help="Attribute all output tokens (up to MAX_OUTPUT_TOKENS) instead of a single token.",
     )
     parser.add_argument(
         "--model-path", type=str, default=None,
@@ -1796,8 +1642,6 @@ if __name__ == "__main__":
 
     if args.test_index is not None:
         SELECTED_TEST_SAMPLE_INDEX = args.test_index
-    if args.token_index is not None:
-        TOKEN_INDEX_TO_RETRIEVE = args.token_index
     if args.top_targets is not None:
         TOP_TARGETS = max(1, int(args.top_targets))
     if args.top_k_source_per_target is not None:
@@ -1811,10 +1655,8 @@ if __name__ == "__main__":
             if x.strip()
         ]
 
-    mode_str = "all_tokens" if args.all_tokens else f"single_token tok={TOKEN_INDEX_TO_RETRIEVE}"
-    print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode={mode_str}")
+    print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode=all_tokens")
     run_causal_intervention_experiment(
-        all_tokens=args.all_tokens,
         model_path=args.model_path,
         train_data=args.train_data,
         test_data=args.test_data,

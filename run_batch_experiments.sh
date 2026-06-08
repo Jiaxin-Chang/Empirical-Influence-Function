@@ -216,7 +216,6 @@ for IDX in "${VALID_RUN_INDICES[@]}"; do
         --train-data  "${TRAIN_DATA}" \
         --test-data   "${TEST_DATA}"  \
         --test-index  "${IDX}"        \
-        --all-tokens  \
         ${TRAIN_LIMIT:+--train-limit "${TRAIN_LIMIT}"} \
         ${ATTN_IMPLEMENTATION:+--attn-implementation "${ATTN_IMPLEMENTATION}"} \
         ${PRESCREEN_MAX_SEQ_LEN:+--prescreen-max-seq-len "${PRESCREEN_MAX_SEQ_LEN}"} \

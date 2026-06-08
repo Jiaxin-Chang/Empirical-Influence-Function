@@ -1688,7 +1688,7 @@ export function NewView({ metas }: Props) {
         return (
             <div className={styles.emptyState}>
                 No all-tokens experiment files found.<br />
-                Run <code>python -m src.intervention_experiment --all-tokens</code> to generate<br />
+                Run <code>python -m src.intervention_experiment</code> to generate<br />
                 <code>correlation_matching_results_test&#123;N&#125;_all_tokens.json</code>.
                 Suffixed files like <code>correlation_matching_results_test&#123;N&#125;_all_tokens_new.json</code> are also supported.
             </div>

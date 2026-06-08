@@ -176,17 +176,13 @@ pnpm install
 ### Generate Experiment Data (Python)
 
 ```bash
-# Single-token mode (analyze one specific output token)
-python -m src.intervention_experiment --test-index 58 --token-index 703
-
-# All-tokens mode (analyze all semantic output tokens — required for New View)
-python -m src.intervention_experiment --test-index 58 --all-tokens
+# Analyze all semantic output tokens
+python -m src.intervention_experiment --test-index 58
 ```
 
 Output files are written to the repo root:
-- `saliency_test{N}_tok{T}.json` — used by Legacy View
-- `correlation_matching_results_test{N}_tok{T}.json` — used by Legacy View
-- `correlation_matching_results_test{N}_all_tokens.json` — used by New View
+- `correlation_matching_results_test{N}_all_tokens_prescreen.json` — global coarse-screen checkpoint
+- `correlation_matching_results_test{N}_all_tokens.json` — full all-token attribution report
 
 ### Start the Visualization Server
 
@@ -225,7 +221,6 @@ Data files are served live from the repo root — no rebuild needed when JSON fi
 | Mode | Data Source | Description |
 |------|------------|-------------|
 | **New View** (default) | `*_all_tokens.json` | Full token attribution explorer: click any output token to trace its source attributions and matching training correlations |
-| **Legacy View** | `saliency_test*.json` + `correlation_matching_results_test*_tok*.json` | Original three-section view: Overfit Experiment, Related Train Samples, Correlation Pair Annotation |
 
 ---
 
