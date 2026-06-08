@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -9,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from src.export_real_ttav_bundle import DEFAULT_MODEL_PATH, build_real_bundle_payload
+from src.export_train_probe_bundle import build_train_probe_bundle_payload
 from src.export_ttav_bundle import build_bundle_payload, infer_sample_id, upload_bundle
 
 
@@ -118,6 +120,41 @@ def load_local_bundle_cache(sample_id: str, explicit_path: str | None = None) ->
     return json.loads(payload_path.read_text(encoding="utf-8"))
 
 
+def _make_probe_sample_id(
+    base_sample_id: str,
+    train_sample_id: int,
+    probe_pairs: list[dict],
+    context_radius: int,
+    include_full_train: bool,
+    focus_train_indices: list[int] | None,
+) -> str:
+    signature = json.dumps(
+        {
+            "trainSampleId": train_sample_id,
+            "contextRadius": context_radius,
+            "includeFullTrain": include_full_train,
+            "focusTrainIndices": [int(idx) for idx in (focus_train_indices or [])],
+            "pairs": [
+                {
+                    "id": pair.get("id"),
+                    "trainSourceIndex": pair.get("trainSourceIndex"),
+                    "trainTargetIndex": pair.get("trainTargetIndex"),
+                    "testSourceIndex": pair.get("testSourceIndex"),
+                    "testTargetIndex": pair.get("testTargetIndex"),
+                }
+                for pair in probe_pairs
+            ],
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
+    return f"{base_sample_id}_train{train_sample_id}_probe_{digest}"
+
+
+def _default_probe_cache_path(base_sample_id: str, train_sample_id: int, probe_sample_id: str) -> str:
+    return str(EIF_BUNDLE_CACHE_ROOT / "probes" / base_sample_id / f"train_{train_sample_id}" / probe_sample_id)
+
+
 def _payload_matches_request(payload: dict, bundle_mode: str, embedding_type: str, model_path: str | None) -> bool:
     bundle = payload.get("bundle") if isinstance(payload, dict) else None
     if not isinstance(bundle, dict):
@@ -205,6 +242,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/prepare-ttav-train-probe":
+            self._handle_prepare_train_probe()
+            return
         if parsed.path != "/api/prepare-ttav-bundle":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -328,6 +368,135 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "uploadResult": upload_result,
         }
         self._send_json(200, response)
+
+    def _handle_prepare_train_probe(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+
+        report_file_name = str(req.get("reportFileName", "")).strip()
+        if not report_file_name:
+            self._send_json(400, {"status": "error", "message": "reportFileName is required"})
+            return
+
+        report_json_path = CORR_RESULTS_DIR / report_file_name
+        if not report_json_path.exists():
+            self._send_json(404, {"status": "error", "message": f"Report JSON not found: {report_file_name}"})
+            return
+
+        train_sample_id = req.get("trainSampleId")
+        probe_pairs = req.get("probePairs")
+        if not isinstance(train_sample_id, int):
+            self._send_json(400, {"status": "error", "message": "trainSampleId is required"})
+            return
+        if not isinstance(probe_pairs, list) or not probe_pairs:
+            self._send_json(400, {"status": "error", "message": "probePairs is required"})
+            return
+
+        base_sample_id = str(req.get("sampleId", "")).strip() or infer_sample_id(str(report_json_path))
+        context_radius = int(req.get("contextRadius", 1))
+        include_full_train = bool(req.get("includeFullTrain", False))
+        raw_focus_train_indices = req.get("focusTrainIndices", [])
+        focus_train_indices = raw_focus_train_indices if isinstance(raw_focus_train_indices, list) else []
+        model_path = str(req.get("modelPath", "")).strip() or str(DEFAULT_MODEL_PATH)
+        ttav_upload_url = str(req.get("ttavUploadUrl", "")).strip()
+        ttav_url = str(req.get("ttavUrl", "")).strip()
+        vis_method = str(req.get("visMethod", "TimeVis")).strip() or "TimeVis"
+        vis_id = str(req.get("visId", "1")).strip() or "1"
+        probe_sample_id = _make_probe_sample_id(
+            base_sample_id,
+            train_sample_id,
+            probe_pairs,
+            context_radius,
+            include_full_train,
+            focus_train_indices,
+        )
+        explicit_cache_path = str(req.get("probeCachePath", "")).strip() or _default_probe_cache_path(base_sample_id, train_sample_id, probe_sample_id)
+        status_key = probe_sample_id
+        started_at = time()
+
+        print(
+            f"[probe] sampleId={base_sample_id} trainSampleId={train_sample_id} pairs={len(probe_pairs)} vis={vis_method}/{vis_id}",
+            flush=True,
+        )
+
+        try:
+            _set_prepare_status(status_key, "building_probe", "Building train-sample embedding probe", active=True)
+            payload = build_train_probe_bundle_payload(
+                report_json_path=str(report_json_path),
+                model_path=model_path,
+                train_sample_id=train_sample_id,
+                probe_pairs=probe_pairs,
+                sample_id=base_sample_id,
+                embedding_type="contextual",
+                hidden_layer=-1,
+                vis_method=vis_method,
+                vis_id=vis_id,
+                context_radius=context_radius,
+                include_full_train=include_full_train,
+                focus_train_indices=focus_train_indices,
+                progress_callback=lambda stage, message: _set_prepare_status(status_key, stage, message, active=True),
+            )
+            payload["sample_id"] = probe_sample_id
+            payload["vis_method"] = vis_method
+            payload["vis_id"] = vis_id
+            payload["overwrite"] = True
+            _set_prepare_status(status_key, "writing_local_cache", "Writing train probe bundle cache", active=True)
+            write_local_bundle_cache(probe_sample_id, payload, explicit_path=explicit_cache_path)
+
+            upload_result = None
+            upload_error = None
+            browser_upload_required = False
+            _set_prepare_status(status_key, "uploading_to_ttav", "Uploading train probe to TTAV", active=True)
+            try:
+                upload_result = upload_bundle(ttav_upload_url, payload)
+            except Exception as upload_exc:
+                upload_error = str(upload_exc)
+                browser_upload_required = True
+                print(
+                    f"[probe] sampleId={base_sample_id} trainSampleId={train_sample_id} server_upload_failed: {upload_error}",
+                    flush=True,
+                )
+                _set_prepare_status(
+                    status_key,
+                    "browser_upload_required",
+                    "Server-side TTAV upload failed; browser upload fallback required",
+                    active=False,
+                )
+
+            elapsed = time() - started_at
+            print(f"[probe] sampleId={base_sample_id} trainSampleId={train_sample_id} elapsed={elapsed:.2f}s", flush=True)
+            if not browser_upload_required:
+                _set_prepare_status(status_key, "completed", f"Train probe completed in {elapsed:.1f}s", active=False)
+        except Exception as exc:
+            elapsed = time() - started_at
+            print(f"[probe] sampleId={base_sample_id} trainSampleId={train_sample_id} error after {elapsed:.2f}s: {exc}", flush=True)
+            _set_prepare_status(status_key, "error", str(exc), active=False, error=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+
+        self._send_json(200, {
+            "status": "success",
+            "sampleId": (upload_result or {}).get("sample_id") or probe_sample_id,
+            "contentPath": (upload_result or {}).get("content_path"),
+            "visMethod": (upload_result or {}).get("vis_method", vis_method),
+            "visId": (upload_result or {}).get("vis_id", vis_id),
+            "ttavUrl": ttav_url,
+            "trainSampleId": train_sample_id,
+            "selectedIndices": payload.get("selected_indices", []),
+            "targetIndex": payload.get("target_index"),
+            "promptLen": payload.get("bundle", {}).get("prompt_len", 0),
+            "probeCachePath": explicit_cache_path,
+            "comparisonSummary": payload.get("comparison_summary"),
+            "uploadResult": upload_result,
+            "browserUploadRequired": browser_upload_required,
+            "uploadError": upload_error,
+            "bundlePayload": payload if browser_upload_required else None,
+        })
 
 
 def main():

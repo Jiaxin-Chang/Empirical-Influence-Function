@@ -10,12 +10,13 @@ const DEFAULT_TTAV_METHOD = 'TimeVis';
 const DEFAULT_TTAV_VIS_ID = '1';
 function getDefaultEifApiUrl(): string {
     if (typeof window === 'undefined') {
-        return 'http://127.0.0.1:8765/api/prepare-ttav-bundle';
+        return 'http://127.0.0.1:8766/api/prepare-ttav-bundle';
     }
 
     const protocol = window.location.protocol || 'http:';
     const hostname = window.location.hostname || '127.0.0.1';
-    return `${protocol}//${hostname}:8765/api/prepare-ttav-bundle`;
+    const port = hostname === 'localhost' || hostname === '127.0.0.1' ? '8766' : '8765';
+    return `${protocol}//${hostname}:${port}/api/prepare-ttav-bundle`;
 }
 
 const DEFAULT_EIF_API_URL = getDefaultEifApiUrl();
@@ -48,6 +49,28 @@ interface CorrelationPair {
     train_correlation: TrainCorrelation;
     train_context: { source_context: string[]; target_context: string[] };
     annotation: string | null;
+}
+
+interface TrainProbeFocusToken {
+    tokenIndex: number;
+    token: string;
+    tokenDisplay: string;
+    pointIndex?: number;
+}
+
+interface TrainProbeComparisonPair {
+    leftIndex: number;
+    leftToken: string;
+    leftTokenDisplay: string;
+    rightIndex: number;
+    rightToken: string;
+    rightTokenDisplay: string;
+    cosine: number;
+}
+
+interface TrainProbeComparisonSummary {
+    focusTokens: TrainProbeFocusToken[];
+    pairwiseCosine: TrainProbeComparisonPair[];
 }
 
 interface PerTokenResult {
@@ -135,18 +158,6 @@ interface TtavHighlightUpdateMessage {
     data: TtavJumpPayload;
 }
 
-interface TtavLoadVisualizationMessage {
-    command: 'loadVisualization';
-    data: {
-        contentPath: string;
-        visualizationMethod: string;
-        visualizationID: string;
-        dataType: 'Text';
-        taskType: 'Alignment';
-        visConfig: { gpu_id: number };
-    };
-}
-
 interface EifPrepareStatusPayload {
     status: 'success';
     sampleId: string;
@@ -202,10 +213,15 @@ async function loadPrecomputedRealBundle(sampleId: string, visMethod: string, vi
     };
 }
 
-function buildEifPrepareStatusUrl(apiUrl: string, sampleId: string): string {
+function buildEifApiUrl(apiUrl: string, pathname: string): string {
     const url = new URL(apiUrl.trim());
-    url.pathname = '/api/prepare-ttav-bundle-status';
+    url.pathname = pathname;
     url.search = '';
+    return url.toString();
+}
+
+function buildEifPrepareStatusUrl(apiUrl: string, sampleId: string): string {
+    const url = new URL(buildEifApiUrl(apiUrl, '/api/prepare-ttav-bundle-status'));
     url.searchParams.set('sampleId', sampleId);
     return url.toString();
 }
@@ -662,13 +678,50 @@ function TrainSampleViewer({
 
 // ─── Correlation Pair Card ────────────────────────────────────────────────────
 
-function PairCard({ pair, detail }: { pair: CorrelationPair; detail?: TrainSampleDetail }) {
+function PairCard({
+    pair,
+    detail,
+    selected,
+    onToggleSelect,
+}: {
+    pair: CorrelationPair;
+    detail?: TrainSampleDetail;
+    selected?: boolean;
+    onToggleSelect?: () => void;
+}) {
     const [expanded, setExpanded] = useState(false);
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
 
     return (
-        <div className={styles.pairCard}>
+        <div
+            className={styles.pairCard}
+            style={selected ? { borderColor: '#7c3aed', boxShadow: '0 0 0 1px rgba(124,58,237,0.18)' } : undefined}
+        >
             <div className={styles.pairCardHeader} onClick={() => setExpanded(e => !e)}>
+                {onToggleSelect && (
+                    <button
+                        type="button"
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onToggleSelect();
+                        }}
+                        aria-pressed={selected === true}
+                        title={selected ? '取消选择这个 correlation pair' : '选择这个 correlation pair 参与 probe'}
+                        style={{
+                            border: selected ? '1px solid #7c3aed' : '1px solid #cbd5e1',
+                            background: selected ? '#f5f3ff' : '#ffffff',
+                            color: selected ? '#6d28d9' : '#64748b',
+                            borderRadius: 999,
+                            padding: '2px 8px',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        {selected ? '已选' : '选择'}
+                    </button>
+                )}
+
                 <span className={styles.pairId}>{pair.id}</span>
 
                 <span className={styles.cosSim} style={{ background: bg, color: fg }}>
@@ -724,14 +777,28 @@ function TrainSampleGroup({
     trainIdx,
     pairs,
     detail,
+    onProbeEmbeddings,
+    probeBusy,
+    selectedPairIds,
+    onTogglePairSelection,
+    comparisonSummary,
 }: {
     trainIdx: number;
     pairs: CorrelationPair[];
     detail?: TrainSampleDetail;
+    onProbeEmbeddings?: (trainIdx: number, pairs: CorrelationPair[]) => void;
+    probeBusy?: boolean;
+    selectedPairIds?: string[];
+    onTogglePairSelection?: (trainIdx: number, pairId: string) => void;
+    comparisonSummary?: TrainProbeComparisonSummary;
 }) {
     const [collapsed, setCollapsed] = useState(false);
     const bestSim = Math.max(...pairs.map(p => p.cos_sim));
     const { bg, fg } = cosSimilarityColor(bestSim);
+    const selectedPairIdSet = useMemo(() => new Set(selectedPairIds ?? []), [selectedPairIds]);
+    const selectedPairCount = selectedPairIdSet.size;
+    const comparisonTokens = comparisonSummary?.focusTokens ?? [];
+    const comparisonPairs = comparisonSummary?.pairwiseCosine ?? [];
 
     return (
         <div className={styles.trainGroup}>
@@ -740,19 +807,95 @@ function TrainSampleGroup({
                 <span className={styles.trainGroupCoarse}>coarse {(detail?.coarse_cos_sim ?? pairs[0]?.coarse_cos_sim ?? 0).toFixed(4)}</span>
                 <span className={styles.trainGroupCount}>{pairs.length} pairs</span>
                 <span className={styles.cosSim} style={{ background: bg, color: fg }}>best {bestSim.toFixed(4)}</span>
+                <span style={{ marginLeft: 8, fontSize: 11, color: '#6b7280', fontWeight: 600 }}>
+                    已选 {selectedPairCount}
+                </span>
+                {detail && onProbeEmbeddings && (
+                    <button
+                        type="button"
+                        onClick={event => {
+                            event.stopPropagation();
+                            onProbeEmbeddings(trainIdx, pairs);
+                        }}
+                        disabled={probeBusy}
+                        style={{
+                            marginLeft: 8,
+                            padding: '4px 10px',
+                            borderRadius: 999,
+                            border: '1px solid #c4b5fd',
+                            background: probeBusy ? '#ede9fe' : '#faf5ff',
+                            color: '#6d28d9',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: probeBusy ? 'wait' : 'pointer',
+                        }}
+                    >
+                        {probeBusy ? 'Probing…' : 'Open Full Probe'}
+                    </button>
+                )}
                 <span className={styles.expandIcon} style={{ marginLeft: 'auto' }}>{collapsed ? '▶' : '▼'}</span>
             </div>
             {!collapsed && (
                 <div className={styles.trainGroupBody}>
                     {detail && (
                         <div className={styles.trainFullView}>
-                            <div className={styles.subLabel}>完整训练样本 — 高亮所有相关 correlation</div>
+                            <div className={styles.subLabel}>完整训练样本 — 全量 token 进入 probe，当前 correlation token 特殊标出</div>
                             <TrainSampleViewer detail={detail} highlightPairs={pairs} />
+                        </div>
+                    )}
+                    {selectedPairCount > 0 && comparisonTokens.length > 0 && (
+                        <div style={{ padding: '0 0 14px' }}>
+                            <div className={styles.subLabel}>已选 token（用于 probe 高亮与数值比较）</div>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+                                {comparisonTokens.map(token => (
+                                    <span
+                                        key={`${token.tokenIndex}-${token.pointIndex ?? 'na'}`}
+                                        style={{
+                                            fontSize: 12,
+                                            padding: '4px 8px',
+                                            borderRadius: 999,
+                                            background: '#f5f3ff',
+                                            color: '#6d28d9',
+                                            border: '1px solid #ddd6fe',
+                                            fontFamily: 'monospace',
+                                        }}
+                                    >
+                                        {token.tokenDisplay} @{token.tokenIndex}
+                                    </span>
+                                ))}
+                            </div>
+                            {comparisonPairs.length > 0 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
+                                    {comparisonPairs.map(pair => (
+                                        <div
+                                            key={`${pair.leftIndex}-${pair.rightIndex}`}
+                                            style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: 10,
+                                                fontSize: 12,
+                                                color: '#475569',
+                                            }}
+                                        >
+                                            <span style={{ fontFamily: 'monospace', color: '#7c2d12', minWidth: 200 }}>
+                                                {pair.leftTokenDisplay} @{pair.leftIndex} ↔ {pair.rightTokenDisplay} @{pair.rightIndex}
+                                            </span>
+                                            <span style={{ fontWeight: 700, color: '#b91c1c' }}>{pair.cosine.toFixed(4)}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
                         </div>
                     )}
                     <div className={styles.pairList}>
                         {pairs.map(pair => (
-                            <PairCard key={pair.id} pair={pair} detail={detail} />
+                            <PairCard
+                                key={pair.id}
+                                pair={pair}
+                                detail={detail}
+                                selected={selectedPairIdSet.has(pair.id)}
+                                onToggleSelect={onTogglePairSelection ? () => onTogglePairSelection(trainIdx, pair.id) : undefined}
+                            />
                         ))}
                     </div>
                 </div>
@@ -804,6 +947,9 @@ export function NewView({ metas }: Props) {
     const [ttavLaunchStatus, setTtavLaunchStatus] = useState<string | null>(null);
     const [ttavPrepareDetail, setTtavPrepareDetail] = useState<string | null>(null);
     const [preparingTtavBundle, setPreparingTtavBundle] = useState(false);
+    const [probingTrainSampleId, setProbingTrainSampleId] = useState<number | null>(null);
+    const [selectedTrainPairIdsByGroup, setSelectedTrainPairIdsByGroup] = useState<Record<number, string[]>>({});
+    const [trainProbeComparisons, setTrainProbeComparisons] = useState<Record<number, TrainProbeComparisonSummary>>({});
     const [showAdvancedTtav, setShowAdvancedTtav] = useState(false);
     const ttavWindowRef = useRef<Window | null>(null);
     const ttavWindowOriginRef = useRef<string | null>(null);
@@ -821,6 +967,8 @@ export function NewView({ metas }: Props) {
         setReport(null);
         setSelectedTokIdx(null);
         setSelectedTestCorrIdx(null);
+        setSelectedTrainPairIdsByGroup({});
+        setTrainProbeComparisons({});
 
         fetch(url)
             .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json(); })
@@ -830,6 +978,11 @@ export function NewView({ metas }: Props) {
 
     // Reset test correlation state when selected token changes
     useEffect(() => { setSelectedTestCorrIdx(null); }, [selectedTokIdx]);
+
+    useEffect(() => {
+        setSelectedTrainPairIdsByGroup({});
+        setTrainProbeComparisons({});
+    }, [selectedTokIdx, selectedTestCorrIdx, selectedMetaIdx]);
 
     useEffect(() => {
         if (typeof window === 'undefined') return;
@@ -968,34 +1121,6 @@ export function NewView({ metas }: Props) {
         ttavWindow.postMessage(message, ttavOrigin);
     };
 
-    const postTtavLoadVisualization = (payload: TtavJumpPayload): boolean => {
-        const ttavWindow = ttavWindowRef.current;
-        const ttavOrigin = ttavWindowOriginRef.current;
-
-        if (!ttavWindow || !ttavOrigin || ttavWindow.closed) {
-            return false;
-        }
-
-        const message: TtavLoadVisualizationMessage = {
-            command: 'loadVisualization',
-            data: {
-                contentPath: payload.contentPath,
-                visualizationMethod: payload.visMethod,
-                visualizationID: payload.visId,
-                dataType: payload.dataType,
-                taskType: payload.taskType,
-                visConfig: { gpu_id: -1 },
-            },
-        };
-        ttavWindow.postMessage(message, ttavOrigin);
-        ttavWindowSampleIdRef.current = payload.sampleId;
-        window.setTimeout(() => {
-            postTtavHighlightUpdate(payload);
-        }, 1200);
-        ttavWindow.focus();
-        return true;
-    };
-
     const handleExport = async () => {
         if (exportBatch && metas.length > 1) {
             setExporting(true);
@@ -1024,61 +1149,35 @@ export function NewView({ metas }: Props) {
         }
     };
 
-    const reserveTtavWindow = (targetUrl: string): Window | null => {
-        const targetOrigin = new URL(targetUrl).origin;
-        const openedWindow = window.open('', '_blank');
-        if (!openedWindow) return null;
+    const buildTtavLaunchUrl = (payload: TtavJumpPayload): string => {
+        const url = new URL(ttavUrl.trim());
+        url.searchParams.set('eif_jump', JSON.stringify(payload));
+        return url.toString();
+    };
 
-        ttavWindowRef.current = openedWindow;
-        ttavWindowOriginRef.current = targetOrigin;
-        ttavWindowSampleIdRef.current = null;
-        return openedWindow;
+    const navigateTtavWindow = (targetWindow: Window, payload: TtavJumpPayload) => {
+        targetWindow.location.href = buildTtavLaunchUrl(payload);
+        ttavWindowRef.current = targetWindow;
+        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
+        ttavWindowSampleIdRef.current = payload.sampleId;
+        window.setTimeout(() => {
+            postTtavHighlightUpdate(payload);
+        }, 1200);
     };
 
     const openTtavWithPayload = (payload: TtavJumpPayload) => {
-        const url = new URL(ttavUrl.trim());
-        url.searchParams.set('eif_jump', JSON.stringify(payload));
-
-        const existingWindow = ttavWindowRef.current;
-        const sameOriginWindow = existingWindow
-            && !existingWindow.closed
-            && ttavWindowOriginRef.current === url.origin;
-
-        if (sameOriginWindow) {
-            const existingHref = (() => {
-                try {
-                    return existingWindow.location.href;
-                } catch {
-                    return '';
-                }
-            })();
-            const isReservedBlankWindow = existingHref === 'about:blank';
-
-            if (isReservedBlankWindow) {
-                existingWindow.location.href = url.toString();
-                ttavWindowSampleIdRef.current = payload.sampleId;
-                window.setTimeout(() => {
-                    postTtavHighlightUpdate(payload);
-                }, 1200);
-                existingWindow.focus();
-                return;
-            }
-
-            if (postTtavLoadVisualization(payload)) {
-                return;
-            }
-        }
-
-        const openedWindow = window.open(url.toString(), '_blank');
-        if (!openedWindow) return;
+        const launchUrl = buildTtavLaunchUrl(payload);
+        const openedWindow = window.open(launchUrl, '_blank');
+        if (!openedWindow) return null;
 
         ttavWindowRef.current = openedWindow;
-        ttavWindowOriginRef.current = url.origin;
+        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
         ttavWindowSampleIdRef.current = payload.sampleId;
 
         window.setTimeout(() => {
             postTtavHighlightUpdate(payload);
         }, 1200);
+        return openedWindow;
     };
 
     const callEifBundleApi = async (requireCached: boolean) => {
@@ -1160,15 +1259,21 @@ export function NewView({ metas }: Props) {
             return;
         }
 
-        const reservedWindow = reserveTtavWindow(trimmedUrl);
-        if (!reservedWindow) {
+        const optimisticPayload = buildCurrentTtavPayload();
+        if (!optimisticPayload) {
+            setTtavLaunchError('Unable to build TTAV jump payload.');
+            return;
+        }
+
+        const openedWindow = openTtavWithPayload(optimisticPayload);
+        if (!openedWindow) {
             setTtavLaunchError('Browser blocked the Visualizer window. Please allow pop-ups for this page.');
             return;
         }
 
         void (async () => {
             setTtavLaunchError(null);
-            setTtavLaunchStatus(null);
+            setTtavLaunchStatus(`Visualizer opening for ${optimisticPayload.sampleId}...`);
             try {
                 new URL(trimmedUrl);
                 const apiResult = await callEifBundleApi(true);
@@ -1193,7 +1298,9 @@ export function NewView({ metas }: Props) {
                     selectedSourceIndex: selectedTestCorrIdx ?? undefined,
                     promptLen,
                 };
-                openTtavWithPayload(payload);
+                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
+                    navigateTtavWindow(openedWindow, payload);
+                }
                 setTtavLaunchStatus(`Visualizer opened for ${apiResult.sampleId}.`);
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Failed to open Visualizer';
@@ -1220,11 +1327,213 @@ export function NewView({ metas }: Props) {
                     selectedSourceIndex: selectedTestCorrIdx ?? undefined,
                     promptLen,
                 };
-                openTtavWithPayload(payload);
+                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
+                    navigateTtavWindow(openedWindow, payload);
+                }
                 setTtavLaunchError(null);
                 setTtavLaunchStatus(preparedBundle
                     ? `Visualizer opened for ${sampleId} using the most recently prepared TTAV bundle.`
                     : `Visualizer opened for ${sampleId} using existing TTAV bundle.`);
+            }
+        })();
+    };
+
+
+    const toggleTrainPairSelection = (trainIdx: number, pairId: string) => {
+        setSelectedTrainPairIdsByGroup(current => {
+            const prev = new Set(current[trainIdx] ?? []);
+            if (prev.has(pairId)) {
+                prev.delete(pairId);
+            } else {
+                prev.add(pairId);
+            }
+            return {
+                ...current,
+                [trainIdx]: Array.from(prev),
+            };
+        });
+        setTrainProbeComparisons(current => {
+            if (!(trainIdx in current)) return current;
+            const next = { ...current };
+            delete next[trainIdx];
+            return next;
+        });
+    };
+
+    const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
+        if (!report || !selectedMeta) return;
+
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+        if (!trimmedUrl) {
+            setTtavLaunchError('TTAV URL is required.');
+            return;
+        }
+
+        const openedWindow = window.open(trimmedUrl, '_blank');
+        if (!openedWindow) {
+            setTtavLaunchError('Browser blocked the probe window. Please allow pop-ups for this page.');
+            return;
+        }
+
+        const selectedPairIdSet = new Set(selectedTrainPairIdsByGroup[trainIdx] ?? []);
+        const selectedPairs = selectedPairIdSet.size > 0
+            ? pairs.filter(pair => selectedPairIdSet.has(pair.id))
+            : [];
+        const focusTrainIndices = Array.from(new Set(selectedPairs.flatMap(pair => [
+            pair.train_correlation.source_token_index,
+            pair.train_correlation.target_token_index,
+        ]))).sort((a, b) => a - b);
+
+        setProbingTrainSampleId(trainIdx);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(`Preparing full-train embedding probe for TRAIN #${trainIdx}...`);
+
+        void (async () => {
+            try {
+                const probeResp = await fetch(buildEifApiUrl(eifApiUrl, '/api/prepare-ttav-train-probe'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        sampleId: selectedSampleId,
+                        trainSampleId: trainIdx,
+                        ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
+                        ttavUrl: trimmedUrl,
+                        visMethod,
+                        visId,
+                        contextRadius: 1,
+                        includeFullTrain: true,
+                        focusTrainIndices,
+                        probePairs: pairs.map(pair => ({
+                            id: pair.id,
+                            trainSourceIndex: pair.train_correlation.source_token_index,
+                            trainTargetIndex: pair.train_correlation.target_token_index,
+                            testSourceIndex: pair.test_correlation.source_token_index,
+                            testTargetIndex: pair.test_correlation.target_token_index,
+                        })),
+                    }),
+                });
+
+                const rawText = await probeResp.text();
+                let parsedJson: Record<string, unknown> | null = null;
+                if (rawText.trim()) {
+                    try {
+                        parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(
+                            `EIF train probe API returned a non-JSON response (HTTP ${probeResp.status}). ` +
+                            `${rawText.slice(0, 240)}`
+                        );
+                    }
+                }
+
+                const apiJson = parsedJson ?? {};
+                if (!probeResp.ok || apiJson.status !== 'success') {
+                    const baseMessage = 'EIF train probe API failed (HTTP ' + probeResp.status + ')';
+                    const message = typeof apiJson.message === 'string'
+                        ? baseMessage + ': ' + apiJson.message
+                        : baseMessage;
+                    throw new Error(message);
+                }
+
+                const comparisonSummary = (typeof apiJson.comparisonSummary === 'object' && apiJson.comparisonSummary !== null)
+                    ? apiJson.comparisonSummary as TrainProbeComparisonSummary
+                    : { focusTokens: [], pairwiseCosine: [] };
+                setTrainProbeComparisons(current => ({
+                    ...current,
+                    [trainIdx]: comparisonSummary,
+                }));
+
+                const browserUploadRequired = apiJson.browserUploadRequired === true;
+                let resolvedSampleId = typeof apiJson.sampleId === 'string'
+                    ? apiJson.sampleId
+                    : `${selectedSampleId}_train${trainIdx}_probe`;
+                let resolvedContentPath = typeof apiJson.contentPath === 'string' ? apiJson.contentPath : '';
+                let resolvedVisMethod = typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod;
+                let resolvedVisId = typeof apiJson.visId === 'string' ? apiJson.visId : visId;
+
+                if (browserUploadRequired) {
+                    setTtavLaunchStatus(`Probe computed on EIF; uploading TRAIN #${trainIdx} probe to TTAV from browser...`);
+                    const bundlePayload = (typeof apiJson.bundlePayload === 'object' && apiJson.bundlePayload !== null)
+                        ? apiJson.bundlePayload
+                        : null;
+                    if (!bundlePayload) {
+                        throw new Error(typeof apiJson.uploadError === 'string'
+                            ? apiJson.uploadError
+                            : 'Probe bundle upload fallback payload is missing.');
+                    }
+
+                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
+                    const uploadResp = await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(bundlePayload),
+                    });
+                    const uploadRawText = await uploadResp.text();
+                    let uploadJson: Record<string, unknown> | null = null;
+                    if (uploadRawText.trim()) {
+                        try {
+                            uploadJson = JSON.parse(uploadRawText) as Record<string, unknown>;
+                        } catch {
+                            throw new Error(
+                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
+                                `${uploadRawText.slice(0, 240)}`
+                            );
+                        }
+                    }
+
+                    const uploadApiJson = uploadJson ?? {};
+                    if (!uploadResp.ok || uploadApiJson.status !== 'success') {
+                        const message = typeof uploadApiJson.message === 'string'
+                            ? uploadApiJson.message
+                            : `Failed to register TTAV probe bundle (HTTP ${uploadResp.status})`;
+                        throw new Error(message);
+                    }
+
+                    resolvedSampleId = typeof uploadApiJson.sample_id === 'string'
+                        ? uploadApiJson.sample_id
+                        : (typeof uploadApiJson.sampleId === 'string' ? uploadApiJson.sampleId : resolvedSampleId);
+                    resolvedContentPath = typeof uploadApiJson.content_path === 'string'
+                        ? uploadApiJson.content_path
+                        : (typeof uploadApiJson.contentPath === 'string' ? uploadApiJson.contentPath : resolvedContentPath);
+                    resolvedVisMethod = typeof uploadApiJson.vis_method === 'string'
+                        ? uploadApiJson.vis_method
+                        : (typeof uploadApiJson.visMethod === 'string' ? uploadApiJson.visMethod : resolvedVisMethod);
+                    resolvedVisId = typeof uploadApiJson.vis_id === 'string'
+                        ? uploadApiJson.vis_id
+                        : (typeof uploadApiJson.visId === 'string' ? uploadApiJson.visId : resolvedVisId);
+                }
+
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId: resolvedSampleId,
+                    contentPath: resolvedContentPath,
+                    visMethod: resolvedVisMethod,
+                    visId: resolvedVisId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: Array.isArray(apiJson.selectedIndices)
+                        ? apiJson.selectedIndices.filter((value): value is number => typeof value === 'number')
+                        : [],
+                    targetIndex: typeof apiJson.targetIndex === 'number' ? apiJson.targetIndex : undefined,
+                    promptLen: typeof apiJson.promptLen === 'number' ? apiJson.promptLen : 0,
+                };
+
+                navigateTtavWindow(openedWindow, payload);
+                setTtavLaunchStatus(browserUploadRequired
+                    ? `Full-train probe opened for TRAIN #${trainIdx} using browser upload fallback.`
+                    : `Full-train probe opened for TRAIN #${trainIdx}.`);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Failed to open embedding probe';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+                if (!openedWindow.closed) {
+                    openedWindow.close();
+                }
+            } finally {
+                setProbingTrainSampleId(current => (current === trainIdx ? null : current));
             }
         })();
     };
@@ -1728,6 +2037,11 @@ export function NewView({ metas }: Props) {
                                                 trainIdx={id}
                                                 pairs={pairs}
                                                 detail={report.train_sample_details[String(id)]}
+                                                onProbeEmbeddings={handleOpenTrainProbe}
+                                                probeBusy={probingTrainSampleId === id}
+                                                selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
+                                                onTogglePairSelection={toggleTrainPairSelection}
+                                                comparisonSummary={trainProbeComparisons[id]}
                                             />
                                         ))}
                                     </div>
