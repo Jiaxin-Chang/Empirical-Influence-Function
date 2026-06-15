@@ -29,22 +29,11 @@ function App() {
         fetch('/data/index.json')
             .then(r => { if (!r.ok) throw new Error(); return r.json(); })
             .then((m: Manifest) => setManifest(m))
-            .catch(() => setManifestError(true));
+            .catch(() => {
+                setManifest({ allTokensExperiments: [], modelCompare: null });
+                setManifestError(true);
+            });
     }, []);
-
-    if (manifestError) {
-        return (
-            <div className="app-root">
-                <header className="app-header"><h1>Attribution Analysis</h1></header>
-                <section className="analysis-section">
-                    <p className="no-data" style={{ marginTop: '16px' }}>
-                        Failed to load <code>/data/index.json</code>. Make sure the Vite dev server is running
-                        (<code>pnpm dev</code>) or run <code>pnpm preview</code> after building.
-                    </p>
-                </section>
-            </div>
-        );
-    }
 
     if (!manifest) {
         return (
@@ -78,6 +67,12 @@ function App() {
                     )}
                 </div>
             </header>
+
+            {manifestError && (
+                <div className="manifest-warning">
+                    Failed to load <code>/data/index.json</code>. Bundled samples are unavailable, but JSON import still works.
+                </div>
+            )}
 
             {viewMode === 'new' && (
                 <NewView metas={manifest.allTokensExperiments ?? []} />
