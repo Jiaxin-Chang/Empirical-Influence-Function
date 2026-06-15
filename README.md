@@ -206,6 +206,8 @@ Then open **http://localhost:5173** in your browser.
 
 > **Note:** The app must be served via HTTP — opening `dist/index.html` directly in a browser will not work because `fetch()` requires a server.
 
+External saliency JSON files can be imported from the browser without rebuilding the app. See `tools/correlation-report/README.md` for the accepted all-token and generic saliency formats.
+
 ### Development Mode (hot reload)
 
 ```bash

@@ -38,6 +38,135 @@
 }
 .metaBtn:hover { border-color: #6366f1; color: #4338ca; }
 .metaBtnActive { background: #6366f1 !important; color: #fff !important; border-color: #6366f1 !important; }
+.metaSelectorHint {
+    font-size: 12px;
+    color: #64748b;
+}
+
+/* ── Import panel ── */
+.importPanel {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) minmax(180px, 260px) minmax(260px, 440px);
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    background: #ffffff;
+    border: 1px solid #dbe3ef;
+    border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+.importPanelText {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+.importPanelTitle {
+    font-size: 13px;
+    font-weight: 800;
+    color: #1e293b;
+}
+.importPanelDesc {
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.4;
+}
+.importDropZone {
+    min-height: 54px;
+    display: grid;
+    place-items: center;
+    gap: 2px;
+    padding: 9px 12px;
+    border: 1.5px dashed #94a3b8;
+    border-radius: 8px;
+    background: #f8fafc;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+}
+.importDropZone:hover,
+.importDropZoneActive {
+    border-color: #6366f1;
+    background: #eef2ff;
+}
+.importFileInput {
+    display: none;
+}
+.importDropMain {
+    font-size: 12px;
+    font-weight: 800;
+    color: #4338ca;
+}
+.importDropSub {
+    font-size: 10px;
+    color: #64748b;
+    text-align: center;
+}
+.importUrlRow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+.importUrlInput {
+    min-width: 0;
+    flex: 1;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    font-size: 12px;
+}
+.importUrlInput:focus {
+    outline: 2px solid #c7d2fe;
+    border-color: #6366f1;
+}
+.importUrlButton {
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid #6366f1;
+    border-radius: 7px;
+    background: #eef2ff;
+    color: #4338ca;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.importUrlButton:disabled {
+    cursor: wait;
+    opacity: 0.7;
+}
+.importStatus,
+.importError {
+    grid-column: 1 / -1;
+    font-size: 12px;
+    line-height: 1.4;
+}
+.importStatus {
+    color: #047857;
+}
+.importError {
+    color: #b91c1c;
+}
+.importedReportNotice {
+    margin-top: 8px;
+    padding: 9px 12px;
+    border-top: 1px solid #e5e7eb;
+    background: #f8fafc;
+    color: #475569;
+    font-size: 12px;
+    line-height: 1.45;
+}
+@media (max-width: 960px) {
+    .importPanel {
+        grid-template-columns: 1fr;
+    }
+    .importUrlRow {
+        flex-wrap: wrap;
+    }
+    .importUrlButton {
+        width: 100%;
+    }
+}
 
 /* ── Top panel ── */
 .topPanel {
