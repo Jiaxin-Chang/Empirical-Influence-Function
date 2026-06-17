@@ -2,12 +2,35 @@ import react from '@vitejs/plugin-react-swc'
 import { defineConfig, type Plugin } from 'vite'
 import { readdirSync, existsSync, readFileSync } from 'fs'
 import { resolve, join } from 'path'
+import type { IncomingMessage, ServerResponse } from 'http'
 
 // ── Repo root where JSON experiment files live ────────────────────────────────
 const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
+
+interface ModelInfo { slug: string; name: string }
+interface RawModelInfo { model_slug: string; model_name?: unknown }
+interface ManifestData {
+  allTokensExperiments: { taskId: string; label: string; fileName: string }[]
+  modelCompare: { models: ModelInfo[]; sampleIds: string[]; oursSlug: string } | null
+}
+interface MiddlewareServer {
+  middlewares: {
+    use: (fn: (req: IncomingMessage, res: ServerResponse, next: () => void) => void) => void
+  }
+}
+
+function isRawModelInfo(value: unknown): value is RawModelInfo {
+  return typeof value === 'object'
+    && value !== null
+    && typeof (value as { model_slug?: unknown }).model_slug === 'string'
+}
+
+function isSafeSegment(value: string): boolean {
+  return /^[\w-]+$/.test(value)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // experimentDataPlugin
@@ -21,23 +44,22 @@ const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
 //   emits dist/data/index.json + all data files
 // ─────────────────────────────────────────────────────────────────────────────
 function experimentDataPlugin(): Plugin {
-  function buildManifest() {
+  function buildManifest(): ManifestData {
     const allTokensExperiments: { taskId: string; label: string; fileName: string }[] = []
 
     // Read legacy_by_model_sample/manifest.json
-    interface ModelInfo { slug: string; name: string }
     const modelCompare: { models: ModelInfo[]; sampleIds: string[]; oursSlug: string } | null = (() => {
       const mp = join(MODEL_COMPARE_DIR, 'manifest.json')
       if (!existsSync(mp)) return null
       try {
-        const mm = JSON.parse(readFileSync(mp, 'utf-8'))
+        const mm = JSON.parse(readFileSync(mp, 'utf-8')) as { models?: unknown[] }
         const models: ModelInfo[] = (mm.models ?? [])
-          .filter((m: any) => typeof m.model_slug === 'string' && /^[\w\-]+$/.test(m.model_slug))
-          .map((m: any) => ({ slug: m.model_slug as string, name: m.model_name as string }))
+          .filter((m): m is RawModelInfo => isRawModelInfo(m) && isSafeSegment(m.model_slug))
+          .map(m => ({ slug: m.model_slug, name: typeof m.model_name === 'string' ? m.model_name : m.model_slug }))
         const oursSlug = models.find(m => m.slug === 'ours_graphsignal')?.slug ?? models[0]?.slug ?? ''
         const oursDir = join(MODEL_COMPARE_DIR, oursSlug)
         const sampleIds = existsSync(oursDir)
-          ? readdirSync(oursDir).filter(d => /^[\w\-]+$/.test(d))
+          ? readdirSync(oursDir).filter(isSafeSegment)
           : []
         return models.length > 0 && sampleIds.length > 0 ? { models, sampleIds, oursSlug } : null
       } catch { return null }
@@ -68,29 +90,30 @@ function experimentDataPlugin(): Plugin {
   }
 
   function readModelSaliency(slug: string, sampleId: string): string | null {
-    if (!/^[\w\-]+$/.test(slug) || !/^[\w\-]+$/.test(sampleId)) return null
+    if (!isSafeSegment(slug) || !isSafeSegment(sampleId)) return null
     const filePath = join(MODEL_COMPARE_DIR, slug, sampleId, 'latest_saliency.json')
     if (!existsSync(filePath)) return null
     return readFileSync(filePath, 'utf-8')
   }
 
   function readRealBundlePayload(sampleId: string): string | null {
-    if (!/^[\w\-]+$/.test(sampleId)) return null
+    if (!isSafeSegment(sampleId)) return null
     const filePath = join(REAL_BUNDLE_DIR, sampleId, 'bundle_payload.json')
     if (!existsSync(filePath)) return null
     return readFileSync(filePath, 'utf-8')
   }
 
-  function addMiddleware(server: { middlewares: { use: (fn: (req: any, res: any, next: () => void) => void) => void } }) {
-    server.middlewares.use((req: any, res: any, next: () => void) => {
-      if (req.url === '/data/index.json') {
+  function addMiddleware(server: MiddlewareServer) {
+    server.middlewares.use((req, res, next) => {
+      const reqUrl = req.url ?? ''
+      if (reqUrl === '/data/index.json') {
         res.setHeader('Content-Type', 'application/json')
         res.setHeader('Cache-Control', 'no-cache')
         res.end(JSON.stringify(buildManifest()))
         return
       }
       // Model compare: /data/model-sample/<slug>/<sampleId>/latest_saliency.json
-      const modelM = (req.url as string)?.match(/^\/data\/model-sample\/([^/?]+)\/([^/?]+)\/latest_saliency\.json/)
+      const modelM = reqUrl.match(/^\/data\/model-sample\/([^/?]+)\/([^/?]+)\/latest_saliency\.json/)
       if (modelM) {
         const content = readModelSaliency(decodeURIComponent(modelM[1]), decodeURIComponent(modelM[2]))
         if (content !== null) {
@@ -101,7 +124,7 @@ function experimentDataPlugin(): Plugin {
         }
       }
       // All-tokens correlation files: /data/results/<filename>.json
-      const resultsM = (req.url as string)?.match(/^\/data\/results\/([^/?]+\.json)/)
+      const resultsM = reqUrl.match(/^\/data\/results\/([^/?]+\.json)/)
       if (resultsM) {
         const content = readDataFile(decodeURIComponent(resultsM[1]))
         if (content !== null) {
@@ -146,7 +169,7 @@ function experimentDataPlugin(): Plugin {
       }
 
       const realBundleIds = existsSync(REAL_BUNDLE_DIR)
-        ? readdirSync(REAL_BUNDLE_DIR).filter(d => /^[\w\-]+$/.test(d))
+        ? readdirSync(REAL_BUNDLE_DIR).filter(isSafeSegment)
         : []
       for (const sampleId of realBundleIds) {
         const content = readRealBundlePayload(sampleId)

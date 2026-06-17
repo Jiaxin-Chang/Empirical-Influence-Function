@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import styles from './NewView.module.css';
 
 const TTAV_PREFS_KEY = 'eif:ttav-launch-prefs';
 const TTAV_PREPARED_BUNDLES_KEY = 'eif:ttav-prepared-bundles';
 const DEFAULT_TTAV_URL = 'http://1.94.115.154/';
 const DEFAULT_TTAV_CONTENT_PATH_TEMPLATE = '/root/project/Dataset/eif_bundles/{sampleId}';
-const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/root/project/Empirical-Influence-Function/ttav_bundles/{sampleId}';
+const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/home/yilu/workspace/Empirical-Influence-Function/ttav_bundles/{sampleId}';
 const DEFAULT_TTAV_METHOD = 'TimeVis';
 const DEFAULT_TTAV_VIS_ID = '1';
 function getDefaultEifApiUrl(): string {
@@ -924,8 +924,15 @@ interface Props {
 export function NewView({ metas }: Props) {
     const [selectedMetaIdx, setSelectedMetaIdx] = useState<number | null>(null);
     const [report, setReport]     = useState<AllTokensReport | null>(null);
+    const [activeMeta, setActiveMeta] = useState<AllTokensExperimentMeta | null>(null);
+    const [importedReportActive, setImportedReportActive] = useState(false);
     const [loading, setLoading]   = useState(false);
     const [loadError, setLoadError] = useState(false);
+    const [importError, setImportError] = useState<string | null>(null);
+    const [importStatus, setImportStatus] = useState<string | null>(null);
+    const [reportUrl, setReportUrl] = useState('');
+    const [loadingReportUrl, setLoadingReportUrl] = useState(false);
+    const [draggingImport, setDraggingImport] = useState(false);
 
     // Selected output token (by absolute sequence index)
     const [selectedTokIdx, setSelectedTokIdx] = useState<number | null>(null);
@@ -974,12 +981,17 @@ export function NewView({ metas }: Props) {
         setSelectedTestCorrIdx(null);
         setSelectedTrainPairIdsByGroup({});
         setTrainProbeComparisons({});
+        setActiveMeta(meta);
+        setImportedReportActive(false);
+        resetReportInteractionState();
+        setImportError(null);
+        setImportStatus(null);
 
         fetch(url)
             .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json(); })
-            .then((data: AllTokensReport) => { setReport(data); setLoading(false); })
+            .then((data: AllTokensReport) => { setReport(normalizeAllTokensReport(data)); setLoading(false); })
             .catch(() => { setLoadError(true); setLoading(false); });
-    }, [metas, selectedMetaIdx]);
+    }, [metas, resetReportInteractionState, selectedMetaIdx]);
 
     // Reset test correlation state when selected token changes
     useEffect(() => { setSelectedTestCorrIdx(null); }, [selectedTokIdx]);
@@ -1127,7 +1139,7 @@ export function NewView({ metas }: Props) {
     };
 
     const handleExport = async () => {
-        if (exportBatch && metas.length > 1) {
+        if (!importedReportActive && exportBatch && metas.length > 1) {
             setExporting(true);
             const parts: string[] = [];
             for (const meta of metas) {
@@ -1731,21 +1743,581 @@ export function NewView({ metas }: Props) {
 
     // ── Early states ──────────────────────────────────────────────────────────
 
-    if (metas.length === 0) {
-        return (
-            <div className={styles.emptyState}>
-                No all-tokens experiment files found.<br />
-                Run <code>python -m src.intervention_experiment</code> to generate<br />
-                <code>correlation_matching_results_test&#123;N&#125;_all_tokens.json</code>.
-                Suffixed files like <code>correlation_matching_results_test&#123;N&#125;_all_tokens_new.json</code> are also supported.
-            </div>
-        );
-    }
+    const navigateTtavWindow = (targetWindow: Window, payload: TtavJumpPayload) => {
+        targetWindow.location.href = buildTtavLaunchUrl(payload);
+        ttavWindowRef.current = targetWindow;
+        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
+        ttavWindowSampleIdRef.current = payload.sampleId;
+        window.setTimeout(() => {
+            postTtavHighlightUpdate(payload);
+        }, 1200);
+    };
+
+    const openTtavWithPayload = (payload: TtavJumpPayload) => {
+        const launchUrl = buildTtavLaunchUrl(payload);
+        const openedWindow = window.open(launchUrl, '_blank');
+        if (!openedWindow) return null;
+
+        ttavWindowRef.current = openedWindow;
+        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
+        ttavWindowSampleIdRef.current = payload.sampleId;
+
+        window.setTimeout(() => {
+            postTtavHighlightUpdate(payload);
+        }, 1200);
+        return openedWindow;
+    };
+
+    const callEifBundleApi = async (requireCached: boolean) => {
+        if (!report || !selectedMeta) return null;
+
+        const sampleId = selectedSampleId;
+        const trimmedApiUrl = eifApiUrl.trim();
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+
+        if (!trimmedApiUrl) {
+            throw new Error('EIF API URL is required.');
+        }
+
+        const apiResp = await fetch(trimmedApiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                reportFileName: selectedMeta.fileName,
+                sampleId,
+                testData: 'sft_test.jsonl',
+                modelPath: null,
+                ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
+                ttavUrl: trimmedUrl,
+                visMethod,
+                visId,
+                eifBundleCachePath: resolvedEifBundleCachePath,
+                selectedIndices: ttavSelectedIndices,
+                targetIndex: selectedTokIdx ?? undefined,
+                requireCached,
+            }),
+        });
+
+        const rawText = await apiResp.text();
+        let parsedJson: Record<string, unknown> | null = null;
+        if (rawText.trim()) {
+            try {
+                parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+            } catch {
+                throw new Error(
+                    `EIF API returned a non-JSON response (HTTP ${apiResp.status}). ` +
+                    `${rawText.slice(0, 240)}`
+                );
+            }
+        }
+
+        const apiJson = parsedJson ?? {};
+        if (!apiResp.ok || apiJson.status !== 'success') {
+            const baseMessage = 'EIF bundle API failed (HTTP ' + apiResp.status + ')';
+            const message = typeof apiJson.message === 'string'
+                ? baseMessage + ': ' + apiJson.message
+                : baseMessage;
+            throw new Error(message);
+        }
+
+        return {
+            sampleId: typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId,
+            contentPath: typeof apiJson.contentPath === 'string'
+                ? apiJson.contentPath
+                : resolveContentPath(ttavContentPathTemplate, sampleId),
+            visMethod: typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod,
+            visId: typeof apiJson.visId === 'string' ? apiJson.visId : visId,
+            eifBundleCachePath: typeof apiJson.eifBundleCachePath === 'string' ? apiJson.eifBundleCachePath : resolvedEifBundleCachePath,
+            eifCacheHit: apiJson.eifCacheHit === true,
+            ttavCached: typeof apiJson.uploadResult === 'object' && apiJson.uploadResult !== null && (apiJson.uploadResult as { cached?: boolean }).cached === true,
+        };
+    };
+
+    const handleOpenInTtav = () => {
+        if (!report || !selectedMeta) return;
+
+        const sampleId = selectedSampleId;
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+        if (!trimmedUrl) {
+            setTtavLaunchError('TTAV URL is required.');
+            return;
+        }
+
+        const optimisticPayload = buildCurrentTtavPayload();
+        if (!optimisticPayload) {
+            setTtavLaunchError('Unable to build TTAV jump payload.');
+            return;
+        }
+
+        const openedWindow = openTtavWithPayload(optimisticPayload);
+        if (!openedWindow) {
+            setTtavLaunchError('Browser blocked the Visualizer window. Please allow pop-ups for this page.');
+            return;
+        }
+
+        void (async () => {
+            setTtavLaunchError(null);
+            setTtavLaunchStatus(`Visualizer opening for ${optimisticPayload.sampleId}...`);
+            try {
+                new URL(trimmedUrl);
+                const apiResult = await callEifBundleApi(true);
+                if (!apiResult) return;
+                savePreparedTtavBundle({
+                    sampleId: apiResult.sampleId,
+                    contentPath: apiResult.contentPath,
+                    visMethod: apiResult.visMethod,
+                    visId: apiResult.visId,
+                    preparedAt: Date.now(),
+                });
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId: apiResult.sampleId,
+                    contentPath: apiResult.contentPath,
+                    visMethod: apiResult.visMethod,
+                    visId: apiResult.visId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: ttavSelectedIndices,
+                    targetIndex: selectedTokIdx ?? undefined,
+                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
+                    promptLen,
+                };
+                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
+                    navigateTtavWindow(openedWindow, payload);
+                }
+                setTtavLaunchStatus(`Visualizer opened for ${apiResult.sampleId}.`);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Failed to open Visualizer';
+                if (!shouldFallbackToDirectPrepare(msg)) {
+                    setTtavLaunchError(msg);
+                    setTtavLaunchStatus(null);
+                    return;
+                }
+
+                const preparedBundle = getPreparedTtavBundle(sampleId);
+                const fallbackContentPath = preparedBundle?.contentPath || resolveContentPath(ttavContentPathTemplate, sampleId);
+                const fallbackVisMethod = preparedBundle?.visMethod || visMethod;
+                const fallbackVisId = preparedBundle?.visId || visId;
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId,
+                    contentPath: fallbackContentPath,
+                    visMethod: fallbackVisMethod,
+                    visId: fallbackVisId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: ttavSelectedIndices,
+                    targetIndex: selectedTokIdx ?? undefined,
+                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
+                    promptLen,
+                };
+                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
+                    navigateTtavWindow(openedWindow, payload);
+                }
+                setTtavLaunchError(null);
+                setTtavLaunchStatus(preparedBundle
+                    ? `Visualizer opened for ${sampleId} using the most recently prepared TTAV bundle.`
+                    : `Visualizer opened for ${sampleId} using existing TTAV bundle.`);
+            }
+        })();
+    };
+
+
+    const toggleTrainPairSelection = (trainIdx: number, pairId: string) => {
+        setSelectedTrainPairIdsByGroup(current => {
+            const prev = new Set(current[trainIdx] ?? []);
+            if (prev.has(pairId)) {
+                prev.delete(pairId);
+            } else {
+                prev.add(pairId);
+            }
+            return {
+                ...current,
+                [trainIdx]: Array.from(prev),
+            };
+        });
+        setTrainProbeComparisons(current => {
+            if (!(trainIdx in current)) return current;
+            const next = { ...current };
+            delete next[trainIdx];
+            return next;
+        });
+    };
+
+    const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
+        if (!report || !selectedMeta) return;
+
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+        if (!trimmedUrl) {
+            setTtavLaunchError('TTAV URL is required.');
+            return;
+        }
+
+        const openedWindow = window.open(trimmedUrl, '_blank');
+        if (!openedWindow) {
+            setTtavLaunchError('Browser blocked the probe window. Please allow pop-ups for this page.');
+            return;
+        }
+
+        const selectedPairIdSet = new Set(selectedTrainPairIdsByGroup[trainIdx] ?? []);
+        const selectedPairs = selectedPairIdSet.size > 0
+            ? pairs.filter(pair => selectedPairIdSet.has(pair.id))
+            : [];
+        const focusTrainIndices = Array.from(new Set(selectedPairs.flatMap(pair => [
+            pair.train_correlation.source_token_index,
+            pair.train_correlation.target_token_index,
+        ]))).sort((a, b) => a - b);
+
+        setProbingTrainSampleId(trainIdx);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(`Preparing full-train embedding probe for TRAIN #${trainIdx}...`);
+
+        void (async () => {
+            try {
+                const probeResp = await fetch(buildEifApiUrl(eifApiUrl, '/api/prepare-ttav-train-probe'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        sampleId: selectedSampleId,
+                        trainSampleId: trainIdx,
+                        ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
+                        ttavUrl: trimmedUrl,
+                        visMethod,
+                        visId,
+                        contextRadius: 1,
+                        includeFullTrain: true,
+                        focusTrainIndices,
+                        probePairs: pairs.map(pair => ({
+                            id: pair.id,
+                            trainSourceIndex: pair.train_correlation.source_token_index,
+                            trainTargetIndex: pair.train_correlation.target_token_index,
+                            testSourceIndex: pair.test_correlation.source_token_index,
+                            testTargetIndex: pair.test_correlation.target_token_index,
+                        })),
+                    }),
+                });
+
+                const rawText = await probeResp.text();
+                let parsedJson: Record<string, unknown> | null = null;
+                if (rawText.trim()) {
+                    try {
+                        parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(
+                            `EIF train probe API returned a non-JSON response (HTTP ${probeResp.status}). ` +
+                            `${rawText.slice(0, 240)}`
+                        );
+                    }
+                }
+
+                const apiJson = parsedJson ?? {};
+                if (!probeResp.ok || apiJson.status !== 'success') {
+                    const baseMessage = 'EIF train probe API failed (HTTP ' + probeResp.status + ')';
+                    const message = typeof apiJson.message === 'string'
+                        ? baseMessage + ': ' + apiJson.message
+                        : baseMessage;
+                    throw new Error(message);
+                }
+
+                const comparisonSummary = (typeof apiJson.comparisonSummary === 'object' && apiJson.comparisonSummary !== null)
+                    ? apiJson.comparisonSummary as TrainProbeComparisonSummary
+                    : { focusTokens: [], pairwiseCosine: [] };
+                setTrainProbeComparisons(current => ({
+                    ...current,
+                    [trainIdx]: comparisonSummary,
+                }));
+
+                const browserUploadRequired = apiJson.browserUploadRequired === true;
+                let resolvedSampleId = typeof apiJson.sampleId === 'string'
+                    ? apiJson.sampleId
+                    : `${selectedSampleId}_train${trainIdx}_probe`;
+                let resolvedContentPath = typeof apiJson.contentPath === 'string' ? apiJson.contentPath : '';
+                let resolvedVisMethod = typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod;
+                let resolvedVisId = typeof apiJson.visId === 'string' ? apiJson.visId : visId;
+
+                if (browserUploadRequired) {
+                    setTtavLaunchStatus(`Probe computed on EIF; uploading TRAIN #${trainIdx} probe to TTAV from browser...`);
+                    const bundlePayload = (typeof apiJson.bundlePayload === 'object' && apiJson.bundlePayload !== null)
+                        ? apiJson.bundlePayload
+                        : null;
+                    if (!bundlePayload) {
+                        throw new Error(typeof apiJson.uploadError === 'string'
+                            ? apiJson.uploadError
+                            : 'Probe bundle upload fallback payload is missing.');
+                    }
+
+                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
+                    const uploadResp = await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(bundlePayload),
+                    });
+                    const uploadRawText = await uploadResp.text();
+                    let uploadJson: Record<string, unknown> | null = null;
+                    if (uploadRawText.trim()) {
+                        try {
+                            uploadJson = JSON.parse(uploadRawText) as Record<string, unknown>;
+                        } catch {
+                            throw new Error(
+                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
+                                `${uploadRawText.slice(0, 240)}`
+                            );
+                        }
+                    }
+
+                    const uploadApiJson = uploadJson ?? {};
+                    if (!uploadResp.ok || uploadApiJson.status !== 'success') {
+                        const message = typeof uploadApiJson.message === 'string'
+                            ? uploadApiJson.message
+                            : `Failed to register TTAV probe bundle (HTTP ${uploadResp.status})`;
+                        throw new Error(message);
+                    }
+
+                    resolvedSampleId = typeof uploadApiJson.sample_id === 'string'
+                        ? uploadApiJson.sample_id
+                        : (typeof uploadApiJson.sampleId === 'string' ? uploadApiJson.sampleId : resolvedSampleId);
+                    resolvedContentPath = typeof uploadApiJson.content_path === 'string'
+                        ? uploadApiJson.content_path
+                        : (typeof uploadApiJson.contentPath === 'string' ? uploadApiJson.contentPath : resolvedContentPath);
+                    resolvedVisMethod = typeof uploadApiJson.vis_method === 'string'
+                        ? uploadApiJson.vis_method
+                        : (typeof uploadApiJson.visMethod === 'string' ? uploadApiJson.visMethod : resolvedVisMethod);
+                    resolvedVisId = typeof uploadApiJson.vis_id === 'string'
+                        ? uploadApiJson.vis_id
+                        : (typeof uploadApiJson.visId === 'string' ? uploadApiJson.visId : resolvedVisId);
+                }
+
+                const payload: TtavJumpPayload = {
+                    source: 'eif',
+                    sampleId: resolvedSampleId,
+                    contentPath: resolvedContentPath,
+                    visMethod: resolvedVisMethod,
+                    visId: resolvedVisId,
+                    dataType: 'Text',
+                    taskType: 'Alignment',
+                    selectedIndices: Array.isArray(apiJson.selectedIndices)
+                        ? apiJson.selectedIndices.filter((value): value is number => typeof value === 'number')
+                        : [],
+                    targetIndex: typeof apiJson.targetIndex === 'number' ? apiJson.targetIndex : undefined,
+                    promptLen: typeof apiJson.promptLen === 'number' ? apiJson.promptLen : 0,
+                };
+
+                navigateTtavWindow(openedWindow, payload);
+                setTtavLaunchStatus(browserUploadRequired
+                    ? `Full-train probe opened for TRAIN #${trainIdx} using browser upload fallback.`
+                    : `Full-train probe opened for TRAIN #${trainIdx}.`);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Failed to open embedding probe';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+                if (!openedWindow.closed) {
+                    openedWindow.close();
+                }
+            } finally {
+                setProbingTrainSampleId(current => (current === trainIdx ? null : current));
+            }
+        })();
+    };
+
+    useEffect(() => {
+        if (!ttavWindowRef.current || ttavWindowRef.current.closed) return;
+        if (!selectedSampleId || ttavWindowSampleIdRef.current !== selectedSampleId) return;
+
+        postTtavHighlightUpdate();
+    }, [postTtavHighlightUpdate, selectedSampleId]);
+
+    const handlePrepareTtavBundle = async () => {
+        if (!report || !selectedMeta) return;
+
+        const sampleId = selectedSampleId;
+        const trimmedUrl = ttavUrl.trim();
+        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
+        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+
+        setPreparingTtavBundle(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(null);
+
+        const eifApiHost = (() => {
+            try {
+                return new URL(eifApiUrl).host;
+            } catch {
+                return eifApiUrl;
+            }
+        })();
+        setTtavPrepareDetail(`Connecting to EIF API (${eifApiHost})...`);
+
+        let statusPollTimer: number | null = null;
+        let statusPollActive = true;
+        const pollPrepareStatus = async () => {
+            if (!statusPollActive) return;
+            try {
+                const statusPayload = await fetchEifPrepareStatus(eifApiUrl, sampleId);
+                if (!statusPollActive || !statusPayload) return;
+                setTtavPrepareDetail(statusPayload.message);
+            } catch {
+                // Ignore status polling failures and let the main request decide fallback behavior.
+            }
+        };
+
+        try {
+            const initialStatus = await fetchEifPrepareStatus(eifApiUrl, sampleId, 2500);
+            if (!initialStatus) {
+                throw new Error(`Unable to reach EIF API at ${eifApiHost}`);
+            }
+
+            setTtavPrepareDetail(`Submitting prepare request to EIF API (${eifApiHost})...`);
+            void pollPrepareStatus();
+            statusPollTimer = window.setInterval(() => {
+                void pollPrepareStatus();
+            }, 1000);
+
+            const requestSubmittedTimer = window.setTimeout(() => {
+                setTtavPrepareDetail('EIF API request submitted. Waiting for server-side embedding computation...');
+            }, 1200);
+
+            const apiResult = await callEifBundleApi(false);
+            window.clearTimeout(requestSubmittedTimer);
+            if (!apiResult) return;
+            savePreparedTtavBundle({
+                sampleId: apiResult.sampleId,
+                contentPath: apiResult.contentPath,
+                visMethod: apiResult.visMethod,
+                visId: apiResult.visId,
+                preparedAt: Date.now(),
+            });
+            const eifMsg = apiResult.eifCacheHit
+                ? 'EIF cache reused'
+                : 'EIF cache created';
+            const ttavMsg = apiResult.ttavCached
+                ? 'TTAV cache reused'
+                : 'sent to TTAV';
+            setTtavLaunchStatus(`${apiResult.sampleId}: ${eifMsg}; ${ttavMsg}.`);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Failed to prepare TTAV bundle';
+            if (!shouldFallbackToDirectPrepare(msg) && !msg.toLowerCase().includes('unable to reach eif api')) {
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } else {
+                try {
+                    setTtavPrepareDetail(`EIF API unreachable; uploading precomputed real bundle to TTAV...`);
+                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
+                    const bundlePayload = await loadPrecomputedRealBundle(sampleId, visMethod, visId);
+                    const uploadResp = await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(bundlePayload),
+                    });
+                    const rawText = await uploadResp.text();
+                    let parsedJson: Record<string, unknown> | null = null;
+                    if (rawText.trim()) {
+                        try {
+                            parsedJson = JSON.parse(rawText) as Record<string, unknown>;
+                        } catch {
+                            throw new Error(
+                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
+                                `${rawText.slice(0, 240)}`
+                            );
+                        }
+                    }
+                    const apiJson = parsedJson ?? {};
+                    if (!uploadResp.ok || apiJson.status !== 'success') {
+                        const message = typeof apiJson.message === 'string'
+                            ? apiJson.message
+                            : `Failed to register TTAV bundle (HTTP ${uploadResp.status})`;
+                        throw new Error(message);
+                    }
+                    const returnedSampleId = typeof apiJson.sample_id === 'string'
+                        ? apiJson.sample_id
+                        : (typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId);
+                    const returnedContentPath = typeof apiJson.content_path === 'string'
+                        ? apiJson.content_path
+                        : (typeof apiJson.contentPath === 'string'
+                            ? apiJson.contentPath
+                            : resolveContentPath(ttavContentPathTemplate, returnedSampleId));
+                    savePreparedTtavBundle({
+                        sampleId: returnedSampleId,
+                        contentPath: returnedContentPath,
+                        visMethod,
+                        visId,
+                        preparedAt: Date.now(),
+                    });
+                    const ttavMsg = apiJson.cached === true ? 'TTAV cache reused' : 'sent to TTAV';
+                    setTtavLaunchError(null);
+                    setTtavLaunchStatus(`${returnedSampleId}: precomputed real bundle used; ${ttavMsg}.`);
+                } catch (fallbackError) {
+                    const fallbackMsg = fallbackError instanceof Error
+                        ? fallbackError.message
+                        : 'Failed to prepare TTAV bundle';
+                    setTtavLaunchError(fallbackMsg);
+                    setTtavLaunchStatus(null);
+                }
+            }
+        } finally {
+            statusPollActive = false;
+            if (statusPollTimer !== null) {
+                window.clearInterval(statusPollTimer);
+            }
+            setTtavPrepareDetail(null);
+            setPreparingTtavBundle(false);
+        }
+    };
 
     // ── Render ──
 
     return (
         <div className={styles.root}>
+            <div className={styles.importPanel}>
+                <div className={styles.importPanelText}>
+                    <div className={styles.importPanelTitle}>Import saliency JSON</div>
+                    <div className={styles.importPanelDesc}>
+                        Drop a report here, choose a local file, or load a CORS-enabled JSON URL.
+                    </div>
+                </div>
+                <label
+                    className={`${styles.importDropZone} ${draggingImport ? styles.importDropZoneActive : ''}`}
+                    onDragOver={event => {
+                        event.preventDefault();
+                        setDraggingImport(true);
+                    }}
+                    onDragLeave={() => setDraggingImport(false)}
+                    onDrop={handleImportDrop}
+                >
+                    <input
+                        type="file"
+                        accept=".json,application/json"
+                        onChange={handleImportInputChange}
+                        className={styles.importFileInput}
+                    />
+                    <span className={styles.importDropMain}>Choose JSON</span>
+                    <span className={styles.importDropSub}>all-token report or generic saliency format</span>
+                </label>
+                <div className={styles.importUrlRow}>
+                    <input
+                        value={reportUrl}
+                        onChange={event => setReportUrl(event.target.value)}
+                        placeholder="https://example.com/my_saliency.json"
+                        className={styles.importUrlInput}
+                    />
+                    <button
+                        type="button"
+                        onClick={() => void loadReportFromUrl(reportUrl)}
+                        disabled={loadingReportUrl}
+                        className={styles.importUrlButton}
+                    >
+                        {loadingReportUrl ? 'Loading...' : 'Load URL'}
+                    </button>
+                </div>
+                {importStatus && <div className={styles.importStatus}>{importStatus}</div>}
+                {importError && <div className={styles.importError}>{importError}</div>}
+            </div>
 
             {/* ── Experiment selector ── */}
             {metas.length > 0 && (
@@ -1762,10 +2334,18 @@ export function NewView({ metas }: Props) {
                     ))}
                 </div>
             )}
+            {metas.length === 0 && (
+                <div className={styles.metaSelector}>
+                    <span className={styles.metaSelectorLabel}>Bundled samples:</span>
+                    <span className={styles.metaSelectorHint}>
+                        No all-token experiment files found. Import a JSON report above.
+                    </span>
+                </div>
+            )}
 
-            {selectedMetaIdx === null && (
+            {selectedMetaIdx === null && !report && (
                 <div className={styles.emptyState}>
-                    Please select an experiment from the top to load the data.
+                    Select a bundled experiment or import a saliency JSON file.
                 </div>
             )}
 
@@ -1903,7 +2483,7 @@ export function NewView({ metas }: Props) {
                                                 disabled={exportScope !== 'range'}
                                                 style={{ width: 56, padding: '2px 4px', border: '1px solid #d1d5db', borderRadius: 4 }} />
                                         </label>
-                                        {metas.length > 1 && (
+                                        {!importedReportActive && metas.length > 1 && (
                                             <label style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 8, cursor: 'pointer' }}>
                                                 <input type="checkbox" checked={exportBatch}
                                                     onChange={e => setExportBatch(e.target.checked)} />
@@ -1922,6 +2502,12 @@ export function NewView({ metas }: Props) {
                                             {exporting ? 'Exporting…' : 'Export Markdown'}
                                         </button>
                                     </div>
+                                    {importedReportActive ? (
+                                        <div className={styles.importedReportNotice}>
+                                            TTAV bundle preparation is available only for bundled experiment files.
+                                            Imported saliency JSON can still be inspected here and exported to Markdown.
+                                        </div>
+                                    ) : (
                                     <div style={{
                                         marginTop: 8, paddingTop: 8,
                                         borderTop: '1px solid #e5e7eb',
@@ -2070,11 +2656,14 @@ export function NewView({ metas }: Props) {
                                             </div>
                                         )}
                                     </div>
+                                    )}
                                 </div>
 
                                 {trainGroups.length === 0 ? (
                                     <div className={styles.emptyState} style={{ padding: '32px 0' }}>
-                                        No matching pairs. Try lowering the threshold.
+                                        {importedReportActive
+                                            ? 'No training correlation pairs are included in this imported report.'
+                                            : 'No matching pairs. Try lowering the threshold.'}
                                     </div>
                                 ) : (
                                     <div className={styles.trainGroupList}>
@@ -2084,7 +2673,7 @@ export function NewView({ metas }: Props) {
                                                 trainIdx={id}
                                                 pairs={pairs}
                                                 detail={report.train_sample_details[String(id)]}
-                                                onProbeEmbeddings={handleOpenTrainProbe}
+                                                onProbeEmbeddings={importedReportActive ? undefined : handleOpenTrainProbe}
                                                 probeBusy={probingTrainSampleId === id}
                                                 selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
                                                 onTogglePairSelection={toggleTrainPairSelection}
