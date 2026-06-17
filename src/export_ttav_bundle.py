@@ -9,6 +9,7 @@ from sklearn.decomposition import PCA
 
 
 DEFAULT_TTAV_UPLOAD_URL = "http://1.94.115.154/registerEIFBundle"
+_UMAP_MIN_POINTS = 6  # fall back to PCA for very small token sequences
 
 
 def infer_sample_id(report_json_path: str) -> str:
@@ -49,7 +50,7 @@ def build_short_token_label(token: str, idx: int, role: str) -> str:
     return f"{role_tag}{idx}: {shortened}"
 
 
-def compute_projection(embeddings: np.ndarray) -> np.ndarray:
+def compute_projection(embeddings: np.ndarray, use_umap: bool = False) -> np.ndarray:
     num_points = embeddings.shape[0]
     if num_points == 0:
         return np.zeros((0, 2), dtype=np.float32)
@@ -57,6 +58,16 @@ def compute_projection(embeddings: np.ndarray) -> np.ndarray:
         return np.zeros((1, 2), dtype=np.float32)
     if embeddings.shape[1] == 1:
         return np.concatenate([embeddings.astype(np.float32), np.zeros((num_points, 1), dtype=np.float32)], axis=1)
+
+    if use_umap and num_points >= _UMAP_MIN_POINTS:
+        try:
+            import umap
+            n_neighbors = min(15, num_points - 1)
+            reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
+            proj = reducer.fit_transform(embeddings)
+            return proj.astype(np.float32)
+        except Exception:
+            pass  # fall through to PCA
 
     pca = PCA(n_components=2, random_state=0)
     proj = pca.fit_transform(embeddings)

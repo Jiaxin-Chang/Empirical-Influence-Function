@@ -5,7 +5,7 @@ const TTAV_PREFS_KEY = 'eif:ttav-launch-prefs';
 const TTAV_PREPARED_BUNDLES_KEY = 'eif:ttav-prepared-bundles';
 const DEFAULT_TTAV_URL = 'http://1.94.115.154/';
 const DEFAULT_TTAV_CONTENT_PATH_TEMPLATE = '/root/project/Dataset/eif_bundles/{sampleId}';
-const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/home/yilu/workspace/Empirical-Influence-Function/ttav_bundles/{sampleId}';
+const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/root/project/Empirical-Influence-Function/ttav_bundles/{sampleId}';
 const DEFAULT_TTAV_METHOD = 'TimeVis';
 const DEFAULT_TTAV_VIS_ID = '1';
 function getDefaultEifApiUrl(): string {
@@ -203,6 +203,11 @@ async function loadPrecomputedRealBundle(sampleId: string, visMethod: string, vi
         throw new Error(`Precomputed real bundle not found for ${sampleId} (HTTP ${bundleResp.status}).`);
     }
 
+    const contentType = bundleResp.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+        throw new Error(`Precomputed real bundle not found for ${sampleId}. No bundle file at ttav_bundles_real/${sampleId}/bundle_payload.json.`);
+    }
+
     const payload = await bundleResp.json() as TtavStaticBundlePayload;
     return {
         ...payload,
@@ -287,7 +292,7 @@ function loadTtavLaunchPrefs(): TtavLaunchPrefs {
         const legacyMethod = parsed.visMethod?.trim().toUpperCase() === 'UMAP';
         const legacyPath = parsed.contentPathTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/');
         const legacyEifCachePath = parsed.eifBundleCacheTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/')
-            || parsed.eifBundleCacheTemplate?.includes('/root/project/Empirical-Influence-Function/ttav_bundles/');
+            || parsed.eifBundleCacheTemplate?.includes('/home/yilu/workspace/Empirical-Influence-Function/ttav_bundles/');
         const defaultApiHost = new URL(DEFAULT_EIF_API_URL).host;
         const parsedApiHost = parsed.eifApiUrl ? (() => {
             try {
@@ -1244,6 +1249,9 @@ export function NewView({ metas }: Props) {
             eifBundleCachePath: typeof apiJson.eifBundleCachePath === 'string' ? apiJson.eifBundleCachePath : resolvedEifBundleCachePath,
             eifCacheHit: apiJson.eifCacheHit === true,
             ttavCached: typeof apiJson.uploadResult === 'object' && apiJson.uploadResult !== null && (apiJson.uploadResult as { cached?: boolean }).cached === true,
+            trainableSessionStatus: typeof apiJson.trainableSessionStatus === 'string' ? apiJson.trainableSessionStatus : 'registered',
+            refineReady: apiJson.refineReady === true,
+            statusMessage: typeof apiJson.statusMessage === 'string' ? apiJson.statusMessage : null,
         };
     };
 
@@ -1301,7 +1309,9 @@ export function NewView({ metas }: Props) {
                 if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
                     navigateTtavWindow(openedWindow, payload);
                 }
-                setTtavLaunchStatus(`Visualizer opened for ${apiResult.sampleId}.`);
+                setTtavLaunchStatus(apiResult.refineReady
+                    ? `Visualizer opened for ${apiResult.sampleId}. Adaptive refine is ready.`
+                    : (apiResult.statusMessage ?? `Visualizer opened for ${apiResult.sampleId}. Adaptive refine session is still preparing.`));
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Failed to open Visualizer';
                 if (!shouldFallbackToDirectPrepare(msg)) {
@@ -1469,7 +1479,24 @@ export function NewView({ metas }: Props) {
                     const uploadResp = await fetch(uploadUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(bundlePayload),
+                        body: JSON.stringify({
+                            ...bundlePayload,
+                            build_trainable_session: true,
+                            wait_until_ready: false,
+                            data_type: 'Text',
+                            task_type: 'Alignment',
+                            vis_config: {
+                                gpu_id: -1,
+                                n_neighbors: 10,
+                                max_epochs: 10,
+                                patient: 3,
+                                s_n_epochs: 500,
+                                b_n_epochs: 0,
+                                t_n_epochs: 5,
+                                lambda: 1.0,
+                                refine_hd_k: 15,
+                            },
+                        }),
                     });
                     const uploadRawText = await uploadResp.text();
                     let uploadJson: Record<string, unknown> | null = null;
@@ -1611,7 +1638,10 @@ export function NewView({ metas }: Props) {
             const ttavMsg = apiResult.ttavCached
                 ? 'TTAV cache reused'
                 : 'sent to TTAV';
-            setTtavLaunchStatus(`${apiResult.sampleId}: ${eifMsg}; ${ttavMsg}.`);
+            const refineMsg = apiResult.refineReady
+                ? 'adaptive refine ready'
+                : (apiResult.statusMessage ?? `adaptive refine ${apiResult.trainableSessionStatus}`);
+            setTtavLaunchStatus(`${apiResult.sampleId}: ${eifMsg}; ${ttavMsg}; ${refineMsg}.`);
         } catch (error) {
             const msg = error instanceof Error ? error.message : 'Failed to prepare TTAV bundle';
             if (!shouldFallbackToDirectPrepare(msg) && !msg.toLowerCase().includes('unable to reach eif api')) {
@@ -1625,7 +1655,24 @@ export function NewView({ metas }: Props) {
                     const uploadResp = await fetch(uploadUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(bundlePayload),
+                        body: JSON.stringify({
+                            ...bundlePayload,
+                            build_trainable_session: true,
+                            wait_until_ready: false,
+                            data_type: 'Text',
+                            task_type: 'Alignment',
+                            vis_config: {
+                                gpu_id: -1,
+                                n_neighbors: 10,
+                                max_epochs: 10,
+                                patient: 3,
+                                s_n_epochs: 500,
+                                b_n_epochs: 0,
+                                t_n_epochs: 5,
+                                lambda: 1.0,
+                                refine_hd_k: 15,
+                            },
+                        }),
                     });
                     const rawText = await uploadResp.text();
                     let parsedJson: Record<string, unknown> | null = null;

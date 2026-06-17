@@ -17,7 +17,7 @@ from src.export_ttav_bundle import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL_PATH = REPO_ROOT / "src" / "sft" / "scripts" / "nif-checkpoints" / "checkpoint-full"
+DEFAULT_MODEL_PATH = REPO_ROOT / "src" / "sft" / "scripts" / "nif-checkpoints" / "checkpoint-full" / "checkpoint-2785"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "ttav_bundles_real"
 _MODEL_AND_TOKENIZER_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
 ProgressCallback = Callable[[str, str], None]
@@ -215,8 +215,8 @@ def build_real_bundle_payload(
         token_list.append(normalize_token_for_display(token))
 
     if progress_callback:
-        progress_callback("projecting_embeddings", "Projecting embeddings to 2D")
-    projection = compute_projection(embeddings)
+        progress_callback("projecting_embeddings", "Projecting embeddings to 2D via UMAP")
+    projection = compute_projection(embeddings, use_umap=True)
 
     if progress_callback:
         progress_callback("packaging_bundle", "Packaging TTAV bundle payload")

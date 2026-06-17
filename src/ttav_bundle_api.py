@@ -335,8 +335,25 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             payload["vis_method"] = vis_method
             payload["vis_id"] = vis_id
             payload["overwrite"] = overwrite_remote
+            payload["build_trainable_session"] = True
+            payload["wait_until_ready"] = False
+            payload["data_type"] = "Text"
+            payload["task_type"] = "Alignment"
+            payload["vis_config"] = {
+                "gpu_id": -1,
+                "n_neighbors": 10,
+                "max_epochs": 10,
+                "patient": 3,
+                "s_n_epochs": 500,
+                "b_n_epochs": 0,
+                "t_n_epochs": 5,
+                "lambda": 1.0,
+                "refine_hd_k": 15,
+            }
             _set_prepare_status(resolved_sample_id, "writing_local_cache", "Writing EIF local bundle cache", active=True)
             write_local_bundle_cache(resolved_sample_id, payload, explicit_path=explicit_cache_path)
+            real_bundle_dir = REPO_ROOT / "ttav_bundles_real" / resolved_sample_id
+            write_local_bundle_cache(resolved_sample_id, payload, explicit_path=str(real_bundle_dir))
             _set_prepare_status(resolved_sample_id, "uploading_to_ttav", "Uploading bundle to TTAV", active=True)
             upload_result = upload_bundle(ttav_upload_url, payload)
             elapsed = time() - started_at
@@ -366,6 +383,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "embeddingType": embedding_type,
             "overwrite": overwrite_remote,
             "uploadResult": upload_result,
+            "refineReady": upload_result.get("refineReady", False),
+            "trainableSessionStatus": upload_result.get("trainableSessionStatus", "registered"),
+            "statusMessage": upload_result.get("statusMessage"),
         }
         self._send_json(200, response)
 
