@@ -102,6 +102,287 @@ interface AllTokensReport {
     train_sample_details: Record<string, TrainSampleDetail>;
 }
 
+interface ImportedReport {
+    report: AllTokensReport;
+    meta: AllTokensExperimentMeta;
+    format: 'all_tokens' | 'generic_saliency';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function asFiniteNumber(value: unknown): number | null {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    return value;
+}
+
+function asString(value: unknown): string | null {
+    return typeof value === 'string' ? value : null;
+}
+
+function asStringArray(value: unknown): string[] | null {
+    if (!Array.isArray(value) || !value.every(item => typeof item === 'string')) return null;
+    return value;
+}
+
+function asNumberArray(value: unknown): number[] | null {
+    if (!Array.isArray(value)) return null;
+    const values = value.map(asFiniteNumber);
+    if (values.some(item => item === null)) return null;
+    return values as number[];
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+        const value = asString(record[key]);
+        if (value) return value;
+    }
+    return null;
+}
+
+function firstStringArray(record: Record<string, unknown>, keys: string[]): string[] | null {
+    for (const key of keys) {
+        const value = asStringArray(record[key]);
+        if (value) return value;
+    }
+    return null;
+}
+
+function firstNumber(record: Record<string, unknown>, keys: string[]): number | null {
+    for (const key of keys) {
+        const value = asFiniteNumber(record[key]);
+        if (value !== null) return value;
+    }
+    return null;
+}
+
+function firstNumberArray(record: Record<string, unknown>, keys: string[]): number[] | null {
+    for (const key of keys) {
+        const value = asNumberArray(record[key]);
+        if (value) return value;
+    }
+    return null;
+}
+
+function stemFromSource(sourceName: string): string {
+    const lastPart = sourceName.split(/[\\/]/).pop() || sourceName;
+    return lastPart.replace(/\.json$/i, '') || 'uploaded-report';
+}
+
+function buildImportedMeta(report: AllTokensReport, sourceName: string): AllTokensExperimentMeta {
+    const stem = stemFromSource(sourceName);
+    const testIndex = report.experiment_meta.test_sample_index;
+    const taskId = testIndex >= 0 ? `uploaded_test${testIndex}_${stem}` : `uploaded_${stem}`;
+    return {
+        taskId,
+        label: `${stem} (uploaded)`,
+        fileName: sourceName,
+    };
+}
+
+function isAllTokensReportLike(value: unknown): value is AllTokensReport {
+    if (!isRecord(value)) return false;
+    const experimentMeta = value.experiment_meta;
+    const baseline = value.test_sample_baseline;
+    if (!isRecord(experimentMeta) || !isRecord(baseline)) return false;
+    return Array.isArray(value.per_token_results)
+        && asStringArray(baseline.full_tokens) !== null
+        && asFiniteNumber(baseline.prompt_len) !== null;
+}
+
+function normalizeTestCorrelation(value: unknown, tokens: string[], fallbackTargetIdx: number): TestCorrelation | null {
+    if (!isRecord(value)) return null;
+    const sourceIdx = asFiniteNumber(value.source_token_index);
+    const targetIdx = asFiniteNumber(value.target_token_index) ?? fallbackTargetIdx;
+    const score = asFiniteNumber(value.saliency_score);
+    if (sourceIdx === null || targetIdx === null || score === null) return null;
+    const sourceIndex = Math.trunc(sourceIdx);
+    const targetIndex = Math.trunc(targetIdx);
+    return {
+        source_token: asString(value.source_token) ?? tokens[sourceIndex] ?? '',
+        source_token_index: sourceIndex,
+        target_token: asString(value.target_token) ?? tokens[targetIndex] ?? '',
+        target_token_index: targetIndex,
+        saliency_score: score,
+    };
+}
+
+function normalizeAllTokensReport(report: AllTokensReport): AllTokensReport {
+    const baseline = report.test_sample_baseline;
+    const fullTokens = asStringArray(baseline.full_tokens) ?? [];
+    const promptLen = Math.max(0, Math.min(fullTokens.length, Math.trunc(asFiniteNumber(baseline.prompt_len) ?? 0)));
+    const correctTokens = asStringArray(baseline.correct_full_tokens) ?? fullTokens;
+    const perTokenResults = (Array.isArray(report.per_token_results) ? report.per_token_results : [])
+        .map((item): PerTokenResult | null => {
+            if (!isRecord(item)) return null;
+            const targetIdxRaw = asFiniteNumber(item.target_token_index);
+            if (targetIdxRaw === null) return null;
+            const targetIdx = Math.trunc(targetIdxRaw);
+            return {
+                target_token_index: targetIdx,
+                target_token: asString(item.target_token) ?? fullTokens[targetIdx] ?? '',
+                top_correlations: (Array.isArray(item.top_correlations) ? item.top_correlations : [])
+                    .map(c => normalizeTestCorrelation(c, fullTokens, targetIdx))
+                    .filter((c): c is TestCorrelation => c !== null),
+                correlation_pairs: Array.isArray(item.correlation_pairs)
+                    ? (item.correlation_pairs as CorrelationPair[])
+                    : [],
+            };
+        })
+        .filter((item): item is PerTokenResult => item !== null);
+
+    return {
+        experiment_meta: {
+            test_sample_index: Math.trunc(asFiniteNumber(report.experiment_meta.test_sample_index) ?? -1),
+            mode: 'all_tokens',
+            tokens_analyzed: Math.trunc(asFiniteNumber(report.experiment_meta.tokens_analyzed) ?? perTokenResults.length),
+        },
+        test_sample_baseline: {
+            full_tokens: fullTokens,
+            correct_full_tokens: correctTokens,
+            prompt_len: promptLen,
+        },
+        per_token_results: perTokenResults,
+        train_sample_details: isRecord(report.train_sample_details)
+            ? report.train_sample_details as Record<string, TrainSampleDetail>
+            : {},
+    };
+}
+
+interface GenericSaliencyItem {
+    targetIdx: number;
+    targetToken?: string;
+    scores: number[];
+}
+
+function readGenericSaliencyItems(record: Record<string, unknown>, tokenCount: number): GenericSaliencyItem[] {
+    const items: GenericSaliencyItem[] = [];
+
+    const pushItem = (raw: unknown) => {
+        if (!isRecord(raw)) return;
+        const targetIdx = firstNumber(raw, ['target_token_index', 'target_index', 'index']);
+        const scores = firstNumberArray(raw, ['scores', 'saliency', 'saliency_scores', 'source_scores']);
+        if (targetIdx === null || !scores) return;
+        const idx = Math.trunc(targetIdx);
+        if (idx < 0 || idx >= tokenCount) return;
+        items.push({
+            targetIdx: idx,
+            targetToken: firstString(raw, ['target_token', 'token']) ?? undefined,
+            scores,
+        });
+    };
+
+    for (const key of ['saliency', 'saliency_list', 'saliencies', 'targets']) {
+        const value = record[key];
+        if (Array.isArray(value)) value.forEach(pushItem);
+    }
+
+    for (const key of ['saliency_by_target', 'saliencyByTarget']) {
+        const value = record[key];
+        if (!isRecord(value)) continue;
+        for (const [targetIdxRaw, scoresRaw] of Object.entries(value)) {
+            const targetIdx = Number(targetIdxRaw);
+            const scores = asNumberArray(scoresRaw);
+            if (!Number.isFinite(targetIdx) || !scores) continue;
+            const idx = Math.trunc(targetIdx);
+            if (idx < 0 || idx >= tokenCount) continue;
+            items.push({ targetIdx: idx, scores });
+        }
+    }
+
+    return items;
+}
+
+function topCorrelationsFromScores(tokens: string[], targetIdx: number, targetToken: string, scores: number[]): TestCorrelation[] {
+    return scores
+        .map((score, idx) => ({ idx, score }))
+        .filter(({ idx, score }) => idx !== targetIdx && idx < tokens.length && Number.isFinite(score) && score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 12)
+        .map(({ idx, score }) => ({
+            source_token: tokens[idx] ?? '',
+            source_token_index: idx,
+            target_token: targetToken,
+            target_token_index: targetIdx,
+            saliency_score: score,
+        }));
+}
+
+function genericSaliencyToAllTokensReport(payload: unknown): AllTokensReport | null {
+    if (!isRecord(payload)) return null;
+
+    const targetTestSample = payload.target_test_sample;
+    const legacyBefore = isRecord(targetTestSample) && isRecord(targetTestSample.before)
+        ? targetTestSample.before
+        : null;
+    const source = legacyBefore ?? payload;
+
+    const tokens = firstStringArray(source, ['full_tokens', 'tokens', 'token_list'])
+        ?? firstStringArray(payload, ['full_tokens', 'tokens', 'token_list']);
+    if (!tokens || tokens.length === 0) return null;
+
+    const promptLenRaw = firstNumber(source, ['prompt_len', 'start_index', 'answer_start_index'])
+        ?? firstNumber(payload, ['prompt_len', 'start_index', 'answer_start_index'])
+        ?? tokens.length;
+    const promptLen = Math.max(0, Math.min(tokens.length, Math.trunc(promptLenRaw)));
+    const correctTokens = firstStringArray(source, ['correct_full_tokens', 'correct_tokens'])
+        ?? firstStringArray(payload, ['correct_full_tokens', 'correct_tokens'])
+        ?? tokens;
+    const saliencyItems = readGenericSaliencyItems(source, tokens.length);
+    if (saliencyItems.length === 0) return null;
+
+    const experimentMeta = payload.experiment_meta;
+    const sampleIndex = firstNumber(payload, ['test_sample_index', 'sample_index'])
+        ?? (isRecord(experimentMeta) ? firstNumber(experimentMeta, ['test_sample_index']) : null)
+        ?? -1;
+
+    return {
+        experiment_meta: {
+            test_sample_index: Math.trunc(sampleIndex),
+            mode: 'all_tokens',
+            tokens_analyzed: saliencyItems.length,
+        },
+        test_sample_baseline: {
+            full_tokens: tokens,
+            correct_full_tokens: correctTokens,
+            prompt_len: promptLen,
+        },
+        per_token_results: saliencyItems.map(item => {
+            const targetToken = item.targetToken ?? tokens[item.targetIdx] ?? '';
+            return {
+                target_token_index: item.targetIdx,
+                target_token: targetToken,
+                top_correlations: topCorrelationsFromScores(tokens, item.targetIdx, targetToken, item.scores),
+                correlation_pairs: [],
+            };
+        }),
+        train_sample_details: {},
+    };
+}
+
+function normalizeImportedReport(payload: unknown, sourceName: string): ImportedReport {
+    if (isAllTokensReportLike(payload)) {
+        const report = normalizeAllTokensReport(payload);
+        return {
+            report,
+            meta: buildImportedMeta(report, sourceName),
+            format: 'all_tokens',
+        };
+    }
+
+    const genericReport = genericSaliencyToAllTokensReport(payload);
+    if (genericReport) {
+        return {
+            report: genericReport,
+            meta: buildImportedMeta(genericReport, sourceName),
+            format: 'generic_saliency',
+        };
+    }
+
+    throw new Error('Unsupported JSON format. Expected an all-token report, or tokens + prompt_len + saliency_list/saliency_by_target.');
+}
+
 interface TtavLaunchPrefs {
     ttavUrl: string;
     contentPathTemplate: string;
@@ -967,6 +1248,93 @@ export function NewView({ metas }: Props) {
     const ttavWindowOriginRef = useRef<string | null>(null);
     const ttavWindowSampleIdRef = useRef<string | null>(null);
 
+    const resetReportInteractionState = useCallback(() => {
+        setSelectedTokIdx(null);
+        setSelectedTestCorrIdx(null);
+        setSelectedTrainPairIdsByGroup({});
+        setTrainProbeComparisons({});
+        setExportBatch(false);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(null);
+        setTtavPrepareDetail(null);
+    }, []);
+
+    const activateImportedPayload = useCallback((payload: unknown, sourceName: string) => {
+        const imported = normalizeImportedReport(payload, sourceName);
+        setReport(imported.report);
+        setActiveMeta(imported.meta);
+        setImportedReportActive(true);
+        setSelectedMetaIdx(null);
+        setLoading(false);
+        setLoadError(false);
+        resetReportInteractionState();
+        setImportError(null);
+        setImportStatus(
+            `Loaded ${imported.report.per_token_results.length} analyzed token(s) from ${sourceName} (${imported.format}).`
+        );
+    }, [resetReportInteractionState]);
+
+    const loadReportFromUrl = useCallback(async (rawUrl: string) => {
+        const trimmedUrl = rawUrl.trim();
+        if (!trimmedUrl) {
+            setImportError('Report URL is required.');
+            return;
+        }
+
+        setLoadingReportUrl(true);
+        setImportError(null);
+        setImportStatus(`Loading ${trimmedUrl}...`);
+        try {
+            const url = new URL(trimmedUrl, window.location.href);
+            const resp = await fetch(url.toString(), { cache: 'no-store' });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const payload = await resp.json();
+            activateImportedPayload(payload, url.pathname.split('/').pop() || url.host);
+            setReportUrl(url.toString());
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to load report URL.';
+            setImportError(`Failed to import URL: ${message}`);
+            setImportStatus(null);
+        } finally {
+            setLoadingReportUrl(false);
+        }
+    }, [activateImportedPayload]);
+
+    const handleImportFile = async (file: File | null | undefined) => {
+        if (!file) return;
+        setImportError(null);
+        setImportStatus(`Reading ${file.name}...`);
+        try {
+            const text = await file.text();
+            const payload = JSON.parse(text);
+            activateImportedPayload(payload, file.name);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to parse JSON.';
+            setImportError(`Failed to import ${file.name}: ${message}`);
+            setImportStatus(null);
+        }
+    };
+
+    const handleImportInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+        void handleImportFile(event.target.files?.[0]);
+        event.target.value = '';
+    };
+
+    const handleImportDrop = (event: DragEvent<HTMLLabelElement>) => {
+        event.preventDefault();
+        setDraggingImport(false);
+        void handleImportFile(event.dataTransfer.files?.[0]);
+    };
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const params = new URLSearchParams(window.location.search);
+        const rawReportUrl = params.get('reportUrl') ?? params.get('report_url');
+        if (!rawReportUrl) return;
+        setReportUrl(rawReportUrl);
+        void loadReportFromUrl(rawReportUrl);
+    }, [loadReportFromUrl]);
+
     // Load report when meta selection changes
     useEffect(() => {
         if (metas.length === 0 || selectedMetaIdx === null) return;
@@ -1685,535 +2053,6 @@ export function NewView({ metas }: Props) {
                                 refine_hd_k: 15,
                             },
                         }),
-                    });
-                    const rawText = await uploadResp.text();
-                    let parsedJson: Record<string, unknown> | null = null;
-                    if (rawText.trim()) {
-                        try {
-                            parsedJson = JSON.parse(rawText) as Record<string, unknown>;
-                        } catch {
-                            throw new Error(
-                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
-                                `${rawText.slice(0, 240)}`
-                            );
-                        }
-                    }
-                    const apiJson = parsedJson ?? {};
-                    if (!uploadResp.ok || apiJson.status !== 'success') {
-                        const message = typeof apiJson.message === 'string'
-                            ? apiJson.message
-                            : `Failed to register TTAV bundle (HTTP ${uploadResp.status})`;
-                        throw new Error(message);
-                    }
-                    const returnedSampleId = typeof apiJson.sample_id === 'string'
-                        ? apiJson.sample_id
-                        : (typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId);
-                    const returnedContentPath = typeof apiJson.content_path === 'string'
-                        ? apiJson.content_path
-                        : (typeof apiJson.contentPath === 'string'
-                            ? apiJson.contentPath
-                            : resolveContentPath(ttavContentPathTemplate, returnedSampleId));
-                    savePreparedTtavBundle({
-                        sampleId: returnedSampleId,
-                        contentPath: returnedContentPath,
-                        visMethod,
-                        visId,
-                        preparedAt: Date.now(),
-                    });
-                    const ttavMsg = apiJson.cached === true ? 'TTAV cache reused' : 'sent to TTAV';
-                    setTtavLaunchError(null);
-                    setTtavLaunchStatus(`${returnedSampleId}: precomputed real bundle used; ${ttavMsg}.`);
-                } catch (fallbackError) {
-                    const fallbackMsg = fallbackError instanceof Error
-                        ? fallbackError.message
-                        : 'Failed to prepare TTAV bundle';
-                    setTtavLaunchError(fallbackMsg);
-                    setTtavLaunchStatus(null);
-                }
-            }
-        } finally {
-            statusPollActive = false;
-            if (statusPollTimer !== null) {
-                window.clearInterval(statusPollTimer);
-            }
-            setTtavPrepareDetail(null);
-            setPreparingTtavBundle(false);
-        }
-    };
-
-    // ── Early states ──────────────────────────────────────────────────────────
-
-    const navigateTtavWindow = (targetWindow: Window, payload: TtavJumpPayload) => {
-        targetWindow.location.href = buildTtavLaunchUrl(payload);
-        ttavWindowRef.current = targetWindow;
-        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
-        ttavWindowSampleIdRef.current = payload.sampleId;
-        window.setTimeout(() => {
-            postTtavHighlightUpdate(payload);
-        }, 1200);
-    };
-
-    const openTtavWithPayload = (payload: TtavJumpPayload) => {
-        const launchUrl = buildTtavLaunchUrl(payload);
-        const openedWindow = window.open(launchUrl, '_blank');
-        if (!openedWindow) return null;
-
-        ttavWindowRef.current = openedWindow;
-        ttavWindowOriginRef.current = new URL(ttavUrl.trim()).origin;
-        ttavWindowSampleIdRef.current = payload.sampleId;
-
-        window.setTimeout(() => {
-            postTtavHighlightUpdate(payload);
-        }, 1200);
-        return openedWindow;
-    };
-
-    const callEifBundleApi = async (requireCached: boolean) => {
-        if (!report || !selectedMeta) return null;
-
-        const sampleId = selectedSampleId;
-        const trimmedApiUrl = eifApiUrl.trim();
-        const trimmedUrl = ttavUrl.trim();
-        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
-        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
-
-        if (!trimmedApiUrl) {
-            throw new Error('EIF API URL is required.');
-        }
-
-        const apiResp = await fetch(trimmedApiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                reportFileName: selectedMeta.fileName,
-                sampleId,
-                testData: 'sft_test.jsonl',
-                modelPath: null,
-                ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
-                ttavUrl: trimmedUrl,
-                visMethod,
-                visId,
-                eifBundleCachePath: resolvedEifBundleCachePath,
-                selectedIndices: ttavSelectedIndices,
-                targetIndex: selectedTokIdx ?? undefined,
-                requireCached,
-            }),
-        });
-
-        const rawText = await apiResp.text();
-        let parsedJson: Record<string, unknown> | null = null;
-        if (rawText.trim()) {
-            try {
-                parsedJson = JSON.parse(rawText) as Record<string, unknown>;
-            } catch {
-                throw new Error(
-                    `EIF API returned a non-JSON response (HTTP ${apiResp.status}). ` +
-                    `${rawText.slice(0, 240)}`
-                );
-            }
-        }
-
-        const apiJson = parsedJson ?? {};
-        if (!apiResp.ok || apiJson.status !== 'success') {
-            const baseMessage = 'EIF bundle API failed (HTTP ' + apiResp.status + ')';
-            const message = typeof apiJson.message === 'string'
-                ? baseMessage + ': ' + apiJson.message
-                : baseMessage;
-            throw new Error(message);
-        }
-
-        return {
-            sampleId: typeof apiJson.sampleId === 'string' ? apiJson.sampleId : sampleId,
-            contentPath: typeof apiJson.contentPath === 'string'
-                ? apiJson.contentPath
-                : resolveContentPath(ttavContentPathTemplate, sampleId),
-            visMethod: typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod,
-            visId: typeof apiJson.visId === 'string' ? apiJson.visId : visId,
-            eifBundleCachePath: typeof apiJson.eifBundleCachePath === 'string' ? apiJson.eifBundleCachePath : resolvedEifBundleCachePath,
-            eifCacheHit: apiJson.eifCacheHit === true,
-            ttavCached: typeof apiJson.uploadResult === 'object' && apiJson.uploadResult !== null && (apiJson.uploadResult as { cached?: boolean }).cached === true,
-        };
-    };
-
-    const handleOpenInTtav = () => {
-        if (!report || !selectedMeta) return;
-
-        const sampleId = selectedSampleId;
-        const trimmedUrl = ttavUrl.trim();
-        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
-        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
-        if (!trimmedUrl) {
-            setTtavLaunchError('TTAV URL is required.');
-            return;
-        }
-
-        const optimisticPayload = buildCurrentTtavPayload();
-        if (!optimisticPayload) {
-            setTtavLaunchError('Unable to build TTAV jump payload.');
-            return;
-        }
-
-        const openedWindow = openTtavWithPayload(optimisticPayload);
-        if (!openedWindow) {
-            setTtavLaunchError('Browser blocked the Visualizer window. Please allow pop-ups for this page.');
-            return;
-        }
-
-        void (async () => {
-            setTtavLaunchError(null);
-            setTtavLaunchStatus(`Visualizer opening for ${optimisticPayload.sampleId}...`);
-            try {
-                new URL(trimmedUrl);
-                const apiResult = await callEifBundleApi(true);
-                if (!apiResult) return;
-                savePreparedTtavBundle({
-                    sampleId: apiResult.sampleId,
-                    contentPath: apiResult.contentPath,
-                    visMethod: apiResult.visMethod,
-                    visId: apiResult.visId,
-                    preparedAt: Date.now(),
-                });
-                const payload: TtavJumpPayload = {
-                    source: 'eif',
-                    sampleId: apiResult.sampleId,
-                    contentPath: apiResult.contentPath,
-                    visMethod: apiResult.visMethod,
-                    visId: apiResult.visId,
-                    dataType: 'Text',
-                    taskType: 'Alignment',
-                    selectedIndices: ttavSelectedIndices,
-                    targetIndex: selectedTokIdx ?? undefined,
-                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
-                    promptLen,
-                };
-                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
-                    navigateTtavWindow(openedWindow, payload);
-                }
-                setTtavLaunchStatus(`Visualizer opened for ${apiResult.sampleId}.`);
-            } catch (error) {
-                const msg = error instanceof Error ? error.message : 'Failed to open Visualizer';
-                if (!shouldFallbackToDirectPrepare(msg)) {
-                    setTtavLaunchError(msg);
-                    setTtavLaunchStatus(null);
-                    return;
-                }
-
-                const preparedBundle = getPreparedTtavBundle(sampleId);
-                const fallbackContentPath = preparedBundle?.contentPath || resolveContentPath(ttavContentPathTemplate, sampleId);
-                const fallbackVisMethod = preparedBundle?.visMethod || visMethod;
-                const fallbackVisId = preparedBundle?.visId || visId;
-                const payload: TtavJumpPayload = {
-                    source: 'eif',
-                    sampleId,
-                    contentPath: fallbackContentPath,
-                    visMethod: fallbackVisMethod,
-                    visId: fallbackVisId,
-                    dataType: 'Text',
-                    taskType: 'Alignment',
-                    selectedIndices: ttavSelectedIndices,
-                    targetIndex: selectedTokIdx ?? undefined,
-                    selectedSourceIndex: selectedTestCorrIdx ?? undefined,
-                    promptLen,
-                };
-                if (!openedWindow.closed && buildTtavLaunchUrl(payload) !== buildTtavLaunchUrl(optimisticPayload)) {
-                    navigateTtavWindow(openedWindow, payload);
-                }
-                setTtavLaunchError(null);
-                setTtavLaunchStatus(preparedBundle
-                    ? `Visualizer opened for ${sampleId} using the most recently prepared TTAV bundle.`
-                    : `Visualizer opened for ${sampleId} using existing TTAV bundle.`);
-            }
-        })();
-    };
-
-
-    const toggleTrainPairSelection = (trainIdx: number, pairId: string) => {
-        setSelectedTrainPairIdsByGroup(current => {
-            const prev = new Set(current[trainIdx] ?? []);
-            if (prev.has(pairId)) {
-                prev.delete(pairId);
-            } else {
-                prev.add(pairId);
-            }
-            return {
-                ...current,
-                [trainIdx]: Array.from(prev),
-            };
-        });
-        setTrainProbeComparisons(current => {
-            if (!(trainIdx in current)) return current;
-            const next = { ...current };
-            delete next[trainIdx];
-            return next;
-        });
-    };
-
-    const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
-        if (!report || !selectedMeta) return;
-
-        const trimmedUrl = ttavUrl.trim();
-        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
-        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
-        if (!trimmedUrl) {
-            setTtavLaunchError('TTAV URL is required.');
-            return;
-        }
-
-        const openedWindow = window.open(trimmedUrl, '_blank');
-        if (!openedWindow) {
-            setTtavLaunchError('Browser blocked the probe window. Please allow pop-ups for this page.');
-            return;
-        }
-
-        const selectedPairIdSet = new Set(selectedTrainPairIdsByGroup[trainIdx] ?? []);
-        const selectedPairs = selectedPairIdSet.size > 0
-            ? pairs.filter(pair => selectedPairIdSet.has(pair.id))
-            : [];
-        const focusTrainIndices = Array.from(new Set(selectedPairs.flatMap(pair => [
-            pair.train_correlation.source_token_index,
-            pair.train_correlation.target_token_index,
-        ]))).sort((a, b) => a - b);
-
-        setProbingTrainSampleId(trainIdx);
-        setTtavLaunchError(null);
-        setTtavLaunchStatus(`Preparing full-train embedding probe for TRAIN #${trainIdx}...`);
-
-        void (async () => {
-            try {
-                const probeResp = await fetch(buildEifApiUrl(eifApiUrl, '/api/prepare-ttav-train-probe'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        reportFileName: selectedMeta.fileName,
-                        sampleId: selectedSampleId,
-                        trainSampleId: trainIdx,
-                        ttavUploadUrl: new URL('/registerEIFBundle', trimmedUrl).toString(),
-                        ttavUrl: trimmedUrl,
-                        visMethod,
-                        visId,
-                        contextRadius: 1,
-                        includeFullTrain: true,
-                        focusTrainIndices,
-                        probePairs: pairs.map(pair => ({
-                            id: pair.id,
-                            trainSourceIndex: pair.train_correlation.source_token_index,
-                            trainTargetIndex: pair.train_correlation.target_token_index,
-                            testSourceIndex: pair.test_correlation.source_token_index,
-                            testTargetIndex: pair.test_correlation.target_token_index,
-                        })),
-                    }),
-                });
-
-                const rawText = await probeResp.text();
-                let parsedJson: Record<string, unknown> | null = null;
-                if (rawText.trim()) {
-                    try {
-                        parsedJson = JSON.parse(rawText) as Record<string, unknown>;
-                    } catch {
-                        throw new Error(
-                            `EIF train probe API returned a non-JSON response (HTTP ${probeResp.status}). ` +
-                            `${rawText.slice(0, 240)}`
-                        );
-                    }
-                }
-
-                const apiJson = parsedJson ?? {};
-                if (!probeResp.ok || apiJson.status !== 'success') {
-                    const baseMessage = 'EIF train probe API failed (HTTP ' + probeResp.status + ')';
-                    const message = typeof apiJson.message === 'string'
-                        ? baseMessage + ': ' + apiJson.message
-                        : baseMessage;
-                    throw new Error(message);
-                }
-
-                const comparisonSummary = (typeof apiJson.comparisonSummary === 'object' && apiJson.comparisonSummary !== null)
-                    ? apiJson.comparisonSummary as TrainProbeComparisonSummary
-                    : { focusTokens: [], pairwiseCosine: [] };
-                setTrainProbeComparisons(current => ({
-                    ...current,
-                    [trainIdx]: comparisonSummary,
-                }));
-
-                const browserUploadRequired = apiJson.browserUploadRequired === true;
-                let resolvedSampleId = typeof apiJson.sampleId === 'string'
-                    ? apiJson.sampleId
-                    : `${selectedSampleId}_train${trainIdx}_probe`;
-                let resolvedContentPath = typeof apiJson.contentPath === 'string' ? apiJson.contentPath : '';
-                let resolvedVisMethod = typeof apiJson.visMethod === 'string' ? apiJson.visMethod : visMethod;
-                let resolvedVisId = typeof apiJson.visId === 'string' ? apiJson.visId : visId;
-
-                if (browserUploadRequired) {
-                    setTtavLaunchStatus(`Probe computed on EIF; uploading TRAIN #${trainIdx} probe to TTAV from browser...`);
-                    const bundlePayload = (typeof apiJson.bundlePayload === 'object' && apiJson.bundlePayload !== null)
-                        ? apiJson.bundlePayload
-                        : null;
-                    if (!bundlePayload) {
-                        throw new Error(typeof apiJson.uploadError === 'string'
-                            ? apiJson.uploadError
-                            : 'Probe bundle upload fallback payload is missing.');
-                    }
-
-                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
-                    const uploadResp = await fetch(uploadUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(bundlePayload),
-                    });
-                    const uploadRawText = await uploadResp.text();
-                    let uploadJson: Record<string, unknown> | null = null;
-                    if (uploadRawText.trim()) {
-                        try {
-                            uploadJson = JSON.parse(uploadRawText) as Record<string, unknown>;
-                        } catch {
-                            throw new Error(
-                                `TTAV backend returned a non-JSON response (HTTP ${uploadResp.status}). ` +
-                                `${uploadRawText.slice(0, 240)}`
-                            );
-                        }
-                    }
-
-                    const uploadApiJson = uploadJson ?? {};
-                    if (!uploadResp.ok || uploadApiJson.status !== 'success') {
-                        const message = typeof uploadApiJson.message === 'string'
-                            ? uploadApiJson.message
-                            : `Failed to register TTAV probe bundle (HTTP ${uploadResp.status})`;
-                        throw new Error(message);
-                    }
-
-                    resolvedSampleId = typeof uploadApiJson.sample_id === 'string'
-                        ? uploadApiJson.sample_id
-                        : (typeof uploadApiJson.sampleId === 'string' ? uploadApiJson.sampleId : resolvedSampleId);
-                    resolvedContentPath = typeof uploadApiJson.content_path === 'string'
-                        ? uploadApiJson.content_path
-                        : (typeof uploadApiJson.contentPath === 'string' ? uploadApiJson.contentPath : resolvedContentPath);
-                    resolvedVisMethod = typeof uploadApiJson.vis_method === 'string'
-                        ? uploadApiJson.vis_method
-                        : (typeof uploadApiJson.visMethod === 'string' ? uploadApiJson.visMethod : resolvedVisMethod);
-                    resolvedVisId = typeof uploadApiJson.vis_id === 'string'
-                        ? uploadApiJson.vis_id
-                        : (typeof uploadApiJson.visId === 'string' ? uploadApiJson.visId : resolvedVisId);
-                }
-
-                const payload: TtavJumpPayload = {
-                    source: 'eif',
-                    sampleId: resolvedSampleId,
-                    contentPath: resolvedContentPath,
-                    visMethod: resolvedVisMethod,
-                    visId: resolvedVisId,
-                    dataType: 'Text',
-                    taskType: 'Alignment',
-                    selectedIndices: Array.isArray(apiJson.selectedIndices)
-                        ? apiJson.selectedIndices.filter((value): value is number => typeof value === 'number')
-                        : [],
-                    targetIndex: typeof apiJson.targetIndex === 'number' ? apiJson.targetIndex : undefined,
-                    promptLen: typeof apiJson.promptLen === 'number' ? apiJson.promptLen : 0,
-                };
-
-                navigateTtavWindow(openedWindow, payload);
-                setTtavLaunchStatus(browserUploadRequired
-                    ? `Full-train probe opened for TRAIN #${trainIdx} using browser upload fallback.`
-                    : `Full-train probe opened for TRAIN #${trainIdx}.`);
-            } catch (error) {
-                const msg = error instanceof Error ? error.message : 'Failed to open embedding probe';
-                setTtavLaunchError(msg);
-                setTtavLaunchStatus(null);
-                if (!openedWindow.closed) {
-                    openedWindow.close();
-                }
-            } finally {
-                setProbingTrainSampleId(current => (current === trainIdx ? null : current));
-            }
-        })();
-    };
-
-    useEffect(() => {
-        if (!ttavWindowRef.current || ttavWindowRef.current.closed) return;
-        if (!selectedSampleId || ttavWindowSampleIdRef.current !== selectedSampleId) return;
-
-        postTtavHighlightUpdate();
-    }, [postTtavHighlightUpdate, selectedSampleId]);
-
-    const handlePrepareTtavBundle = async () => {
-        if (!report || !selectedMeta) return;
-
-        const sampleId = selectedSampleId;
-        const trimmedUrl = ttavUrl.trim();
-        const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
-        const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
-
-        setPreparingTtavBundle(true);
-        setTtavLaunchError(null);
-        setTtavLaunchStatus(null);
-
-        const eifApiHost = (() => {
-            try {
-                return new URL(eifApiUrl).host;
-            } catch {
-                return eifApiUrl;
-            }
-        })();
-        setTtavPrepareDetail(`Connecting to EIF API (${eifApiHost})...`);
-
-        let statusPollTimer: number | null = null;
-        let statusPollActive = true;
-        const pollPrepareStatus = async () => {
-            if (!statusPollActive) return;
-            try {
-                const statusPayload = await fetchEifPrepareStatus(eifApiUrl, sampleId);
-                if (!statusPollActive || !statusPayload) return;
-                setTtavPrepareDetail(statusPayload.message);
-            } catch {
-                // Ignore status polling failures and let the main request decide fallback behavior.
-            }
-        };
-
-        try {
-            const initialStatus = await fetchEifPrepareStatus(eifApiUrl, sampleId, 2500);
-            if (!initialStatus) {
-                throw new Error(`Unable to reach EIF API at ${eifApiHost}`);
-            }
-
-            setTtavPrepareDetail(`Submitting prepare request to EIF API (${eifApiHost})...`);
-            void pollPrepareStatus();
-            statusPollTimer = window.setInterval(() => {
-                void pollPrepareStatus();
-            }, 1000);
-
-            const requestSubmittedTimer = window.setTimeout(() => {
-                setTtavPrepareDetail('EIF API request submitted. Waiting for server-side embedding computation...');
-            }, 1200);
-
-            const apiResult = await callEifBundleApi(false);
-            window.clearTimeout(requestSubmittedTimer);
-            if (!apiResult) return;
-            savePreparedTtavBundle({
-                sampleId: apiResult.sampleId,
-                contentPath: apiResult.contentPath,
-                visMethod: apiResult.visMethod,
-                visId: apiResult.visId,
-                preparedAt: Date.now(),
-            });
-            const eifMsg = apiResult.eifCacheHit
-                ? 'EIF cache reused'
-                : 'EIF cache created';
-            const ttavMsg = apiResult.ttavCached
-                ? 'TTAV cache reused'
-                : 'sent to TTAV';
-            setTtavLaunchStatus(`${apiResult.sampleId}: ${eifMsg}; ${ttavMsg}.`);
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : 'Failed to prepare TTAV bundle';
-            if (!shouldFallbackToDirectPrepare(msg) && !msg.toLowerCase().includes('unable to reach eif api')) {
-                setTtavLaunchError(msg);
-                setTtavLaunchStatus(null);
-            } else {
-                try {
-                    setTtavPrepareDetail(`EIF API unreachable; uploading precomputed real bundle to TTAV...`);
-                    const uploadUrl = new URL('/registerEIFBundle', trimmedUrl).toString();
-                    const bundlePayload = await loadPrecomputedRealBundle(sampleId, visMethod, visId);
-                    const uploadResp = await fetch(uploadUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(bundlePayload),
                     });
                     const rawText = await uploadResp.text();
                     let parsedJson: Record<string, unknown> | null = null;
