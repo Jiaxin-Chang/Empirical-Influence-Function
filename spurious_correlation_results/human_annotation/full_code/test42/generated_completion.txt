@@ -1,0 +1,2 @@
+		log.Changefeed.Errorf(ca.Ctx(), "failed to get SliMetrics: %v", err)
+		return

@@ -8,6 +8,8 @@ import random
 from glob import glob
 from pathlib import Path
 
+from src.spurious_correlation_analysis import _build_code_context
+
 
 def _load_jsonl(path: str) -> list[dict]:
     records: list[dict] = []
@@ -55,14 +57,82 @@ def _completion_context(tokens: list[str], prompt_len: int, window: int = 80) ->
     return _single_line(text)
 
 
-def _load_tokens(feature_dir: str, test_sample_index: int) -> list[str]:
+def _load_feature_payload(feature_dir: str, test_sample_index: int) -> dict:
     path = _feature_path(feature_dir, test_sample_index)
     if not path:
-        return []
+        return {}
     with open(path, encoding="utf-8") as handle:
-        payload = json.load(handle)
+        return json.load(handle)
+
+
+def _load_tokens(feature_dir: str, test_sample_index: int) -> list[str]:
+    payload = _load_feature_payload(feature_dir, test_sample_index)
     baseline = payload.get("test_sample_baseline", {})
     return baseline.get("generated_full_tokens", []) or []
+
+
+def _tokens_to_text(tokens: list[str], start_idx: int = 0, stop_at_im_end: bool = False) -> str:
+    parts: list[str] = []
+    for token in tokens[start_idx:]:
+        if stop_at_im_end and token == "<|im_end|>":
+            break
+        parts.append(token)
+    return "".join(parts)
+
+
+def _relative_path(path: Path) -> str:
+    try:
+        return path.relative_to(Path.cwd()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _reconstructed_code(prompt_text: str, completion_text: str) -> str:
+    context = _build_code_context(prompt_text, completion_text)
+    if context is not None:
+        return context.code
+    return (
+        "/* Reconstructed prompt/code context fallback. */\n\n"
+        + prompt_text
+        + "\n\n/* Completion */\n"
+        + completion_text
+    )
+
+
+def _write_case_code_files(feature_dir: str, output_dir: str, test_sample_index: int) -> dict[str, str]:
+    payload = _load_feature_payload(feature_dir, test_sample_index)
+    baseline = payload.get("test_sample_baseline", {})
+    prompt_len = int(baseline.get("prompt_len", 0))
+    generated_tokens = baseline.get("generated_full_tokens", []) or []
+    reference_tokens = baseline.get("ground_truth_full_tokens", []) or []
+
+    prompt_text = "".join(generated_tokens[:prompt_len])
+    generated_completion = _tokens_to_text(generated_tokens, prompt_len, stop_at_im_end=True)
+    reference_completion = _tokens_to_text(reference_tokens, prompt_len, stop_at_im_end=True)
+
+    case_dir = Path(output_dir) / "full_code" / f"test{test_sample_index}"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "full_prompt_path": case_dir / "prompt.txt",
+        "full_generated_completion_path": case_dir / "generated_completion.txt",
+        "full_reference_completion_path": case_dir / "reference_completion.txt",
+        "full_generated_code_path": case_dir / "generated.go",
+        "full_reference_code_path": case_dir / "reference.go",
+    }
+    paths["full_prompt_path"].write_text(prompt_text, encoding="utf-8")
+    paths["full_generated_completion_path"].write_text(generated_completion, encoding="utf-8")
+    paths["full_reference_completion_path"].write_text(reference_completion, encoding="utf-8")
+    paths["full_generated_code_path"].write_text(
+        _reconstructed_code(prompt_text, generated_completion),
+        encoding="utf-8",
+    )
+    paths["full_reference_code_path"].write_text(
+        _reconstructed_code(prompt_text, reference_completion),
+        encoding="utf-8",
+    )
+
+    return {name: _relative_path(path) for name, path in paths.items()}
 
 
 def _select_records(
@@ -143,6 +213,11 @@ def export_annotation_sheets(
         "target_context",
         "generated_completion_preview",
         "reference_completion_preview",
+        "full_generated_code_path",
+        "full_reference_code_path",
+        "full_generated_completion_path",
+        "full_reference_completion_path",
+        "full_prompt_path",
         "human_label",
         "human_confidence",
         "human_rationale",
@@ -180,6 +255,7 @@ def export_annotation_sheets(
             )
             reference_preview = _single_line(record.get("reference_completion_preview") or "")
             target_context = _token_context(tokens, target_index, "TARGET", context_window)
+            code_paths = _write_case_code_files(feature_dir, output_dir, test_index)
 
             for source_order, source_row in enumerate(record.get("top_sources", [])[:top_k], start=1):
                 source_index = int(source_row.get("source_token_index", -1))
@@ -202,6 +278,11 @@ def export_annotation_sheets(
                     "target_context": target_context,
                     "generated_completion_preview": generated_preview,
                     "reference_completion_preview": reference_preview,
+                    "full_generated_code_path": code_paths.get("full_generated_code_path", ""),
+                    "full_reference_code_path": code_paths.get("full_reference_code_path", ""),
+                    "full_generated_completion_path": code_paths.get("full_generated_completion_path", ""),
+                    "full_reference_completion_path": code_paths.get("full_reference_completion_path", ""),
+                    "full_prompt_path": code_paths.get("full_prompt_path", ""),
                     "human_label": "",
                     "human_confidence": "",
                     "human_rationale": "",
