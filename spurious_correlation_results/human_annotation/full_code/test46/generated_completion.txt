@@ -1,0 +1,3 @@
+		if prev.PrivateKeyType != next.PrivateKeyType {
+			return fmt.Errorf("cannot update the privateKeyType field without changingRootPKIPath")
+		}

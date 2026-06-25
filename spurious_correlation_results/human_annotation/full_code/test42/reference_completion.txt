@@ -1,0 +1,4 @@
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error getting sli metrics: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return

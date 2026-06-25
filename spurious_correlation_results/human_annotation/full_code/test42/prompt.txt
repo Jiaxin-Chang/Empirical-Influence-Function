@@ -1,0 +1,368 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl Below is the code repository: github.com/cockroachdb/cockroach/ Below is the imported package path "context"; "fmt"; "iter"; "math/rand"; "slices"; "sync"; "time"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcprogresspb"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcutils"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/checkpoint"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/resolvedspan"; "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed"; "github.com/cockroachdb/cockroach/pkg/clusterversion"; "github.com/cockroachdb/cockroach/pkg/jobs"; "github.com/cockroachdb/cockroach/pkg/jobs/jobfrontier"; "github.com/cockroachdb/cockroach/pkg/jobs/jobspb"; "github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"; "github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"; "github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"; "github.com/cockroachdb/cockroach/pkg/roachpb"; "github.com/cockroachdb/cockroach/pkg/settings"; "github.com/cockroachdb/cockroach/pkg/settings/cluster"; "github.com/cockroachdb/cockroach/pkg/sql"; "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"; "github.com/cockroachdb/cockroach/pkg/sql/execinfra"; "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"; "github.com/cockroachdb/cockroach/pkg/sql/isql"; "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"; "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"; "github.com/cockroachdb/cockroach/pkg/sql/rowenc"; "github.com/cockroachdb/cockroach/pkg/sql/sem/eval"; "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"; "github.com/cockroachdb/cockroach/pkg/util"; "github.com/cockroachdb/cockroach/pkg/util/bulk"; "github.com/cockroachdb/cockroach/pkg/util/cancelchecker"; "github.com/cockroachdb/cockroach/pkg/util/envutil"; "github.com/cockroachdb/cockroach/pkg/util/hlc"; "github.com/cockroachdb/cockroach/pkg/util/log"; "github.com/cockroachdb/cockroach/pkg/util/log/logcrash"; "github.com/cockroachdb/cockroach/pkg/util/mon"; "github.com/cockroachdb/cockroach/pkg/util/protoutil"; "github.com/cockroachdb/cockroach/pkg/util/span"; "github.com/cockroachdb/cockroach/pkg/util/timeutil"; "github.com/cockroachdb/cockroach/pkg/util/tracing"; "github.com/cockroachdb/cockroach/pkg/util/uuid"; "github.com/cockroachdb/crlib/crtime"; "github.com/cockroachdb/errors"; "github.com/cockroachdb/logtags"; "github.com/cockroachdb/redact"; "google.golang.org/grpc/codes"; "google.golang.org/grpc/status" The receiver struct definitions of the function is type changeAggregator struct {
+	execinfra.ProcessorBase
+
+	spec   execinfrapb.ChangeAggregatorSpec
+	memAcc mon.BoundAccount
+
+	// checkForNodeDrain is a callback that returns an error
+	// if this node is being drained.
+	checkForNodeDrain func() error
+
+	// cancel cancels the context passed to all resources created while starting
+	// this aggregator.
+	cancel func()
+	// errCh contains the return values of the kvfeed.
+	errCh chan error
+	// kvFeedDoneCh is closed when the kvfeed exits.
+	kvFeedDoneCh chan struct{}
+
+	// sink is the Sink to write rows to. Resolved timestamps are never written
+	// by changeAggregator.
+	sink EventSink
+	// changedRowBuf, if non-nil, contains changed rows to be emitted. Anything
+	// queued in `resolvedSpanBuf` is dependent on these having been emitted, so
+	// this one must be empty before moving on to that one.
+	changedRowBuf *encDatumRowBuffer
+	// resolvedSpanBuf contains resolved span updates to send to changeFrontier.
+	// If sink is a bufferSink, it must be emptied before these are sent.
+	resolvedSpanBuf encDatumRowBuffer
+	// lastPush records the time when we last pushed data to the coordinator.
+	lastPush time.Time
+
+	// recentKVCount contains the number of emits since the last time a resolved
+	// span was forwarded to the frontier
+	recentKVCount uint64
+
+	// eventProducer produces the next event from the kv feed.
+	eventProducer kvevent.Reader
+	// eventConsumer consumes the event.
+	eventConsumer eventConsumer
+
+	flushFrequency time.Duration // how often high watermark can be checkpointed.
+	lastSpanFlush  time.Time     // last time expensive, span based checkpoint was written.
+
+	// frontierFlushLimiter is a rate limiter for flushing the span frontier
+	// to the coordinator because of frontier advancement.
+	frontierFlushLimiter *saveRateLimiter
+
+	// frontier keeps track of resolved timestamps for spans along with schema change
+	// boundary information.
+	frontier *resolvedspan.AggregatorFrontier
+
+	// Aggregator that aggregates StructuredEvents emitted in the
+	// changeAggregator's trace recording.
+	agg      *tracing.TracingAggregator
+	aggTimer timeutil.Timer
+
+	metrics                *Metrics
+	sliMetrics             *sliMetrics
+	sliMetricsID           int64
+	closeTelemetryRecorder func()
+	knobs                  TestingKnobs
+
+	targets changefeedbase.Targets
+}
+
+// Methods:
+- func (ca *changeAggregator) MustBeStreaming() bool
+- func (ca *changeAggregator) wrapMetricsRecorderWithTelemetry((ctx context.Context, recorder metricsRecorder, targets changefeedbase.Targets)) ((metricsRecorder, error))
+- func (ca *changeAggregator) Start(ctx context.Context)
+- func (ca *changeAggregator) startKVFeed((ctx context.Context, spans *ast.ArrayType, initialHighWater hlc.Timestamp, needsInitialScan bool, config ChangefeedConfig, parentMemMon *mon.BytesMonitor, memLimit int64, opts changefeedbase.StatementOptions)) ((kvevent.Reader, *ast.ChanType, *ast.ChanType, error))
+- func (ca *changeAggregator) checkKVFeedErr() error
+- func (ca *changeAggregator) makeKVFeedCfg((ctx context.Context, config ChangefeedConfig, spans *ast.ArrayType, buf kvevent.Writer, initialHighWater hlc.Timestamp, needsInitialScan bool, memMon *mon.BytesMonitor, opts changefeedbase.StatementOptions)) ((kvfeed.Config, error))
+- func (ca *changeAggregator) getInitialHighWaterAndSpans() ((hlc.Timestamp, *ast.ArrayType, error))
+- func (ca *changeAggregator) setupSpansAndFrontier() ((spans *ast.ArrayType, err error))
+- func (ca *changeAggregator) close()
+- func (ca *changeAggregator) Next() ((rowenc.EncDatumRow, *execinfrapb.ProducerMetadata))
+- func (ca *changeAggregator) computeTrailingMetadata(meta *execinfrapb.ChangefeedMeta)
+- func (ca *changeAggregator) tick() error
+- func (ca *changeAggregator) flushBufferedEvents(ctx context.Context) error
+- func (ca *changeAggregator) noteResolvedSpan(resolved jobspb.ResolvedSpan) error
+- func (ca *changeAggregator) flushFrontier(ctx context.Context) error
+- func (ca *changeAggregator) emitResolved(batch jobspb.ResolvedSpans) error
+- func (ca *changeAggregator) ConsumerClosed()
+- func (ca *changeAggregator) isSinkless() bool
+ The parameter struct definition or not exist of the function is ctx context.Context The return value struct definitions or not exist of the function is not exist The code snippets before the function is func (w drainWatcher) enabled() bool {
+	return w != nil
+}
+
+func makeDrainWatcher(flowCtx *execinfra.FlowCtx) (w drainWatcher, _ func()) {
+	if !aggregatorEmitsShutdownCheckpoint.Get(&flowCtx.Cfg.Settings.SV) {
+		// Drain watcher disabled
+		return nil, func() {}
+	}
+
+	if cfKnobs, ok := flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok && cfKnobs != nil && cfKnobs.OnDrain != nil {
+		return cfKnobs.OnDrain(), func() {}
+	}
+	return flowCtx.Cfg.JobRegistry.OnDrain()
+}
+
+) (_ execinfra.Processor, retErr error) {
+	// Setup monitoring for this node drain.
+	drainWatcher, drainDone := makeDrainWatcher(flowCtx)
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, mon.MakeName("changeagg-mem"))
+	ca := &changeAggregator{
+		spec:              spec,
+		memAcc:            memMonitor.MakeBoundAccount(),
+		checkForNodeDrain: drainWatcher.checkForNodeDrain,
+	}
+
+	defer func() {
+		if retErr != nil {
+			ca.close()
+			drainDone()
+		}
+	}()
+
+	if err := ca.Init(
+		ctx,
+		ca,
+		post,
+		changefeedResultTypes,
+		flowCtx,
+		processorID,
+		memMonitor,
+		execinfra.ProcStateOpts{
+			TrailingMetaCallback: func() (producerMeta []execinfrapb.ProducerMetadata) {
+				defer drainDone()
+
+				if drainWatcher.enabled() {
+					var meta execinfrapb.ChangefeedMeta
+					if err := drainWatcher.checkForNodeDrain(); err != nil {
+						// This node is draining.  Indicate so in the trailing metadata.
+						nodeID, _ := flowCtx.Cfg.NodeID.OptionalNodeID()
+						meta.DrainInfo = &execinfrapb.ChangefeedMeta_DrainInfo{NodeID: nodeID}
+					}
+					ca.computeTrailingMetadata(&meta)
+					producerMeta = []execinfrapb.ProducerMetadata{{Changefeed: &meta}}
+				}
+
+				if ca.agg != nil {
+					meta := bulkutil.ConstructTracingAggregatorProducerMeta(ctx,
+						ca.FlowCtx.NodeID.SQLInstanceID(), ca.FlowCtx.ID, ca.agg)
+					producerMeta = append(producerMeta, *meta)
+				}
+
+				ca.close()
+				return producerMeta
+			},
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	opts := changefeedbase.MakeStatementOptions(ca.spec.Feed.Opts)
+
+	// MinCheckpointFrequency controls how frequently the changeAggregator flushes the sink
+	// and checkpoints the local frontier to changeFrontier. It is used as a rough
+	// approximation of how latency-sensitive the changefeed user is. For a high latency
+	// user, such as cloud storage sink where flushes can take much longer, it is often set
+	// as the sink's flush frequency so as not to negate the sink's batch config.
+	//
+	// If a user does not specify a 'min_checkpoint_frequency' duration, we instead default
+	// to 30s, which is hopefully long enough to account for most possible sink latencies we
+	// could see without falling too behind.
+	//
+	// NB: As long as we periodically get new span-level resolved timestamps
+	// from the poller (which should always happen, even if the watched data is
+	// not changing), then this is sufficient and we don't have to do anything
+	// fancy with timers.
+	// // TODO(casper): add test for OptMinCheckpointFrequency.
+	checkpointFreq, err := opts.GetMinCheckpointFrequency()
+	if err != nil {
+		return nil, err
+	}
+	if checkpointFreq != nil {
+		ca.flushFrequency = *checkpointFreq
+	} else {
+		ca.flushFrequency = changefeedbase.DefaultMinCheckpointFrequency
+	}
+
+	ca.frontierFlushLimiter, err = newSaveRateLimiter(saveRateConfig{
+		name: "frontier",
+		intervalName: func() redact.SafeValue {
+			return redact.SafeString(changefeedbase.OptMinCheckpointFrequency)
+		},
+		interval: func() time.Duration {
+			return ca.flushFrequency
+		},
+		jitter: func() float64 {
+			return aggregatorFlushJitter.Get(&ca.FlowCtx.Cfg.Settings.SV)
+		},
+	}, timeutil.DefaultTimeSource{})
+	if err != nil {
+		return nil, err
+	}
+
+	return ca, nil
+}
+
+func (ca *changeAggregator) MustBeStreaming() bool {
+	return true
+}
+
+) (metricsRecorder, error) {
+	details := ca.spec.Feed
+	jobID := ca.spec.JobID
+	description := ca.spec.Description
+	// This code exists so that the old behavior is preserved if the spec is created
+	// in a mixed-version cluster on a node without the new Description field.
+	// It can be deleted once we no longer need to interoperate with binaries that
+	// are version 24.3 or earlier.
+	if description == "" {
+		// Don't emit telemetry messages for core changefeeds without a description.
+		if ca.isSinkless() {
+			return recorder, nil
+		}
+		job, err := ca.FlowCtx.Cfg.JobRegistry.LoadJob(ctx, jobID)
+		if err != nil {
+			return nil, err
+		}
+		description = job.Payload().Description
+	}
+
+	recorderWithTelemetry, err := wrapMetricsRecorderWithTelemetry(ctx, details, description, jobID, ca.FlowCtx.Cfg.Settings, recorder, ca.knobs, targets)
+	if err != nil {
+		return ca.sliMetrics, err
+	}
+	ca.closeTelemetryRecorder = recorderWithTelemetry.close
+
+	return recorderWithTelemetry, nil
+} And here is the function you are asked to complete func (ca *changeAggregator) Start(ctx context.Context)
+func (ca *changeAggregator) Start(ctx context.Context) {
+	// Derive a separate context so that we can shutdown the poller.
+	ctx, ca.cancel = ca.FlowCtx.Stopper().WithCancelOnQuiesce(ctx)
+
+	if ca.spec.JobID != 0 {
+		ctx = logtags.AddTag(ctx, "job", ca.spec.JobID)
+	}
+	ctx = logtags.RemoveTag(ctx, changeFrontierLogTag)
+	ctx = logtags.AddTag(ctx, changeAggregatorLogTag, nil /* value */)
+
+	ca.agg = tracing.TracingAggregatorForContext(ctx)
+	if ca.agg != nil {
+		ca.aggTimer.Reset(tracingAggTimerInterval)
+	}
+
+	ctx = ca.StartInternal(ctx, changeAggregatorProcName, ca.agg)
+
+	spans, err := ca.setupSpansAndFrontier()
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error setting up spans and frontier: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+
+	execCfg := ca.FlowCtx.Cfg.ExecutorConfig.(*sql.ExecutorConfig)
+	if ca.knobs.OverrideExecCfg != nil {
+		execCfg = ca.knobs.OverrideExecCfg(execCfg)
+	}
+	targetTS := ca.spec.GetSchemaTS()
+	ca.targets, err = AllTargets(ctx, ca.spec.Feed, execCfg, targetTS)
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error getting targets: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+
+	feed, err := makeChangefeedConfigFromJobDetails(ca.spec.Feed, ca.targets)
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error making changefeed config: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+	opts := feed.Opts
+
+	timestampOracle := &changeAggregatorLowerBoundOracle{
+		sf:                         ca.frontier,
+		initialInclusiveLowerBound: feed.ScanTime,
+	}
+
+	if cfKnobs, ok := ca.FlowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
+		ca.knobs = *cfKnobs
+	}
+
+	// The job registry has a set of metrics used to monitor the various jobs it
+	// runs. They're all stored as the `metric.Struct` interface because of
+	// dependency cycles.
+	ca.metrics = ca.FlowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	scope, _ := opts.GetMetricScope()
+	ca.sliMetrics, err = ca.metrics.getSLIMetrics(scope)
+	if err != nil { <MID> 	}
+	ca.sliMetricsID = ca.sliMetrics.claimId()
+
+	recorder := metricsRecorder(ca.sliMetrics)
+	recorder, err = ca.wrapMetricsRecorderWithTelemetry(ctx, recorder, ca.targets)
+
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error wrapping metrics controller: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+	}
+
+	ca.sink, err = getEventSink(ctx, ca.FlowCtx.Cfg, ca.spec.Feed, timestampOracle,
+		ca.spec.User(), ca.spec.JobID, recorder, ca.targets)
+	if err != nil {
+		err = changefeedbase.MarkRetryableError(err)
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error getting sink: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+
+	// This is the correct point to set up certain hooks depending on the sink
+	// type.
+	if b, ok := ca.sink.(*bufferSink); ok {
+		ca.changedRowBuf = &b.buf
+	}
+
+	// If the initial scan was disabled the highwater would've already been forwarded
+	needsInitialScan := ca.frontier.Frontier().IsEmpty()
+
+	// The "HighWater" of the KVFeed is the timestamp it will begin streaming
+	// change events from.  When there's an inital scan, we want the scan to cover
+	// data up to the StatementTime and change events to begin from that point.
+	kvFeedHighWater := ca.frontier.Frontier()
+	if needsInitialScan {
+		kvFeedHighWater = ca.spec.Feed.StatementTime
+	}
+
+	// TODO(yevgeniy): Introduce separate changefeed monitor that's a parent
+	// for all changefeeds to control memory allocated to all changefeeds.
+	pool := ca.FlowCtx.Cfg.BackfillerMonitor
+	if ca.knobs.MemMonitor != nil {
+		pool = ca.knobs.MemMonitor
+	}
+	limit := changefeedbase.PerChangefeedMemLimit.Get(&ca.FlowCtx.Cfg.Settings.SV)
+	ca.eventProducer, ca.kvFeedDoneCh, ca.errCh, err = ca.startKVFeed(ctx, spans, kvFeedHighWater, needsInitialScan, feed, pool, limit, opts)
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error starting kv feed: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+	ca.sink = &errorWrapperSink{wrapped: ca.sink}
+	ca.eventConsumer, ca.sink, err = newEventConsumer(
+		ctx, ca.FlowCtx.Cfg, ca.spec, feed, ca.frontier, kvFeedHighWater,
+		ca.sink, ca.metrics, ca.sliMetrics, ca.knobs)
+	if err != nil {
+		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error creating event consumer: %v", err)
+		ca.MoveToDraining(err)
+		ca.cancel()
+		return
+	}
+
+	// Init heartbeat timer.
+	ca.lastPush = timeutil.Now()
+
+	// Generate expensive checkpoint only after we ran for a while.
+	ca.lastSpanFlush = timeutil.Now()
+} Ensure that only missing codes marked as <MID> are returned<|im_end|>
+<|im_start|>assistant

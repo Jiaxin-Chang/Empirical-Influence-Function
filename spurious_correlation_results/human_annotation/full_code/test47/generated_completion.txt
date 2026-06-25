@@ -1,0 +1,3 @@
+		filterType = structs.HealthFilterExcludeNonPassing
+	} else if query.Service.OnlyCritical {
+		filterType = structs.HealthFilterExcludePassing

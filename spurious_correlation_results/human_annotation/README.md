@@ -30,6 +30,12 @@ spurious_correlation_results/
 spurious_correlation_results/human_annotation/human_annotation_top10.tsv
 ```
 
+每个样本的完整代码上下文在：
+
+```bash
+spurious_correlation_results/human_annotation/full_code/
+```
+
 自动方法的标签在：
 
 ```bash
@@ -79,6 +85,7 @@ python -m src.export_spurious_annotation_sheet --top-k 10 --max-cases 30
 ```bash
 spurious_correlation_results/human_annotation/human_annotation_top10.tsv
 spurious_correlation_results/human_annotation/human_annotation_top10_auto_key.tsv
+spurious_correlation_results/human_annotation/full_code/
 ```
 
 如果只想先做小规模试标，可以标 5 个样本，共 50 个相关性：
@@ -127,9 +134,24 @@ spurious_correlation_results/human_annotation/human_annotation_top10.tsv
 - `target_context`: target token 周围上下文，`[TARGET:...]` 标出 target。
 - `generated_completion_preview`: 模型生成的代码片段。
 - `reference_completion_preview`: reference 代码片段。
+- `full_generated_code_path`: 当前样本的完整 generated code 文件路径。
+- `full_reference_code_path`: 当前样本的完整 reference code 文件路径。
+- `full_generated_completion_path`: 模型生成的完整补全内容。
+- `full_reference_completion_path`: reference 的完整补全内容。
+- `full_prompt_path`: 原始 prompt 文本。
 - `human_label`: 标注者要填写的主标签。
 - `human_confidence`: 标注者填写的置信度。
 - `human_rationale`: 可选，简短说明标注原因。
+
+标注时不要只看 `generated_completion_preview` 和 `reference_completion_preview`。这两个字段只是快速预览。正式判断应以 `full_generated_code_path` 和 `full_reference_code_path` 指向的完整代码上下文为准。
+
+`full_code/` 中每个样本目录包含：
+
+- `generated.go`: 将模型生成内容填入 `<MID>` 后得到的完整代码上下文。
+- `reference.go`: 将 reference 内容填入 `<MID>` 后得到的完整代码上下文。
+- `generated_completion.txt`: 模型生成的完整补全部分。
+- `reference_completion.txt`: reference 的完整补全部分。
+- `prompt.txt`: 原始 prompt，包括任务描述、代码片段和带 `<MID>` 的目标函数。
 
 ## 7. 标注标签
 
@@ -195,9 +217,9 @@ U = 不确定
 建议按下面顺序标注：
 
 1. 先看 `generated_first_error` 和 `reference_token`，理解模型第一个错在哪里。
-2. 再看 `generated_completion_preview` 和 `reference_completion_preview`，理解错误代码和正确代码的差异。
-3. 看当前行的 `source_token` 和 `source_context`。
-4. 判断这个 source token 是否应该影响 target token 的生成。
+2. 打开 `full_generated_code_path` 和 `full_reference_code_path`，从完整代码上下文理解错误代码和正确代码的差异。
+3. 回到 TSV，看当前行的 `source_token`、`source_context` 和 `target_context`，定位这个 source 和 target。
+4. 结合完整 generated/reference 代码，判断这个 source token 是否应该影响 target token 的生成。
 5. 在 `human_label` 填 `S`、`N` 或 `U`。
 6. 在 `human_confidence` 填 1、2、3。
 7. 如果不是显然情况，在 `human_rationale` 写一句很短的原因。

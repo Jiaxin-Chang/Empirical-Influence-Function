@@ -1,0 +1,2 @@
+		Message: fmt.Sprintf(`The regular expression used in the file filter "%s" is invalid: %s`, filter, err.Error()),
+		DocLink
