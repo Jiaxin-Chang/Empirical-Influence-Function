@@ -1,2 +1,0 @@
-		Message: fmt.Sprintf(`The provided file filter: "%s" included an invalid regular expression.  regexp.Compile error: %s`, filter, err),
-		DocLink: "filtering-specs",

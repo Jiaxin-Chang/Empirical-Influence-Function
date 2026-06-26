@@ -4,9 +4,11 @@
 
 这里的“虚假相关性”指：模型生成某个 target token 时高度依赖了某个 source token，但从程序语义、数据依赖、控制依赖或局部代码结构来看，这个 source token 不应该是生成该 target token 的合理依据。
 
+标注者请拉取 `feat/qwen3-moe-alti-correlation` 分支，打开 `spurious_correlation_results/human_annotation/human_annotation_top10.tsv` 进行标注，并结合 `spurious_correlation_results/human_annotation/full_code/` 中的完整代码判断。之前基于旧 signed_clip 排名的标注表不能直接继续标，本轮只使用纯 ALTI saliency top-10。已经标过的旧 TSV 可以交给实验负责人，用脚本自动迁移其中仍然对应同一条 correlation 的标签。
+
 ## 1. 标注任务
 
-对每个生成失败的样本，我们取模型生成代码中的第一个错误 token 作为 target token。ALTI 会给出模型生成这个 target token 时最依赖的 top-10 source tokens。人工标注者需要逐行判断每个 `source token -> target token` 是否是虚假相关性。
+对每个生成失败的样本，我们取模型生成代码中的第一个错误 token 作为 target token。ALTI 会给出模型生成这个 target token 时最依赖的 top-10 source tokens。本版本使用纯 ALTI saliency 排名，不使用 signed / signed_clip 等新方法。这里的 top-10 按 `alti_saliency` 降序排列。人工标注者需要逐行判断每个 `source token -> target token` 是否是虚假相关性。
 
 标注完成后，我们会把人工标签和自动方法的标签进行比较，计算准确率、召回率、F1 和集合重合度。
 
@@ -15,8 +17,10 @@
 原始 feature attribution 结果在：
 
 ```bash
-attribution_results_feature_loo_overlap_signed_clip_full100/feature/
+attribution_results_feature_alti_saliency_full100/feature/
 ```
+
+注意：不要使用旧目录 `attribution_results_feature_loo_overlap_signed_clip_full100/feature/` 做本轮人工标注。旧目录里的 `method_top` 是 signed_clip 排名，不是纯 ALTI saliency 排名。
 
 程序结构分析结果在：
 
@@ -61,9 +65,10 @@ python -c "import tree_sitter, tree_sitter_go; print('tree-sitter ok')"
 
 ```bash
 python -m src.spurious_correlation_analysis \
-  --feature-dir attribution_results_feature_loo_overlap_signed_clip_full100/feature \
+  --feature-dir attribution_results_feature_alti_saliency_full100/feature \
   --output-dir spurious_correlation_results \
-  --k-values 5,10,20,50
+  --k-values 5,10,20,50 \
+  --source-ranking alti_saliency
 ```
 
 这一步会生成：
@@ -74,10 +79,26 @@ python -m src.spurious_correlation_analysis \
 
 ## 5. 生成标注表
 
-默认建议标注 30 个随机抽样的生成失败样本。每个样本标 ALTI top-10 source tokens，一共 300 个 `source -> target` 相关性。随机种子固定为 42，保证可复现：
+当前已经生成好的正式标注表包含 30 个样本。每个样本标纯 ALTI top-10 source tokens，一共 300 个 `source -> target` 相关性。
+
+为了减少旧标注工作的浪费，当前表保留了旧 signed_clip 标注表中仍可被纯 ALTI 结构分析覆盖的 25 个样本，并用固定随机种子补了 5 个新样本。旧表中有 5 个样本在纯 ALTI 分析下是 `uncovered_target`，不能用于本轮自动评估。
+
+当前表对应的样本编号是：
+
+```text
+test0, test6, test8, test16, test18, test21, test27, test28, test34, test38,
+test39, test41, test49, test51, test53, test55, test57, test58, test65, test66,
+test68, test69, test70, test79, test84, test86, test90, test91, test92, test95
+```
+
+复现当前正式表的命令是：
 
 ```bash
-python -m src.export_spurious_annotation_sheet --top-k 10 --max-cases 30
+python -m src.export_spurious_annotation_sheet \
+  --top-k 10 \
+  --max-cases 30 \
+  --selection test_index \
+  --case-indices 0,6,8,16,18,21,27,28,34,38,39,41,49,51,53,55,57,58,65,66,68,69,70,79,84,86,90,91,92,95
 ```
 
 输出文件：
@@ -94,10 +115,10 @@ spurious_correlation_results/human_annotation/full_code/
 python -m src.export_spurious_annotation_sheet --top-k 10 --max-cases 5
 ```
 
-如果时间足够，可以标当前所有可覆盖的生成失败样本。当前是 53 个样本，共 530 个相关性：
+如果时间足够，可以标当前所有可覆盖的生成失败样本。当前是 42 个样本，共 420 个相关性：
 
 ```bash
-python -m src.export_spurious_annotation_sheet --top-k 10 --max-cases 53
+python -m src.export_spurious_annotation_sheet --top-k 10 --max-cases 42
 ```
 
 如果只想标指定样本，例如 `test80`, `test89`, `test90`：
@@ -109,9 +130,48 @@ python -m src.export_spurious_annotation_sheet \
   --max-cases 99
 ```
 
-正式评估建议使用默认的 `--selection random`。不要用自动虚假相关性分数挑选样本，否则会让评估偏向自动方法。`--selection high_spurious` 只适合找论文里的定性 case，不适合用于人工准确性评估。
+如果完全重新开始一轮随机标注，可以用下面的命令生成一份新的随机 30-case 表：
 
-## 6. 标注表字段
+```bash
+python -m src.export_spurious_annotation_sheet \
+  --top-k 10 \
+  --max-cases 30 \
+  --selection random \
+  --seed 42
+```
+
+不要用自动虚假相关性分数挑选样本，否则会让评估偏向自动方法。`--selection high_spurious` 只适合找论文里的定性 case，不适合用于人工准确性评估。
+
+## 6. 迁移旧标注
+
+如果标注者已经在旧 signed_clip 表中标了一部分，不要手工复制标签。把旧的已标 TSV 保存成一个单独文件，例如：
+
+```bash
+spurious_correlation_results/human_annotation/old_signed_clip_labeled.tsv
+```
+
+然后运行：
+
+```bash
+python -m src.transfer_spurious_annotation_labels \
+  --old-annotation spurious_correlation_results/human_annotation/old_signed_clip_labeled.tsv \
+  --new-annotation spurious_correlation_results/human_annotation/human_annotation_top10.tsv \
+  --output spurious_correlation_results/human_annotation/human_annotation_top10_transferred.tsv
+```
+
+这个脚本只会在下面字段完全一致时迁移标签：
+
+- `test_sample_index`
+- `target_token_index`
+- `target_token`
+- `source_token_index`
+- `source_token`
+
+也就是说，它只迁移同一个 target 上同一个 source token 的标签。旧表中不再对应纯 ALTI top-10 的行不会迁移，需要重新标注。当前 300 行新表和旧表最多有 75 行可以直接迁移；实际能迁移多少取决于旧表已经标了多少行。
+
+如果运行了迁移脚本，后续标注者应继续填写 `human_annotation_top10_transferred.tsv` 中仍为空的 `human_label` 行。最后评估时，把填完的 transferred TSV 作为 `--annotation` 输入即可。
+
+## 7. 标注表字段
 
 人工只需要打开：
 
@@ -128,7 +188,9 @@ spurious_correlation_results/human_annotation/human_annotation_top10.tsv
 - `target_token`: 模型生成时被解释的 tokenizer token。
 - `generated_first_error`: 模型生成代码中的第一个错误 lexical token。
 - `reference_token`: reference code 中对应的正确 lexical token。
-- `source_rank`: source token 在 ALTI top-10 中的排名。
+- `source_rank`: source token 在 ALTI top-10 中的排名，按 `alti_saliency` 降序排列。
+- `source_method_rank`: 该 source token 在原始 feature 文件 `method_top` 中的排名，仅用于记录，不是标注排序依据。
+- `source_ranking`: 当前标注表使用的排序方式，正式表应为 `alti_saliency`。
 - `source_token`: ALTI 认为重要的 source token。
 - `source_context`: source token 周围上下文，`[SOURCE:...]` 标出 source。
 - `target_context`: target token 周围上下文，`[TARGET:...]` 标出 target。
@@ -153,7 +215,7 @@ spurious_correlation_results/human_annotation/human_annotation_top10.tsv
 - `reference_completion.txt`: reference 的完整补全部分。
 - `prompt.txt`: 原始 prompt，包括任务描述、代码片段和带 `<MID>` 的目标函数。
 
-## 7. 标注标签
+## 8. 标注标签
 
 `human_label` 只填写三种标签：
 
@@ -200,7 +262,7 @@ U = 不确定
 
 主实验计算准确率、召回率和 F1 时会先去掉 `U`。论文附录可以报告 `U` 的比例。
 
-## 8. 置信度
+## 9. 置信度
 
 `human_confidence` 填 1、2、3：
 
@@ -212,7 +274,7 @@ U = 不确定
 
 如果 `human_label` 是 `U`，置信度可以留空或填 1。
 
-## 9. 标注流程
+## 10. 标注流程
 
 建议按下面顺序标注：
 
@@ -226,17 +288,17 @@ U = 不确定
 
 标注者不需要知道 tree-sitter oracle 的判断，也不要打开 `human_annotation_top10_auto_key.tsv`。
 
-## 10. 推荐标注规模
+## 11. 推荐标注规模
 
 只有一个标注者时，推荐分三档：
 
 - 试标：5 个样本 × top-10 = 50 个相关性。用于确认标注规则是否清楚。
 - 主实验：30 个样本 × top-10 = 300 个相关性。建议作为论文主实验。
-- 完整标注：53 个样本 × top-10 = 530 个相关性。时间足够时使用。
+- 完整标注：42 个样本 × top-10 = 420 个相关性。时间足够时使用。
 
-当前最推荐的是主实验设置，也就是默认生成的 300 行。
+当前最推荐的是主实验设置，也就是已经生成好的 300 行。
 
-## 11. 后续评估
+## 12. 后续评估
 
 标注完成后，把填好的 TSV 和自动 key 按 `item_id` 合并：
 
