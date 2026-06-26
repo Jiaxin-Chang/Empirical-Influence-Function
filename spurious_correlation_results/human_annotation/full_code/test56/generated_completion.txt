@@ -1,5 +1,0 @@
-		segment_id_limit = 256
-		ports = {
-			grpc = 8502
-		}
-		experiments

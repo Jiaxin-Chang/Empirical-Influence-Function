@@ -145,6 +145,149 @@ def _token_spans(tokens: list[str], start_idx: int, *, stop_at_im_end: bool) -> 
     return "".join(parts), spans
 
 
+def _valid_offsets(offsets) -> bool:
+    return (
+        isinstance(offsets, list)
+        and all(
+            isinstance(item, list | tuple)
+            and len(item) == 2
+            and isinstance(item[0], int)
+            and isinstance(item[1], int)
+            for item in offsets
+        )
+    )
+
+
+def _align_tokens_ignoring_whitespace(full_text: str, tokens: list[str]) -> list[list[int]] | None:
+    raw_positions = [
+        (idx, ch)
+        for idx, ch in enumerate(full_text)
+        if not ch.isspace()
+    ]
+    offsets: list[list[int]] = []
+    cursor = 0
+    previous_end = 0
+    for token in tokens:
+        token_chars = [ch for ch in token if not ch.isspace()]
+        if not token_chars:
+            offsets.append([previous_end, previous_end])
+            continue
+
+        start = None
+        end = None
+        for ch in token_chars:
+            while cursor < len(raw_positions) and raw_positions[cursor][1] != ch:
+                cursor += 1
+            if cursor >= len(raw_positions):
+                return None
+            raw_idx = raw_positions[cursor][0]
+            if start is None:
+                start = raw_idx
+            end = raw_idx + 1
+            cursor += 1
+        if start is None or end is None:
+            offsets.append([previous_end, previous_end])
+            continue
+        offsets.append([start, end])
+        previous_end = end
+    return offsets
+
+
+def _prefix_end_from_offsets(offsets: list[list[int]], prompt_len: int) -> int | None:
+    if prompt_len <= 0:
+        return 0
+    if prompt_len > len(offsets):
+        return None
+    return int(offsets[prompt_len - 1][1])
+
+
+def _stop_end_from_offsets(
+    full_text: str,
+    tokens: list[str],
+    offsets: list[list[int]],
+    start_idx: int,
+    *,
+    stop_at_im_end: bool,
+) -> int:
+    end = len(full_text)
+    if not stop_at_im_end:
+        return end
+    for seq_idx in range(start_idx, min(len(tokens), len(offsets))):
+        if tokens[seq_idx] == "<|im_end|>":
+            return int(offsets[seq_idx][0])
+    return end
+
+
+def _spans_from_offsets(
+    full_text: str,
+    tokens: list[str],
+    offsets: list[list[int]],
+    start_idx: int,
+    end_idx: int,
+    text_start: int,
+) -> list[TokenSpan]:
+    spans: list[TokenSpan] = []
+    for seq_idx in range(start_idx, min(end_idx, len(tokens), len(offsets))):
+        abs_start, abs_end = int(offsets[seq_idx][0]), int(offsets[seq_idx][1])
+        if abs_end <= abs_start:
+            continue
+        rel_start = abs_start - text_start
+        rel_end = abs_end - text_start
+        if rel_end <= 0:
+            continue
+        token_text = full_text[abs_start:abs_end]
+        spans.append(
+            TokenSpan(
+                seq_idx=seq_idx,
+                token=token_text,
+                start=max(0, rel_start),
+                end=max(0, rel_end),
+            )
+        )
+    return spans
+
+
+def _build_text_and_spans(
+    tokens: list[str],
+    prompt_len: int,
+    *,
+    full_text: str | None,
+    offsets: list[list[int]] | None,
+    stop_at_im_end: bool,
+) -> tuple[str, list[TokenSpan], str, list[TokenSpan]] | None:
+    if not full_text or not offsets or not _valid_offsets(offsets):
+        return None
+    prompt_end = _prefix_end_from_offsets(offsets, prompt_len)
+    if prompt_end is None:
+        return None
+    completion_end = _stop_end_from_offsets(
+        full_text,
+        tokens,
+        offsets,
+        prompt_len,
+        stop_at_im_end=stop_at_im_end,
+    )
+    prompt_text = full_text[:prompt_end]
+    completion_text = full_text[prompt_end:completion_end]
+    prompt_spans = _spans_from_offsets(
+        full_text,
+        tokens,
+        offsets,
+        0,
+        prompt_len,
+        0,
+    )
+    completion_spans = _spans_from_offsets(
+        full_text,
+        tokens,
+        offsets,
+        prompt_len,
+        len(tokens),
+        prompt_end,
+    )
+    return prompt_text, prompt_spans, completion_text, completion_spans
+
+
 def _lex_tokens(text: str, spans: list[TokenSpan] | None = None) -> list[LexToken]:
     lexed: list[LexToken] = []
     for match in LEX_RE.finditer(text):
@@ -479,23 +622,116 @@ def _feature_files(feature_dir: str) -> list[str]:
     return sorted(glob(os.path.join(feature_dir, "*_feature.json")), key=key)
 
 
-def analyze_file(path: str, parser: Parser, k_values: Iterable[int]) -> dict | None:
+def _rank_source_items(items: list[dict], source_ranking: str) -> list[dict]:
+    if source_ranking == "stored":
+        return list(items)
+    if source_ranking == "rank_score":
+        return sorted(
+            items,
+            key=lambda item: (
+                _safe_float(item.get("rank_score")),
+                _safe_float(item.get("alti_saliency")),
+                -int(item.get("source_token_index", 0)),
+            ),
+            reverse=True,
+        )
+    if source_ranking == "alti_saliency":
+        return sorted(
+            items,
+            key=lambda item: (
+                _safe_float(item.get("alti_saliency")),
+                _safe_float(item.get("rank_score")),
+                -int(item.get("source_token_index", 0)),
+            ),
+            reverse=True,
+        )
+    raise ValueError(f"Unsupported source ranking: {source_ranking}")
+
+
+def analyze_file(
+    path: str,
+    parser: Parser,
+    k_values: Iterable[int],
+    source_ranking: str,
+) -> dict | None:
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     meta = payload["experiment_meta"]
     baseline = payload["test_sample_baseline"]
+    if payload.get("status") == "skipped" or baseline.get("status") == "skipped":
+        return {
+            "status": baseline.get("skip_reason") or payload.get("skip_reason") or "skipped",
+            "path": path,
+            "test_sample_index": int(meta["test_sample_index"]),
+            "task_id": meta.get("task_id"),
+        }
+    required_baseline_keys = (
+        "generated_full_tokens",
+        "ground_truth_full_tokens",
+    )
+    missing_baseline_keys = [
+        key for key in required_baseline_keys
+        if key not in baseline
+    ]
+    if missing_baseline_keys or meta.get("prompt_len") is None:
+        return {
+            "status": "missing_baseline_context",
+            "path": path,
+            "test_sample_index": int(meta["test_sample_index"]),
+            "task_id": meta.get("task_id"),
+            "missing_keys": missing_baseline_keys,
+        }
     generated_tokens = baseline["generated_full_tokens"]
     reference_tokens = baseline["ground_truth_full_tokens"]
     prompt_len = int(meta["prompt_len"])
 
-    prompt_text, prompt_span_list = _build_prompt_spans(generated_tokens, prompt_len)
-    completion_text, completion_span_list = _token_spans(
+    generated_full_text = baseline.get("raw_generated_full_text") or baseline.get("generated_full_text")
+    generated_offsets = (
+        _align_tokens_ignoring_whitespace(generated_full_text, generated_tokens)
+        if baseline.get("raw_generated_full_text") and generated_full_text
+        else None
+    )
+    if generated_offsets is None:
+        generated_offsets = baseline.get("generated_full_token_offsets")
+
+    generated_text_spans = _build_text_and_spans(
         generated_tokens,
         prompt_len,
+        full_text=generated_full_text,
+        offsets=generated_offsets,
         stop_at_im_end=True,
     )
-    reference_text, _ = _token_spans(reference_tokens, prompt_len, stop_at_im_end=True)
+    if generated_text_spans is None:
+        prompt_text, prompt_span_list = _build_prompt_spans(generated_tokens, prompt_len)
+        completion_text, completion_span_list = _token_spans(
+            generated_tokens,
+            prompt_len,
+            stop_at_im_end=True,
+        )
+    else:
+        prompt_text, prompt_span_list, completion_text, completion_span_list = generated_text_spans
+
+    reference_full_text = baseline.get("raw_ground_truth_full_text") or baseline.get("ground_truth_full_text")
+    reference_offsets = (
+        _align_tokens_ignoring_whitespace(reference_full_text, reference_tokens)
+        if baseline.get("raw_ground_truth_full_text") and reference_full_text
+        else None
+    )
+    if reference_offsets is None:
+        reference_offsets = baseline.get("ground_truth_full_token_offsets")
+
+    reference_text_spans = _build_text_and_spans(
+        reference_tokens,
+        prompt_len,
+        full_text=reference_full_text,
+        offsets=reference_offsets,
+        stop_at_im_end=True,
+    )
+    if reference_text_spans is None:
+        reference_text, _ = _token_spans(reference_tokens, prompt_len, stop_at_im_end=True)
+    else:
+        _, _, reference_text, _ = reference_text_spans
 
     mismatch = _first_lexical_mismatch(completion_text, completion_span_list, reference_text)
     if mismatch is None:
@@ -552,8 +788,10 @@ def analyze_file(path: str, parser: Parser, k_values: Iterable[int]) -> dict | N
         context.completion_start + generated_lex.end,
     )
 
+    method_top = list(feature_row.get("method_top", []))
+    ranked_items = _rank_source_items(method_top, source_ranking)
     source_rows = []
-    for item in feature_row.get("method_top", []):
+    for selected_rank, item in enumerate(ranked_items, start=1):
         source_idx = int(item["source_token_index"])
         source_chars = _map_seq_token_to_code_chars(
             source_idx,
@@ -564,7 +802,8 @@ def analyze_file(path: str, parser: Parser, k_values: Iterable[int]) -> dict | N
         )
         judgment = _judge_pair(context.code, parser, source_chars, target_chars)
         source_rows.append({
-            "rank": int(item.get("rank", len(source_rows) + 1)),
+            "rank": selected_rank,
+            "method_rank": int(item.get("rank", len(source_rows) + 1)),
             "source_token_index": source_idx,
             "source_token": item.get("source_token"),
             "alti_saliency": _safe_float(item.get("alti_saliency")),
@@ -625,6 +864,9 @@ def analyze_file(path: str, parser: Parser, k_values: Iterable[int]) -> dict | N
         "generated_lex": generated_value,
         "reference_lex": reference_value,
         "first_mismatch_ordinal": int(mismatch_ordinal),
+        "source_ranking": source_ranking,
+        "source_pool": "method_top",
+        "source_pool_size": len(method_top),
         "metrics": metrics,
         "top_sources": source_rows,
         "generated_completion_preview": completion_text[:500],
@@ -733,11 +975,20 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--feature-dir",
-        default="attribution_results_feature_loo_overlap_signed_clip_full100/feature",
+        default="attribution_results_feature_alti_saliency_full100/feature",
     )
     parser.add_argument("--output-dir", default="spurious_correlation_results")
     parser.add_argument("--k-values", default="5,10,20,50")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--source-ranking",
+        choices=["alti_saliency", "rank_score", "stored"],
+        default="alti_saliency",
+        help=(
+            "How to rank source correlations before computing top-k metrics. "
+            "Use alti_saliency for ALTI top-k; rank_score reproduces the old signed_clip method order."
+        ),
+    )
     args = parser.parse_args(argv)
 
     k_values = parse_k_values(args.k_values)
@@ -748,7 +999,7 @@ def main(argv: list[str] | None = None) -> None:
 
     records = []
     for path in files:
-        records.append(analyze_file(path, parser_go, k_values))
+        records.append(analyze_file(path, parser_go, k_values, args.source_ranking))
     summary = build_summary(records, k_values)
     write_outputs(records, summary, args.output_dir)
 

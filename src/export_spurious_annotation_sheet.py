@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import random
+import shutil
 from glob import glob
 from pathlib import Path
 
@@ -191,6 +192,9 @@ def export_annotation_sheets(
 ) -> tuple[str, str]:
     records = _select_records(_load_jsonl(analysis_jsonl), max_cases, case_indices, selection, seed)
     os.makedirs(output_dir, exist_ok=True)
+    full_code_dir = Path(output_dir) / "full_code"
+    if full_code_dir.exists():
+        shutil.rmtree(full_code_dir)
 
     annotation_path = os.path.join(output_dir, f"human_annotation_top{top_k}.tsv")
     key_path = os.path.join(output_dir, f"human_annotation_top{top_k}_auto_key.tsv")
@@ -206,6 +210,8 @@ def export_annotation_sheets(
         "generated_first_error",
         "reference_token",
         "source_rank",
+        "source_method_rank",
+        "source_ranking",
         "source_token_index",
         "source_token",
         "alti_saliency",
@@ -271,6 +277,8 @@ def export_annotation_sheets(
                     "generated_first_error": _single_line(record.get("generated_lex", "")),
                     "reference_token": _single_line(record.get("reference_lex", "")),
                     "source_rank": source_row.get("rank", source_order),
+                    "source_method_rank": source_row.get("method_rank", ""),
+                    "source_ranking": record.get("source_ranking", ""),
                     "source_token_index": source_index,
                     "source_token": _single_line(source_row.get("source_token", "")),
                     "alti_saliency": source_row.get("alti_saliency", ""),
@@ -317,7 +325,7 @@ def main() -> None:
         description="Export a blind human-annotation TSV from spurious-correlation analysis results."
     )
     parser.add_argument("--analysis-jsonl", default="spurious_correlation_results/per_sample.jsonl")
-    parser.add_argument("--feature-dir", default="attribution_results_feature_loo_overlap_signed_clip_full100/feature")
+    parser.add_argument("--feature-dir", default="attribution_results_feature_alti_saliency_full100/feature")
     parser.add_argument("--output-dir", default="spurious_correlation_results/human_annotation")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--max-cases", type=int, default=30)
