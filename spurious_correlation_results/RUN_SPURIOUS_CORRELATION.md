@@ -8,6 +8,7 @@
 
 - `src.feature_attribution_batch_evaluation`: 批量生成每个 test sample 的 ALTI feature attribution JSON。测新模型时先跑这个。
 - `src.spurious_correlation_analysis`: 读取上一步的 feature JSON，定位第一个 lexical mismatch，并计算 spurious correlation 指标。
+- `src.multilang_split`: 如果本地没有 `data/multilang_splits/*_{train,test}.jsonl`，先用它从原始多语言 SFT 数据生成 deterministic train/test splits。
 - `src.multimodel_multilang_spurious_report`: 可选。把多个 model/language 的 `summary.json` 汇总成论文表格和图。
 
 不要混淆：
@@ -22,6 +23,8 @@
 - fine-tuned model path，例如某个 LoRA merge 后模型目录或 HuggingFace 模型目录。
 - test JSONL，例如 `data/multilang_splits/go_test.jsonl`。
 - train JSONL，例如 `data/multilang_splits/go_train.jsonl`。这只用于估计六类 spurious pattern 里的 training-set co-occurrence 类别；spurious rate 本身主要由 feature attribution 和 structural support 决定。
+
+注意：`data/` 是本仓库的 ignored large-data directory，`data/multilang_splits/` 不随代码 commit 提交。如果本地没有这些 split 文件，需要按第 4 节先生成；如果原始数据也不存在，需要先准备第 4 节列出的原始 JSONL 文件。
 
 输出：
 
@@ -49,7 +52,40 @@ python -c "import tree_sitter, tree_sitter_go, tree_sitter_java, tree_sitter_jav
 
 如果只测某一种语言，至少要安装对应的 `tree_sitter_<language>` 包。
 
-## 4. 单个模型、单个语言的标准命令
+## 4. 准备多语言 train/test splits
+
+如果 `data/multilang_splits/` 不存在，先运行：
+
+```bash
+cd /home/yilu/Repo/Empirical-Influence-Function
+
+python -m src.multilang_split \
+  --output-dir data/multilang_splits \
+  --test-size 1000 \
+  --seed 42
+```
+
+该命令默认读取以下原始数据：
+
+- `data/go/go_single_train_v2_chatml.jsonl`
+- `data/java/java_single_train_codesearchnet_20000_chatml.jsonl`
+- `data/javascript/javascript_single_train_codesearchnet_20000_chatml.jsonl`
+- `data/python/python_single_train_codesearchnet_20000_chatml.jsonl`
+
+生成后应能看到：
+
+```text
+data/multilang_splits/go_train.jsonl
+data/multilang_splits/go_test.jsonl
+data/multilang_splits/java_train.jsonl
+data/multilang_splits/java_test.jsonl
+data/multilang_splits/javascript_train.jsonl
+data/multilang_splits/javascript_test.jsonl
+data/multilang_splits/python_train.jsonl
+data/multilang_splits/python_test.jsonl
+```
+
+## 5. 单个模型、单个语言的标准命令
 
 下面以 Go 为例。把 `MODEL_PATH` 换成要测的模型路径。
 
@@ -98,7 +134,7 @@ python -m src.spurious_correlation_analysis \
 - `--feature-max-prefix-len 2048` 会跳过太长 prefix 的 target，避免 ALTI rollout 显存爆掉。跳过数量会体现在 `summary.json` 的 `status_counts` 里。
 - `--attn-implementation eager` 很重要；ALTI 需要显式 attention probabilities。
 
-## 5. 查看结果
+## 6. 查看结果
 
 不用依赖 `jq`，直接用 Python 读主指标：
 
@@ -120,7 +156,7 @@ PY
 
 主结果写成百分比时乘以 100。例如 `0.7391` 就是 `73.91%`。
 
-## 6. 四语言批量模板
+## 7. 四语言批量模板
 
 如果同一个模型要测 Go、Java、JavaScript、Python，可以用：
 
@@ -162,7 +198,7 @@ for LANG in go java javascript python; do
 done
 ```
 
-## 7. 多模型论文图表汇总
+## 8. 多模型论文图表汇总
 
 如果输出目录组织成下面形式：
 
@@ -191,10 +227,11 @@ python -m src.multimodel_multilang_spurious_report \
 - `spurious_correlation_results/paper_draft/figures/figure_multimodel_multilang_spurious_breakdown.pdf`
 - `spurious_correlation_results/paper_draft/figures/figure_multimodel_multilang_spurious_breakdown.tex`
 
-## 8. 常见问题
+## 9. 常见问题
 
 1. `ok_count` 小于 100 是正常的。只有生成失败、能定位第一个 lexical mismatch、且该 target 的 ALTI attribution 可用的样本会进入主统计。
 2. 如果 `uncovered_target` 很多，通常是 `--max-output-tokens` 太小，或者 first mismatch 出现在没有计算 ALTI 的 target 位置。可以适当提高 `--max-output-tokens`，但会增加计算量。
 3. 如果显存爆掉，先降低 `--feature-max-prefix-len`，例如 1536；或者减少一次跑的 index 范围。
 4. 如果只想快速试跑，先用 `--start-idx 0 --end-idx 4`，确认 feature JSON 和 `summary.json` 都能生成后再跑 100 个样本。
 5. 论文主结果不要用 `signed` 或 `signed_clip`；当前主结果统一使用 `--feature-ranking-mode alti` 和 `--source-ranking alti_saliency`。
+6. 如果报 `No module named src.feature_attribution_batch_evaluation`，说明代码 commit 漏掉了 `src/feature_attribution_batch_evaluation.py`；如果报 `data/multilang_splits/... does not exist`，按第 4 节先生成 split。
