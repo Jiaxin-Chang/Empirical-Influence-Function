@@ -446,6 +446,17 @@
     text-transform: uppercase;
     margin-bottom: 4px;
 }
+.correlationListHint {
+    font-size: 11px;
+    color: #89b4fa;
+    line-height: 1.35;
+    margin-bottom: 4px;
+}
+.corrArrow {
+    margin: 0 6px;
+    color: #a6adc8;
+    font-weight: 700;
+}
 .correlationListItems {
     display: grid;
     grid-template-columns: 1fr 1fr;
