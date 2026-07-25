@@ -100,7 +100,7 @@ def compact_row_to_messages(tokenizer, row: dict[str, Any]) -> dict[str, Any]:
                 pass
 
     uid = row.get("uid") or row.get("raw_id") or row.get("task_id") or ""
-    return {
+    out = {
         "messages": [
             {"role": "system", "content": roles["system"]},
             {"role": "user", "content": roles["user"]},
@@ -110,6 +110,11 @@ def compact_row_to_messages(tokenizer, row: dict[str, Any]) -> dict[str, Any]:
         "uid": str(uid),
         "language": row.get("language"),
     }
+    # Keep graphsignal edges so CE+saliency train-bank can use the training objective.
+    edges = row.get("attention_edges")
+    if edges is not None:
+        out["attention_edges"] = edges
+    return out
 
 
 def verify_row(tokenizer, row: dict[str, Any], messages_obj: dict[str, Any]) -> tuple[bool, str]:

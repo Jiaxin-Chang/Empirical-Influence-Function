@@ -1327,30 +1327,27 @@ export function ReportPanel({
         return Array.from(selected).sort((a, b) => a - b);
     }, [selectedTokIdx, sourceHighlightIndices]);
 
-    // Pairs to show in the right panel
+    // Pairs to show in the right panel — only after the user picks one test (s→t) edge.
+    const selectedTestCorr = useMemo(() => {
+        if (!selectedResult || selectedTestCorrIdx === null) return null;
+        return selectedResult.top_correlations.find(c => c.source_token_index === selectedTestCorrIdx) ?? null;
+    }, [selectedResult, selectedTestCorrIdx]);
+
     const allDisplayPairs = useMemo(() => {
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
 
-        if (selectedResult) {
-            if (selectedTestCorrIdx !== null) {
-                return selectedResult.correlation_pairs.filter(p =>
-                    keep(p) && p.test_correlation.source_token_index === selectedTestCorrIdx
-                );
-            }
-            return selectedResult.correlation_pairs.filter(keep);
-        }
+        // Require an explicit Top-Correlation click before showing train matches.
+        if (!selectedResult || selectedTestCorrIdx === null) return [];
 
-        // Show all pairs across all analyzed tokens if no token is selected
-        const all: CorrelationPair[] = [];
-        report?.per_token_results.forEach(r => {
-            r.correlation_pairs.forEach(p => { if (keep(p)) all.push(p); });
-        });
-        all.sort((a, b) => b.cos_sim - a.cos_sim);
-        return all;
-    }, [selectedResult, selectedTestCorrIdx, report, threshold, hideZero]);
+        return selectedResult.correlation_pairs
+            .filter(p =>
+                keep(p) && p.test_correlation.source_token_index === selectedTestCorrIdx
+            )
+            .sort((a, b) => b.cos_sim - a.cos_sim);
+    }, [selectedResult, selectedTestCorrIdx, threshold, hideZero]);
 
-    // Group pairs by train_sample_id
+    // Group pairs by train_sample_id; keep Top-10 trains by best pair cos for this edge.
     const trainGroups = useMemo(() => {
         const map = new Map<number, CorrelationPair[]>();
         allDisplayPairs.forEach(p => {
@@ -1358,9 +1355,27 @@ export function ReportPanel({
             map.get(p.train_sample_id)!.push(p);
         });
         return Array.from(map.entries())
-            .map(([id, pairs]) => ({ id, pairs, bestSim: Math.max(...pairs.map(p => p.cos_sim)) }))
-            .sort((a, b) => b.bestSim - a.bestSim);
+            .map(([id, pairs]) => ({
+                id,
+                pairs: [...pairs].sort((a, b) => b.cos_sim - a.cos_sim),
+                bestSim: Math.max(...pairs.map(p => p.cos_sim)),
+            }))
+            .sort((a, b) => b.bestSim - a.bestSim)
+            .slice(0, 10);
     }, [allDisplayPairs]);
+
+    const trainPanelEmptyHint = useMemo(() => {
+        if (!selectedResult) {
+            return 'Click an analyzed output token, then choose one Top Correlation (source→target) to retrieve related training samples.';
+        }
+        if (selectedTestCorrIdx === null) {
+            return 'Select one Top Correlation on the left to show its Top-10 related training samples and matching pairs.';
+        }
+        if (importedReportActive && allDisplayPairs.length === 0) {
+            return 'No training correlation pairs are included for this selected source→target edge.';
+        }
+        return 'No matching pairs for this source→target edge. Try lowering the cos_sim threshold.';
+    }, [selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length]);
 
     // ── Export logic ─────────────────────────────────────────────────────────
 
@@ -2018,18 +2033,27 @@ export function ReportPanel({
                                     <div className={styles.correlationListTitle}>
                                         Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
                                     </div>
+                                    <div className={styles.correlationListHint}>
+                                        Click one source→target edge to load its Top-10 training matches on the right.
+                                    </div>
                                     <div className={styles.correlationListItems}>
                                         {selectedResult.top_correlations.slice(0, 4).map(c => (
                                             <button
                                                 key={c.source_token_index}
+                                                type="button"
+                                                title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(selectedResult.target_token).trim()} for train retrieval`}
                                                 className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
                                                 onClick={() => setSelectedTestCorrIdx(
                                                     prev => prev === c.source_token_index ? null : c.source_token_index
                                                 )}
                                             >
                                                 <div className={styles.corrBtnLeft}>
-                                                    <span className={styles.corrLabel}>source token</span>
-                                                    <span className={styles.corrSourceTok}>{c.source_token.trim() || '·'}</span>
+                                                    <span className={styles.corrLabel}>source → target</span>
+                                                    <span className={styles.corrSourceTok}>
+                                                        {(decodeToken(c.source_token).trim() || '·')}
+                                                        <span className={styles.corrArrow}>→</span>
+                                                        {decodeToken(selectedResult.target_token).trim() || '·'}
+                                                    </span>
                                                 </div>
                                                 <div className={styles.corrBtnRight}>
                                                     <span className={styles.corrScoreLabel}>saliency</span>
@@ -2047,13 +2071,13 @@ export function ReportPanel({
                             <div className={styles.bottomPanel}>
                                 <div className={styles.bottomPanelHeader}>
                                     <div className={styles.bottomPanelTitle}>
-                                        {selectedResult
-                                            ? (selectedTestCorrIdx !== null
-                                                ? `Training Correlations for Selected Source Token`
-                                                : `Training Correlations for Target Token`)
-                                            : 'All Training Correlations'}
+                                        {selectedTestCorr && selectedResult
+                                            ? `Training matches for "${decodeToken(selectedTestCorr.source_token).trim() || '·'} → ${decodeToken(selectedResult.target_token).trim()}"`
+                                            : 'Training Correlations'}
                                         <span className={styles.pairCount}>
-                                            {trainGroups.length} groups · {allDisplayPairs.length} pairs
+                                            {selectedTestCorrIdx === null
+                                                ? 'select a Top Correlation'
+                                                : `${trainGroups.length} trains · ${allDisplayPairs.length} pairs (Top-10)`}
                                         </span>
                                     </div>
                                     <div className={styles.filterRow}>
@@ -2285,9 +2309,7 @@ export function ReportPanel({
 
                                 {trainGroups.length === 0 ? (
                                     <div className={styles.emptyState} style={{ padding: '32px 0' }}>
-                                        {importedReportActive
-                                            ? 'No training correlation pairs are included in this imported report.'
-                                            : 'No matching pairs. Try lowering the threshold.'}
+                                        {trainPanelEmptyHint}
                                     </div>
                                 ) : (
                                     <div className={styles.trainGroupList}>
