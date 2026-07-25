@@ -195,21 +195,33 @@ N_SKIP=0
 N_FAIL=0
 FAILED_INDICES=()
 
+# Derive model tag the same way as intervention_experiment.model_tag_from_path
+MODEL_TAG="$(python3 - "$MODEL_PATH" <<'PYEOF'
+import os, re, sys
+path = sys.argv[1]
+tag = os.path.basename(os.path.normpath(path)).strip()
+tag = re.sub(r"[^\w.\-]+", "_", tag).strip("._") or "model"
+print(tag)
+PYEOF
+)"
+
 for IDX in "${VALID_RUN_INDICES[@]}"; do
     TASK_ID="${TASK_IDS[$IDX]}"
-    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${TASK_ID}_all_tokens.json"
+    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${MODEL_TAG}_${TASK_ID}_all_tokens.json"
+    # Backward compatible: also skip if old filename without model tag exists
+    LEGACY_RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${TASK_ID}_all_tokens.json"
 
     # Resume: skip if result already exists
-    if [[ -f "$RESULT_FILE" ]]; then
-        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] SKIP  ${TASK_ID}  (result exists)"
+    if [[ -f "$RESULT_FILE" || -f "$LEGACY_RESULT_FILE" ]]; then
+        echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] SKIP  ${MODEL_TAG}/${TASK_ID}  (result exists)"
         N_SKIP=$((N_SKIP + 1))
         continue
     fi
 
     echo ""
-    echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] START  task_id=${TASK_ID}"
+    echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] START  model=${MODEL_TAG} task_id=${TASK_ID}"
 
-    LOG_FILE="${LOG_DIR}/${TASK_ID}.log"
+    LOG_FILE="${LOG_DIR}/${MODEL_TAG}_${TASK_ID}.log"
 
     "${PYTHON}" -m src.intervention_experiment \
         --model-path  "${MODEL_PATH}" \
@@ -259,6 +271,6 @@ if [[ ${#FAILED_INDICES[@]} -gt 0 ]]; then
     echo ""
     echo "  Logs for failed samples are in: ${LOG_DIR}/"
 fi
-echo "  Results : ${ROOT_DIR}/correlation_matching_results_test*_all_tokens.json"
+echo "  Results : ${ROOT_DIR}/correlation_matching_results_<model>_*_all_tokens.json"
 echo "  Logs    : ${LOG_DIR}/"
 echo "================================================================="

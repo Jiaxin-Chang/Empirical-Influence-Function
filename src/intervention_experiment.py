@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import torch
 import torch.nn.functional as F
@@ -348,6 +349,15 @@ def get_context_window(tokenizer, input_ids_1d, idx, window=CONTEXT_WINDOW_SIZE)
         tok_str = tokenizer.decode([input_ids_1d[i].item()])
         tokens.append(f"→[{tok_str}]←" if i == idx else tok_str)
     return tokens
+
+
+def model_tag_from_path(model_path: str | None) -> str:
+    """Derive a short model tag from a checkpoint path (e.g. .../merged/ce_saliency → ce_saliency)."""
+    if not model_path:
+        return "model"
+    tag = os.path.basename(os.path.normpath(model_path)).strip()
+    tag = re.sub(r"[^\w.\-]+", "_", tag).strip("._")
+    return tag or "model"
 
 
 def _write_json_report(report_json: dict, report_filename: str, accelerator) -> str | None:
@@ -843,6 +853,8 @@ def run_causal_intervention_experiment(
         attn_implementation=attn_implementation,
         max_gpu_memory=max_gpu_memory,
     )
+    model_tag = model_tag_from_path(model_path)
+    print(f"[DEBUG] model_tag={model_tag}", flush=True)
     if corr_feature_mode != "auto":
         print(
             f"[DEBUG] --corr-feature-mode={corr_feature_mode} is ignored; "
@@ -1302,6 +1314,9 @@ def run_causal_intervention_experiment(
     prescreen_report_json = {
         "experiment_meta": {
             "test_sample_index": SELECTED_TEST_SAMPLE_INDEX,
+            "task_id": _task_id,
+            "model_name": model_tag,
+            "model_path": model_path,
             "mode": "all_tokens",
             "stage": "global_prescreen",
             "is_checkpoint": True,
@@ -1345,7 +1360,7 @@ def run_causal_intervention_experiment(
         "per_token_results": prescreen_per_token_results,
         "train_sample_details": prescreen_train_details,
     }
-    prescreen_filename = f"correlation_matching_results_{_task_id}_all_tokens_prescreen.json"
+    prescreen_filename = f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens_prescreen.json"
     prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
     if prescreen_path is not None:
         print(f"  Prescreen checkpoint saved → {prescreen_path}", flush=True)
@@ -1486,6 +1501,9 @@ def run_causal_intervention_experiment(
     report_json = {
         "experiment_meta": {
             "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
+            "task_id":            _task_id,
+            "model_name":         model_tag,
+            "model_path":         model_path,
             "mode":               "all_tokens",
             "max_output_tokens":  MAX_OUTPUT_TOKENS,
             "tokens_analyzed":    len(per_token_results),
@@ -1524,7 +1542,7 @@ def run_causal_intervention_experiment(
         "train_sample_details": train_sample_details,
     }
 
-    report_filename = f"correlation_matching_results_{_task_id}_all_tokens.json"
+    report_filename = f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens.json"
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
     report_path = _write_json_report(report_json, report_filename, accelerator)
