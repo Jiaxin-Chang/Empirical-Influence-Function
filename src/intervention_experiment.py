@@ -328,11 +328,29 @@ def _resolve_base_model_path(adapter_path: str, base_model_path: str | None) -> 
     )
 
 
-def make_lora_param_filter():
-    """Select PEFT LoRA parameters only (same space as viz data_attribution)."""
+def make_lora_param_filter(model=None, last_n_layers: int | None = None):
+    """Select PEFT LoRA parameters (optionally restricted to the last N layers).
+
+    When ``last_n_layers`` is set, bank / probe / ALTI-∇C share the same last-N
+    LoRA subspace (needed on 24GB GPUs; avoids full-stack LoRA ALTI graphs).
+    """
+
+    allowed_layers = None
+    if model is not None and last_n_layers is not None and int(last_n_layers) > 0:
+        decoder = _get_decoder_layers_module(model)
+        num_layers = len(decoder.layers)
+        start_layer = max(0, num_layers - int(last_n_layers))
+        allowed_layers = set(range(start_layer, num_layers))
 
     def _filter(name, param):
-        return "lora_" in name
+        if "lora_" not in name:
+            return False
+        if allowed_layers is None:
+            return True
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+        if match is None:
+            return False
+        return int(match.group(1)) in allowed_layers
 
     return _filter
 
@@ -362,10 +380,10 @@ SELECTED_TEST_SAMPLE_INDEX = 58
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
-TOP_TARGETS = 3                # How many response tokens to scan per train sample
-TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per target (includes response-internal tokens)
+TOP_TARGETS = None             # None = all non-trivial train response tokens; int = optional cap
+TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per train target (saliency top-3)
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
-FINE_MATCH_LAST_N_LAYERS = 1   # ALTI-gradient matching params: last N layers
+FINE_MATCH_LAST_N_LAYERS = 1   # LoRA / fine-attn grads: last N layers (bank + probe + ∇C)
 FINE_MATCH_PROJ = "qk"         # Attention projections used for fine matching: qk, qkvo, vo, q/k/v/o, all
 ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computation
 ALTI_GRAD_CHUNK_SIZE = 32      # Pair-gradient starts fast and falls back on OOM
@@ -1343,14 +1361,16 @@ def run_causal_intervention_experiment(
             flush=True,
         )
     if grad_space == "lora":
-        fine_param_filter = make_lora_param_filter()
+        fine_param_filter = make_lora_param_filter(
+            model, last_n_layers=FINE_MATCH_LAST_N_LAYERS
+        )
         print(
             "[DEBUG] correlation / probe / train-bank gradients: LoRA params "
-            "(viz-aligned; all adapter tensors with 'lora_' in name)",
+            f"(last {FINE_MATCH_LAST_N_LAYERS} layer(s); aligned bank↔probe↔∇C)",
             flush=True,
         )
-        bank_grad_tag = f"lora_{bank_cfg.cache_tag}"
-        match_desc = "alti_gradient_lora"
+        bank_grad_tag = f"lora_L{FINE_MATCH_LAST_N_LAYERS}_{bank_cfg.cache_tag}"
+        match_desc = f"alti_gradient_lora_L{FINE_MATCH_LAST_N_LAYERS}"
     else:
         fine_param_filter = make_attention_projection_filter(
             model, FINE_MATCH_LAST_N_LAYERS, fine_match_proj
@@ -1415,8 +1435,8 @@ def run_causal_intervention_experiment(
         max_seq_len=prescreen_max_seq_len,
         sketch_dim=prescreen_sketch_dim,
         sketch_seed=prescreen_sketch_seed,
-        fine_match_proj=fine_match_proj if grad_space != "lora" else "lora_all",
-        last_n_layers=FINE_MATCH_LAST_N_LAYERS if grad_space != "lora" else -1,
+        fine_match_proj=fine_match_proj if grad_space != "lora" else f"lora_L{FINE_MATCH_LAST_N_LAYERS}",
+        last_n_layers=FINE_MATCH_LAST_N_LAYERS,
         cache_dir=saliency_train_bank_cache_dir,
         bank_cfg=bank_cfg,
         train_samples=train_samples,
@@ -1519,8 +1539,9 @@ def run_causal_intervention_experiment(
                 last_error_message = str(exc)
                 print(f"  OOM in ALTI-gradient chunk={chunk}; retrying smaller chunk...")
                 torch.cuda.empty_cache()
-        print(f"  Skipping ALTI-gradient after OOM chunks {chunks}: {last_error_message}")
-        return None
+        raise RuntimeError(
+            f"ALTI-gradient OOM after trying chunks {chunks}: {last_error_message}"
+        )
 
     def _compute_alti_match_and_probe_retry(**kwargs):
         target_idx = int(kwargs["target_idx_in_seq"])
@@ -1548,8 +1569,9 @@ def run_causal_intervention_experiment(
                 last_error_message = str(exc)
                 print(f"  OOM in ALTI match/probe chunk={chunk}; retrying smaller chunk...")
                 torch.cuda.empty_cache()
-        print(f"  Skipping ALTI match/probe after OOM chunks {chunks}: {last_error_message}")
-        return None
+        raise RuntimeError(
+            f"ALTI match/probe OOM after trying chunks {chunks}: {last_error_message}"
+        )
 
     # ════════════════════════════════════════════════════════════════════════════
     # Helper: Stage 3 processing for one train sample
@@ -1591,10 +1613,15 @@ def run_causal_intervention_experiment(
             target_saliencies: dict[int, list[float]] = {}
             candidate_pairs: list[tuple[float, int, int]] = []
 
+            # All non-trivial train answer tokens as targets (optional --top-targets cap);
+            # each keeps saliency top-K sources (default 3) → ~n_valid × 3 candidate pairs.
+            max_train_targets = TOP_TARGETS  # None => no cap
             with torch.inference_mode(False):
                 t_tr = response_start
                 kept_targets = 0
-                while t_tr < tr_seq_len and kept_targets < TOP_TARGETS:
+                while t_tr < tr_seq_len:
+                    if max_train_targets is not None and kept_targets >= max_train_targets:
+                        break
                     if is_trivial_token(tokenizer, int(tr_batch["input_ids"][0, t_tr].item())):
                         t_tr += 1
                         continue
@@ -1615,8 +1642,11 @@ def run_causal_intervention_experiment(
                     kept_targets += 1
                     t_tr += 1
 
-            print(f"  Step A: {len(candidate_pairs)} candidate pairs "
-                  f"({TOP_TARGETS}t × {TOP_K_SOURCE_PER_TARGET}s each)")
+            print(
+                f"  Step A: {len(candidate_pairs)} candidate pairs "
+                f"({kept_targets} valid pred tokens × {TOP_K_SOURCE_PER_TARGET}s each)",
+                flush=True,
+            )
 
             cached_detail = {
                 "full_tokens":        full_tokens,
@@ -2136,7 +2166,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--top-targets", type=int, default=None,
-        help="How many response target tokens to scan per train sample.",
+        help=(
+            "Optional cap on non-trivial train response tokens to scan. "
+            "Default: all valid prediction tokens (each keeps saliency top-K sources)."
+        ),
     )
     parser.add_argument(
         "--top-k-source-per-target", type=int, default=None,
@@ -2147,7 +2180,7 @@ if __name__ == "__main__":
     if args.test_index is not None:
         SELECTED_TEST_SAMPLE_INDEX = args.test_index
     if args.top_targets is not None:
-        TOP_TARGETS = max(1, int(args.top_targets))
+        TOP_TARGETS = None if int(args.top_targets) <= 0 else max(1, int(args.top_targets))
     if args.top_k_source_per_target is not None:
         TOP_K_SOURCE_PER_TARGET = max(1, int(args.top_k_source_per_target))
 

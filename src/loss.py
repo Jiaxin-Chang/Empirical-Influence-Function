@@ -1037,11 +1037,9 @@ def compute_alti_match_and_probe_gradients(
     """Compute ∇_θ ALTI(s→t) and viz-style ∇_θ (-log(ALTI+ε)).
 
     Uses two separate forwards (no retain_graph) to cut peak memory.
-    When the param filter spans many layers (typical full-LoRA), ALTI score is
-    computed with the last-layer rollout path so earlier layers run under
-    no_grad — otherwise eager attention + full-graph LoRA OOMs on 24GB GPUs.
-    Earlier-layer LoRA slots in the flat vector are then zeros; bank vectors
-    remain full-LoRA CE grads (same length, cosine still defined).
+    Prefer passing a last-N LoRA ``param_filter_fn`` so bank/probe/∇C share one
+    subspace. If the filter still spans many layers, this falls back to a
+    last-layer ALTI path (earlier-layer slots zero) to avoid OOM on 24GB GPUs.
     """
     if torch.is_inference_mode_enabled():
         raise RuntimeError("Disable torch.inference_mode() before calling this function.")
@@ -1198,21 +1196,43 @@ def compute_alti_match_and_probe_gradients(
                 else:
                     loss = alti_score
 
+                # Only differentiate w.r.t. params that currently require grad.
+                # Earlier-layer LoRA slots stay in the flat vector as zeros so the
+                # length still matches the full-LoRA bank.
+                grad_params = [param for param in target_params if param.requires_grad]
+                if not grad_params:
+                    raise RuntimeError(
+                        "compute_alti_match_and_probe_gradients: no requires_grad "
+                        "parameters left after last-layer restriction."
+                    )
+                if not torch.is_tensor(loss) or not loss.requires_grad:
+                    raise RuntimeError(
+                        "ALTI match/probe score is not connected to the graph "
+                        "(loss.requires_grad=False). Check eager attention and "
+                        "last-layer LoRA requires_grad settings."
+                    )
                 grads = torch.autograd.grad(
                     loss,
-                    target_params,
+                    grad_params,
                     create_graph=False,
                     retain_graph=False,
                     allow_unused=True,
                 )
+                grad_map = {
+                    id(param): g for param, g in zip(grad_params, grads)
+                }
+                del grads
 
             flat = torch.cat([
-                g.reshape(-1).detach().cpu().float()
-                if g is not None else torch.zeros(p.numel(), dtype=torch.float32)
-                for g, p in zip(grads, target_params)
+                (
+                    grad_map[id(param)].reshape(-1).detach().cpu().float()
+                    if id(param) in grad_map and grad_map[id(param)] is not None
+                    else torch.zeros(param.numel(), dtype=torch.float32)
+                )
+                for param in target_params
             ])
             score_value = float(alti_score.detach().cpu().item())
-            del hidden_states, attentions, relevance, grads
+            del hidden_states, attentions, relevance, grad_map
             return flat, score_value
         finally:
             for param, flag in original_flags:
