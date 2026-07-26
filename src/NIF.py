@@ -730,8 +730,10 @@ class NewInferenceFunction:
             trimmed_ids[i, :tlen] = input_ids[i, :tlen]
             trimmed_mask[i, :tlen] = 1
 
-        if not isinstance(self.model, GenerationMixin):
-            raise ValueError("Expect self.model to be GenerationMixin")
+        # PeftModel wraps CausalLM and exposes .generate(), but is often not a
+        # GenerationMixin subclass — so do not require isinstance(..., GenerationMixin).
+        if not hasattr(self.model, "generate") or not callable(getattr(self.model, "generate")):
+            raise ValueError("Expect self.model to support .generate()")
 
         # Part 2: generation sequence inference, saliency on generated sequence
 
