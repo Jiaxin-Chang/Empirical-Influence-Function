@@ -1428,6 +1428,8 @@ def run_causal_intervention_experiment(
             "Saliency train bank is required for Top-K train retrieval. "
             "Check --prescreen-sketch-dim (>0) and GPU memory, then retry."
         )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     infer_fw = NewInferenceFunction(
         model=model, tokenizer=tokenizer,
