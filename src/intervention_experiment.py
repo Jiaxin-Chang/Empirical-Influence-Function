@@ -101,6 +101,12 @@ def load_samples(jsonl_path: str) -> list[dict]:
                 edges = obj.get("edges")
             if edges is not None:
                 sample["attention_edges"] = edges
+            # Preserve compact token ids when present (viz free-run uses these verbatim).
+            if isinstance(obj.get("input_ids"), list) and obj["input_ids"]:
+                sample["input_ids"] = list(obj["input_ids"])
+                labs = obj.get("label", obj.get("labels"))
+                if isinstance(labs, list) and len(labs) == len(sample["input_ids"]):
+                    sample["labels"] = list(labs)
             samples.append(sample)
 
     return samples
@@ -1383,6 +1389,12 @@ def run_causal_intervention_experiment(
         )
         bank_grad_tag = f"fineattn_{fine_match_proj}_L{FINE_MATCH_LAST_N_LAYERS}_{bank_cfg.cache_tag}"
         match_desc = f"alti_gradient_{fine_match_proj}"
+    _stage3_tgt = "all valid pred tokens" if TOP_TARGETS is None else f"first {TOP_TARGETS} valid pred tokens"
+    print(
+        f"[DEBUG] Stage3 train scan: {_stage3_tgt} × saliency top-{TOP_K_SOURCE_PER_TARGET} sources "
+        f"(--top-targets / --top-k-source-per-target). Quick 3×3: --top-targets 3",
+        flush=True,
+    )
     print("[DEBUG] Model and tokenizer loaded.", flush=True)
     param_filter = lm_head_filter
 
@@ -1466,6 +1478,8 @@ def run_causal_intervention_experiment(
     marker_ids = tuple(tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
 
     # ── Build full test sequence (prompt + generated response) ──────────────
+    # Prefer compact input_ids/label like viz/precompute._free_run so the prompt
+    # is exactly ids[:first_label!=-100]. Fall back to ChatML re-encode otherwise.
     _cur_test     = test_samples[SELECTED_TEST_SAMPLE_INDEX]
     # Use task_id for output file naming; fall back to index if absent.
     _task_id = _safe_filename_token(
@@ -1476,19 +1490,122 @@ def run_causal_intervention_experiment(
         f"[DEBUG] report files → correlation_matching_results_{model_tag}_{_task_id}_all_tokens*.json",
         flush=True,
     )
-    test_ds       = build_single_sample_dataset(_cur_test, convert_to_chatml)
-    raw_test_batch = base_collator([test_ds[0]])
-    print(f"[DEBUG] Moving test batch to device {accelerator.device}...", flush=True)
-    raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
-    print(f"[DEBUG] Test batch on device. input_ids shape={raw_test_batch['input_ids'].shape}", flush=True)
 
     infer_fw.model.eval()
-    print("[DEBUG] Starting infer_fw.infer(raw_test_batch)...", flush=True)
-    gen_result = infer_fw.infer(raw_test_batch, skip_saliency=True)
-    print("[DEBUG] Inference done.", flush=True)
-    prompt_len = int(gen_result["target_idx"][0])
-    prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
-    pred_ids   = torch.tensor(gen_result["pred_ids"][0], device=prompt_ids.device, dtype=prompt_ids.dtype)
+    _compact_ids = _cur_test.get("input_ids")
+    _compact_lbl = _cur_test.get("labels")
+    if (
+        isinstance(_compact_ids, list)
+        and isinstance(_compact_lbl, list)
+        and len(_compact_ids) == len(_compact_lbl)
+        and any(int(x) != -100 for x in _compact_lbl)
+    ):
+        print(
+            "[DEBUG] Using compact input_ids/label for free-run (viz-aligned prompt cut).",
+            flush=True,
+        )
+        p0 = next(i for i, lab in enumerate(_compact_lbl) if int(lab) != -100)
+        prompt_ids_list = [int(x) for x in _compact_ids[:p0]]
+        gold_ans_ids = [int(tid) for tid, lab in zip(_compact_ids, _compact_lbl) if int(lab) != -100]
+        device = accelerator.device
+        prompt = torch.tensor([prompt_ids_list], device=device)
+        _im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        _eos_ids = sorted({i for i in [tokenizer.eos_token_id, _im_end] if i is not None})
+        print("[DEBUG] Starting viz-style model.generate(prompt)...", flush=True)
+        with torch.inference_mode():
+            gen_out = model.generate(
+                input_ids=prompt,
+                attention_mask=torch.ones_like(prompt),
+                max_new_tokens=128,
+                do_sample=False,
+                num_beams=1,
+                repetition_penalty=1.0,
+                temperature=1.0,
+                top_p=1.0,
+                eos_token_id=_eos_ids,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                use_cache=True,
+            )
+        print("[DEBUG] Inference done.", flush=True)
+        full_ids = gen_out[0].tolist()
+        prompt_len = p0
+        pred_ids_list = full_ids[p0:]
+        pred_ids = torch.tensor(pred_ids_list, device=device, dtype=torch.long)
+        prompt_ids = torch.tensor(prompt_ids_list, device=device, dtype=torch.long)
+        model_out_text = tokenizer.decode(pred_ids_list, skip_special_tokens=False)
+        gold_text = tokenizer.decode(gold_ans_ids, skip_special_tokens=False)
+        gen_source = "compact_ids"
+    else:
+        print(
+            "[DEBUG] No compact input_ids/label on sample; falling back to ChatML re-encode + NIF.infer.",
+            flush=True,
+        )
+        test_ds       = build_single_sample_dataset(_cur_test, convert_to_chatml)
+        raw_test_batch = base_collator([test_ds[0]])
+        print(f"[DEBUG] Moving test batch to device {accelerator.device}...", flush=True)
+        raw_test_batch = {k: v.to(accelerator.device) for k, v in raw_test_batch.items()}
+        print(f"[DEBUG] Test batch on device. input_ids shape={raw_test_batch['input_ids'].shape}", flush=True)
+        print("[DEBUG] Starting infer_fw.infer(raw_test_batch)...", flush=True)
+        gen_result = infer_fw.infer(raw_test_batch, skip_saliency=True)
+        print("[DEBUG] Inference done.", flush=True)
+        prompt_len = int(gen_result["target_idx"][0])
+        pred_ids   = torch.tensor(
+            gen_result["pred_ids"][0],
+            device=raw_test_batch["input_ids"].device,
+            dtype=raw_test_batch["input_ids"].dtype,
+        )
+        model_out_text = gen_result.get("pred_text", [None])[0]
+        if model_out_text is None:
+            model_out_text = tokenizer.decode(pred_ids.tolist(), skip_special_tokens=False)
+        gold_text = gen_result.get("answer_text", [None])[0]
+        if gold_text is None:
+            gold_text = _cur_test.get("output", "")
+        prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
+        gen_source = "chatml_reencode"
+
+    model_out_clean = str(model_out_text).split("<|im_end|>")[0]
+    gold_clean = str(gold_text).split("<|im_end|>")[0]
+    _prompt_sha = hashlib.sha1(
+        ",".join(str(int(x)) for x in prompt_ids.tolist()).encode()
+    ).hexdigest()[:12]
+    _gen_sha = hashlib.sha1(
+        ",".join(str(int(x)) for x in pred_ids.tolist()).encode()
+    ).hexdigest()[:12]
+    print("=" * 64, flush=True)
+    print(
+        f"[DEBUG] model generation  task_id={_task_id}  source={gen_source}  "
+        f"prompt_len={prompt_len}  prompt_sha1={_prompt_sha}  "
+        f"n_gen_tokens={int(pred_ids.numel())}  gen_sha1={_gen_sha}",
+        flush=True,
+    )
+    print("--- MODEL OUTPUT (this run) ---", flush=True)
+    print(model_out_clean, flush=True)
+    print("--- GOLD (from label / JSONL) ---", flush=True)
+    print(gold_clean, flush=True)
+    print(
+        f"[DEBUG] gen token ids (first 64): {pred_ids.tolist()[:64]}",
+        flush=True,
+    )
+    print("=" * 64, flush=True)
+
+    # Token lists for report UI (always available, both free-run paths).
+    _prompt_id_list = [int(x) for x in prompt_ids.tolist()]
+    _pred_id_list = [int(x) for x in pred_ids.tolist()]
+    pred_full_tokens = [tokenizer.decode([i]) for i in (_prompt_id_list + _pred_id_list)]
+    if gen_source == "compact_ids":
+        _gold_id_list = [
+            int(tid) for tid, lab in zip(_compact_ids, _compact_lbl) if int(lab) != -100
+        ]
+        correct_full_tokens = [
+            tokenizer.decode([i]) for i in (_prompt_id_list + _gold_id_list)
+        ]
+    else:
+        correct_full_tokens = gen_result.get("full_tokens", [pred_full_tokens])[0]
+    gen_result = {
+        "pred_full_tokens": [pred_full_tokens],
+        "full_tokens": [correct_full_tokens],
+    }
+
     new_input_ids      = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
     new_attention_mask = torch.ones_like(new_input_ids)
     new_labels         = new_input_ids.clone()
@@ -2167,13 +2284,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top-targets", type=int, default=None,
         help=(
-            "Optional cap on non-trivial train response tokens to scan. "
-            "Default: all valid prediction tokens (each keeps saliency top-K sources)."
+            "Cap Stage3 to the first K non-trivial answer tokens per train sample "
+            "(each still keeps saliency top sources). Default: all valid tokens. "
+            "Use --top-targets 3 for classic ~3×3 (with default --top-k-source-per-target 3). "
+            "Pass <=0 to mean 'no cap' (same as omitting)."
         ),
     )
     parser.add_argument(
         "--top-k-source-per-target", type=int, default=None,
-        help="How many source tokens to keep for each train response target.",
+        help=(
+            "Saliency top-K sources kept per train answer token in Stage3 "
+            "(default 3). Together with --top-targets K → about K×this many candidate pairs."
+        ),
     )
     args = parser.parse_args()
 
