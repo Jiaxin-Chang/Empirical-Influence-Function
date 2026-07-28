@@ -110,6 +110,10 @@ def compact_row_to_messages(tokenizer, row: dict[str, Any]) -> dict[str, Any]:
         "uid": str(uid),
         "language": row.get("language"),
     }
+    # Keep original token ids/labels so free-run matches viz (ids[:first label!=-100]).
+    out["input_ids"] = list(ids)
+    if isinstance(labels, list) and len(labels) == len(ids):
+        out["label"] = list(labels)
     # Keep graphsignal edges so CE+saliency train-bank can use the training objective.
     edges = row.get("attention_edges")
     if edges is not None:

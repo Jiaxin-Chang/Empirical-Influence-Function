@@ -6,7 +6,6 @@ ce_saliency -> CE + λ * contrastive saliency loss (needs attention_edges)
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,32 +80,39 @@ def load_bank_loss_config(model_path: str | None, model_tag: str) -> BankLossCon
     )
 
 
-def _resolve_cca_train_dir() -> Path | None:
-    here = Path(__file__).resolve().parent  # .../src
+def _import_saliency_loss_from_outputs():
+    """Load contrastive saliency loss used by ce_saliency train-bank grads.
+
+    Prefers the vendored copy at ``src/saliency_loss.py`` (moved out of
+    code-corr-annotation). Falls back to the old CCA path if present.
+    """
+    try:
+        from src.saliency_loss import saliency_loss_from_outputs
+        return saliency_loss_from_outputs
+    except ImportError:
+        pass
+
+    # Fallback: legacy code-corr-annotation/src/train/loss.py
+    import sys
+
+    here = Path(__file__).resolve().parent
     root = here.parent
     candidates = [
         root / "code-corr-annotation" / "src" / "train",
         root.parent / "code-corr-annotation" / "src" / "train",
     ]
-    for p in candidates:
-        if (p / "loss.py").is_file():
-            return p
-    return None
+    for train_dir in candidates:
+        if (train_dir / "loss.py").is_file():
+            train_dir_s = str(train_dir)
+            if train_dir_s not in sys.path:
+                sys.path.insert(0, train_dir_s)
+            from loss import saliency_loss_from_outputs  # type: ignore
+            return saliency_loss_from_outputs
 
-
-def _import_saliency_loss_from_outputs():
-    train_dir = _resolve_cca_train_dir()
-    if train_dir is None:
-        raise ImportError(
-            "Cannot find code-corr-annotation/src/train/loss.py for CE+saliency bank. "
-            "Place code-corr-annotation next to (or inside) this repo."
-        )
-    train_dir_s = str(train_dir)
-    if train_dir_s not in sys.path:
-        sys.path.insert(0, train_dir_s)
-    from loss import saliency_loss_from_outputs  # type: ignore
-
-    return saliency_loss_from_outputs
+    raise ImportError(
+        "Cannot import saliency_loss_from_outputs. Expected src/saliency_loss.py "
+        "(or legacy code-corr-annotation/src/train/loss.py)."
+    )
 
 
 def _annot_pairs_from_edges(edges, n_tokens: int, device) -> list[torch.Tensor]:
