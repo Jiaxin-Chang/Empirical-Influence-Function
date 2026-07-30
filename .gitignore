@@ -229,3 +229,4 @@ samples*.md
 .DS_Store
 reports/
 .vite/results.txt
+logs/

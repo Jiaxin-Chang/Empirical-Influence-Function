@@ -387,6 +387,13 @@
     border-radius: 3px;
 }
 
+.token-annotated-source {
+    text-decoration: underline;
+    text-decoration-color: #ef4444;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+}
+
 /* ── Bottom Section ── */
 .bottomSection {
     display: flex;
