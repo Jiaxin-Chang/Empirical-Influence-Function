@@ -1765,14 +1765,35 @@ def run_causal_intervention_experiment(
                 flush=True,
             )
 
+            # Collect annotation edges for this train sample, grouped by dst (target).
+            # Filter out edges whose source is a ChatML structural token (noise).
+            edges = train_samples[train_idx].get("attention_edges") or []
+            annotations_by_target: dict[str, list[dict]] = {}
+            for e in edges:
+                src = int(e["src"])
+                dst = int(e["dst"])
+                # Skip edges where source is a ChatML template marker
+                if src < len(full_tokens):
+                    src_tok = full_tokens[src].strip()
+                    if (src_tok in {"<|im_start|>", "<|im_end|>", "system", "user", "assistant",
+                                    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+                                    "<|repo_name|>", "<|file_sep|>", "<|endoftext|>"}
+                            or "<|im_start|>" in src_tok or "<|im_end|>" in src_tok
+                            or src_tok == "\n"):
+                        continue
+                dst_key = str(dst)
+                entry = {"src": src, "subtype": str(e.get("subtype", ""))}
+                annotations_by_target.setdefault(dst_key, []).append(entry)
+
             cached_detail = {
-                "full_tokens":        full_tokens,
-                "answer_start_index": response_start,
-                "coarse_cos_sim":     float(coarse_score),
-                "saliencies_by_token": {str(k): v for k, v in target_saliencies.items()},
-                "_candidate_pairs":   candidate_pairs,
-                "_tr_batch_cpu":      {k: v.cpu() for k, v in tr_batch.items()},
-                "_feature_cache":     {},
+                "full_tokens":             full_tokens,
+                "answer_start_index":      response_start,
+                "coarse_cos_sim":          float(coarse_score),
+                "saliencies_by_token":     {str(k): v for k, v in target_saliencies.items()},
+                "annotations_by_target":   annotations_by_target,
+                "_candidate_pairs":        candidate_pairs,
+                "_tr_batch_cpu":           {k: v.cpu() for k, v in tr_batch.items()},
+                "_feature_cache":          {},
             }
         else:
             # Update coarse score to the maximum seen across test tokens
