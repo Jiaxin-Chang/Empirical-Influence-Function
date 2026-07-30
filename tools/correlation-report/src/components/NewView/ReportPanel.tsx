@@ -85,6 +85,7 @@ interface TrainSampleDetail {
     answer_start_index: number;
     coarse_cos_sim: number;
     saliencies_by_token: Record<string, number[]>;
+    annotations_by_target?: Record<string, { src: number; subtype: string }[]>;
 }
 
 export interface AllTokensReport {
@@ -843,16 +844,18 @@ function TokenSpan({
     state,
     onClick,
     title,
+    className,
 }: {
     token: string;
     state: TokenState;
     onClick?: () => void;
     title?: string;
+    className?: string;
 }) {
     const display = token === '\n' ? '↵\n' : token === '  ' ? '→' : token;
     return (
         <span
-            className={`${styles.token} ${styles[`token-${state}`]}`}
+            className={`${styles.token} ${styles[`token-${state}`]}${className ? ' ' + className : ''}`}
             onClick={onClick}
             title={title}
             style={{ cursor: onClick ? 'pointer' : 'default' }}
@@ -955,6 +958,39 @@ function TrainSampleViewer({
     const sourceIndices = useMemo(() => new Set(highlightPairs.map(p => p.train_correlation.source_token_index)), [highlightPairs]);
     const targetIndices = useMemo(() => new Set(highlightPairs.map(p => p.train_correlation.target_token_index)), [highlightPairs]);
 
+    // Collect annotation source indices for all highlighted target tokens.
+    const annotationSourceIndices = useMemo(() => {
+        const set = new Set<number>();
+        const ann = detail.annotations_by_target;
+        if (!ann) return set;
+        for (const tgIdx of targetIndices) {
+            const sources = ann[String(tgIdx)];
+            if (sources) {
+                for (const s of sources) set.add(s.src);
+            }
+        }
+        return set;
+    }, [detail.annotations_by_target, targetIndices]);
+
+    // Build tooltip map for annotated tokens (shows subtype + target info).
+    const annotationSubtypes = useMemo(() => {
+        const map = new Map<number, string>();
+        const ann = detail.annotations_by_target;
+        if (!ann) return map;
+        for (const tgIdx of targetIndices) {
+            const sources = ann[String(tgIdx)];
+            if (sources) {
+                for (const s of sources) {
+                    const subtype = s.subtype || "annotated";
+                    const label = `annotation: ${subtype} → target @${tgIdx}`;
+                    const prev = map.get(s.src);
+                    map.set(s.src, prev ? `${prev} | ${label}` : label);
+                }
+            }
+        }
+        return map;
+    }, [detail.annotations_by_target, targetIndices]);
+
     return (
         <div className={styles.trainSampleViewer}>
             <pre className={styles.codeBlock} style={{ fontSize: '12px', maxHeight: '260px', overflow: 'auto' }}>
@@ -962,10 +998,14 @@ function TrainSampleViewer({
                     {tokens.map((tok, i) => {
                         const isSrc = sourceIndices.has(i);
                         const isTgt = targetIndices.has(i);
+                        const isAnnSrc = annotationSourceIndices.has(i);
+                        // Base state (background / text color) — annotation underline is additive
                         let state: TokenState = i >= detail.answer_start_index ? 'response' : 'normal';
                         if (isTgt) state = 'selected';
                         else if (isSrc) state = 'source-highlight';
-                        return <TokenSpan key={i} token={tok} state={state} />;
+                        const annClass = isAnnSrc ? styles['token-annotated-source'] : undefined;
+                        const annSubtypes = annotationSubtypes.get(i);
+                        return <TokenSpan key={i} token={tok} state={state} title={annSubtypes} className={annClass} />;
                     })}
                 </code>
             </pre>
@@ -1136,7 +1176,7 @@ function TrainSampleGroup({
                 <div className={styles.trainGroupBody}>
                     {detail && (
                         <div className={styles.trainFullView}>
-                            <div className={styles.subLabel}>完整训练样本 — 全量 token 进入 probe，当前 correlation token 特殊标出</div>
+                            <div className={styles.subLabel}>完整训练样本 — 全量 token 进入 probe，当前 correlation token 特殊标出，带红色下划线的为潜在的annotation edge，鼠标悬停以查看对应target</div>
                             <TrainSampleViewer detail={detail} highlightPairs={pairs} />
                         </div>
                     )}
