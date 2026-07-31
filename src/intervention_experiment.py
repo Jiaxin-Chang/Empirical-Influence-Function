@@ -385,6 +385,7 @@ SEED = 42
 SELECTED_TEST_SAMPLE_INDEX = 58
 
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
+TOP_K_PROMPT_OFFSET = 0        # Skip this many higher-ranked sources (0→ranks 1..K; 4→ranks 5..8 if K=4)
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
 TOP_TARGETS = None             # None = all non-trivial train response tokens; int = optional cap
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per train target (saliency top-3)
@@ -502,14 +503,42 @@ def is_trivial_token(tokenizer, token_id: int) -> bool:
     return False
 
 
-def top_nontrivial_saliency_sources(tokenizer, input_ids_1d, sal_vec, k: int):
-    """Return top-k saliency sources after removing chat-template/trivial tokens."""
+def top_nontrivial_saliency_sources(
+    tokenizer,
+    input_ids_1d,
+    sal_vec,
+    k: int,
+    *,
+    offset: int = 0,
+):
+    """Return saliency sources ranked ``offset+1 .. offset+k`` (1-based ranks).
+
+    Trivial / chat-template tokens are excluded before ranking.
+    ``offset=0, k=4`` → ranks 1–4; ``offset=4, k=4`` → ranks 5–8.
+    """
+    k = max(1, int(k))
+    offset = max(0, int(offset))
     candidates = (
         (idx, score)
         for idx, score in enumerate(sal_vec)
         if not is_trivial_token(tokenizer, int(input_ids_1d[idx].item()))
     )
-    return nlargest(k, candidates, key=lambda x: x[1])
+    ranked = nlargest(offset + k, candidates, key=lambda x: x[1])
+    return ranked[offset : offset + k]
+
+
+def saliency_rank_filename_tag(
+    k: int | None = None,
+    offset: int | None = None,
+) -> str:
+    """Suffix for report files when not using the default ranks 1–4."""
+    k = max(1, int(TOP_K_PROMPT_TOKENS if k is None else k))
+    offset = max(0, int(TOP_K_PROMPT_OFFSET if offset is None else offset))
+    if offset == 0 and k == 4:
+        return ""
+    start = offset + 1
+    end = offset + k
+    return f"_salr{start}-{end}"
 
 
 def find_first_valid_token_index(tokenizer, input_ids_tensor, start_idx):
@@ -1487,7 +1516,10 @@ def run_causal_intervention_experiment(
         fallback=f"test{SELECTED_TEST_SAMPLE_INDEX}",
     )
     print(
-        f"[DEBUG] report files → correlation_matching_results_{model_tag}_{_task_id}_all_tokens*.json",
+        f"[DEBUG] report files → correlation_matching_results_{model_tag}_{_task_id}_all_tokens"
+        f"{saliency_rank_filename_tag()}*.json "
+        f"(saliency ranks {TOP_K_PROMPT_OFFSET + 1}-"
+        f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS})",
         flush=True,
     )
 
@@ -1974,6 +2006,10 @@ def run_causal_intervention_experiment(
             "config": {
                 "TOP_K_TRAIN_SAMPLES": TOP_K_TRAIN_SAMPLES,
                 "TOP_K_PROMPT_TOKENS": TOP_K_PROMPT_TOKENS,
+                "TOP_K_PROMPT_OFFSET": TOP_K_PROMPT_OFFSET,
+                "SALIENCY_RANKS": (
+                    f"{TOP_K_PROMPT_OFFSET + 1}-{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
+                ),
                 "prescreen_max_seq_len": prescreen_max_seq_len,
                 "prescreen_batch_size": prescreen_batch_size,
                 "PRESCREEN_SKETCH_DIM": prescreen_sketch_dim,
@@ -2003,7 +2039,10 @@ def run_causal_intervention_experiment(
         "per_token_results": [],
         "train_sample_details": {},
     }
-    prescreen_filename = f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens_prescreen.json"
+    _sal_tag = saliency_rank_filename_tag()
+    prescreen_filename = (
+        f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens{_sal_tag}_prescreen.json"
+    )
     prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
     if prescreen_path is not None:
         print(f"  Bank checkpoint saved → {prescreen_path}", flush=True)
@@ -2032,6 +2071,7 @@ def run_causal_intervention_experiment(
             test_batch["input_ids"][0],
             sal_vec,
             TOP_K_PROMPT_TOKENS,
+            offset=TOP_K_PROMPT_OFFSET,
         )
         top_test_correlations = [
             {
@@ -2040,8 +2080,9 @@ def run_causal_intervention_experiment(
                 "target_token_index": t,
                 "target_token":       target_tok_text,
                 "saliency_score":     float(score),
+                "saliency_rank":      TOP_K_PROMPT_OFFSET + rank_i,
             }
-            for idx, score in top_test_corr
+            for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
         ]
 
         # Stage 1b: ALTI match feature (∇C) + viz probe (∇(-log C)) from one forward
@@ -2140,6 +2181,10 @@ def run_causal_intervention_experiment(
             "screening":          TRAIN_RETRIEVAL_METHOD,
             "config": {
                 "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
+                "TOP_K_PROMPT_OFFSET":     TOP_K_PROMPT_OFFSET,
+                "SALIENCY_RANKS": (
+                    f"{TOP_K_PROMPT_OFFSET + 1}-{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
+                ),
                 "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
                 "TOP_TARGETS":             TOP_TARGETS,
                 "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
@@ -2177,7 +2222,10 @@ def run_causal_intervention_experiment(
         "train_sample_details": train_sample_details,
     }
 
-    report_filename = f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens.json"
+    report_filename = (
+        f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens"
+        f"{saliency_rank_filename_tag()}.json"
+    )
 
     # ── Save (main process only in multi-GPU) ────────────────────────────────
     report_path = _write_json_report(report_json, report_filename, accelerator)
@@ -2303,6 +2351,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--top-k-prompt-tokens", type=int, default=None,
+        help=(
+            "How many test saliency sources to keep per target token (default 4). "
+            "Together with --top-k-prompt-offset: offset=0,k=4 → ranks 1–4; "
+            "offset=4,k=4 → ranks 5–8."
+        ),
+    )
+    parser.add_argument(
+        "--top-k-prompt-offset", type=int, default=None,
+        help=(
+            "Skip this many higher-ranked nontrivial saliency sources before taking "
+            "--top-k-prompt-tokens (default 0). Example for ranks 5–8: "
+            "--top-k-prompt-offset 4 --top-k-prompt-tokens 4."
+        ),
+    )
+    parser.add_argument(
         "--top-targets", type=int, default=None,
         help=(
             "Cap Stage3 to the first K non-trivial answer tokens per train sample "
@@ -2322,6 +2386,10 @@ if __name__ == "__main__":
 
     if args.test_index is not None:
         SELECTED_TEST_SAMPLE_INDEX = args.test_index
+    if args.top_k_prompt_tokens is not None:
+        TOP_K_PROMPT_TOKENS = max(1, int(args.top_k_prompt_tokens))
+    if args.top_k_prompt_offset is not None:
+        TOP_K_PROMPT_OFFSET = max(0, int(args.top_k_prompt_offset))
     if args.top_targets is not None:
         TOP_TARGETS = None if int(args.top_targets) <= 0 else max(1, int(args.top_targets))
     if args.top_k_source_per_target is not None:
@@ -2335,7 +2403,11 @@ if __name__ == "__main__":
             if x.strip()
         ]
 
-    print(f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode=all_tokens")
+    print(
+        f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode=all_tokens  "
+        f"saliency_ranks={TOP_K_PROMPT_OFFSET + 1}-"
+        f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
+    )
     run_causal_intervention_experiment(
         model_path=args.model_path,
         train_data=args.train_data,

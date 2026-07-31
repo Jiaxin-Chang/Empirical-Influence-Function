@@ -29,6 +29,7 @@ interface TestCorrelation {
     target_token: string;
     target_token_index: number;
     saliency_score: number;
+    saliency_rank?: number;
 }
 
 interface TrainCorrelation {
@@ -195,12 +196,14 @@ function normalizeTestCorrelation(value: unknown, tokens: string[], fallbackTarg
     if (sourceIdx === null || targetIdx === null || score === null) return null;
     const sourceIndex = Math.trunc(sourceIdx);
     const targetIndex = Math.trunc(targetIdx);
+    const rankRaw = asFiniteNumber(value.saliency_rank);
     return {
         source_token: asString(value.source_token) ?? tokens[sourceIndex] ?? '',
         source_token_index: sourceIndex,
         target_token: asString(value.target_token) ?? tokens[targetIndex] ?? '',
         target_token_index: targetIndex,
         saliency_score: score,
+        ...(rankRaw !== null ? { saliency_rank: Math.trunc(rankRaw) } : {}),
     };
 }
 
@@ -2075,9 +2078,17 @@ export function ReportPanel({
                                     </div>
                                     <div className={styles.correlationListHint}>
                                         Click one source→target edge to load its Top-10 training matches on the right.
+                                        {selectedResult.top_correlations.some(c => c.saliency_rank != null) && (
+                                            <> Showing saliency ranks{' '}
+                                                {Math.min(...selectedResult.top_correlations.map(c => c.saliency_rank ?? 0))}
+                                                –
+                                                {Math.max(...selectedResult.top_correlations.map(c => c.saliency_rank ?? 0))}
+                                                .
+                                            </>
+                                        )}
                                     </div>
                                     <div className={styles.correlationListItems}>
-                                        {selectedResult.top_correlations.slice(0, 4).map(c => (
+                                        {selectedResult.top_correlations.map(c => (
                                             <button
                                                 key={c.source_token_index}
                                                 type="button"
@@ -2088,7 +2099,9 @@ export function ReportPanel({
                                                 )}
                                             >
                                                 <div className={styles.corrBtnLeft}>
-                                                    <span className={styles.corrLabel}>source → target</span>
+                                                    <span className={styles.corrLabel}>
+                                                        {c.saliency_rank != null ? `#${c.saliency_rank} source → target` : 'source → target'}
+                                                    </span>
                                                     <span className={styles.corrSourceTok}>
                                                         {(decodeToken(c.source_token).trim() || '·')}
                                                         <span className={styles.corrArrow}>→</span>

@@ -57,6 +57,8 @@ ALTI_GRAD_MAX_SEQ_LEN="${ALTI_GRAD_MAX_SEQ_LEN:-}"  # empty = intervention defau
 FINE_MATCH_PROJ="${FINE_MATCH_PROJ:-}"  # empty = qk; use qkvo/all for previous behavior
 TOP_TARGETS="${TOP_TARGETS:-}"  # empty = intervention default
 TOP_K_SOURCE_PER_TARGET="${TOP_K_SOURCE_PER_TARGET:-}"  # empty = intervention default
+TOP_K_PROMPT_TOKENS="${TOP_K_PROMPT_TOKENS:-}"  # empty = 4; with offset selects a rank window
+TOP_K_PROMPT_OFFSET="${TOP_K_PROMPT_OFFSET:-}"  # empty = 0; e.g. 4 → ranks 5–8 when k=4
 PRESCREEN_SKETCH_DIM="${PRESCREEN_SKETCH_DIM:-}"  # empty = intervention default; <=0 disables cache
 PRESCREEN_SKETCH_SEED="${PRESCREEN_SKETCH_SEED:-}"  # empty = intervention default
 PRESCREEN_SKETCH_CACHE_DIR="${PRESCREEN_SKETCH_CACHE_DIR:-}"  # legacy CE cache (unused)
@@ -87,6 +89,8 @@ while [[ $# -gt 0 ]]; do
         --fine-match-proj) FINE_MATCH_PROJ="$2"; shift 2 ;;
         --top-targets) TOP_TARGETS="$2"; shift 2 ;;
         --top-k-source-per-target) TOP_K_SOURCE_PER_TARGET="$2"; shift 2 ;;
+        --top-k-prompt-tokens) TOP_K_PROMPT_TOKENS="$2"; shift 2 ;;
+        --top-k-prompt-offset) TOP_K_PROMPT_OFFSET="$2"; shift 2 ;;
         --prescreen-sketch-dim) PRESCREEN_SKETCH_DIM="$2"; shift 2 ;;
         --prescreen-sketch-seed) PRESCREEN_SKETCH_SEED="$2"; shift 2 ;;
         --prescreen-sketch-cache-dir) PRESCREEN_SKETCH_CACHE_DIR="$2"; shift 2 ;;
@@ -201,9 +205,20 @@ echo "  prescreen batch size: ${PRESCREEN_BATCH_SIZE:-1}"
 echo "  sketch dim: ${PRESCREEN_SKETCH_DIM:-8192}"
 echo "  stage3 train targets: ${TOP_TARGETS:-all}  (first K valid answer tokens; empty=all)"
 echo "  stage3 sources/target: ${TOP_K_SOURCE_PER_TARGET:-3}"
+echo "  test saliency window: k=${TOP_K_PROMPT_TOKENS:-4} offset=${TOP_K_PROMPT_OFFSET:-0}  (ranks offset+1 .. offset+k)"
 echo "  saliency train bank: ${SALIENCY_TRAIN_BANK_CACHE_DIR:-.cache/saliency_train_bank}"
 echo "  legacy CE sketch (unused): ${PRESCREEN_SKETCH_CACHE_DIR:-.cache/prescreen_sketch}"
-echo "  result pattern: correlation_matching_results_${MODEL_TAG}_<task_id>_all_tokens.json"
+# Filename tag mirrors intervention_experiment.saliency_rank_filename_tag()
+_SAL_K="${TOP_K_PROMPT_TOKENS:-4}"
+_SAL_OFF="${TOP_K_PROMPT_OFFSET:-0}"
+if [[ "${_SAL_OFF}" -eq 0 && "${_SAL_K}" -eq 4 ]]; then
+    SAL_RANK_TAG=""
+else
+    _SAL_START=$((_SAL_OFF + 1))
+    _SAL_END=$((_SAL_OFF + _SAL_K))
+    SAL_RANK_TAG="_salr${_SAL_START}-${_SAL_END}"
+fi
+echo "  result pattern: correlation_matching_results_${MODEL_TAG}_<task_id>_all_tokens${SAL_RANK_TAG}.json"
 echo "  log dir   : ${LOG_DIR}"
 echo "================================================================="
 
@@ -217,12 +232,12 @@ FAILED_INDICES=()
 
 for IDX in "${VALID_RUN_INDICES[@]}"; do
     TASK_ID="${TASK_IDS[$IDX]}"
-    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${MODEL_TAG}_${TASK_ID}_all_tokens.json"
-    # Backward compatible: also skip if old filename without model tag exists
+    RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${MODEL_TAG}_${TASK_ID}_all_tokens${SAL_RANK_TAG}.json"
+    # Backward compatible: also skip if old filename without model tag exists (default ranks only)
     LEGACY_RESULT_FILE="${ROOT_DIR}/correlation_matching_results_${TASK_ID}_all_tokens.json"
 
     # Resume: skip if result already exists
-    if [[ -f "$RESULT_FILE" || -f "$LEGACY_RESULT_FILE" ]]; then
+    if [[ -f "$RESULT_FILE" ]] || { [[ -z "$SAL_RANK_TAG" ]] && [[ -f "$LEGACY_RESULT_FILE" ]]; }; then
         echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] SKIP  ${MODEL_TAG}/${TASK_ID}  (result exists)"
         N_SKIP=$((N_SKIP + 1))
         continue
@@ -231,7 +246,7 @@ for IDX in "${VALID_RUN_INDICES[@]}"; do
     echo ""
     echo "[$(date +%H:%M:%S)] [${IDX}/${END_IDX}] START  model=${MODEL_TAG} task_id=${TASK_ID}"
 
-    LOG_FILE="${LOG_DIR}/${MODEL_TAG}_${TASK_ID}.log"
+    LOG_FILE="${LOG_DIR}/${MODEL_TAG}_${TASK_ID}${SAL_RANK_TAG}.log"
 
     "${PYTHON}" -m src.intervention_experiment \
         --model-path  "${MODEL_PATH}" \
@@ -250,6 +265,8 @@ for IDX in "${VALID_RUN_INDICES[@]}"; do
         ${FINE_MATCH_PROJ:+--fine-match-proj "${FINE_MATCH_PROJ}"} \
         ${TOP_TARGETS:+--top-targets "${TOP_TARGETS}"} \
         ${TOP_K_SOURCE_PER_TARGET:+--top-k-source-per-target "${TOP_K_SOURCE_PER_TARGET}"} \
+        ${TOP_K_PROMPT_TOKENS:+--top-k-prompt-tokens "${TOP_K_PROMPT_TOKENS}"} \
+        ${TOP_K_PROMPT_OFFSET:+--top-k-prompt-offset "${TOP_K_PROMPT_OFFSET}"} \
         ${PRESCREEN_SKETCH_DIM:+--prescreen-sketch-dim "${PRESCREEN_SKETCH_DIM}"} \
         ${PRESCREEN_SKETCH_SEED:+--prescreen-sketch-seed "${PRESCREEN_SKETCH_SEED}"} \
         ${PRESCREEN_SKETCH_CACHE_DIR:+--prescreen-sketch-cache-dir "${PRESCREEN_SKETCH_CACHE_DIR}"} \
