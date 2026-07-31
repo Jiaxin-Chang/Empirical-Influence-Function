@@ -27,22 +27,34 @@
 
 编辑主要写入 `attention_edges`（BPE 索引，与 `input_ids` 对齐）；`annotations` 做 best-effort 同步。
 
-## 启动
+## Saliency（蓝底 top-6）
 
+两种方式：
+
+### A. 本机有 GPU / 模型权重
 ```bash
-# 终端 1 — API（会索引 ~10k 行，首次约几秒）
-cd tools/annotation-viewer
-pip install -r server/requirements.txt
-python -m server.main --data ../../go_single_train_v2_graphsignal_10k_compact.json.bak
-
-# 可选：启用 saliency（需本机有 Qwen 权重）
-python -m server.main --data ../../go_single_train_v2_graphsignal_10k_compact.json.bak \
-  --model ../../../code-corr-annotation/models/Qwen2.5-Coder-7B-Instruct
-
-# 终端 2 — 前端
-cd tools/annotation-viewer
-npm install
-npm run dev    # http://127.0.0.1:5174
+python -m server.main --data ../../go_single_train_....jsonl \
+  --model /path/to/Qwen2.5-Coder-7B-Instruct
 ```
 
-后端默认 `http://127.0.0.1:8765`，Vite 已把 `/api` 代理过去。
+### B. 在别的 GPU 服务器算完，拷到本机（推荐笔记本）
+```bash
+# 1) GPU 服务器预计算（例如前 20 条、answer 区所有 target）
+python tools/annotation-viewer/scripts/precompute_saliency_cache.py \
+  --data go_single_train_v2_graphsignal_10k_compact_resp_edges.jsonl \
+  --model /path/to/Qwen2.5-Coder-7B-Instruct \
+  --out saliency_cache \
+  --indices 0-19 \
+  --targets answer
+
+# 2) 把整个 saliency_cache/ 目录拷到本机（可放在 annotation-viewer/ 下）
+
+# 3) 本机启动：不要 --model，改传缓存目录
+cd tools/annotation-viewer
+python -m server.main \
+  --data ../../go_single_train_v2_graphsignal_10k_compact_resp_edges.jsonl \
+  --saliency-cache ./saliency_cache
+```
+
+缓存文件格式：`saliency_cache/<样本index>.json`，内含该样本各 target 的 top-k source。  
+只对缓存里有的 `(样本, target)` 会显示蓝底；未预计算的 target 仍无蓝底。

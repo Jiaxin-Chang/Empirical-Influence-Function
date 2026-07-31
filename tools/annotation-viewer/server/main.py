@@ -60,7 +60,36 @@ _offsets: list[int] = []  # byte offset of each non-empty line; last sentinel = 
 _tokenizer = None
 _model = None
 _model_path: str | None = None
+_saliency_cache_dir: Path | None = None
 _saliency_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
+
+
+def _disk_saliency_path(idx: int) -> Path | None:
+    if _saliency_cache_dir is None:
+        return None
+    return _saliency_cache_dir / f"{idx}.json"
+
+
+def _load_disk_saliency(idx: int, target: int, top_k: int) -> list[dict[str, Any]] | None:
+    """Load precomputed top sources for (sample, target) from cache dir."""
+    path = _disk_saliency_path(idx)
+    if path is None or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    by_target = payload.get("by_target") or {}
+    hits = by_target.get(str(target))
+    if hits is None:
+        return None
+    return list(hits)[: max(1, min(top_k, 20))]
+
+
+def _saliency_enabled() -> bool:
+    return bool(_model_path) or (
+        _saliency_cache_dir is not None and _saliency_cache_dir.exists()
+    )
 
 
 # ── Index / IO ────────────────────────────────────────────────────────────────
@@ -219,7 +248,11 @@ def health():
         "data_path": str(_data_path) if _data_path else None,
         "n_samples": max(0, len(_offsets) - 1),
         "subtypes": SUBTYPES,
-        "saliency_available": bool(_model_path),
+        "saliency_available": _saliency_enabled(),
+        "saliency_mode": (
+            "model" if _model_path else ("disk_cache" if _saliency_cache_dir else "off")
+        ),
+        "saliency_cache_dir": str(_saliency_cache_dir) if _saliency_cache_dir else None,
         "model_loaded": _model is not None,
     }
 
@@ -327,20 +360,48 @@ def get_sample(idx: int):
 
 @app.get("/api/sample/{idx}/saliency/{target}")
 def get_saliency(idx: int, target: int, top_k: int = 6):
-    """Return top-k ALTI saliency source indices for a target token position."""
+    """Return top-k ALTI saliency source indices for a target token position.
+
+    Resolution order:
+      1) in-memory cache
+      2) on-disk precompute cache (--saliency-cache)
+      3) live ALTI with --model
+    """
     if _data_path is None:
         raise HTTPException(400, "No data file open.")
     cache_key = (idx, target)
     with _state_lock:
         if cache_key in _saliency_cache:
-            return {"target": target, "top": _saliency_cache[cache_key], "cached": True}
+            return {
+                "target": target,
+                "top": _saliency_cache[cache_key],
+                "cached": True,
+                "available": True,
+                "source": "memory",
+            }
+
+    disk_top = _load_disk_saliency(idx, target, top_k)
+    if disk_top is not None:
+        with _state_lock:
+            _saliency_cache[cache_key] = disk_top
+        return {
+            "target": target,
+            "top": disk_top,
+            "cached": True,
+            "available": True,
+            "source": "disk",
+        }
 
     if not _model_path:
         return {
             "target": target,
             "top": [],
             "available": False,
-            "message": "Start server with --model to enable ALTI saliency.",
+            "message": (
+                "No live model and no disk cache hit. "
+                "Either start with --model, or precompute on a GPU machine and "
+                "pass --saliency-cache <dir> (see scripts/precompute_saliency_cache.py)."
+            ),
         }
 
     with _state_lock:
@@ -372,7 +433,7 @@ def get_saliency(idx: int, target: int, top_k: int = 6):
 
     with _state_lock:
         _saliency_cache[cache_key] = top
-    return {"target": target, "top": top, "available": True, "cached": False}
+    return {"target": target, "top": top, "available": True, "cached": False, "source": "model"}
 
 
 @app.post("/api/sample/{idx}/edges/delete")
@@ -474,13 +535,20 @@ def main(argv: list[str] | None = None) -> None:
         "--model",
         type=str,
         default="",
-        help="Optional Qwen path for ALTI saliency (tokenizer also loaded from here)",
+        help="Optional Qwen path for live ALTI saliency (tokenizer also loaded from here)",
+    )
+    parser.add_argument(
+        "--saliency-cache",
+        type=str,
+        default="",
+        help="Directory of precomputed saliency JSON files ({idx}.json). "
+             "Use this on a machine without GPU after copying from a GPU server.",
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
 
-    global _data_path, _offsets, _model_path
+    global _data_path, _offsets, _model_path, _saliency_cache_dir
     data = Path(args.data).expanduser().resolve()
     if not data.exists():
         print(f"[WARN] data file not found yet: {data}", flush=True)
@@ -490,6 +558,12 @@ def main(argv: list[str] | None = None) -> None:
         _offsets = _build_offsets(data)
         print(f"  {len(_offsets) - 1} samples", flush=True)
 
+    if args.saliency_cache:
+        _saliency_cache_dir = Path(args.saliency_cache).expanduser().resolve()
+        _saliency_cache_dir.mkdir(parents=True, exist_ok=True)
+        n_files = sum(1 for _ in _saliency_cache_dir.glob("*.json"))
+        print(f"Saliency disk cache: {_saliency_cache_dir} ({n_files} files)", flush=True)
+
     if args.model:
         _model_path = str(Path(args.model).expanduser().resolve())
         print(f"Saliency model: {_model_path}", flush=True)
@@ -497,7 +571,8 @@ def main(argv: list[str] | None = None) -> None:
         # Still try default tokenizer path for decode-only.
         if DEFAULT_TOKENIZER.exists():
             _model_path = None
-            print(f"Tokenizer default: {DEFAULT_TOKENIZER} (saliency disabled)", flush=True)
+            mode = "disk_cache" if _saliency_cache_dir else "disabled"
+            print(f"Tokenizer default: {DEFAULT_TOKENIZER} (live saliency {mode})", flush=True)
 
     # Eager-load tokenizer for faster first sample
     try:
