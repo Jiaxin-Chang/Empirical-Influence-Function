@@ -122,6 +122,15 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
             "--token_select_keep_special", "True" if sel.get("keep_special", True) else "False",
         ]
 
+    # ---- annotation-gated skip with structural protection (default OFF)
+    ask = data.get("annot_skip", {}) or {}
+    if ask.get("enabled"):
+        argv += [
+            "--annot_skip", "True",
+            "--annot_skip_keep_first", str(ask.get("keep_first", 2)),
+            "--annot_skip_keep_special", "True" if ask.get("keep_special", True) else "False",
+        ]
+
     valid_name = data.get("valid")
     if valid_name:
         valid_ds = get_dataset(valid_name)
@@ -166,6 +175,7 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
             "--saliency_alpha", str(sal.get("alpha", 1.0)),
             "--saliency_margin_plus", str(sal.get("margin_plus", 2.0)),
             "--saliency_layer", str(sal.get("layer", -1)),
+            "--saliency_agg", str(sal.get("agg", "last")),
         ]
         if sal.get("neg_sample_k"):
             argv += ["--saliency_neg_sample_k", str(sal["neg_sample_k"])]

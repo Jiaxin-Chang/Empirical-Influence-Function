@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,342 @@ def _unwrap_to_decoder_stack(model):
             continue
         raise RuntimeError(f"Cannot locate decoder layer stack on {type(model).__name__}.")
 
+
+def canonical_saliency_agg(saliency_agg: str | None) -> str:
+    """Saliency aggregation for the training objective.
+
+    ``last`` (default): cheap surrogate — ||T_i(x_j)||_2 at ``saliency_layer``.
+    ``rollout``: paper §B diagnostic ALTI — L1 distance row-stochastic C per layer,
+    then C_roll = C^(L) ... C^(1).
+    """
+    value = (saliency_agg or "last").strip().lower().replace("-", "_")
+    if value in {"", "last", "l2", "norm", "layer", "single"}:
+        return "last"
+    if value in {"rollout", "alti", "alti_b", "alti_rollout", "full", "all_layers"}:
+        return "rollout"
+    raise ValueError(
+        f"Unsupported saliency_agg={saliency_agg!r}; expected 'last' or 'rollout'."
+    )
+
+
+def normalize_alti_importance_l1(
+    source_vectors: Tensor,
+    *,
+    eps: float = 1e-9,
+) -> Tensor:
+    """Paper §B / ALTI min_sum row weights from contribution vectors T_i(x_j).
+
+    With y_i = sum_j T_i(x_j) (attention-block reconstruction):
+
+        d_{i,j} = ||y_i - T_i(x_j)||_1
+        C_{i,j} = max(0, ||y_i||_1 - d_{i,j}) / sum_k max(0, ||y_i||_1 - d_{i,k})
+
+    ``source_vectors`` shape: [Q, S, D] → returns [Q, S] row-stochastic (approx).
+    """
+    resultant = source_vectors.sum(dim=1)  # [Q, D] = y_i
+    resultant_norm = resultant.abs().sum(dim=-1, keepdim=True)  # ||y||_1
+    # Chunk hidden dim for L1 distance to limit peak memory on long D.
+    distances = torch.zeros(
+        source_vectors.shape[:-1],
+        dtype=source_vectors.dtype,
+        device=source_vectors.device,
+    )
+    hidden_chunk = 2048
+    for start in range(0, source_vectors.size(-1), hidden_chunk):
+        end = min(start + hidden_chunk, source_vectors.size(-1))
+        distances = distances + (
+            source_vectors[..., start:end] - resultant[:, None, start:end]
+        ).abs().sum(dim=-1)
+    scores = torch.clamp(resultant_norm - distances, min=0.0)
+    denom = scores.sum(dim=-1, keepdim=True)
+    if bool(torch.all(denom > eps)):
+        return scores / denom.clamp_min(eps)
+
+    # Rare fallback: L1 norms of T, then uniform if still degenerate.
+    norm_scores = source_vectors.abs().sum(dim=-1)
+    norm_denom = norm_scores.sum(dim=-1, keepdim=True)
+    normalized = norm_scores / norm_denom.clamp_min(eps)
+    zero_rows = denom <= eps
+    if bool(zero_rows.any()):
+        uniform = torch.full_like(scores, 1.0 / max(int(scores.size(-1)), 1))
+        normalized = torch.where((norm_denom <= eps) & zero_rows, uniform, normalized)
+        scores = torch.where(zero_rows, normalized, scores / denom.clamp_min(eps))
+    return scores
+
+
+def _alti_layer_value_states(
+    model,
+    hidden_in: Tensor,   # [1, T, D]
+    attn_probs: Tensor,  # [1, H, T, T]
+    *,
+    layer_index: int,
+):
+    """Shared ALTI value path for one layer (no full [H,T,D] transform)."""
+    if hidden_in.dim() != 3 or hidden_in.size(0) != 1:
+        raise ValueError("ALTI helpers expect hidden_in shape [1, T, D].")
+    if attn_probs.dim() != 4 or attn_probs.size(0) != 1:
+        raise ValueError("ALTI helpers expect attn_probs shape [1, H, T, T].")
+
+    decoder = _unwrap_to_decoder_stack(model)
+    layer = decoder.layers[layer_index]
+    self_attn = layer.self_attn
+
+    bsz, T, D = hidden_in.shape
+    H = attn_probs.size(1)
+    head_dim = getattr(self_attn, "head_dim", None) or (
+        self_attn.q_proj.weight.shape[0] // H
+    )
+    v_out = self_attn.v_proj.weight.shape[0]
+    num_kv_heads = v_out // head_dim
+    assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
+    n_rep = H // num_kv_heads
+
+    normed = layer.input_layernorm(hidden_in)
+    v_proj = self_attn.v_proj(normed)
+    v_states = v_proj.view(bsz, T, num_kv_heads, head_dim).transpose(1, 2)
+    if n_rep > 1:
+        v_states = (
+            v_states.unsqueeze(2)
+            .expand(bsz, num_kv_heads, n_rep, T, head_dim)
+            .reshape(bsz, H, T, head_dim)
+        )
+    # Keep compute dtype = model dtype (bf16/fp16) to cut peak memory vs float32.
+    v_states = v_states[0]  # [H, T, hd]
+    o_w_by_head = self_attn.o_proj.weight.view(D, H, head_dim)  # [D, H, hd]
+    attn_f = attn_probs[0]
+    residual = hidden_in[0]
+    return v_states, o_w_by_head, attn_f, residual, D
+
+
+def build_alti_b_rows_for_queries(
+    model,
+    hidden_in: Tensor,      # [1, T, D]
+    attn_probs: Tensor,     # [1, H, T, T]
+    query_indices: Tensor,  # [Qc]
+    *,
+    layer_index: int,
+    source_chunk_size: int = 32,
+    query_chunk_size: int = 1,
+) -> Tensor:
+    """Selected rows of paper-§B ALTI C^{(l)} without materializing the full [T,T].
+
+    Returns [Qc, T] row-stochastic (approx), differentiable.
+    """
+    v_states, o_w_by_head, attn_f, residual, D = _alti_layer_value_states(
+        model, hidden_in, attn_probs, layer_index=layer_index,
+    )
+    device = hidden_in.device
+    T = hidden_in.size(1)
+    H = attn_f.size(0)
+    query_indices = query_indices.to(device=device, dtype=torch.long)
+    Qc_all = int(query_indices.numel())
+    if Qc_all == 0:
+        return torch.empty((0, T), device=device, dtype=hidden_in.dtype)
+
+    # Accumulate contribution vectors in float32 for stable L1 norms, but build
+    # them source-chunked so peak is O(Qc * Sc * D) not O(H * T * D).
+    out_rows: list[Tensor] = []
+    qchunk = max(1, int(query_chunk_size))
+    schunk = max(1, int(source_chunk_size))
+    for q0 in range(0, Qc_all, qchunk):
+        q1 = min(q0 + qchunk, Qc_all)
+        q_idx = query_indices[q0:q1]
+        Qc = int(q_idx.numel())
+        # [Qc, T, D] built in source chunks
+        source_vectors = hidden_in.new_zeros((Qc, T, D), dtype=torch.float32)
+        for s0 in range(0, T, schunk):
+            s1 = min(s0 + schunk, T)
+            # [H, Sc, D] = V_chunk projected by W_O^h
+            transformed_chunk = torch.einsum(
+                "hsd,ohd->hso",
+                v_states[:, s0:s1, :].float(),
+                o_w_by_head.float(),
+            )  # [H, Sc, D]
+            attn_chunk = attn_f[:, q_idx, s0:s1].float()  # [H, Qc, Sc]
+            contrib = torch.einsum("hqs,hso->qso", attn_chunk, transformed_chunk)
+            source_vectors[:, s0:s1, :] = contrib
+            del transformed_chunk, attn_chunk, contrib
+
+        # Residual on the diagonal (self) positions.
+        local = torch.arange(Qc, device=device)
+        source_vectors[local, q_idx, :] = (
+            source_vectors[local, q_idx, :] + residual[q_idx].float()
+        )
+        out_rows.append(normalize_alti_importance_l1(source_vectors))
+        del source_vectors
+    return torch.cat(out_rows, dim=0).to(dtype=hidden_in.dtype)
+
+
+def _left_multiply_by_alti_layer(
+    W: Tensor,  # [Q, T]
+    model,
+    hidden_in: Tensor,
+    attn_probs: Tensor,
+    *,
+    layer_index: int,
+    mix_row_chunk: int = 4,
+    source_chunk_size: int = 32,
+) -> Tensor:
+    """Compute ``W @ C^{(l)}`` without forming the full C matrix.
+
+    ``new_W[q, j] = sum_i W[q, i] * C[i, j]``, with C rows computed in chunks.
+    Uses activation checkpointing so backward does not keep every chunk's
+    ``[Ic, T, D]`` contribution tensors alive across all layers.
+    """
+    Q, T = W.shape
+    out = torch.zeros_like(W)
+    rchunk = max(1, int(mix_row_chunk))
+
+    def _rows_for(indices: Tensor) -> Tensor:
+        return build_alti_b_rows_for_queries(
+            model,
+            hidden_in,
+            attn_probs,
+            indices,
+            layer_index=layer_index,
+            source_chunk_size=source_chunk_size,
+            query_chunk_size=min(rchunk, 4),
+        )
+
+    for i0 in range(0, T, rchunk):
+        i1 = min(i0 + rchunk, T)
+        rows = torch.arange(i0, i1, device=W.device, dtype=torch.long)
+        # Checkpoint recomputes C rows on backward → large memory win for rollout.
+        if W.requires_grad or hidden_in.requires_grad or attn_probs.requires_grad:
+            C_part = checkpoint(_rows_for, rows, use_reentrant=False)
+        else:
+            C_part = _rows_for(rows)
+        out = out + W[:, i0:i1].to(dtype=C_part.dtype) @ C_part
+        del C_part
+    return out.to(dtype=W.dtype)
+
+
+def build_alti_b_layer_matrix(
+    model,
+    hidden_in: Tensor,      # [1, T, D]  input to this decoder layer
+    attn_probs: Tensor,     # [1, H, T, T]
+    *,
+    layer_index: int,
+    query_chunk_size: int = 8,
+    source_chunk_size: int = 32,
+) -> Tensor:
+    """One-layer ALTI contribution matrix C^{(l)} under paper §B (L1 min_sum).
+
+    Returns [T, T]. Prefer ``build_alti_b_rows_for_queries`` / rollout helper for
+    training — full matrices are memory-heavy.
+    """
+    T = hidden_in.size(1)
+    rows = torch.arange(T, device=hidden_in.device, dtype=torch.long)
+    return build_alti_b_rows_for_queries(
+        model,
+        hidden_in,
+        attn_probs,
+        rows,
+        layer_index=layer_index,
+        source_chunk_size=source_chunk_size,
+        query_chunk_size=query_chunk_size,
+    )
+
+
+def build_alti_rollout_rows(
+    model,
+    outputs,
+    row_batch: Tensor,
+    row_qry: Tensor,
+    *,
+    query_chunk_size: int = 1,
+    source_chunk_size: int = 32,
+    mix_row_chunk: int = 4,
+) -> Tensor:
+    """Paper §B full ALTI rollout rows for selected queries (memory-efficient).
+
+    Computes
+
+        C_roll = C^{(L)} C^{(L-1)} ... C^{(1)}
+
+    but only tracks the annotated query rows:
+
+        W = C^{(L)}[q, :]
+        W ← W @ C^{(l)}   for l = L-1 .. 1
+
+    Never materializes a full [T, T] product. Returns [Q, T] aligned with
+    ``row_batch`` / ``row_qry``.
+    """
+    if row_qry.numel() == 0:
+        T0 = outputs.hidden_states[0].size(1)
+        return torch.empty((0, T0), device=outputs.hidden_states[0].device,
+                           dtype=outputs.hidden_states[0].dtype)
+
+    n_layers = len(outputs.attentions)
+    device = outputs.hidden_states[0].device
+    dtype = outputs.hidden_states[0].dtype
+    B, T, _ = outputs.hidden_states[0].shape
+
+    row_batch = row_batch.to(device=device, dtype=torch.long)
+    row_qry = row_qry.to(device=device, dtype=torch.long)
+    Q = int(row_qry.numel())
+    out = torch.empty((Q, T), device=device, dtype=dtype)
+
+    for b in range(B):
+        mask = row_batch == b
+        if not bool(mask.any()):
+            continue
+        idxs = mask.nonzero(as_tuple=False).flatten()
+        q_pos = row_qry[idxs]
+
+        # Last layer rows only for annotated queries (checkpointed in query chunks).
+        last_li = n_layers - 1
+        attn = outputs.attentions[last_li]
+        assert attn is not None, (
+            "outputs.attentions is None — use attn_implementation='eager' for rollout."
+        )
+        hs_last = outputs.hidden_states[last_li][b:b + 1]
+        attn_last = attn[b:b + 1]
+
+        def _last_rows(indices: Tensor) -> Tensor:
+            return build_alti_b_rows_for_queries(
+                model,
+                hs_last,
+                attn_last,
+                indices,
+                layer_index=last_li,
+                source_chunk_size=source_chunk_size,
+                query_chunk_size=query_chunk_size,
+            )
+
+        # Chunk annotated queries so peak stays O(qchunk * T * D).
+        qchunk = max(1, int(query_chunk_size))
+        W_parts: list[Tensor] = []
+        for q0 in range(0, int(q_pos.numel()), qchunk):
+            q1 = min(q0 + qchunk, int(q_pos.numel()))
+            idx_chunk = q_pos[q0:q1]
+            if hs_last.requires_grad or attn_last.requires_grad:
+                part = checkpoint(_last_rows, idx_chunk, use_reentrant=False)
+            else:
+                part = _last_rows(idx_chunk)
+            W_parts.append(part)
+        W = torch.cat(W_parts, dim=0)  # [Qb, T]
+        del W_parts
+
+        # W ← W @ C_l for earlier layers (paper product right-to-left).
+        for li in range(n_layers - 2, -1, -1):
+            attn = outputs.attentions[li]
+            assert attn is not None, (
+                "outputs.attentions is None — use attn_implementation='eager' for rollout."
+            )
+            W = _left_multiply_by_alti_layer(
+                W,
+                model,
+                outputs.hidden_states[li][b:b + 1],
+                attn[b:b + 1],
+                layer_index=li,
+                mix_row_chunk=mix_row_chunk,
+                source_chunk_size=source_chunk_size,
+            )
+
+        out[idxs] = W.to(dtype=dtype)
+        del W
+    return out
 
 
 def build_contribution_matrix(
@@ -1001,6 +1338,7 @@ def saliency_loss_from_outputs(
         annot_pairs: list[Tensor] | Tensor,  # flat [B, 3] or list of [Number of pairs, 2]
         *,
         saliency_layer: int = -1,
+        saliency_agg: str = "last",
         exclude_source_mask: Tensor | None = None,
         alpha: float = 1.5,
         eps: float = 1e-8,
@@ -1027,27 +1365,25 @@ def saliency_loss_from_outputs(
     `outputs` must have `.attentions` (non-None) and `.hidden_states`.
     `annot_pairs` may be either a flat [B, 3] tensor (batch_idx, pos_a, pos_b)
     or a list of [Number of pairs, 2] tensors.
+
+    ``saliency_agg``:
+      - ``last`` (default): ||T||_2 rows at ``saliency_layer`` (training surrogate).
+      - ``rollout``: paper §B ALTI — L1 min_sum C per layer, full-layer product.
     """
+    agg = canonical_saliency_agg(saliency_agg)
     n_layers = len(outputs.attentions)
-    li = int(saliency_layer) if int(saliency_layer) >= 0 else n_layers + int(saliency_layer)
-    li = max(0, min(li, n_layers - 1))
-    attn_sel = outputs.attentions[li]
-    assert attn_sel is not None, "outputs.attentions[...] is None — switch to eager attention."
-
-    # hidden_states tuple: [embedding_out, layer_0_out, ..., layer_{L-1}_out];
-    # the input to decoder layer ``li`` is hidden_states[li].
-    last_hidden_in = outputs.hidden_states[li]  # [B, T, D]
-
-    B, T, _ = last_hidden_in.shape
+    # Device/dtype anchor from embedding states (always present with output_hidden_states).
+    hs0 = outputs.hidden_states[0]
+    B, T, _ = hs0.shape
     row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
         annot_pairs,
         B=B,
         T=T,
-        device=last_hidden_in.device,
+        device=hs0.device,
     )
     if row_qry.numel() == 0:
         return SaliencyDiagnostics(
-            loss=torch.tensor(0.0, device=last_hidden_in.device, dtype=last_hidden_in.dtype),
+            loss=torch.tensor(0.0, device=hs0.device, dtype=hs0.dtype),
             avg_C=0.0,
             avg_N=0.0,
             avg_ratio=0.0,
@@ -1055,14 +1391,25 @@ def saliency_loss_from_outputs(
             n_samples=0,
         )
 
-    C_rows = build_contribution_rows(
-        model,
-        last_hidden_in,
-        attn_sel,
-        row_batch,
-        row_qry,
-        layer_index=li,
-    )
+    if agg == "rollout":
+        C_rows = build_alti_rollout_rows(
+            model, outputs, row_batch, row_qry,
+        )
+    else:
+        li = int(saliency_layer) if int(saliency_layer) >= 0 else n_layers + int(saliency_layer)
+        li = max(0, min(li, n_layers - 1))
+        attn_sel = outputs.attentions[li]
+        assert attn_sel is not None, "outputs.attentions[...] is None — switch to eager attention."
+        # hidden_states: [embedding_out, layer_0_out, ...]; input to layer li is hs[li].
+        last_hidden_in = outputs.hidden_states[li]
+        C_rows = build_contribution_rows(
+            model,
+            last_hidden_in,
+            attn_sel,
+            row_batch,
+            row_qry,
+            layer_index=li,
+        )
     exclude_rows = None
     if exclude_source_mask is not None:
         em = exclude_source_mask.to(device=C_rows.device)

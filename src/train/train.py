@@ -23,6 +23,7 @@ from attn_viz import AttentionVisualizationCallback
 from dataset import AnnotatedSFTDataset, DataCollatorForAnnotatedSFT, IGNORE_INDEX
 from loss import (
     canonical_saliency_loss_type,
+    canonical_saliency_agg,
     saliency_loss_display_name,
     saliency_loss_from_outputs,
     build_shortcut_mask,
@@ -187,6 +188,7 @@ class AnnotatedSFTTrainer(Trainer):
                  saliency_neg_hard_only: bool = False,
                  saliency_neg_sample_k: int = 0,
                  saliency_layer: int = -1,
+                 saliency_agg: str = "last",
                  saliency_exclude_sink_prefix: int = 0,
                  saliency_exclude_special_tokens: bool = False,
                  cfmask_rate: float = 0.3,
@@ -233,6 +235,7 @@ class AnnotatedSFTTrainer(Trainer):
         self.saliency_neg_hard_only = saliency_neg_hard_only
         self.saliency_neg_sample_k = int(saliency_neg_sample_k or 0)
         self.saliency_layer = int(saliency_layer)
+        self.saliency_agg = canonical_saliency_agg(saliency_agg)
         self.saliency_exclude_sink_prefix = int(saliency_exclude_sink_prefix or 0)
         self.saliency_exclude_special_tokens = bool(saliency_exclude_special_tokens)
         # Counterfactual shortcut-masking augmentation (loss_mode=ce_shortcut_mask)
@@ -365,6 +368,7 @@ class AnnotatedSFTTrainer(Trainer):
             clean,
             annot_pairs_batch,
             saliency_layer=self.saliency_layer,
+            saliency_agg=self.saliency_agg,
             exclude_source_mask=exclude_source_mask,
             alpha=self.saliency_alpha,
             eps=self.saliency_eps,
@@ -686,6 +690,7 @@ class AnnotatedSFTTrainer(Trainer):
                 outputs,
                 annot_pairs_batch,
                 saliency_layer=self.saliency_layer,
+                saliency_agg=self.saliency_agg,
                 exclude_source_mask=exclude_source_mask,
                 alpha=self.saliency_alpha,
                 eps=self.saliency_eps,
@@ -935,6 +940,18 @@ class DataArguments:
         default=True,
         metadata={"help": "[token_select] Never exclude special tokens (EOS/im_end) even if above threshold."},
     )
+    annot_skip: bool = field(
+        default=False,
+        metadata={"help": "[annot_skip] Drop completion tokens that are not an annotation-edge destination from the CE loss. Protected tokens (first keep_first completion tokens + keyword/punct/whitespace + optional specials) are never dropped. Default OFF."},
+    )
+    annot_skip_keep_first: int = field(
+        default=2,
+        metadata={"help": "[annot_skip] Always keep the first K completion tokens in the loss (default 2 = positions 0 and 1)."},
+    )
+    annot_skip_keep_special: bool = field(
+        default=True,
+        metadata={"help": "[annot_skip] Never drop special tokens (EOS/im_end) even if unannotated."},
+    )
 
 
 @dataclass
@@ -1009,7 +1026,11 @@ class SFTTrainingArguments(TrainingArguments):
     )
     saliency_layer: int = field(
         default=-1,
-        metadata={"help": "Decoder layer whose attention/value path defines the saliency. -1 = last layer (default, feeds the logits directly). A middle layer (e.g. 14 of 28) leaves the final readout free and targets value-carrying routing."}
+        metadata={"help": "Decoder layer whose attention/value path defines the saliency when saliency_agg=last. -1 = last layer (default). Ignored when saliency_agg=rollout."}
+    )
+    saliency_agg: str = field(
+        default="last",
+        metadata={"help": "Saliency aggregation: 'last' = ||T||_2 at saliency_layer (default training surrogate); 'rollout' = paper §B ALTI (L1 min_sum C per layer, full-layer product C_roll=C^L...C^1)."}
     )
     saliency_exclude_sink_prefix: int = field(
         default=0,
@@ -1163,6 +1184,9 @@ def train():
         token_select=data_args.token_select,
         token_select_threshold=data_args.token_select_threshold,
         token_select_keep_special=data_args.token_select_keep_special,
+        annot_skip=data_args.annot_skip,
+        annot_skip_keep_first=data_args.annot_skip_keep_first,
+        annot_skip_keep_special=data_args.annot_skip_keep_special,
     )
     eval_dataset = None
     if data_args.eval_data_path:
@@ -1176,6 +1200,9 @@ def train():
             edge_augment_max_hops=data_args.edge_augment_max_hops,
             edge_augment_node_weight=data_args.edge_augment_node_weight,
             edge_augment_mode=data_args.edge_augment_mode,
+            annot_skip=data_args.annot_skip,
+            annot_skip_keep_first=data_args.annot_skip_keep_first,
+            annot_skip_keep_special=data_args.annot_skip_keep_special,
         )
         if data_args.eval_max_samples > 0 and len(eval_dataset) > data_args.eval_max_samples:
             # Deterministic first-N subsample. Direct slice of internal list keeps
@@ -1277,6 +1304,7 @@ def train():
         saliency_neg_hard_only=training_args.saliency_neg_hard_only,
         saliency_neg_sample_k=training_args.saliency_neg_sample_k,
         saliency_layer=training_args.saliency_layer,
+        saliency_agg=training_args.saliency_agg,
         saliency_exclude_sink_prefix=training_args.saliency_exclude_sink_prefix,
         saliency_exclude_special_tokens=training_args.saliency_exclude_special_tokens,
         cfmask_rate=training_args.cfmask_rate,
@@ -1305,10 +1333,13 @@ def train():
         EvalBreakdownCallback._trainer = trainer
 
     logger.info(
-        "Training objective: loss_mode=%s saliency_loss=%s saliency_loss_type=%s "
+        "Training objective: loss_mode=%s saliency_agg=%s saliency_layer=%s "
+        "saliency_loss=%s saliency_loss_type=%s "
         "saliency_lambda=%s tau=%s eps_num=%s floor_eps=%s floor_logit_eps=%s floor_mode=%s "
         "floor_quantile=%s floor_warmup=%s output_dir=%s",
         training_args.loss_mode,
+        training_args.saliency_agg,
+        training_args.saliency_layer,
         saliency_loss_display_name(training_args.saliency_loss_type),
         training_args.saliency_loss_type,
         training_args.saliency_lambda,

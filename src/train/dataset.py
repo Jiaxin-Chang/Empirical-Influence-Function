@@ -1,8 +1,8 @@
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, Sequence
 import torch
 import transformers
 from torch.utils.data import Dataset
@@ -12,6 +12,7 @@ import json
 # way as elsewhere in the repo (``from data.<mod> import ...``).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.edge_augment import augment_edges, node_target_weights  # noqa: E402
+from token_klass import is_protected_completion_token  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ CHAT_MIDDLE   = "<|im_end|>\n<|im_start|>assistant\n"
 CHAT_SUFFIX   = "<|im_end|>\n"
 
 IGNORE_INDEX = -100
+
 
 class AnnotatedSFTDataset(Dataset):
     """
@@ -38,15 +40,16 @@ class AnnotatedSFTDataset(Dataset):
                  edge_augment_max_hops: int = 0, edge_augment_node_weight: bool = False,
                  edge_augment_mode: str = "directed",
                  token_select: bool = False, token_select_threshold: float = 2.0,
-                 token_select_keep_special: bool = True):
+                 token_select_keep_special: bool = True,
+                 annot_skip: bool = False, annot_skip_keep_first: int = 2,
+                 annot_skip_keep_special: bool = True):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.language = (language or "go").lower()
         self.items: list[dict] = []
 
         # ── Edge-label augmentation (config-gated, default OFF) ────────────────
-        # When enabled, edges are densified by transitive closure with a per-hop
-        # decay weight (see data/edge_augment.py). Disabled => identical behavior.
         self.edge_augment = bool(edge_augment)
         self.edge_augment_decay = float(edge_augment_decay)
         self.edge_augment_max_hops = int(edge_augment_max_hops)
@@ -60,10 +63,6 @@ class AnnotatedSFTDataset(Dataset):
             )
 
         # ── Teacher-gated informative-token selection (config-gated, default OFF)
-        # When enabled, completion tokens whose precomputed teacher NLL
-        # (``comp_teacher_nll`` field) exceeds the threshold are "missing-info"
-        # (uninferable from the input) and are EXCLUDED from the loss by setting
-        # their label to IGNORE_INDEX. Special tokens (EOS/im_end) are kept.
         self.token_select = bool(token_select)
         self.token_select_threshold = float(token_select_threshold)
         self.token_select_keep_special = bool(token_select_keep_special)
@@ -76,9 +75,21 @@ class AnnotatedSFTDataset(Dataset):
                 f"{self.token_select_threshold} (keep_special={self.token_select_keep_special})"
             )
 
-        prefix_len = len(CHAT_PREFIX)
-        middle = CHAT_MIDDLE
-        suffix = CHAT_SUFFIX
+        # ── Annotation-gated skip with structural protection (default OFF) ─────
+        # Skip completion tokens that are not the destination of any annotation
+        # edge, EXCEPT protected tokens: first ``keep_first`` completion tokens,
+        # and keyword / punct / whitespace (only identifier/number may be dropped).
+        self.annot_skip = bool(annot_skip)
+        self.annot_skip_keep_first = int(annot_skip_keep_first)
+        self.annot_skip_keep_special = bool(annot_skip_keep_special)
+        self._as_excluded = 0
+        self._as_total = 0
+        if self.annot_skip:
+            logger.info(
+                f"Annot-skip ON: drop unannotated completion tokens "
+                f"(keep_first={self.annot_skip_keep_first}, "
+                f"keep_special={self.annot_skip_keep_special}, language={self.language})"
+            )
 
         with open(data_path, encoding="utf-8") as f:
             for line in f:
@@ -97,6 +108,10 @@ class AnnotatedSFTDataset(Dataset):
 
                     if self.token_select:
                         self._apply_token_select(entry, input_ids, labels)
+                    if self.annot_skip:
+                        self._apply_annot_skip(
+                            input_ids, labels, entry.get("attention_edges", []),
+                        )
 
                     self.items.append(
                         self._make_item(input_ids, labels, entry.get("attention_edges", []))
@@ -115,23 +130,22 @@ class AnnotatedSFTDataset(Dataset):
                 if not tokens:
                     continue
 
-                # Build input_ids from qwen_tokens
                 input_ids = [t["token_id"] for t in tokens]
                 if len(input_ids) > max_len:
                     continue
 
-                # output starts right after CHAT_PREFIX + sft_input + CHAT_MIDDLE
                 output_char_start = len(CHAT_PREFIX) + len(sft_input) + len(CHAT_MIDDLE)
 
-                # Find first qwen token whose char_start >= output_char_start
-                output_token_start = len(input_ids)  # default: no output tokens
+                output_token_start = len(input_ids)
                 for idx, tok in enumerate(tokens):
                     if tok["char_start"] >= output_char_start:
                         output_token_start = idx
                         break
 
-                # Build labels
                 labels = [IGNORE_INDEX] * output_token_start + input_ids[output_token_start:]
+
+                if self.annot_skip:
+                    self._apply_annot_skip(input_ids, labels, annotated_edges)
 
                 self.items.append(self._make_item(input_ids, labels, annotated_edges))
 
@@ -142,14 +156,15 @@ class AnnotatedSFTDataset(Dataset):
                 f"completion tokens ({100*self._ts_excluded/self._ts_total:.1f}%) as missing-info "
                 f"(teacher NLL > {self.token_select_threshold})"
             )
+        if self.annot_skip and self._as_total:
+            logger.info(
+                f"Annot-skip: excluded {self._as_excluded}/{self._as_total} completion "
+                f"tokens ({100*self._as_excluded/self._as_total:.1f}%) as unannotated "
+                f"(kept first {self.annot_skip_keep_first} + keyword/punct/whitespace)"
+            )
 
     def _apply_token_select(self, entry, input_ids, labels):
-        """Exclude 'missing-info' completion tokens from the loss in-place.
-
-        A completion token whose precomputed teacher NLL exceeds the threshold is
-        not inferable from the input; its label is set to IGNORE_INDEX so the CE
-        loss skips it. Special tokens (EOS/im_end) are kept when configured.
-        """
+        """Exclude 'missing-info' completion tokens from the loss in-place."""
         for pos, nll in entry.get("comp_teacher_nll", []) or []:
             pos = int(pos)
             if not (0 <= pos < len(labels)) or labels[pos] == IGNORE_INDEX:
@@ -162,19 +177,50 @@ class AnnotatedSFTDataset(Dataset):
             labels[pos] = IGNORE_INDEX
             self._ts_excluded += 1
 
-    def _build_annot(self, raw_edges, n_tokens, labels):
-        """Return ``(pairs, weights, node_weight)`` for one sample.
+    def _annotated_dst_positions(self, raw_edges, n_tokens: int) -> set[int]:
+        """Positions that appear as an annotation edge destination (dst)."""
+        dsts: set[int] = set()
+        for ann in raw_edges or []:
+            qj = ann.get("dst", ann.get("target", ann.get("token_j_idx", -1)))
+            try:
+                qj = int(qj)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= qj < n_tokens:
+                dsts.add(qj)
+        return dsts
 
-        ``pairs`` is the list of ``(qi, qj)`` edges (qi < qj). With augmentation
-        OFF this reproduces the legacy edge list exactly and ``weights`` /
-        ``node_weight`` are ``None`` (so the item dict is byte-for-byte legacy).
-        With augmentation ON, edges are densified by transitive closure;
-        ``weights`` is the per-edge decay weight and ``node_weight`` (only when
-        ``edge_augment_node_weight``) is a length-``n_tokens`` vector giving each
-        position's max weight into any target token (for weight-aware cfmask).
+    def _apply_annot_skip(self, input_ids, labels, raw_edges):
+        """Exclude unannotated completion tokens, with structural protections.
+
+        Drop when ALL of:
+          - not an annotation destination,
+          - relative completion index >= keep_first,
+          - surface class is identifier or number,
+          - not a special token (when keep_special).
         """
-        # Normalize raw edges to a uniform {src, dst, subtype} list (handles both
-        # the compact `attention_edges` and the qwen `token_i/j_idx` schemas).
+        n = len(labels)
+        annotated_dsts = self._annotated_dst_positions(raw_edges, n)
+        comp = [i for i, lab in enumerate(labels) if lab != IGNORE_INDEX]
+        for rel, pos in enumerate(comp):
+            self._as_total += 1
+            if pos in annotated_dsts:
+                continue
+            if self.annot_skip_keep_special and int(input_ids[pos]) in self._special_ids:
+                continue
+            surface = self.tokenizer.decode([int(input_ids[pos])])
+            if is_protected_completion_token(
+                relative_pos=rel,
+                surface=surface,
+                keep_first=self.annot_skip_keep_first,
+                language=self.language,
+            ):
+                continue
+            labels[pos] = IGNORE_INDEX
+            self._as_excluded += 1
+
+    def _build_annot(self, raw_edges, n_tokens, labels):
+        """Return ``(pairs, weights, node_weight)`` for one sample."""
         norm = []
         for ann in raw_edges:
             qi = ann.get("src", ann.get("source", ann.get("token_i_idx", -1)))
@@ -195,7 +241,7 @@ class AnnotatedSFTDataset(Dataset):
                 mode=self.edge_augment_mode,
             )
         else:
-            edges = norm  # weight implicitly 1.0; kept identical to legacy path
+            edges = norm
 
         pairs, weights = [], []
         for e in edges:
@@ -214,7 +260,7 @@ class AnnotatedSFTDataset(Dataset):
                     node_weight[p] = float(w)
 
         if not self.edge_augment:
-            weights = None  # legacy path surfaces no weights
+            weights = None
         return pairs, weights, node_weight
 
     def _make_item(self, input_ids, labels, raw_edges):
@@ -241,8 +287,6 @@ class AnnotatedSFTDataset(Dataset):
         return self.items[idx]
 
 
-# ── Collator ──────────────────────────────────────────────────────────────────
-
 @dataclass
 class DataCollatorForAnnotatedSFT:
     tokenizer: transformers.PreTrainedTokenizer
@@ -252,7 +296,6 @@ class DataCollatorForAnnotatedSFT:
         labels_list = [inst["labels"] for inst in instances]
         annot_pairs_list = [inst.get("annot_pairs", torch.zeros(0, 2, dtype=torch.long))
                             for inst in instances]
-        # Pad input_ids and labels
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids_list, batch_first=True,
             padding_value=self.tokenizer.pad_token_id
@@ -263,18 +306,13 @@ class DataCollatorForAnnotatedSFT:
         )
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
 
-        # annot_pairs: list of [N_i, 2] tensors, one per sample in batch
-        # We keep them as a list (ragged) — the trainer will handle per-sample.
         batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
-            "annot_pairs": annot_pairs_list,  # list of tensors
+            "annot_pairs": annot_pairs_list,
         }
 
-        # Optional augmentation fields (present only when edge_augment is on).
-        # Kept ragged/padded and added conditionally so the default path is
-        # byte-for-byte identical to before.
         if "annot_weights" in instances[0]:
             batch["annot_weights"] = [
                 inst.get("annot_weights", torch.zeros(0, dtype=torch.float))
