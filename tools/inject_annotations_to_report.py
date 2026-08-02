@@ -36,18 +36,11 @@ def load_train_line(jsonl_path: str, line_no: int) -> dict | None:
 
 
 # ChatML structural tokens that should never be annotation sources.
-_CHATML_NOISE = {
+_CHATML_NOISE = frozenset({
     "<|im_start|>", "<|im_end|>", "system", "user", "assistant",
     "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
     "<|repo_name|>", "<|file_sep|>", "<|endoftext|>",
-    "\n",  # standalone newline tokens that are part of the ChatML template
-}
-
-
-def _is_chatml_noise(token_text: str) -> bool:
-    """Check if a decoded token is a ChatML structural marker (not real code)."""
-    t = token_text.strip()
-    return t in _CHATML_NOISE or "<|im_start|>" in t or "<|im_end|>" in t
+})
 
 
 def build_annotations_by_target(sample: dict, tokenizer=None) -> dict[str, list[dict]]:
@@ -67,8 +60,8 @@ def build_annotations_by_target(sample: dict, tokenizer=None) -> dict[str, list[
 
             # Decode and filter ChatML template noise from sources
             if tokenizer is not None and src < len(input_ids):
-                src_tok = tokenizer.decode([input_ids[src]])
-                if _is_chatml_noise(src_tok):
+                src_tok = tokenizer.decode([input_ids[src]]).strip()
+                if src_tok in _CHATML_NOISE:
                     skipped += 1
                     continue
 
@@ -81,8 +74,8 @@ def build_annotations_by_target(sample: dict, tokenizer=None) -> dict[str, list[
             dst = str(int(e[1]))
             src = int(e[0])
             if tokenizer is not None and src < len(input_ids):
-                src_tok = tokenizer.decode([input_ids[src]])
-                if _is_chatml_noise(src_tok):
+                src_tok = tokenizer.decode([input_ids[src]]).strip()
+                if src_tok in _CHATML_NOISE:
                     skipped += 1
                     continue
             ann[dst].append({
