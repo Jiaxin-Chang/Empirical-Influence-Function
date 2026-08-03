@@ -63,6 +63,7 @@ PRESCREEN_SKETCH_DIM="${PRESCREEN_SKETCH_DIM:-}"  # empty = intervention default
 PRESCREEN_SKETCH_SEED="${PRESCREEN_SKETCH_SEED:-}"  # empty = intervention default
 PRESCREEN_SKETCH_CACHE_DIR="${PRESCREEN_SKETCH_CACHE_DIR:-}"  # legacy CE cache (unused)
 SALIENCY_TRAIN_BANK_CACHE_DIR="${SALIENCY_TRAIN_BANK_CACHE_DIR:-}"  # empty = .cache/saliency_train_bank
+BANK_LOSS_MODE="${BANK_LOSS_MODE:-}"  # empty|auto = infer; ce_only|ce_saliency force bank objective
 IE_EXTRA_ARGS="${IE_EXTRA_ARGS:-}"  # optional raw passthrough args
 PYTHON="${PYTHON:-python}"
 
@@ -95,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --prescreen-sketch-seed) PRESCREEN_SKETCH_SEED="$2"; shift 2 ;;
         --prescreen-sketch-cache-dir) PRESCREEN_SKETCH_CACHE_DIR="$2"; shift 2 ;;
         --saliency-train-bank-cache-dir) SALIENCY_TRAIN_BANK_CACHE_DIR="$2"; shift 2 ;;
+        --bank-loss-mode) BANK_LOSS_MODE="$2"; shift 2 ;;
         *) echo "[batch] Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -271,6 +273,7 @@ for IDX in "${VALID_RUN_INDICES[@]}"; do
         ${PRESCREEN_SKETCH_SEED:+--prescreen-sketch-seed "${PRESCREEN_SKETCH_SEED}"} \
         ${PRESCREEN_SKETCH_CACHE_DIR:+--prescreen-sketch-cache-dir "${PRESCREEN_SKETCH_CACHE_DIR}"} \
         ${SALIENCY_TRAIN_BANK_CACHE_DIR:+--saliency-train-bank-cache-dir "${SALIENCY_TRAIN_BANK_CACHE_DIR}"} \
+        ${BANK_LOSS_MODE:+--bank-loss-mode "${BANK_LOSS_MODE}"} \
         ${IE_EXTRA_ARGS} \
         2>&1 | tee "${LOG_FILE}"
 

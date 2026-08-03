@@ -31,6 +31,10 @@ from src.loss import (
     compute_alti_correlation_gradient,
     compute_alti_match_and_probe_gradients,
     compute_alti_saliency_vector,
+    compute_last_layer_correlation_gradient,
+    compute_last_layer_match_and_probe_gradients,
+    compute_last_layer_saliency_vector,
+    compute_last_layer_topk_probe_gradient,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_scores_no_backward,
     compute_lm_head_ce_gradient_sketches_no_backward,
@@ -52,7 +56,12 @@ def load_samples(jsonl_path: str) -> list[dict]:
     ``{"prompt": "...", "response": "...", "task_id": "...", "system": "..."}``
     ``system`` is optional; ``task_id`` is preserved for output file naming.
 
-    Both formats are normalised to ``{system, input, output, task_id}``.
+    **Format C – eval predictions:**
+    ``{"prompt": "...", "label": "...", "predict": "...", "task_id": "..."}``
+    Gold is ``label`` (or ``response``); optional ``predict`` is kept for
+    teacher-forced attribution via ``--completion-source predict|auto``.
+
+    Normalised to ``{system, input, output, task_id[, predict]}``.
     """
     samples: list[dict] = []
     seen_inputs: set[str] = set()
@@ -72,14 +81,22 @@ def load_samples(jsonl_path: str) -> list[dict]:
                 inp    = msgs[1]["content"]
                 output = msgs[2]["content"]
                 task_id = obj.get("task_id", "") or obj.get("uid", "")
+                predict = obj.get("predict")
 
-            # ── Format B: flat prompt / response ──────────────────────────
-            elif "prompt" in obj and "response" in obj:
+            # ── Format B/C: flat prompt + gold (+ optional predict) ───────
+            elif "prompt" in obj and (
+                "response" in obj or "label" in obj or "predict" in obj
+            ):
                 system  = obj.get("system", "")
                 inp     = obj["prompt"]
-                output  = obj["response"]
+                # Gold for UI / correct_full_tokens; prefer explicit response/label.
+                output  = obj.get("response")
+                if output is None or output == "":
+                    output = obj.get("label", "")
                 task_id = str(obj.get("task_id", "") or obj.get("uid", ""))
-                if not output:
+                predict = obj.get("predict")
+                # Allow predict-only rows when gold is missing (rare).
+                if not output and not predict:
                     continue
 
             else:
@@ -92,9 +109,11 @@ def load_samples(jsonl_path: str) -> list[dict]:
             sample = {
                 "system":  system,
                 "input":   inp,
-                "output":  output,
+                "output":  output or "",
                 "task_id": task_id,
             }
+            if isinstance(predict, str) and predict:
+                sample["predict"] = predict
             # Optional annotation edges for CE+saliency train-bank (viz-aligned).
             edges = obj.get("attention_edges")
             if edges is None:
@@ -105,11 +124,54 @@ def load_samples(jsonl_path: str) -> list[dict]:
             if isinstance(obj.get("input_ids"), list) and obj["input_ids"]:
                 sample["input_ids"] = list(obj["input_ids"])
                 labs = obj.get("label", obj.get("labels"))
+                # Compact rows use list labels; string "label" is eval gold text.
                 if isinstance(labs, list) and len(labs) == len(sample["input_ids"]):
                     sample["labels"] = list(labs)
             samples.append(sample)
 
     return samples
+
+
+def _render_qwen_eval_prompt(
+    tokenizer,
+    user_text: str,
+    system: str = "",
+    *,
+    enable_thinking: bool = False,
+) -> str:
+    """Match AI4Go ``generate_local.render_model_prompt`` (thinking off by default)."""
+    sys_msg = system or "You are a helpful assistant."
+    messages = [
+        {"role": "system", "content": sys_msg},
+        {"role": "user", "content": user_text},
+    ]
+    apply_template = getattr(tokenizer, "apply_chat_template", None)
+    if callable(apply_template):
+        try:
+            return apply_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except (TypeError, ValueError):
+            if not enable_thinking:
+                messages[-1] = {
+                    "role": "user",
+                    "content": f"{user_text}\n/no_think",
+                }
+            try:
+                return apply_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except (TypeError, ValueError):
+                pass
+    suffix = "" if enable_thinking else "\n/no_think"
+    return (
+        f"<|im_start|>system\n{sys_msg}<|im_end|>\n"
+        f"<|im_start|>user\n{user_text}{suffix}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
 
 # ====== MODEL LOADING (generic — supports Qwen2, Qwen3, Qwen3-MoE, etc.) ======
@@ -387,8 +449,10 @@ SELECTED_TEST_SAMPLE_INDEX = 58
 TOP_K_PROMPT_TOKENS = 4        # How many test correlation features to extract
 TOP_K_PROMPT_OFFSET = 0        # Skip this many higher-ranked sources (0→ranks 1..K; 4→ranks 5..8 if K=4)
 TOP_K_TRAIN_SAMPLES = 10       # How many top train samples from coarse screening
-TOP_TARGETS = None             # None = all non-trivial train response tokens; int = optional cap
+TOP_TARGETS = None             # None = all valid train answer tokens; use --train-scan-3x3 for 3×3
 TOP_K_SOURCE_PER_TARGET = 3    # Top source tokens per train target (saliency top-3)
+# last_layer: viz/precompute-style single-layer ALTI (cheaper). full_alti: multi-layer rollout.
+SALIENCY_MODE = "last_layer"
 CONTEXT_WINDOW_SIZE = 3        # Tokens shown on each side of source/target for annotation
 FINE_MATCH_LAST_N_LAYERS = 1   # LoRA / fine-attn grads: last N layers (bank + probe + ∇C)
 FINE_MATCH_PROJ = "qk"         # Attention projections used for fine matching: qk, qkvo, vo, q/k/v/o, all
@@ -399,6 +463,8 @@ ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix len
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
 SEQUENCE_LENGTH_LIMIT = 3000   # Default guard for gradient-heavy train sample scans
+# Cap prompt+completion for attribution to match training max_len (attn ~ T^2).
+ATTR_MAX_SEQ_LEN = 3000
 # Global pre-screen pool size. The full training set is scanned ONCE with the full-response
 # CE gradient to obtain this pool, then each per-token re-ranking only scans the pool
 # (COARSE_POOL_SIZE samples) instead of the full training set.
@@ -1134,6 +1200,7 @@ def _saliency_train_bank_cache_path(
     last_n_layers: int,
     bank_cache_tag: str,
     cache_dir: str,
+    bank_left_truncate: bool = True,
 ) -> str:
     # Prefer the actual checkpoint path so ce_only / ce_saliency do not collide.
     model_key = str(model_path or getattr(getattr(model, "config", None), "_name_or_path", "model"))
@@ -1144,11 +1211,64 @@ def _saliency_train_bank_cache_path(
         sketch_dim=sketch_dim,
         sketch_seed=sketch_seed,
     )
+    lt = "lt1" if bank_left_truncate else "lt0"
     tag = (
         f"bank_{bank_cache_tag}_{fine_match_proj}_L{last_n_layers}"
-        f"_{model_hash}_{data_hash}_d{sketch_dim}_s{sketch_seed}.pt"
+        f"_{model_hash}_{data_hash}_d{sketch_dim}_s{sketch_seed}_{lt}.pt"
     )
     return os.path.join(cache_dir, tag)
+
+
+def _left_truncate_train_row_for_bank(
+    row_batch: dict,
+    edges,
+    max_seq_len: int,
+) -> tuple[dict, list | None, int]:
+    """Left-truncate a single train row so real seq_len <= max_seq_len; remap edges.
+
+    ``seq_len`` is the full tokenized sequence (ChatML prompt + response), not
+    prompt-only. ``attention_edges`` indices are into that same sequence, so
+    after dropping ``D`` leading tokens we keep edges with
+    ``src' = src - D``, ``dst' = dst - D`` only when both land in ``[0, new_len)``.
+    """
+    mask = row_batch["attention_mask"][0]
+    real_len = int(mask.sum().item())
+    # Content is left-aligned; ignore right padding when measuring length.
+    if real_len <= max_seq_len:
+        # Still squeeze away unused pad so bank forward sees the true length.
+        if int(row_batch["input_ids"].size(1)) != real_len:
+            out = {}
+            for k, v in row_batch.items():
+                if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(1) >= real_len:
+                    out[k] = v[:, :real_len].contiguous()
+                else:
+                    out[k] = v
+            return out, edges, 0
+        return row_batch, edges, 0
+    drop = real_len - int(max_seq_len)
+    new_len = int(max_seq_len)
+    out = {}
+    for k, v in row_batch.items():
+        if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(1) >= real_len:
+            out[k] = v[:, drop:real_len].contiguous()
+        else:
+            out[k] = v
+    remapped = None
+    if edges:
+        remapped = []
+        for e in edges:
+            try:
+                src = int(e.get("src", e.get("token_i_idx", -1)))
+                dst = int(e.get("dst", e.get("token_j_idx", -1)))
+            except (TypeError, ValueError):
+                continue
+            src_n, dst_n = src - drop, dst - drop
+            if 0 <= src_n < new_len and 0 <= dst_n < new_len:
+                ne = dict(e)
+                ne["src"] = src_n
+                ne["dst"] = dst_n
+                remapped.append(ne)
+    return out, remapped, drop
 
 
 def _load_or_build_saliency_train_bank(
@@ -1169,6 +1289,7 @@ def _load_or_build_saliency_train_bank(
     train_samples: list[dict],
     special_ids: set[int],
     bank_cache_tag_override: str | None = None,
+    bank_left_truncate: bool = True,
 ):
     """
     Build/load sketched train gradients on selected params (LoRA or fine-attn).
@@ -1178,6 +1299,9 @@ def _load_or_build_saliency_train_bank(
       ce_saliency -> CE + λ * saliency loss (needs attention_edges on samples)
 
     Retrieval query is sketched g_probe = ∇(-log C) (viz L_probe).
+
+    If ``bank_left_truncate`` and a row is longer than ``max_seq_len``, keep the
+    rightmost ``max_seq_len`` tokens and remap ``attention_edges`` (do not skip).
     """
     if sketch_dim <= 0:
         print("[WARN] sketch_dim<=0: saliency train bank disabled.", flush=True)
@@ -1198,6 +1322,7 @@ def _load_or_build_saliency_train_bank(
         last_n_layers=last_n_layers,
         bank_cache_tag=cache_tag,
         cache_dir=cache_dir,
+        bank_left_truncate=bank_left_truncate,
     )
     if os.path.exists(cache_path):
         print(f"Loading saliency train bank: {cache_path}", flush=True)
@@ -1227,6 +1352,12 @@ def _load_or_build_saliency_train_bank(
         "Legacy .cache/prescreen_sketch is NOT used.",
         flush=True,
     )
+    print(
+        f"  Bank length: max_seq_len={max_seq_len} "
+        f"left_truncate={bank_left_truncate} "
+        "(full ChatML prompt+response; edges remapped on truncate).",
+        flush=True,
+    )
     if bank_cfg.loss_mode == "ce_saliency":
         n_edges = sum(1 for s in train_samples if s.get("attention_edges"))
         print(
@@ -1245,58 +1376,108 @@ def _load_or_build_saliency_train_bank(
     sample_ids = []
     sketch_chunks = []
     skipped_long = 0
+    truncated_rows = 0
+    truncated_edges_kept = 0
     skipped_bad = 0
     used_cesal = 0
     used_ce = 0
+    # OOM retry ladder (full-seq CE+saliency grads are much heavier than training forward).
+    _oom_retry_caps = (2048, 1536, 1280, 1024, 768)
 
     for batch in tqdm(train_loader, desc="Build Saliency Train Bank", leave=False):
         train_indices = batch["sample_index"].view(-1).tolist()
         for row, train_idx in enumerate(train_indices):
             seq_len = int(batch["attention_mask"][row].sum().item())
-            if max_seq_len is not None and seq_len > max_seq_len:
-                skipped_long += 1
-                continue
-            row_batch = {
+            row_batch_full = {
                 k: v[row:row + 1]
                 for k, v in batch.items()
                 if isinstance(v, torch.Tensor) and k != "sample_index"
             }
-            edges = None
+            edges_full = None
             if 0 <= int(train_idx) < len(train_samples):
-                edges = train_samples[int(train_idx)].get("attention_edges")
-            try:
-                flat = _compute_bank_flat_grad_filtered(
-                    model,
-                    row_batch,
-                    param_filter_fn,
-                    accelerator.device,
-                    cfg=bank_cfg,
-                    edges=edges,
-                    special_ids=special_ids,
+                edges_full = train_samples[int(train_idx)].get("attention_edges")
+
+            if max_seq_len is not None and seq_len > max_seq_len and not bank_left_truncate:
+                skipped_long += 1
+                continue
+
+            target_cap = seq_len
+            if max_seq_len is not None:
+                target_cap = min(seq_len, int(max_seq_len))
+            attempt_caps = [int(target_cap)]
+            if bank_left_truncate:
+                for cand in _oom_retry_caps:
+                    if cand < target_cap and cand not in attempt_caps:
+                        attempt_caps.append(int(cand))
+
+            flat = None
+            edges_used = edges_full
+            seq_used = seq_len
+            did_truncate = False
+            for try_cap in attempt_caps:
+                row_batch, edges_used, dropped = _left_truncate_train_row_for_bank(
+                    row_batch_full, edges_full, int(try_cap)
                 )
-            except ImportError:
-                raise
-            except (torch.OutOfMemoryError, RuntimeError) as exc:
-                if isinstance(exc, RuntimeError) and not _is_cuda_alloc_error(exc):
+                seq_used = int(row_batch["input_ids"].size(1))
+                if dropped:
+                    did_truncate = True
+                    n_e = 0 if not edges_used else len(edges_used)
+                    print(
+                        f"  [bank] left-truncate train_idx={train_idx}: "
+                        f"{seq_len}→{seq_used} (drop {dropped}; edges kept={n_e})",
+                        flush=True,
+                    )
+                try:
+                    flat = _compute_bank_flat_grad_filtered(
+                        model,
+                        row_batch,
+                        param_filter_fn,
+                        accelerator.device,
+                        cfg=bank_cfg,
+                        edges=edges_used,
+                        special_ids=special_ids,
+                    )
+                    break
+                except ImportError:
                     raise
-                _clear_cuda_after_oom()
-                skipped_bad += 1
-                print(
-                    f"[WARN] Saliency bank OOM/skip train_idx={train_idx} seq_len={seq_len}",
-                    flush=True,
-                )
+                except (torch.OutOfMemoryError, RuntimeError) as exc:
+                    if isinstance(exc, RuntimeError) and not _is_cuda_alloc_error(exc):
+                        raise
+                    _clear_cuda_after_oom()
+                    flat = None
+                    if try_cap == attempt_caps[-1] or not bank_left_truncate:
+                        skipped_bad += 1
+                        print(
+                            f"[WARN] Saliency bank OOM/skip train_idx={train_idx} "
+                            f"seq_len={seq_used}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[WARN] Saliency bank OOM train_idx={train_idx} "
+                            f"seq_len={seq_used}; retry shorter left-truncate…",
+                            flush=True,
+                        )
+                    continue
+                finally:
+                    del row_batch
+
+            if flat is None:
                 continue
-            if flat is None or flat.numel() == 0:
+            if flat.numel() == 0:
                 skipped_bad += 1
                 continue
-            if bank_cfg.loss_mode == "ce_saliency" and edges:
+            if did_truncate:
+                truncated_rows += 1
+                truncated_edges_kept += 0 if not edges_used else len(edges_used)
+            if bank_cfg.loss_mode == "ce_saliency" and edges_used:
                 used_cesal += 1
             else:
                 used_ce += 1
             sketch = _project_flat_grad(flat, sketch_dim, sketch_seed).to(torch.float16)
             sample_ids.append(int(train_idx))
             sketch_chunks.append(sketch.unsqueeze(0))
-            del flat, sketch, row_batch
+            del flat, sketch, row_batch_full
             torch.cuda.empty_cache()
 
     if not sketch_chunks:
@@ -1309,6 +1490,7 @@ def _load_or_build_saliency_train_bank(
         "sketch_dim": int(sketch_dim),
         "sketch_seed": int(sketch_seed),
         "max_seq_len": max_seq_len,
+        "bank_left_truncate": bool(bank_left_truncate),
         "fine_match_proj": fine_match_proj,
         "last_n_layers": int(last_n_layers),
         "bank_type": "train_obj_on_fine_attn",
@@ -1320,6 +1502,12 @@ def _load_or_build_saliency_train_bank(
         "used_cesal_rows": used_cesal,
     }
     torch.save(cache, cache_path)
+    if truncated_rows:
+        print(
+            f"  Bank left-truncated {truncated_rows} long samples "
+            f"(edges remapped; kept≈{truncated_edges_kept} edges total).",
+            flush=True,
+        )
     if skipped_long:
         print(f"  Bank skipped {skipped_long} samples longer than {max_seq_len} tokens.", flush=True)
     if skipped_bad:
@@ -1351,6 +1539,13 @@ def run_causal_intervention_experiment(
     saliency_train_bank_cache_dir: str = SALIENCY_TRAIN_BANK_CACHE_DIR,
     prescreen_length_sweep: tuple[int, ...] | list[int] | None = PRESCREEN_LENGTH_SWEEP,
     base_model_path: str | None = None,
+    completion_source: str = "auto",
+    bank_loss_mode: str | None = None,
+    live_generate_compare: bool = True,
+    saliency_mode: str | None = None,
+    attr_max_seq_len: int | None = ATTR_MAX_SEQ_LEN,
+    bank_left_truncate: bool = True,
+    bank_max_seq_len: int | None = None,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -1368,6 +1563,24 @@ def run_causal_intervention_experiment(
     alti_grad_chunk_size = max(1, int(alti_grad_chunk_size))
     if alti_grad_max_seq_len is not None and alti_grad_max_seq_len <= 0:
         alti_grad_max_seq_len = None
+    _saliency_mode = (saliency_mode or SALIENCY_MODE or "last_layer").strip().lower()
+    if _saliency_mode not in {"last_layer", "full_alti"}:
+        raise ValueError(
+            f"Unknown saliency_mode={saliency_mode!r}; use last_layer|full_alti"
+        )
+    if _saliency_mode == "last_layer":
+        _saliency_fn = compute_last_layer_saliency_vector
+        _match_probe_fn = compute_last_layer_match_and_probe_gradients
+        _corr_grad_fn = compute_last_layer_correlation_gradient
+    else:
+        _saliency_fn = compute_alti_saliency_vector
+        _match_probe_fn = compute_alti_match_and_probe_gradients
+        _corr_grad_fn = compute_alti_correlation_gradient
+    print(
+        f"[DEBUG] saliency_mode={_saliency_mode}  "
+        f"train_scan≈{TOP_TARGETS or 'all'}×{TOP_K_SOURCE_PER_TARGET}",
+        flush=True,
+    )
     prescreen_sketch_dim = int(prescreen_sketch_dim or 0)
     prescreen_limit = PRESCREEN_SAMPLE_LIMIT
     fine_match_proj = (fine_match_proj or FINE_MATCH_PROJ).lower()
@@ -1378,13 +1591,41 @@ def run_causal_intervention_experiment(
         max_gpu_memory=max_gpu_memory,
         base_model_path=base_model_path,
     )
+    if _saliency_mode == "last_layer":
+        # Match viz/data_attribution: checkpointing cuts activation memory on backward.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        model.train()
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.eval()
+        print(
+            "[DEBUG] gradient checkpointing ON for last_layer probe "
+            "(dropout frozen; viz-aligned)",
+            flush=True,
+        )
     model_tag = model_tag_from_path(model_path)
-    bank_cfg = load_bank_loss_config(model_path, model_tag)
+    bank_cfg = load_bank_loss_config(
+        model_path,
+        model_tag,
+        loss_mode_override=bank_loss_mode,
+    )
     grad_space = getattr(model, "_eif_grad_space", "fine_attn")
     print(f"[DEBUG] model_tag={model_tag}  grad_space={grad_space}", flush=True)
+    _bank_mode_src = (
+        f"cli:{bank_loss_mode}"
+        if bank_loss_mode and str(bank_loss_mode).strip().lower() not in ("", "auto", "none")
+        else "auto"
+    )
     print(
         f"[intervention] train_retrieval={TRAIN_RETRIEVAL_METHOD}  "
-        f"bank_loss={bank_cfg.loss_mode}({bank_cfg.cache_tag})  "
+        f"bank_loss={bank_cfg.loss_mode}({bank_cfg.cache_tag}, src={_bank_mode_src})  "
         f"grad_space={grad_space}  "
         f"report_prefix=correlation_matching_results_{model_tag}_<task_id>_all_tokens.json",
         flush=True,
@@ -1421,7 +1662,7 @@ def run_causal_intervention_experiment(
     _stage3_tgt = "all valid pred tokens" if TOP_TARGETS is None else f"first {TOP_TARGETS} valid pred tokens"
     print(
         f"[DEBUG] Stage3 train scan: {_stage3_tgt} × saliency top-{TOP_K_SOURCE_PER_TARGET} sources "
-        f"(--top-targets / --top-k-source-per-target). Quick 3×3: --top-targets 3",
+        f"(default: all×{TOP_K_SOURCE_PER_TARGET}; quick 3×3: --train-scan-3x3)",
         flush=True,
     )
     print("[DEBUG] Model and tokenizer loaded.", flush=True)
@@ -1466,6 +1707,13 @@ def run_causal_intervention_experiment(
             f"{TRAIN_RETRIEVAL_METHOD}. Safe to delete if you do not need old runs.",
             flush=True,
         )
+    # Bank length guard: full ChatML seq (prompt+response), not prompt-only.
+    # Default to prescreen_max_seq_len; override with --bank-max-seq-len for tighter VRAM.
+    if bank_max_seq_len is None:
+        bank_max_seq_len = prescreen_max_seq_len
+    if bank_max_seq_len is not None and bank_max_seq_len <= 0:
+        bank_max_seq_len = None
+
     saliency_train_bank = _load_or_build_saliency_train_bank(
         model,
         train_ds,
@@ -1473,7 +1721,7 @@ def run_causal_intervention_experiment(
         accelerator,
         model_path=model_path,
         param_filter_fn=fine_param_filter,
-        max_seq_len=prescreen_max_seq_len,
+        max_seq_len=bank_max_seq_len,
         sketch_dim=prescreen_sketch_dim,
         sketch_seed=prescreen_sketch_seed,
         fine_match_proj=fine_match_proj if grad_space != "lora" else f"lora_L{FINE_MATCH_LAST_N_LAYERS}",
@@ -1483,6 +1731,7 @@ def run_causal_intervention_experiment(
         train_samples=train_samples,
         special_ids=set(getattr(tokenizer, "all_special_ids", []) or []),
         bank_cache_tag_override=bank_grad_tag,
+        bank_left_truncate=bank_left_truncate,
     )
     if saliency_train_bank is None:
         raise RuntimeError(
@@ -1526,7 +1775,122 @@ def run_causal_intervention_experiment(
     infer_fw.model.eval()
     _compact_ids = _cur_test.get("input_ids")
     _compact_lbl = _cur_test.get("labels")
-    if (
+    _fixed_predict = _cur_test.get("predict")
+    _completion_source = (completion_source or "auto").strip().lower()
+    if _completion_source not in {"auto", "predict", "generate"}:
+        raise ValueError(
+            f"Unknown completion_source={completion_source!r}; "
+            "use auto|predict|generate"
+        )
+    _use_fixed_predict = (
+        _completion_source == "predict"
+        or (_completion_source == "auto" and isinstance(_fixed_predict, str) and bool(_fixed_predict))
+    )
+    if _completion_source == "predict" and not (
+        isinstance(_fixed_predict, str) and _fixed_predict
+    ):
+        raise ValueError(
+            "--completion-source=predict requires a non-empty 'predict' field on the test sample"
+        )
+
+    live_gen_text = None  # optional diagnostic generate; never used for attribution when fixed
+    if _use_fixed_predict:
+        # Teacher-force the eval completion for attribution; optionally also
+        # generate once for log comparison (same eval-aligned prompt).
+        device = accelerator.device
+        prompt_text = _render_qwen_eval_prompt(
+            tokenizer,
+            _cur_test["input"],
+            system=_cur_test.get("system") or "",
+            enable_thinking=False,
+        )
+        prompt_ids_list = tokenizer(
+            prompt_text, add_special_tokens=False
+        )["input_ids"]
+        pred_ids_list = tokenizer(
+            _fixed_predict, add_special_tokens=False
+        )["input_ids"]
+        if not pred_ids_list:
+            raise ValueError("Tokenized predict is empty; cannot teacher-force attribution")
+        # Left-truncate prompt so prompt+predict fits training-like max_len.
+        # Eval chat prompts are often LONGER than train compact max_len → OOM
+        # even when saliency math matches training (attn memory ∝ T²).
+        _attr_cap = None if not attr_max_seq_len or int(attr_max_seq_len) <= 0 else int(attr_max_seq_len)
+        if _attr_cap is not None:
+            n_pred = len(pred_ids_list)
+            if n_pred >= _attr_cap:
+                raise ValueError(
+                    f"predict tokens ({n_pred}) >= --attr-max-seq-len ({_attr_cap}); "
+                    "raise the cap or shorten predict."
+                )
+            max_prompt = _attr_cap - n_pred
+            if len(prompt_ids_list) > max_prompt:
+                dropped = len(prompt_ids_list) - max_prompt
+                prompt_ids_list = prompt_ids_list[-max_prompt:]
+                print(
+                    f"[DEBUG] Left-truncated prompt by {dropped} tokens so "
+                    f"prompt+predict <= {_attr_cap} (train-aligned; "
+                    f"attn memory scales with T^2).",
+                    flush=True,
+                )
+        gold_text = _cur_test.get("output") or ""
+        gold_ids_list = tokenizer(gold_text, add_special_tokens=False)["input_ids"] if gold_text else []
+        prompt_len = len(prompt_ids_list)
+        prompt_ids = torch.tensor(prompt_ids_list, device=device, dtype=torch.long)
+        pred_ids = torch.tensor(pred_ids_list, device=device, dtype=torch.long)
+        model_out_text = _fixed_predict
+        gen_source = "fixed_predict"
+        print(
+            f"[DEBUG] Teacher-forcing eval predict "
+            f"(completion_source={_completion_source}, enable_thinking=False); "
+            f"prompt_len={prompt_len} predict_tokens={len(pred_ids_list)} "
+            f"total={prompt_len + len(pred_ids_list)} "
+            f"attr_max_seq_len={_attr_cap}",
+            flush=True,
+        )
+        if live_generate_compare:
+            # Live generate for log contrast only (does not replace pred_ids).
+            _im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+            _eos_ids = sorted({
+                i for i in [tokenizer.eos_token_id, _im_end] if i is not None
+            })
+            prompt_batch = prompt_ids.unsqueeze(0)
+            print(
+                "[DEBUG] Running live generate for log comparison "
+                f"(max_new_tokens={MAX_OUTPUT_TOKENS}, not used for attribution)...",
+                flush=True,
+            )
+            with torch.inference_mode():
+                gen_out = model.generate(
+                    input_ids=prompt_batch,
+                    attention_mask=torch.ones_like(prompt_batch),
+                    max_new_tokens=max(128, int(MAX_OUTPUT_TOKENS)),
+                    do_sample=False,
+                    num_beams=1,
+                    repetition_penalty=1.0,
+                    temperature=1.0,
+                    top_p=1.0,
+                    eos_token_id=_eos_ids,
+                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+            live_ids = gen_out[0, prompt_len:].tolist()
+            live_gen_text = tokenizer.decode(live_ids, skip_special_tokens=False)
+            del gen_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(
+                f"[DEBUG] Live generate done: n_tokens={len(live_ids)} "
+                f"(attribution still uses JSONL predict).",
+                flush=True,
+            )
+        else:
+            print(
+                "[DEBUG] Live generate compare disabled "
+                "(--no-live-generate-compare); attribution uses JSONL predict only.",
+                flush=True,
+            )
+    elif (
         isinstance(_compact_ids, list)
         and isinstance(_compact_lbl, list)
         and len(_compact_ids) == len(_compact_lbl)
@@ -1567,6 +1931,7 @@ def run_causal_intervention_experiment(
         model_out_text = tokenizer.decode(pred_ids_list, skip_special_tokens=False)
         gold_text = tokenizer.decode(gold_ans_ids, skip_special_tokens=False)
         gen_source = "compact_ids"
+        gold_ids_list = gold_ans_ids
     else:
         print(
             "[DEBUG] No compact input_ids/label on sample; falling back to ChatML re-encode + NIF.infer.",
@@ -1594,6 +1959,7 @@ def run_causal_intervention_experiment(
             gold_text = _cur_test.get("output", "")
         prompt_ids = raw_test_batch["input_ids"][0, :prompt_len]
         gen_source = "chatml_reencode"
+        gold_ids_list = None
 
     model_out_clean = str(model_out_text).split("<|im_end|>")[0]
     gold_clean = str(gold_text).split("<|im_end|>")[0]
@@ -1605,17 +1971,29 @@ def run_causal_intervention_experiment(
     ).hexdigest()[:12]
     print("=" * 64, flush=True)
     print(
-        f"[DEBUG] model generation  task_id={_task_id}  source={gen_source}  "
+        f"[DEBUG] attribution completion  task_id={_task_id}  source={gen_source}  "
         f"prompt_len={prompt_len}  prompt_sha1={_prompt_sha}  "
-        f"n_gen_tokens={int(pred_ids.numel())}  gen_sha1={_gen_sha}",
+        f"n_attr_tokens={int(pred_ids.numel())}  attr_sha1={_gen_sha}",
         flush=True,
     )
-    print("--- MODEL OUTPUT (this run) ---", flush=True)
+    if gen_source == "fixed_predict":
+        print("--- FIXED PREDICT (used for attribution) ---", flush=True)
+    else:
+        print("--- MODEL OUTPUT (this run, used for attribution) ---", flush=True)
     print(model_out_clean, flush=True)
+    if live_gen_text is not None:
+        live_clean = str(live_gen_text).split("<|im_end|>")[0]
+        print("--- LIVE GENERATE (log only, NOT used for attribution) ---", flush=True)
+        print(live_clean, flush=True)
+        _live_match = live_clean.strip() == model_out_clean.strip()
+        print(
+            f"[DEBUG] live_generate == fixed_predict ? {_live_match}",
+            flush=True,
+        )
     print("--- GOLD (from label / JSONL) ---", flush=True)
     print(gold_clean, flush=True)
     print(
-        f"[DEBUG] gen token ids (first 64): {pred_ids.tolist()[:64]}",
+        f"[DEBUG] attr token ids (first 64): {pred_ids.tolist()[:64]}",
         flush=True,
     )
     print("=" * 64, flush=True)
@@ -1624,10 +2002,11 @@ def run_causal_intervention_experiment(
     _prompt_id_list = [int(x) for x in prompt_ids.tolist()]
     _pred_id_list = [int(x) for x in pred_ids.tolist()]
     pred_full_tokens = [tokenizer.decode([i]) for i in (_prompt_id_list + _pred_id_list)]
-    if gen_source == "compact_ids":
-        _gold_id_list = [
-            int(tid) for tid, lab in zip(_compact_ids, _compact_lbl) if int(lab) != -100
-        ]
+    if gen_source in {"compact_ids", "fixed_predict"}:
+        if gold_ids_list is None:
+            _gold_id_list = []
+        else:
+            _gold_id_list = [int(x) for x in gold_ids_list]
         correct_full_tokens = [
             tokenizer.decode([i]) for i in (_prompt_id_list + _gold_id_list)
         ]
@@ -1674,7 +2053,7 @@ def run_causal_intervention_experiment(
         last_error_message = None
         for chunk in chunks:
             try:
-                return compute_alti_correlation_gradient(
+                return _corr_grad_fn(
                     **kwargs,
                     chunk_size=chunk,
                 )
@@ -1704,7 +2083,7 @@ def run_causal_intervention_experiment(
         last_error_message = None
         for chunk in chunks:
             try:
-                return compute_alti_match_and_probe_gradients(
+                return _match_probe_fn(
                     **kwargs,
                     chunk_size=chunk,
                 )
@@ -1774,7 +2153,7 @@ def run_causal_intervention_experiment(
                     if is_trivial_token(tokenizer, int(tr_batch["input_ids"][0, t_tr].item())):
                         t_tr += 1
                         continue
-                    sal_vec = compute_alti_saliency_vector(
+                    sal_vec = _saliency_fn(
                         model,
                         tr_batch,
                         t_tr,
@@ -2016,7 +2395,10 @@ def run_causal_intervention_experiment(
                 "PRESCREEN_SKETCH_SEED": prescreen_sketch_seed,
                 "SALIENCY_TRAIN_BANK_SIZE": bank_n,
                 "SALIENCY_TRAIN_BANK_CACHE": True,
-                "SALIENCY_METHOD": "alti",
+                "SALIENCY_METHOD": (
+                    "alti_last_layer" if _saliency_mode == "last_layer" else "alti_full"
+                ),
+                "SALIENCY_MODE": _saliency_mode,
                 "MATCHING_METHOD": match_desc,
                 "GRAD_SPACE": grad_space,
                 "TRAIN_RETRIEVAL_METHOD": TRAIN_RETRIEVAL_METHOD,
@@ -2058,53 +2440,118 @@ def run_causal_intervention_experiment(
         target_tok_text = tokenizer.decode([target_tok_id])
         print(f"\n=== Token {t}: '{target_tok_text}' ===")
 
-        # Stage 1a: cheap saliency at t
-        with torch.inference_mode(False):
-            sal_vec = compute_alti_saliency_vector(
-                model,
-                test_batch,
-                t,
-                chunk_size=ALTI_CHUNK_SIZE,
-            )
-        top_test_corr = top_nontrivial_saliency_sources(
-            tokenizer,
-            test_batch["input_ids"][0],
-            sal_vec,
-            TOP_K_PROMPT_TOKENS,
-            offset=TOP_K_PROMPT_OFFSET,
-        )
-        top_test_correlations = [
-            {
-                "source_token_index": idx,
-                "source_token":       tokenizer.decode([int(test_batch["input_ids"][0, idx].item())]),
-                "target_token_index": t,
-                "target_token":       target_tok_text,
-                "saliency_score":     float(score),
-                "saliency_rank":      TOP_K_PROMPT_OFFSET + rank_i,
-            }
-            for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
-        ]
-
-        # Stage 1b: ALTI match feature (∇C) + viz probe (∇(-log C)) from one forward
-        print(f"  Computing {len(top_test_correlations)} test ALTI match/probe features...")
+        # Stage 1: saliency sources + probe features
         test_corr_features: dict = {}
         with torch.inference_mode(False):
-            for item in top_test_correlations:
-                p_idx = item["source_token_index"]
-                pair = _compute_alti_match_and_probe_retry(
-                    model=model,
-                    batch=test_batch,
-                    target_idx_in_seq=t,
-                    source_idx_in_seq=p_idx,
-                    param_filter_fn=fine_param_filter,
-                    device=accelerator.device,
+            if _saliency_mode == "last_layer":
+                # Ranking uses a cheap no-grad forward (hidden_states only, no all-layer attn).
+                sal_vec = _saliency_fn(
+                    model,
+                    test_batch,
+                    t,
+                    chunk_size=ALTI_CHUNK_SIZE,
                 )
-                if pair is None:
+                top_test_corr = top_nontrivial_saliency_sources(
+                    tokenizer,
+                    test_batch["input_ids"][0],
+                    sal_vec,
+                    TOP_K_PROMPT_TOKENS,
+                    offset=TOP_K_PROMPT_OFFSET,
+                )
+                top_test_correlations = [
+                    {
+                        "source_token_index": idx,
+                        "source_token": tokenizer.decode(
+                            [int(test_batch["input_ids"][0, idx].item())]
+                        ),
+                        "target_token_index": t,
+                        "target_token": target_tok_text,
+                        "saliency_score": float(score),
+                        "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
+                    }
+                    for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
+                ]
+                if not top_test_correlations:
+                    per_token_results.append({
+                        "target_token_index": t,
+                        "target_token": target_tok_text,
+                        "top_correlations": [],
+                        "correlation_pairs": [],
+                    })
+                    torch.cuda.empty_cache()
                     continue
-                feat_match, feat_probe = pair
-                test_corr_features[p_idx] = (
-                    feat_match, feat_probe, item["source_token"], item["saliency_score"],
+                src_list = [int(it["source_token_index"]) for it in top_test_correlations]
+                print(
+                    f"  Computing viz last_layer top-{len(src_list)} probe "
+                    f"(hidden_states forward + recompute last attn only)...",
+                    flush=True,
                 )
+                try:
+                    feat_probe, _ = compute_last_layer_topk_probe_gradient(
+                        model=model,
+                        batch=test_batch,
+                        target_idx_in_seq=t,
+                        source_indices=src_list,
+                        param_filter_fn=fine_param_filter,
+                        device=accelerator.device,
+                    )
+                except torch.OutOfMemoryError as exc:
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        f"last_layer top-k probe OOM at target={t}: {exc}"
+                    ) from exc
+                for item in top_test_correlations:
+                    p_idx = item["source_token_index"]
+                    test_corr_features[p_idx] = (
+                        feat_probe, feat_probe, item["source_token"], item["saliency_score"],
+                    )
+            else:
+                sal_vec = _saliency_fn(
+                    model,
+                    test_batch,
+                    t,
+                    chunk_size=ALTI_CHUNK_SIZE,
+                )
+                top_test_corr = top_nontrivial_saliency_sources(
+                    tokenizer,
+                    test_batch["input_ids"][0],
+                    sal_vec,
+                    TOP_K_PROMPT_TOKENS,
+                    offset=TOP_K_PROMPT_OFFSET,
+                )
+                top_test_correlations = [
+                    {
+                        "source_token_index": idx,
+                        "source_token": tokenizer.decode(
+                            [int(test_batch["input_ids"][0, idx].item())]
+                        ),
+                        "target_token_index": t,
+                        "target_token": target_tok_text,
+                        "saliency_score": float(score),
+                        "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
+                    }
+                    for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
+                ]
+                print(
+                    f"  Computing {len(top_test_correlations)} test "
+                    f"{_saliency_mode} match/probe features..."
+                )
+                for item in top_test_correlations:
+                    p_idx = item["source_token_index"]
+                    pair = _compute_alti_match_and_probe_retry(
+                        model=model,
+                        batch=test_batch,
+                        target_idx_in_seq=t,
+                        source_idx_in_seq=p_idx,
+                        param_filter_fn=fine_param_filter,
+                        device=accelerator.device,
+                    )
+                    if pair is None:
+                        continue
+                    feat_match, feat_probe = pair
+                    test_corr_features[p_idx] = (
+                        feat_match, feat_probe, item["source_token"], item["saliency_score"],
+                    )
 
         if not test_corr_features:
             print(f"  No ALTI-gradient test features survived for token {t}; skipping retrieval/Stage 3.")
@@ -2119,8 +2566,13 @@ def run_causal_intervention_experiment(
 
         # Stage 2: retrieve Top-K trains with viz L_probe gradient vs train bank
         token_pair_records: list = []
-        for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
-            probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
+        if _saliency_mode == "last_layer":
+            # One bank query per target (shared probe); Stage3 still walks edges for UI.
+            any_feat = next(iter(test_corr_features.values()))
+            feat_probe = any_feat[1]
+            probe_sketch = _project_flat_grad(
+                feat_probe, prescreen_sketch_dim, prescreen_sketch_seed
+            )
             edge_scores = _score_prescreen_sketch_cache(
                 probe_sketch,
                 saliency_train_bank,
@@ -2128,28 +2580,62 @@ def run_causal_intervention_experiment(
             )
             related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
             print(
-                f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
+                f"  Target '{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} trains (shared L_probe): "
                 f"{[(i, round(s, 4)) for i, s in related_samples]}",
                 flush=True,
             )
-            # Stage 3 still matches with ∇C features (pair geometry), not L_probe.
-            single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
+            # Pass all edges once so Stage3 pair records cover each saliency source.
+            multi_edge_features = {
+                p_idx: (feat_match, src_text, sal_score)
+                for p_idx, (feat_match, _fp, src_text, sal_score) in test_corr_features.items()
+            }
             for rank, (train_idx, probe_score) in enumerate(related_samples):
                 print(
-                    f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
-                    f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
+                    f"\n  --- Train {train_idx} (rank={rank + 1}, "
+                    f"probe_cos={probe_score:.4f}) ---"
                 )
                 cached = train_sample_cache.get(str(train_idx))
                 detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                    train_idx, probe_score, single_edge_features,
+                    train_idx, probe_score, multi_edge_features,
                     target_tok_text, t,
-                    f"t{t}_s{p_idx}", pair_id_counter,
+                    f"t{t}", pair_id_counter,
                     cached_detail=cached,
                 )
                 if detail is not None:
                     train_sample_cache[str(train_idx)] = detail
                     token_pair_records.extend(pairs)
             del probe_sketch, edge_scores
+        else:
+            for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
+                probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
+                edge_scores = _score_prescreen_sketch_cache(
+                    probe_sketch,
+                    saliency_train_bank,
+                    accelerator.device,
+                )
+                related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
+                print(
+                    f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
+                    f"{[(i, round(s, 4)) for i, s in related_samples]}",
+                    flush=True,
+                )
+                single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
+                for rank, (train_idx, probe_score) in enumerate(related_samples):
+                    print(
+                        f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
+                        f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
+                    )
+                    cached = train_sample_cache.get(str(train_idx))
+                    detail, pairs, pair_id_counter = _process_train_sample_stage3(
+                        train_idx, probe_score, single_edge_features,
+                        target_tok_text, t,
+                        f"t{t}_s{p_idx}", pair_id_counter,
+                        cached_detail=cached,
+                    )
+                    if detail is not None:
+                        train_sample_cache[str(train_idx)] = detail
+                        token_pair_records.extend(pairs)
+                del probe_sketch, edge_scores
 
         token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
         per_token_results.append({
@@ -2188,8 +2674,11 @@ def run_causal_intervention_experiment(
                 "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
                 "TOP_TARGETS":             TOP_TARGETS,
                 "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
+                "SALIENCY_MODE":           _saliency_mode,
                 "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
-                "SALIENCY_METHOD":         "alti",
+                "SALIENCY_METHOD": (
+                    "alti_last_layer" if _saliency_mode == "last_layer" else "alti_full"
+                ),
                 "MATCHING_METHOD":         match_desc,
                 "GRAD_SPACE":              grad_space,
                 "TRAIN_RETRIEVAL_METHOD":  TRAIN_RETRIEVAL_METHOD,
@@ -2275,6 +2764,59 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train-limit", type=int, default=None,
         help="Limit the number of training samples to process (default: all). Useful for debugging.",
+    )
+    parser.add_argument(
+        "--completion-source",
+        type=str,
+        default="auto",
+        choices=["auto", "predict", "generate"],
+        help=(
+            "Where the attributed completion comes from. "
+            "auto: use JSONL 'predict' when present, else model.generate; "
+            "predict: teacher-force JSONL predict (AI4Go eval-aligned prompt, thinking off); "
+            "generate: always re-generate (legacy)."
+        ),
+    )
+    parser.add_argument(
+        "--live-generate-compare",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When teacher-forcing JSONL predict, also run one greedy generate for log "
+            "comparison only. Use --no-live-generate-compare to skip (saves time/VRAM)."
+        ),
+    )
+    parser.add_argument(
+        "--bank-loss-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "ce_only", "ce_saliency"],
+        help=(
+            "Train-bank gradient objective when retrieving training samples. "
+            "auto: infer from saliency_training_config.json / model_tag path "
+            "(checkpoint-N often falls back to ce_only); "
+            "ce_only: CE only; ce_saliency: CE + λ·saliency (needs attention_edges)."
+        ),
+    )
+    parser.add_argument(
+        "--bank-left-truncate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When building the saliency train bank, left-truncate long sequences "
+            "(and remap attention_edges) instead of skipping. On OOM, retry with "
+            "shorter caps (2048→768). Use --no-bank-left-truncate to skip long rows."
+        ),
+    )
+    parser.add_argument(
+        "--bank-max-seq-len",
+        type=int,
+        default=None,
+        help=(
+            "Max full-sequence length (prompt+response tokens) when building the "
+            "train bank. Default: same as --prescreen-max-seq-len. Bank grads are "
+            "heavier than train forward; try 1500–2000 if bank still OOMs under 3000."
+        ),
     )
     parser.add_argument(
         "--attn-implementation", type=str, default=None,
@@ -2370,16 +2912,55 @@ if __name__ == "__main__":
         "--top-targets", type=int, default=None,
         help=(
             "Cap Stage3 to the first K non-trivial answer tokens per train sample "
-            "(each still keeps saliency top sources). Default: all valid tokens. "
-            "Use --top-targets 3 for classic ~3×3 (with default --top-k-source-per-target 3). "
-            "Pass <=0 to mean 'no cap' (same as omitting)."
+            "(each still keeps saliency top sources). Default: no cap (all valid "
+            "tokens × --top-k-source-per-target). Pass K>0 to cap; <=0 also means all."
         ),
     )
     parser.add_argument(
         "--top-k-source-per-target", type=int, default=None,
         help=(
             "Saliency top-K sources kept per train answer token in Stage3 "
-            "(default 3). Together with --top-targets K → about K×this many candidate pairs."
+            "(default 3). Default scan is all valid answer tokens × this K; "
+            "use --train-scan-3x3 for a quick 3×3 smoke."
+        ),
+    )
+    parser.add_argument(
+        "--train-scan-3x3",
+        action="store_true",
+        help=(
+            "Quick smoke: --top-targets 3 and --top-k-source-per-target 3. "
+            "Without this flag, Stage3 defaults to all valid answer tokens × top-3."
+        ),
+    )
+    parser.add_argument(
+        "--saliency-mode",
+        type=str,
+        default="last_layer",
+        choices=["last_layer", "full_alti"],
+        help=(
+            "Saliency / pair-gradient backend. "
+            "last_layer: viz/precompute single-layer ALTI C[q,s] (default, cheaper); "
+            "full_alti: multi-layer ALTI rollout + match/probe (legacy, VRAM-heavy)."
+        ),
+    )
+    parser.add_argument(
+        "--attr-max-seq-len",
+        type=int,
+        default=ATTR_MAX_SEQ_LEN,
+        help=(
+            "Max prompt+predict tokens for attribution (default 3000, align with "
+            "training max_len). Left-truncates the prompt if longer. Use 0 to disable. "
+            "Eval chat prompts are often > train compact length and OOM for that reason."
+        ),
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help=(
+            "How many response tokens (from prompt_len) to analyze in all-tokens mode "
+            f"(default {MAX_OUTPUT_TOKENS}). Trivial tokens inside the window are skipped. "
+            "Use e.g. 250 to cover a longer predict; runtime scales roughly with this."
         ),
     )
     args = parser.parse_args()
@@ -2390,6 +2971,11 @@ if __name__ == "__main__":
         TOP_K_PROMPT_TOKENS = max(1, int(args.top_k_prompt_tokens))
     if args.top_k_prompt_offset is not None:
         TOP_K_PROMPT_OFFSET = max(0, int(args.top_k_prompt_offset))
+    if args.max_output_tokens is not None:
+        MAX_OUTPUT_TOKENS = max(1, int(args.max_output_tokens))
+    if args.train_scan_3x3:
+        TOP_TARGETS = 3
+        TOP_K_SOURCE_PER_TARGET = 3
     if args.top_targets is not None:
         TOP_TARGETS = None if int(args.top_targets) <= 0 else max(1, int(args.top_targets))
     if args.top_k_source_per_target is not None:
@@ -2405,6 +2991,9 @@ if __name__ == "__main__":
 
     print(
         f"[intervention] test_index={SELECTED_TEST_SAMPLE_INDEX}  mode=all_tokens  "
+        f"saliency_mode={args.saliency_mode}  "
+        f"train_scan≈{TOP_TARGETS or 'all'}×{TOP_K_SOURCE_PER_TARGET}  "
+        f"max_output_tokens={MAX_OUTPUT_TOKENS}  "
         f"saliency_ranks={TOP_K_PROMPT_OFFSET + 1}-"
         f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
     )
@@ -2427,4 +3016,11 @@ if __name__ == "__main__":
         saliency_train_bank_cache_dir=args.saliency_train_bank_cache_dir,
         prescreen_length_sweep=prescreen_length_sweep,
         base_model_path=args.base_model_path,
+        completion_source=args.completion_source,
+        bank_loss_mode=args.bank_loss_mode,
+        live_generate_compare=args.live_generate_compare,
+        saliency_mode=args.saliency_mode,
+        attr_max_seq_len=args.attr_max_seq_len,
+        bank_left_truncate=args.bank_left_truncate,
+        bank_max_seq_len=args.bank_max_seq_len,
     )

@@ -30,9 +30,8 @@ from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA = REPO_ROOT / "go_single_train_v2_graphsignal_10k_compact.json.bak"
-DEFAULT_TOKENIZER = Path(
-    r"d:\AAAworks\code-corr-annotation\models\Qwen2.5-Coder-7B-Instruct"
-)
+# Decode-only default (no GPU / no live saliency). Override with --tokenizer.
+DEFAULT_TOKENIZER = Path(r"D:\AAAworks\Qwen3-8B")
 
 SUBTYPES = [
     "bracket",
@@ -58,6 +57,7 @@ _state_lock = threading.RLock()
 _data_path: Path | None = None
 _offsets: list[int] = []  # byte offset of each non-empty line; last sentinel = file size
 _tokenizer = None
+_tokenizer_path: str | None = None
 _model = None
 _model_path: str | None = None
 _saliency_cache_dir: Path | None = None
@@ -155,17 +155,26 @@ def _rewrite_sample(idx: int, obj: dict[str, Any]) -> None:
     _saliency_cache.clear()
 
 
+def _resolve_tokenizer_path() -> str:
+    if _tokenizer_path:
+        return _tokenizer_path
+    if _model_path:
+        return _model_path
+    return str(DEFAULT_TOKENIZER)
+
+
 def _get_tokenizer():
     global _tokenizer
     if _tokenizer is not None:
         return _tokenizer
     from transformers import AutoTokenizer
 
-    path = _model_path or str(DEFAULT_TOKENIZER)
+    path = _resolve_tokenizer_path()
     if not Path(path).exists():
         raise HTTPException(
             500,
-            f"Tokenizer/model path not found: {path}. Pass --model <path>.",
+            f"Tokenizer path not found: {path}. "
+            "Pass --tokenizer D:\\AAAworks\\Qwen3-8B (decode-only; no saliency).",
         )
     _tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     return _tokenizer
@@ -243,11 +252,14 @@ class AddEdgeBody(BaseModel):
 
 @app.get("/api/health")
 def health():
+    tok_path = _resolve_tokenizer_path()
     return {
         "ok": True,
         "data_path": str(_data_path) if _data_path else None,
-        "n_samples": max(0, len(_offsets) - 1),
+        "n_samples": max(0, len(_offsets) - 1) if _offsets else 0,
         "subtypes": SUBTYPES,
+        "tokenizer_path": tok_path,
+        "tokenizer_ready": _tokenizer is not None,
         "saliency_available": _saliency_enabled(),
         "saliency_mode": (
             "model" if _model_path else ("disk_cache" if _saliency_cache_dir else "off")
@@ -532,10 +544,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to annotated train JSONL (.bak ok)",
     )
     parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="",
+        help=(
+            "Tokenizer-only path for decoding input_ids (no GPU / no live saliency). "
+            f"Default: {DEFAULT_TOKENIZER}"
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default="",
-        help="Optional Qwen path for live ALTI saliency (tokenizer also loaded from here)",
+        help="Optional Qwen path for live ALTI saliency (also used as tokenizer if --tokenizer omitted)",
     )
     parser.add_argument(
         "--saliency-cache",
@@ -548,7 +569,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
 
-    global _data_path, _offsets, _model_path, _saliency_cache_dir
+    global _data_path, _offsets, _model_path, _tokenizer_path, _saliency_cache_dir
     data = Path(args.data).expanduser().resolve()
     if not data.exists():
         print(f"[WARN] data file not found yet: {data}", flush=True)
@@ -564,21 +585,34 @@ def main(argv: list[str] | None = None) -> None:
         n_files = sum(1 for _ in _saliency_cache_dir.glob("*.json"))
         print(f"Saliency disk cache: {_saliency_cache_dir} ({n_files} files)", flush=True)
 
+    if args.tokenizer:
+        _tokenizer_path = str(Path(args.tokenizer).expanduser().resolve())
+        print(f"Tokenizer: {_tokenizer_path} (decode-only)", flush=True)
     if args.model:
         _model_path = str(Path(args.model).expanduser().resolve())
         print(f"Saliency model: {_model_path}", flush=True)
-    else:
-        # Still try default tokenizer path for decode-only.
+    elif not args.tokenizer:
         if DEFAULT_TOKENIZER.exists():
-            _model_path = None
-            mode = "disk_cache" if _saliency_cache_dir else "disabled"
-            print(f"Tokenizer default: {DEFAULT_TOKENIZER} (live saliency {mode})", flush=True)
+            print(
+                f"Tokenizer default: {DEFAULT_TOKENIZER} "
+                f"(live saliency {'disk_cache' if _saliency_cache_dir else 'off'})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[WARN] default tokenizer missing: {DEFAULT_TOKENIZER}. "
+                "Pass --tokenizer <path> to decode tokens.",
+                flush=True,
+            )
 
     # Eager-load tokenizer for faster first sample
     try:
-        if DEFAULT_TOKENIZER.exists() or args.model:
+        tok_path = Path(_resolve_tokenizer_path())
+        if tok_path.exists():
             _get_tokenizer()
-            print("Tokenizer ready.", flush=True)
+            print(f"Tokenizer ready: {tok_path}", flush=True)
+        else:
+            print(f"[WARN] tokenizer path not found: {tok_path}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[WARN] tokenizer not loaded: {exc}", flush=True)
 

@@ -56,7 +56,12 @@ def infer_bank_loss_mode(model_path: str | None, model_tag: str) -> str:
     return "ce_only"
 
 
-def load_bank_loss_config(model_path: str | None, model_tag: str) -> BankLossConfig:
+def load_bank_loss_config(
+    model_path: str | None,
+    model_tag: str,
+    *,
+    loss_mode_override: str | None = None,
+) -> BankLossConfig:
     raw: dict = {}
     if model_path:
         cfg_path = Path(model_path) / "saliency_training_config.json"
@@ -65,7 +70,19 @@ def load_bank_loss_config(model_path: str | None, model_tag: str) -> BankLossCon
                 raw = json.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception:
                 raw = {}
-    mode = infer_bank_loss_mode(model_path, model_tag)
+    override = (loss_mode_override or "").strip().lower()
+    if override in ("", "auto", "none"):
+        mode = infer_bank_loss_mode(model_path, model_tag)
+    elif override in ("ce_only", "ce_saliency"):
+        mode = override
+    elif override == "saliency_only":
+        # Bank sketches currently share the ce_saliency objective path.
+        mode = "ce_saliency"
+    else:
+        raise ValueError(
+            f"Unknown bank loss_mode_override={loss_mode_override!r}; "
+            "use auto|ce_only|ce_saliency"
+        )
     return BankLossConfig(
         loss_mode=mode,
         saliency_loss_type=str(raw.get("saliency_loss_type") or "contrastive"),

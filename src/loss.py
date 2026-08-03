@@ -1283,3 +1283,356 @@ def compute_alti_correlation_gradient(
     flat_match, flat_probe = out
     return flat_probe if as_probe_loss else flat_match
 
+
+# ── viz-aligned last-layer ALTI (cheaper temporary path) ─────────────────────
+
+def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
+    """Recompute last-layer attention probs from layer input hidden states.
+
+    Avoids ``output_attentions=True`` (which materializes HxTxT for *every*
+    layer and is what OOM'd at seq≈3.5k). Returns ``[B, H, T, T]``.
+    """
+    from src.saliency_loss import _unwrap_to_decoder_stack
+    try:
+        from transformers.models.qwen3.modeling_qwen3 import (
+            apply_rotary_pos_emb,
+            repeat_kv,
+        )
+    except ImportError:  # pragma: no cover
+        from transformers.models.llama.modeling_llama import (
+            apply_rotary_pos_emb,
+            repeat_kv,
+        )
+
+    decoder = _unwrap_to_decoder_stack(model)
+    layer = decoder.layers[-1]
+    attn = layer.self_attn
+    B, T, _ = hid_in.shape
+    device = hid_in.device
+    dtype = hid_in.dtype
+
+    normed = layer.input_layernorm(hid_in)
+    head_dim = attn.head_dim
+    hidden_shape = (B, T, -1, head_dim)
+    query_states = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
+    key_states = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
+
+    position_ids = torch.arange(T, device=device, dtype=torch.long).unsqueeze(0)
+    if hasattr(decoder, "rotary_emb"):
+        cos, sin = decoder.rotary_emb(normed, position_ids)
+    else:
+        # Fallback: some wrappers keep rotary on the outer CausalLM.model
+        rotary = getattr(getattr(model, "model", model), "rotary_emb", None)
+        if rotary is None:
+            raise RuntimeError("Cannot locate rotary_emb to recompute last-layer attention.")
+        cos, sin = rotary(normed, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    key_states = repeat_kv(key_states, attn.num_key_value_groups)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn.scaling
+    # Causal mask (additive)
+    causal = torch.triu(
+        torch.full((T, T), torch.finfo(attn_weights.dtype).min, device=device, dtype=attn_weights.dtype),
+        diagonal=1,
+    )
+    attn_weights = attn_weights + causal.view(1, 1, T, T)
+    attn_probs = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
+    del query_states, key_states, attn_weights, normed, cos, sin, causal
+    return attn_probs
+
+
+def _last_layer_contribution_row(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    *,
+    device=None,
+    require_grad: bool = False,
+):
+    """Return (C_row_before_q, local_device) using viz last-layer ALTI.
+
+    Forward uses ``output_hidden_states`` only (no all-layer attentions), then
+    recomputes last-layer attn probs. Contribution uses training's chunked
+    ``build_contribution_rows``. Indexing matches viz ``C[q, :q]``.
+    """
+    from src.saliency_loss import build_contribution_rows
+
+    if target_idx_in_seq <= 0:
+        raise ValueError("target_idx_in_seq must be > 0")
+    q = int(target_idx_in_seq)
+    end = q + 1
+    local_device = device
+    if local_device is None:
+        try:
+            local_device = next(model.parameters()).device
+        except StopIteration:
+            local_device = batch["input_ids"].device
+
+    input_ids = batch["input_ids"][:, :end].to(local_device)
+    inputs = {"input_ids": input_ids}
+    if "attention_mask" in batch:
+        inputs["attention_mask"] = batch["attention_mask"][:, :end].to(local_device)
+
+    ctx = torch.enable_grad() if require_grad else torch.no_grad()
+    with ctx:
+        outputs = model(
+            **inputs,
+            output_hidden_states=True,
+            output_attentions=False,  # critical: do NOT materialize all-layer HxTxT
+            use_cache=False,
+            return_dict=True,
+        )
+        # viz: hid = input to last decoder layer = hidden_states[-2]
+        hid = outputs.hidden_states[-2]
+        # Drop the big tuple ASAP (keep only `hid` for autograd).
+        outputs.hidden_states = None
+        del outputs
+        if hid is None:
+            raise RuntimeError("Model did not return hidden_states for last-layer ALTI.")
+        att = _recompute_last_layer_attn_probs(model, hid)
+        row_batch = torch.zeros(1, dtype=torch.long, device=hid.device)
+        row_qry = torch.tensor([q], dtype=torch.long, device=hid.device)
+        C_rows = build_contribution_rows(
+            model,
+            hid,
+            att,
+            row_batch,
+            row_qry,
+            layer_index=-1,
+            source_chunk_size=16,
+            query_chunk_size=1,
+        )
+        del hid, att
+        row = C_rows[0, :q]
+        del C_rows
+    return row, local_device
+
+
+@torch.no_grad()
+def compute_last_layer_saliency_vector(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    *,
+    p: int = 1,
+    chunk_size: int = 8,
+) -> list[float]:
+    """Forward-only last-layer ALTI row (viz/precompute). ``p``/``chunk_size`` ignored."""
+    del p, chunk_size
+    row, _ = _last_layer_contribution_row(
+        model, batch, target_idx_in_seq, require_grad=False
+    )
+    out = [float(x) for x in row.detach().cpu().tolist()]
+    del row
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
+
+
+def compute_last_layer_match_and_probe_gradients(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+    param_filter_fn,
+    *,
+    device=None,
+    p: int = 1,
+    chunk_size: int = 8,
+    return_score: bool = False,
+    probe_eps: float = 1e-8,
+):
+    """viz-style ∇C / ∇(-log C) on last-layer contribution C[q, s] only.
+
+    Much cheaper than full multi-layer ALTI match/probe. Signature matches
+    ``compute_alti_match_and_probe_gradients`` for drop-in use.
+    """
+    del p, chunk_size
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+    if source_idx_in_seq < 0 or source_idx_in_seq >= target_idx_in_seq:
+        raise ValueError(
+            f"source_idx_in_seq={source_idx_in_seq} must be in [0, {target_idx_in_seq})."
+        )
+
+    def _flat_grad(objective: str):
+        model.eval()
+        model.zero_grad(set_to_none=True)
+
+        target_params = []
+        original_flags = []
+        for name, param in model.named_parameters():
+            selected = param_filter_fn is None or param_filter_fn(name, param)
+            original_flags.append((param, param.requires_grad))
+            param.requires_grad_(bool(selected))
+            if selected:
+                target_params.append(param)
+
+        if not target_params:
+            for param, flag in original_flags:
+                param.requires_grad_(flag)
+            raise RuntimeError(
+                "compute_last_layer_match_and_probe_gradients: no params matched filter."
+            )
+
+        try:
+            row, _ = _last_layer_contribution_row(
+                model,
+                batch,
+                target_idx_in_seq,
+                device=device,
+                require_grad=True,
+            )
+            score = row[int(source_idx_in_seq)].clamp_min(0.0)
+            if objective == "probe":
+                loss = -torch.log(score + float(probe_eps))
+            else:
+                loss = score
+
+            grad_params = [param for param in target_params if param.requires_grad]
+            grads = torch.autograd.grad(
+                loss,
+                grad_params,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=True,
+            )
+            grad_map = {id(param): g for param, g in zip(grad_params, grads)}
+            del grads, row, loss
+            flat = torch.cat([
+                (
+                    grad_map[id(param)].reshape(-1).detach().cpu().float()
+                    if id(param) in grad_map and grad_map[id(param)] is not None
+                    else torch.zeros(param.numel(), dtype=torch.float32)
+                )
+                for param in target_params
+            ])
+            score_value = float(score.detach().cpu().item())
+            del grad_map, score
+            return flat, score_value
+        finally:
+            for param, flag in original_flags:
+                param.requires_grad_(flag)
+            model.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    flat_match, score_value = _flat_grad("match")
+    flat_probe, _ = _flat_grad("probe")
+    if return_score:
+        return flat_match, flat_probe, score_value
+    return flat_match, flat_probe
+
+
+def compute_last_layer_correlation_gradient(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_idx_in_seq: int,
+    param_filter_fn,
+    *,
+    device=None,
+    p: int = 1,
+    chunk_size: int = 8,
+    return_score: bool = False,
+    as_probe_loss: bool = False,
+    probe_eps: float = 1e-8,
+):
+    out = compute_last_layer_match_and_probe_gradients(
+        model,
+        batch,
+        target_idx_in_seq,
+        source_idx_in_seq,
+        param_filter_fn,
+        device=device,
+        p=p,
+        chunk_size=chunk_size,
+        return_score=return_score,
+        probe_eps=probe_eps,
+    )
+    if return_score:
+        flat_match, flat_probe, score_value = out
+        return (flat_probe if as_probe_loss else flat_match), score_value
+    flat_match, flat_probe = out
+    return flat_probe if as_probe_loss else flat_match
+
+
+def compute_last_layer_topk_probe_gradient(
+    model,
+    batch,
+    target_idx_in_seq: int,
+    source_indices: list[int],
+    param_filter_fn,
+    *,
+    device=None,
+    probe_eps: float = 1e-8,
+):
+    """viz/data_attribution probe: one forward + one backward.
+
+    ``L_probe = -mean_i log(C[q, s_i] + eps)`` over the given sources.
+    Returns ``(flat_grad, score_mean)`` where ``flat_grad`` is on CPU float32.
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+    srcs = [int(s) for s in source_indices]
+    if not srcs:
+        raise ValueError("source_indices must be non-empty")
+    if any(s < 0 or s >= target_idx_in_seq for s in srcs):
+        raise ValueError(
+            f"source indices {srcs} must be in [0, {target_idx_in_seq})"
+        )
+
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    target_params = []
+    original_flags = []
+    for name, param in model.named_parameters():
+        selected = param_filter_fn is None or param_filter_fn(name, param)
+        original_flags.append((param, param.requires_grad))
+        param.requires_grad_(bool(selected))
+        if selected:
+            target_params.append(param)
+    if not target_params:
+        for param, flag in original_flags:
+            param.requires_grad_(flag)
+        raise RuntimeError("compute_last_layer_topk_probe_gradient: no params matched filter.")
+
+    try:
+        row, _ = _last_layer_contribution_row(
+            model,
+            batch,
+            target_idx_in_seq,
+            device=device,
+            require_grad=True,
+        )
+        idx = torch.tensor(srcs, device=row.device, dtype=torch.long)
+        vals = row[idx].clamp_min(0.0)
+        loss = -torch.log(vals + float(probe_eps)).mean()
+        score_mean = float(vals.detach().mean().cpu().item())
+        grad_params = [p for p in target_params if p.requires_grad]
+        grads = torch.autograd.grad(
+            loss,
+            grad_params,
+            create_graph=False,
+            retain_graph=False,
+            allow_unused=True,
+        )
+        grad_map = {id(p): g for p, g in zip(grad_params, grads)}
+        del grads, row, loss, vals, idx
+        flat = torch.cat([
+            (
+                grad_map[id(p)].reshape(-1).detach().cpu().float()
+                if id(p) in grad_map and grad_map[id(p)] is not None
+                else torch.zeros(p.numel(), dtype=torch.float32)
+            )
+            for p in target_params
+        ])
+        del grad_map
+        return flat, score_mean
+    finally:
+        for param, flag in original_flags:
+            param.requires_grad_(flag)
+        model.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+

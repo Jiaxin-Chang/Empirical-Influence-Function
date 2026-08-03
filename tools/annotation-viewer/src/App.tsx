@@ -77,7 +77,7 @@ export default function App() {
             `服务已加载 ${h.data_path}（${h.n_samples} 条）` +
               (h.saliency_available
                 ? ' · saliency 已启用'
-                : ' · saliency 未启用（需 --model 重启后端）'),
+                : ' · 仅展示 annotation（未开 saliency）'),
           )
           await refreshList('', 0, false)
         }
