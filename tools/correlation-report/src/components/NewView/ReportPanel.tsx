@@ -877,6 +877,8 @@ function CodePanel({
     selectedTargetIndex,
     analyzedIndices,
     onTokenClick,
+    trailingContent,
+    trailingColor,
 }: {
     label: string;
     badge: string;
@@ -887,6 +889,8 @@ function CodePanel({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
+    trailingContent?: string;
+    trailingColor?: string;
 }) {
     return (
         <div className={styles.codePanel}>
@@ -894,7 +898,7 @@ function CodePanel({
                 <span className={styles.badge} style={{ background: badgeColor }}>{badge}</span>
                 <span className={styles.codePanelLabel}>{label}</span>
             </div>
-            <pre className={styles.codeBlock}>
+            <pre className={styles.codeBlock} style={{ fontSize: 11, lineHeight: 1.5 }}>
                 <code>
                     {tokens.map((tok, i) => {
                         const isResponse = i >= promptLen;
@@ -919,6 +923,9 @@ function CodePanel({
                             />
                         );
                     })}
+                    {trailingContent && (
+                        <span style={{ color: trailingColor ?? '#16a34a' }}>{trailingContent}</span>
+                    )}
                 </code>
             </pre>
         </div>
@@ -1003,12 +1010,68 @@ function TrainSampleViewer({
                         let state: TokenState = i >= detail.answer_start_index ? 'response' : 'normal';
                         if (isTgt) state = 'selected';
                         else if (isSrc) state = 'source-highlight';
-                        const annClass = isAnnSrc ? styles['token-annotated-source'] : undefined;
+                        // Train response tokens use green, annotation sources get red underline
+                        const extraClass = [
+                            isAnnSrc ? styles['token-annotated-source'] : '',
+                            state === 'response' ? styles['token-train-response'] : '',
+                        ].filter(Boolean).join(' ') || undefined;
                         const annSubtypes = annotationSubtypes.get(i);
-                        return <TokenSpan key={i} token={tok} state={state} title={annSubtypes} className={annClass} />;
+                        return <TokenSpan key={i} token={tok} state={state} title={annSubtypes} className={extraClass} />;
                     })}
                 </code>
             </pre>
+        </div>
+    );
+}
+
+// ─── Image Panel (linked to pair selection) ────────────────────────────────────
+
+function ImagePanel({ pair }: { pair: { pairId: string; trainIdx: number } | null }) {
+    const [imgError, setImgError] = useState(false);
+    useEffect(() => { setImgError(false); }, [pair]);
+
+    if (!pair) {
+        return (
+            <div className={styles.codePanel} style={{ marginTop: 14 }}>
+                <div className={styles.codePanelHeader}>
+                    <span className={styles.badge} style={{ background: '#8b5cf6' }}>IMG</span>
+                    <span className={styles.codePanelLabel}>Visualization</span>
+                </div>
+                <div style={{
+                    padding: 24, background: '#1e1e2e', borderRadius: '0 0 8px 8px',
+                    color: '#6b7280', fontSize: 13, textAlign: 'center',
+                }}>
+                    Choose a correlation pair
+                </div>
+            </div>
+        );
+    }
+
+    const src = `/images/${pair.pairId}_${pair.trainIdx}.jpg`;
+    const label = `${pair.pairId}_${pair.trainIdx}`;
+
+    return (
+        <div className={styles.codePanel} style={{ marginTop: 14 }}>
+            <div className={styles.codePanelHeader}>
+                <span className={styles.badge} style={{ background: '#8b5cf6' }}>IMG</span>
+                <span className={styles.codePanelLabel}>
+                    {label}
+                    <span style={{ marginLeft: 8, fontSize: 10, color: '#6b7280' }}>
+                        (预生成图片，实时生成接口预留)
+                    </span>
+                </span>
+            </div>
+            <div style={{ padding: 12, background: '#1e1e2e', borderRadius: '0 0 8px 8px' }}>
+                {imgError ? (
+                    <div style={{ color: '#ef4444', fontSize: 13, textAlign: 'center', padding: 24 }}>
+                        {label} 图片未找到
+                    </div>
+                ) : (
+                    <img src={src} alt={label}
+                         onError={() => setImgError(true)}
+                         style={{ width: '100%', display: 'block' }} />
+                )}
+            </div>
         </div>
     );
 }
@@ -1303,6 +1366,7 @@ export function ReportPanel({
     const [probingTrainSampleId, setProbingTrainSampleId] = useState<number | null>(null);
     const [selectedTrainPairIdsByGroup, setSelectedTrainPairIdsByGroup] = useState<Record<number, string[]>>({});
     const [trainProbeComparisons, setTrainProbeComparisons] = useState<Record<number, TrainProbeComparisonSummary>>({});
+    const [lastSelectedPair, setLastSelectedPair] = useState<{ pairId: string; trainIdx: number } | null>(null);
     const [showAdvancedTtav, setShowAdvancedTtav] = useState(false);
     const ttavWindowRef = useRef<Window | null>(null);
     const ttavWindowOriginRef = useRef<string | null>(null);
@@ -1374,20 +1438,15 @@ export function ReportPanel({
     }, [selectedResult, selectedTestCorrIdx]);
 
     const allDisplayPairs = useMemo(() => {
-        const keep = (p: CorrelationPair) =>
-            p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
-
         // Require an explicit Top-Correlation click before showing train matches.
         if (!selectedResult || selectedTestCorrIdx === null) return [];
 
         return selectedResult.correlation_pairs
-            .filter(p =>
-                keep(p) && p.test_correlation.source_token_index === selectedTestCorrIdx
-            )
+            .filter(p => p.test_correlation.source_token_index === selectedTestCorrIdx)
             .sort((a, b) => b.cos_sim - a.cos_sim);
-    }, [selectedResult, selectedTestCorrIdx, threshold, hideZero]);
+    }, [selectedResult, selectedTestCorrIdx]);
 
-    // Group pairs by train_sample_id; keep Top-10 trains by best pair cos for this edge.
+    // Group pairs by train_sample_id; keep Top-10 trains, max 5 pairs each.
     const trainGroups = useMemo(() => {
         const map = new Map<number, CorrelationPair[]>();
         allDisplayPairs.forEach(p => {
@@ -1397,7 +1456,7 @@ export function ReportPanel({
         return Array.from(map.entries())
             .map(([id, pairs]) => ({
                 id,
-                pairs: [...pairs].sort((a, b) => b.cos_sim - a.cos_sim),
+                pairs: [...pairs].sort((a, b) => b.cos_sim - a.cos_sim).slice(0, 5),
                 bestSim: Math.max(...pairs.map(p => p.cos_sim)),
             }))
             .sort((a, b) => b.bestSim - a.bestSim)
@@ -1687,15 +1746,21 @@ export function ReportPanel({
     const toggleTrainPairSelection = (trainIdx: number, pairId: string) => {
         setSelectedTrainPairIdsByGroup(current => {
             const prev = new Set(current[trainIdx] ?? []);
-            if (prev.has(pairId)) {
+            const wasSelected = prev.has(pairId);
+            if (wasSelected) {
                 prev.delete(pairId);
             } else {
                 prev.add(pairId);
             }
-            return {
-                ...current,
-                [trainIdx]: Array.from(prev),
-            };
+            const next = { ...current, [trainIdx]: Array.from(prev) };
+            // Update image panel: show the most recently selected pair, or clear if none
+            const totalSelected = Object.values(next).reduce((s, arr) => s + arr.length, 0);
+            if (totalSelected === 0) {
+                setLastSelectedPair(null);
+            } else if (!wasSelected) {
+                setLastSelectedPair({ pairId, trainIdx });
+            }
+            return next;
         });
         setTrainProbeComparisons(current => {
             if (!(trainIdx in current)) return current;
@@ -2041,23 +2106,12 @@ export function ReportPanel({
                 </span>
             </div>
 
-                    {/* ── Top: Ground Truth (Full width, scrolls normally) ── */}
-                    <div className={styles.topPanel}>
-                        <CodePanel
-                            label="Correct Output (Ground Truth)"
-                            badge="GT"
-                            badgeColor="#16a34a"
-                            tokens={correctTokens}
-                            promptLen={promptLen}
-                        />
-                    </div>
-
                     {/* ── Bottom Section: Left Sticky, Right Scroll ── */}
                     <div className={styles.bottomSection}>
-                        {/* ── Left Column: Model Output & Correlations ── */}
-                        <div className={styles.bottomLeft}>
+                        {/* ── Left Column: Model Output, Ground Truth & Top Correlations ── */}
+                        <div className={styles.bottomLeft} style={{ overflow: 'auto' }}>
                             <CodePanel
-                                label="Model Output (Incorrect)"
+                                label="Model Output + Ground Truth"
                                 badge="MODEL"
                                 badgeColor="#dc2626"
                                 tokens={modelTokens}
@@ -2066,10 +2120,12 @@ export function ReportPanel({
                                 selectedTargetIndex={selectedTokIdx ?? undefined}
                                 analyzedIndices={analyzedIndices}
                                 onTokenClick={idx => setSelectedTokIdx(prev => prev === idx ? null : idx)}
+                                trailingContent={'\n\n' + correctTokens.slice(promptLen).join('')}
+                                trailingColor="#16a34a"
                             />
 
                             {selectedResult && (
-                                <div className={styles.correlationList}>
+                                <div className={styles.correlationList} style={{ marginTop: 14 }}>
                                     <div className={styles.correlationListTitle}>
                                         Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
                                     </div>
@@ -2104,6 +2160,9 @@ export function ReportPanel({
                                     </div>
                                 </div>
                             )}
+
+                            {/* ── Image panel ── */}
+                            <ImagePanel pair={lastSelectedPair} />
                         </div>
 
                         {/* ── Right Column: Training pairs ── */}
@@ -2117,78 +2176,8 @@ export function ReportPanel({
                                         <span className={styles.pairCount}>
                                             {selectedTestCorrIdx === null
                                                 ? 'select a Top Correlation'
-                                                : `${trainGroups.length} trains · ${allDisplayPairs.length} pairs (Top-10)`}
+                                                : `${trainGroups.length} trains · ${allDisplayPairs.length} pairs`}
                                         </span>
-                                    </div>
-                                    <div className={styles.filterRow}>
-                                        <span className={styles.filterLabel}>cos_sim ≥</span>
-                                        <input
-                                            type="range" min={0} max={0.2} step={0.001} value={threshold}
-                                            onChange={e => setThreshold(parseFloat(e.target.value))}
-                                            className={styles.thresholdSlider}
-                                        />
-                                        <span className={styles.thresholdVal}>{threshold.toFixed(3)}</span>
-                                        <button
-                                            onClick={() => setHideZero(v => !v)}
-                                            style={{
-                                                marginLeft: '12px',
-                                                padding: '3px 10px',
-                                                borderRadius: '6px',
-                                                fontSize: '11px',
-                                                cursor: 'pointer',
-                                                border: `1px solid ${hideZero ? '#ef4444' : '#d1d5db'}`,
-                                                background: hideZero ? '#fef2f2' : '#fff',
-                                                color: hideZero ? '#b91c1c' : '#6b7280',
-                                                fontWeight: hideZero ? 700 : 500,
-                                                transition: 'all 0.12s',
-                                            }}
-                                        >
-                                            {hideZero ? '✗ 已隐藏 cos=0' : '隐藏 cos_sim=0'}
-                                        </button>
-                                    </div>
-                                    {/* ── Export row ── */}
-                                    <div style={{
-                                        marginTop: 8, padding: '8px 0',
-                                        borderTop: '1px solid #e5e7eb',
-                                        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, fontSize: 13,
-                                    }}>
-                                        <span style={{ fontWeight: 600, color: '#374151' }}>Export:</span>
-                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                                            <input type="radio" name="exportScope" value="all"
-                                                checked={exportScope === 'all'} onChange={() => setExportScope('all')} />
-                                            All tokens
-                                        </label>
-                                        {selectedTokIdx !== null && (
-                                            <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                                                <input type="radio" name="exportScope" value="selected"
-                                                    checked={exportScope === 'selected'} onChange={() => setExportScope('selected')} />
-                                                Selected only
-                                            </label>
-                                        )}
-                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                                            <input type="radio" name="exportScope" value="range"
-                                                checked={exportScope === 'range'} onChange={() => setExportScope('range')} />
-                                            Range:
-                                            <input type="number" value={rangeFrom}
-                                                onChange={e => setRangeFrom(+e.target.value)}
-                                                disabled={exportScope !== 'range'}
-                                                style={{ width: 56, padding: '2px 4px', border: '1px solid #d1d5db', borderRadius: 4 }} />
-                                            <span>—</span>
-                                            <input type="number" value={rangeTo}
-                                                onChange={e => setRangeTo(+e.target.value)}
-                                                disabled={exportScope !== 'range'}
-                                                style={{ width: 56, padding: '2px 4px', border: '1px solid #d1d5db', borderRadius: 4 }} />
-                                        </label>
-                                        <button
-                                            onClick={handleExport}
-                                            style={{
-                                                marginLeft: 'auto', padding: '4px 16px', borderRadius: 6,
-                                                border: '1px solid #6366f1', background: '#eef2ff', color: '#4338ca',
-                                                fontWeight: 600, fontSize: 13, cursor: 'pointer',
-                                            }}
-                                        >
-                                            Export Markdown
-                                        </button>
                                     </div>
                                     {importedReportActive ? (
                                         <div className={styles.importedReportNotice}>

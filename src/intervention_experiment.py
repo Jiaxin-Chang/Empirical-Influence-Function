@@ -395,6 +395,12 @@ ALTI_CHUNK_SIZE = 8            # Query chunk size for ALTI contribution computat
 ALTI_GRAD_CHUNK_SIZE = 32      # Pair-gradient starts fast and falls back on OOM
 ALTI_GRAD_MAX_SEQ_LEN = None   # Skip ALTI-gradient pairs beyond this prefix length; <=0 disables
 
+_CHATML_NOISE_TOKENS = frozenset({
+    "<|im_start|>", "<|im_end|>", "system", "user", "assistant",
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+    "<|repo_name|>", "<|file_sep|>", "<|endoftext|>",
+})
+
 # All-tokens mode parameters
 MAX_OUTPUT_TOKENS = 40         # Max response tokens to analyze in all-tokens mode
 SEQUENCE_LENGTH_LIMIT = 3000   # Default guard for gradient-heavy train sample scans
@@ -1766,24 +1772,16 @@ def run_causal_intervention_experiment(
             )
 
             # Collect annotation edges for this train sample, grouped by dst (target).
-            # Filter out edges whose source is a ChatML structural token (noise).
+            # Filter out ChatML template tokens (noise from graphsignal running on full ChatML seq).
             edges = train_samples[train_idx].get("attention_edges") or []
             annotations_by_target: dict[str, list[dict]] = {}
             for e in edges:
                 src = int(e["src"])
                 dst = int(e["dst"])
-                # Skip edges where source is a ChatML template marker
-                if src < len(full_tokens):
-                    src_tok = full_tokens[src].strip()
-                    if (src_tok in {"<|im_start|>", "<|im_end|>", "system", "user", "assistant",
-                                    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
-                                    "<|repo_name|>", "<|file_sep|>", "<|endoftext|>"}
-                            or "<|im_start|>" in src_tok or "<|im_end|>" in src_tok
-                            or src_tok == "\n"):
-                        continue
-                dst_key = str(dst)
-                entry = {"src": src, "subtype": str(e.get("subtype", ""))}
-                annotations_by_target.setdefault(dst_key, []).append(entry)
+                if src < len(full_tokens) and full_tokens[src].strip() not in _CHATML_NOISE_TOKENS:
+                    dst_key = str(dst)
+                    entry = {"src": src, "subtype": str(e.get("subtype", ""))}
+                    annotations_by_target.setdefault(dst_key, []).append(entry)
 
             cached_detail = {
                 "full_tokens":             full_tokens,

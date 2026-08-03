@@ -14,8 +14,6 @@ interface Props {
     metas: AllTokensExperimentMeta[];
 }
 
-type SlotId = 'left' | 'right';
-
 interface SlotState {
     report: AllTokensReport | null;
     meta: AllTokensExperimentMeta | null;
@@ -120,21 +118,10 @@ function SlotImportCard({
 }
 
 export function NewView({ metas }: Props) {
-    const [left, setLeft] = useState<SlotState>(() => emptySlot());
-    const [right, setRight] = useState<SlotState>(() => emptySlot());
-    const [draggingLeft, setDraggingLeft] = useState(false);
-    const [draggingRight, setDraggingRight] = useState(false);
-    const [linkTokenSelection, setLinkTokenSelection] = useState(false);
-    const [linkedTokIdx, setLinkedTokIdx] = useState<number | null>(null);
+    const [slot, setSlot] = useState<SlotState>(() => emptySlot());
+    const [dragging, setDragging] = useState(false);
 
-    const dualMode = Boolean(left.report && right.report);
-
-    const setSlot = useCallback((id: SlotId, next: SlotState) => {
-        if (id === 'left') setLeft(next);
-        else setRight(next);
-    }, []);
-
-    const activatePayload = useCallback((id: SlotId, payload: unknown, sourceName: string) => {
+    const activatePayload = useCallback((payload: unknown, sourceName: string) => {
         try {
             const imported = normalizeImportedReport(payload, sourceName);
             const modelName = imported.report.experiment_meta.model_name;
@@ -145,7 +132,7 @@ export function NewView({ metas }: Props) {
                     : imported.meta.label,
                 fileName: `uploaded:${sourceName}`,
             };
-            setSlot(id, {
+            setSlot({
                 report: imported.report,
                 meta,
                 status: `Loaded ${imported.report.per_token_results.length} token(s) from ${sourceName}`
@@ -154,170 +141,89 @@ export function NewView({ metas }: Props) {
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to parse JSON.';
-            setSlot(id, {
-                report: null,
-                meta: null,
-                status: null,
-                error: `Failed to import ${sourceName}: ${message}`,
-            });
+            setSlot({ report: null, meta: null, status: null, error: `Failed to import ${sourceName}: ${message}` });
         }
-    }, [setSlot]);
+    }, []);
 
-    const loadMeta = useCallback(async (id: SlotId, meta: AllTokensExperimentMeta) => {
-        setSlot(id, {
-            report: null,
-            meta,
-            status: `Loading ${meta.fileName}...`,
-            error: null,
-        });
+    const loadMeta = useCallback(async (meta: AllTokensExperimentMeta) => {
+        setSlot({ report: null, meta, status: `Loading ${meta.fileName}...`, error: null });
         try {
             const resp = await fetch(`/data/results/${meta.fileName}`);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = normalizeAllTokensReport(await resp.json() as AllTokensReport);
             const modelName = data.experiment_meta.model_name;
-            setSlot(id, {
+            setSlot({
                 report: data,
-                meta: {
-                    ...meta,
-                    label: modelName ? `${modelName} · ${meta.taskId}` : meta.label,
-                },
+                meta: { ...meta, label: modelName ? `${modelName} · ${meta.taskId}` : meta.label },
                 status: `Loaded ${meta.fileName}` + (modelName ? ` [${modelName}]` : ''),
                 error: null,
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to load.';
-            setSlot(id, {
-                report: null,
-                meta: null,
-                status: null,
-                error: `Failed to load ${meta.fileName}: ${message}`,
-            });
+            setSlot({ report: null, meta: null, status: null, error: `Failed to load ${meta.fileName}: ${message}` });
         }
-    }, [setSlot]);
+    }, []);
 
-    const handleFile = useCallback(async (id: SlotId, file: File | null | undefined) => {
+    const handleFile = useCallback(async (file: File | null | undefined) => {
         if (!file) return;
         try {
             const text = await file.text();
-            activatePayload(id, JSON.parse(text), file.name);
+            activatePayload(JSON.parse(text), file.name);
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to parse JSON.';
-            setSlot(id, {
-                report: null,
-                meta: null,
-                status: null,
-                error: `Failed to import ${file.name}: ${message}`,
-            });
+            setSlot({ report: null, meta: null, status: null, error: `Failed to import ${file.name}: ${message}` });
         }
-    }, [activatePayload, setSlot]);
+    }, [activatePayload]);
 
-    // Optional URL query: ?leftUrl=...&rightUrl=...
+    // Optional URL query: ?reportUrl=...
     useEffect(() => {
         if (typeof window === 'undefined') return;
         const params = new URLSearchParams(window.location.search);
-        const leftUrl = params.get('leftUrl') ?? params.get('reportUrl') ?? params.get('report_url');
-        const rightUrl = params.get('rightUrl');
-
-        const loadUrl = async (id: SlotId, raw: string) => {
+        const reportUrl = params.get('reportUrl') ?? params.get('report_url') ?? params.get('leftUrl');
+        if (!reportUrl) return;
+        (async () => {
             try {
-                const url = new URL(raw, window.location.href);
+                const url = new URL(reportUrl, window.location.href);
                 const resp = await fetch(url.toString(), { cache: 'no-store' });
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                activatePayload(id, await resp.json(), url.pathname.split('/').pop() || url.host);
+                activatePayload(await resp.json(), url.pathname.split('/').pop() || url.host);
             } catch (error) {
                 const message = error instanceof Error ? error.message : 'Failed to load URL.';
-                setSlot(id, { report: null, meta: null, status: null, error: message });
+                setSlot({ report: null, meta: null, status: null, error: message });
             }
-        };
-
-        if (leftUrl) void loadUrl('left', leftUrl);
-        if (rightUrl) void loadUrl('right', rightUrl);
-    }, [activatePayload, setSlot]);
-
-    const onTokChange = useCallback((idx: number | null) => {
-        setLinkedTokIdx(idx);
-    }, []);
-
-    const loadedCount = useMemo(() => Number(Boolean(left.report)) + Number(Boolean(right.report)), [left.report, right.report]);
+        })();
+    }, [activatePayload]);
 
     return (
         <div className={styles.root}>
-            <div className={styles.dualImportRow}>
-                <SlotImportCard
-                    title="Model A (left)"
-                    slot={left}
-                    metas={metas}
-                    dragging={draggingLeft}
-                    onDrag={setDraggingLeft}
-                    onDrop={file => void handleFile('left', file)}
-                    onFile={file => void handleFile('left', file)}
-                    onPickMeta={idx => { const m = metas[idx]; if (m) void loadMeta('left', m); }}
-                    onClear={() => setLeft(emptySlot())}
-                />
-                <SlotImportCard
-                    title="Model B (right)"
-                    slot={right}
-                    metas={metas}
-                    dragging={draggingRight}
-                    onDrag={setDraggingRight}
-                    onDrop={file => void handleFile('right', file)}
-                    onFile={file => void handleFile('right', file)}
-                    onPickMeta={idx => { const m = metas[idx]; if (m) void loadMeta('right', m); }}
-                    onClear={() => setRight(emptySlot())}
-                />
-            </div>
+            <SlotImportCard
+                title="Import Report"
+                slot={slot}
+                metas={metas}
+                dragging={dragging}
+                onDrag={setDragging}
+                onDrop={file => void handleFile(file)}
+                onFile={file => void handleFile(file)}
+                onPickMeta={idx => { const m = metas[idx]; if (m) void loadMeta(m); }}
+                onClear={() => setSlot(emptySlot())}
+            />
 
-            <div className={styles.compareToolbar}>
-                <label className={styles.linkToggle}>
-                    <input
-                        type="checkbox"
-                        checked={linkTokenSelection}
-                        onChange={e => setLinkTokenSelection(e.target.checked)}
-                        disabled={!dualMode}
-                    />
-                    Link token selection across models
-                </label>
-                <span className={styles.compareHint}>
-                    {loadedCount === 0
-                        ? 'Load one JSON for single-model view, or two for side-by-side compare.'
-                        : loadedCount === 1
-                            ? 'Single-model mode — all attribution features available. Load a second JSON to compare.'
-                            : 'Dual-model mode — panels scroll independently. Enable link only if you want shared token clicks.'}
-                </span>
-            </div>
-
-            {loadedCount === 0 && (
+            {!slot.report && (
                 <div className={styles.emptyState}>
-                    Import or select at least one correlation report to begin.
+                    Import or select a correlation report to begin.
                 </div>
             )}
 
-            <div className={dualMode ? styles.dualGrid : styles.singleGrid}>
-                {left.report && left.meta && (
-                    <div className={styles.modelColumn}>
-                        <ReportPanel
-                            report={left.report}
-                            meta={left.meta}
-                            modelLabel={modelLabelFrom(left.report, left.meta, 'Model A')}
-                            compact={dualMode}
-                            selectedTokIdx={dualMode && linkTokenSelection ? linkedTokIdx : undefined}
-                            onSelectedTokIdxChange={dualMode && linkTokenSelection ? onTokChange : undefined}
-                        />
-                    </div>
-                )}
-                {right.report && right.meta && (
-                    <div className={styles.modelColumn}>
-                        <ReportPanel
-                            report={right.report}
-                            meta={right.meta}
-                            modelLabel={modelLabelFrom(right.report, right.meta, 'Model B')}
-                            compact={dualMode}
-                            selectedTokIdx={dualMode && linkTokenSelection ? linkedTokIdx : undefined}
-                            onSelectedTokIdxChange={dualMode && linkTokenSelection ? onTokChange : undefined}
-                        />
-                    </div>
-                )}
-            </div>
+            {slot.report && slot.meta && (
+                <div className={styles.singleGrid}>
+                    <ReportPanel
+                        report={slot.report}
+                        meta={slot.meta}
+                        modelLabel={modelLabelFrom(slot.report, slot.meta, 'Model')}
+                        compact={false}
+                    />
+                </div>
+            )}
         </div>
     );
 }

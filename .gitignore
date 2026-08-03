@@ -230,3 +230,4 @@ samples*.md
 reports/
 .vite/results.txt
 logs/
+tools/correlation-report/images/
