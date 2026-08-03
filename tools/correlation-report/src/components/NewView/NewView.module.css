@@ -353,7 +353,7 @@
     font-size: 13px;
     line-height: 1.7;
     overflow-x: auto;
-    max-height: 420px;
+    max-height: 187px;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
@@ -363,10 +363,13 @@
 .token { border-radius: 3px; transition: background 0.1s; }
 
 .token-normal   { color: #cdd6f4; }
-.token-response { color: #a6e3a1; }
+.token-response { color: #ef4444; }
+
+/* Train sample response tokens (green, distinct from model output red) */
+.token-train-response { color: #a6e3a1 !important; }
 
 .token-analyzed {
-    color: #a6e3a1;
+    color: #ef4444;
     border-bottom: 1.5px dashed #89b4fa;
     cursor: pointer;
 }
@@ -417,6 +420,10 @@
 .bottomRight {
     flex: 1;
     min-width: 0;
+    max-height: calc(3 * (100vh - 260px));
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
 }
 
 .panelRootCompact .bottomSection {
@@ -468,6 +475,8 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
+    max-height: 187px;
+    overflow-y: auto;
 }
 @media (max-width: 1200px) {
     .correlationListItems { grid-template-columns: 1fr; }

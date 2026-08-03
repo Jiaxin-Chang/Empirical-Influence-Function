@@ -9,6 +9,7 @@ const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
+const IMAGES_DIR          = resolve(__dirname, 'images')
 
 interface ModelInfo { slug: string; name: string }
 interface RawModelInfo { model_slug: string; model_name?: unknown }
@@ -145,6 +146,18 @@ function experimentDataPlugin(): Plugin {
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Cache-Control', 'no-cache')
           res.end(content)
+          return
+        }
+      }
+      const imageM = reqUrl.match(/^\/images\/([^/?]+)$/)
+      if (imageM) {
+        const imagePath = resolve(IMAGES_DIR, decodeURIComponent(imageM[1]))
+        if (existsSync(imagePath)) {
+          const ext = imagePath.split('.').pop()?.toLowerCase() ?? ''
+          const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' }[ext] ?? 'application/octet-stream'
+          res.setHeader('Content-Type', mime)
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(readFileSync(imagePath))
           return
         }
       }
