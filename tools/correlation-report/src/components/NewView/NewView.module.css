@@ -12,15 +12,7 @@
     padding-bottom: 24px;
 }
 
-/* ── Dual import / compare ── */
-.dualImportRow {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-}
-@media (max-width: 1100px) {
-    .dualImportRow { grid-template-columns: 1fr; }
-}
+/* ── Import card ── */
 .slotImportCard {
     display: grid;
     gap: 10px;
@@ -99,6 +91,10 @@
 .singleGrid {
     display: grid;
     grid-template-columns: 1fr;
+    /* Fill the viewport under the app header + import card so the two
+       columns can scroll independently instead of scrolling the page. */
+    height: calc(100vh - 210px);
+    min-height: 420px;
 }
 @media (max-width: 1400px) {
     .dualGrid {
@@ -109,18 +105,31 @@
 .modelColumn {
     min-width: 0;
     min-height: 0;
+    height: 100%;
     border: 1px solid #e2e8f0;
     border-radius: 12px;
-    padding: 10px 12px 16px;
+    padding: 10px 12px 12px;
     background: #fff;
-    overflow-x: hidden;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
 }
 .dualGrid .modelColumn {
     /* Independent vertical scroll per model; do not share page scroll. */
     max-height: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    display: block;
+}
+/* ReportPanel fills the column; its own left/right panes handle scrolling. */
+.modelColumn > .root {
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+    padding-bottom: 0;
+    gap: 12px;
 }
 .modelBanner {
     display: flex;
@@ -128,7 +137,8 @@
     align-items: baseline;
     gap: 8px 12px;
     padding: 8px 10px;
-    margin-bottom: 8px;
+    margin-bottom: 0;
+    flex-shrink: 0;
     border-radius: 8px;
     background: #eef2ff;
     border: 1px solid #c7d2fe;
@@ -311,11 +321,6 @@
     }
 }
 
-/* ── Top panel ── */
-.topPanel {
-    margin-bottom: 20px;
-}
-
 /* ── Code Panel ── */
 .codePanel {
     border: 1px solid #e2e8f0;
@@ -344,6 +349,33 @@
     font-weight: 600;
     color: #475569;
 }
+.outputCompareBody {
+    display: flex;
+    flex-direction: column;
+}
+.outputSection {
+    display: flex;
+    flex-direction: column;
+}
+.outputSection + .outputSection {
+    border-top: 1px solid #313244;
+}
+.outputSectionHeader {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: #181825;
+    border-bottom: 1px solid #313244;
+}
+.outputSectionTitle {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.outputSectionTitleModel { color: #f38ba8; }
+.outputSectionTitleGold { color: #a6e3a1; }
 .codeBlock {
     margin: 0;
     padding: 14px;
@@ -358,15 +390,20 @@
     white-space: pre-wrap;
     word-break: break-all;
 }
+.codeBlockCompact {
+    max-height: 280px;
+}
 
 /* ── Token states ── */
 .token { border-radius: 3px; transition: background 0.1s; }
 
 .token-normal   { color: #cdd6f4; }
 .token-response { color: #a6e3a1; }
+.token-response-model { color: #f38ba8; }
+.token-response-gold { color: #a6e3a1; }
 
 .token-analyzed {
-    color: #a6e3a1;
+    color: #f38ba8;
     border-bottom: 1.5px dashed #89b4fa;
     cursor: pointer;
 }
@@ -387,6 +424,8 @@
     border-radius: 3px;
 }
 
+/* GT annotation source for the current saliency target(s): red underline.
+   Orthogonal to saliency highlighting so both can show on the same token. */
 .token-annotated-source {
     text-decoration: underline;
     text-decoration-color: #ef4444;
@@ -394,37 +433,77 @@
     text-underline-offset: 2px;
 }
 
-/* ── Bottom Section ── */
+/* Linked to the embedding plot: the token whose point is under the cursor.
+   Deliberately its own channel (cyan outline) rather than reusing .token-selected
+   or .token-source-highlight — those already mean "current target" and
+   "attribution source", and overloading them would make the picture unreadable. */
+.token-linked {
+    outline: 2px solid #22d3ee;
+    outline-offset: 1px;
+    background: rgba(34, 211, 238, 0.28);
+    border-radius: 3px;
+}
+
+/* The endpoints of the pair whose card is open, scrolled to in the full listing.
+   Its own colour again: cyan already means "the plot's cursor is on this token",
+   and the two can be true at once. Animated because the jump moves the panel
+   under the reader — the pulse says which two tokens the jump was for. */
+.token-located {
+    outline: 2px solid #c084fc;
+    outline-offset: 1px;
+    background: rgba(192, 132, 252, 0.3);
+    border-radius: 3px;
+    animation: token-located-pulse 1.4s ease-out 2;
+}
+@keyframes token-located-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(192, 132, 252, 0); }
+    35%      { box-shadow: 0 0 0 4px rgba(192, 132, 252, 0.55); }
+}
+
+/* ── Bottom Section: Model left, Train right — each scrolls on its own ── */
 .bottomSection {
     display: flex;
     gap: 20px;
-    align-items: flex-start;
+    align-items: stretch;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
 }
 @media (max-width: 900px) {
-    .bottomSection { flex-direction: column; }
+    .bottomSection {
+        flex-direction: column;
+        overflow: auto;
+    }
 }
 
 .bottomLeft {
     flex: 1;
-    position: sticky;
-    top: 20px;
     display: flex;
     flex-direction: column;
     gap: 16px;
     min-width: 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
 }
 
 .bottomRight {
     flex: 1;
     min-width: 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
 }
 
 .panelRootCompact .bottomSection {
-    /* In dual view, keep train correlations scroll local to this column. */
     align-items: stretch;
 }
 .panelRootCompact .bottomLeft {
-    position: static;
+    overflow: visible;
 }
 .panelRootCompact .bottomRight {
     max-height: min(70vh, 820px);
@@ -697,6 +776,189 @@
     color: #78350f;
     font-weight: 700;
     border: 1.5px solid #f59e0b;
+}
+
+/* ── Inline embedding plot ── */
+
+/* Picks between drawing the plot in this page and opening the TTAV web app. */
+.modeSwitch {
+    display: inline-flex;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    overflow: hidden;
+    background: #fff;
+}
+.modeSwitchBtn {
+    padding: 2px 10px;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.modeSwitchBtn:hover { background: #f1f5f9; }
+.modeSwitchBtnActive {
+    background: #7c3aed;
+    color: #fff;
+}
+.modeSwitchBtnActive:hover { background: #6d28d9; }
+
+/* Floats over the left column instead of sitting in the document.
+   In flow it made that column ~1020px tall, so the code panel and the plot could
+   never be on screen together, and hovering a point scrolled one of them away to
+   reach the other. Fixed decouples the two: the page is free to scroll the code
+   to any token while the plot stays put.
+   `left` and `width` come from JS — they track the left column's measured
+   viewport rect, so the panel covers that column and leaves the training-pair
+   column clear. Only `bottom` is fixed here. */
+.inlineVisualizer {
+    position: fixed;
+    bottom: 16px;
+    z-index: 900;
+    border: 1px solid #cbd5e1;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 10px 34px rgba(15, 23, 42, 0.24), 0 2px 8px rgba(0,0,0,0.08);
+    background: #fff;
+}
+
+/* Collapsed keeps the bundle loaded and the header (with its hover readout)
+   visible, and gives the page its bottom strip back. */
+.inlineVisualizerCollapsed > *:not(:first-child) {
+    display: none;
+}
+
+/* Compare view renders two ReportPanels side by side; two floating panels would
+   land on top of each other, so there it stays in flow. */
+.panelRootCompact .inlineVisualizer {
+    position: static;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    margin-top: 12px;
+}
+.inlineVisualizerHeader {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    /* Extra room on the right so the resize grip doesn't sit on the buttons. */
+    padding: 8px 26px 8px 12px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    min-width: 0;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+}
+.inlineVisualizerMoving .inlineVisualizerHeader {
+    cursor: grabbing;
+}
+.inlineVisualizerHeader > .codePanelLabel {
+    white-space: nowrap;
+}
+.inlineVisualizerMeta {
+    font-size: 11px;
+    color: #64748b;
+}
+.inlineVisualizerDockBtn,
+.inlineVisualizerClose {
+    padding: 2px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #fff;
+    color: #64748b;
+    font-size: 11px;
+    cursor: pointer;
+    touch-action: manipulation;
+}
+.inlineVisualizerDockBtn { margin-left: auto; }
+.inlineVisualizerDockBtn:hover,
+.inlineVisualizerClose:hover { background: #f1f5f9; }
+
+.inlineVisualizerBody {
+    display: flex;
+    flex-direction: column;
+}
+/* Height comes from the resize handle (inline style); this is only the fallback
+   for the compare view, which renders the panel in flow. */
+.inlineVisualizerCanvas {
+    height: 260px;
+    width: 100%;
+    position: relative;
+}
+
+/* Resize grip, top-right. The panel is anchored bottom-left, so that corner is
+   the one whose drag grows it in both axes. Sits above the header buttons. */
+.inlineVisualizerResizeGrip {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 18px;
+    height: 18px;
+    z-index: 2;
+    cursor: nesw-resize;
+    touch-action: none;
+    background:
+        linear-gradient(to bottom left, transparent 46%, #94a3b8 46%, #94a3b8 54%, transparent 54%),
+        linear-gradient(to bottom left, transparent 66%, #94a3b8 66%, #94a3b8 74%, transparent 74%);
+}
+.inlineVisualizerResizeGrip:hover {
+    background:
+        linear-gradient(to bottom left, transparent 46%, #6366f1 46%, #6366f1 54%, transparent 54%),
+        linear-gradient(to bottom left, transparent 66%, #6366f1 66%, #6366f1 74%, transparent 74%);
+}
+.inlineVisualizerLegend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    padding: 6px 12px;
+    border-top: 1px solid #e2e8f0;
+    font-size: 11px;
+    color: #475569;
+}
+.inlineLegendItem {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.inlineLegendSwatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+}
+.inlineLegendCount {
+    color: #94a3b8;
+}
+.inlineLegendToggle {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: #64748b;
+    cursor: pointer;
+    user-select: none;
+}
+.inlineVisualizerHint {
+    padding: 6px 12px;
+    border-top: 1px solid #e2e8f0;
+    background: #f8fafc;
+    font-size: 11px;
+    color: #475569;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    min-height: 26px;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+.inlineVisualizerNotice {
+    padding: 20px 12px;
+    text-align: center;
+    font-size: 12px;
+    color: #64748b;
+}
+.inlineVisualizerError {
+    color: #b91c1c;
+    text-align: left;
+    line-height: 1.6;
 }
 
 /* ── Misc ── */

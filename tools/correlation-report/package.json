@@ -10,6 +10,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@uwdata/mosaic-core": "^0.25.0",
+    "@uwdata/mosaic-sql": "^0.25.0",
+    "embedding-atlas": "^0.12.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

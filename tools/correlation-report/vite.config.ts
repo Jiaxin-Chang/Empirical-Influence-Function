@@ -9,6 +9,53 @@ const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
+const TRAIN_GT_EDGES_JSONL = resolve(DATA_ROOT, 'smoke_train_data_oversample_llm.jsonl')
+
+/** targetIdx -> sourceIdx[] for each train sample id (line index in the jsonl). */
+type TrainGtEdges = Record<string, Record<string, number[]>>
+
+let trainGtEdgesCache: string | null | undefined
+
+function buildTrainGtEdgesPayload(): string | null {
+  if (trainGtEdgesCache !== undefined) return trainGtEdgesCache
+  if (!existsSync(TRAIN_GT_EDGES_JSONL)) {
+    trainGtEdgesCache = null
+    return null
+  }
+  try {
+    const lines = readFileSync(TRAIN_GT_EDGES_JSONL, 'utf-8').split(/\r?\n/).filter(Boolean)
+    const out: TrainGtEdges = {}
+    // First five lines map to train samples 0..4 used by the current reports.
+    for (let i = 0; i < Math.min(5, lines.length); i++) {
+      const row = JSON.parse(lines[i]) as {
+        attention_edges?: { src?: unknown; dst?: unknown }[]
+        qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
+      }
+      const byTarget: Record<string, number[]> = {}
+      const edges = Array.isArray(row.attention_edges) && row.attention_edges.length > 0
+        ? row.attention_edges.map(e => ({ src: e.src, dst: e.dst }))
+        : (row.qwen_annotations ?? []).map(e => ({ src: e.token_i_idx, dst: e.token_j_idx }))
+      for (const edge of edges) {
+        const src = typeof edge.src === 'number' ? edge.src : null
+        const dst = typeof edge.dst === 'number' ? edge.dst : null
+        if (src === null || dst === null) continue
+        const key = String(dst)
+        if (!byTarget[key]) byTarget[key] = []
+        byTarget[key].push(src)
+      }
+      // Dedup while preserving order
+      for (const key of Object.keys(byTarget)) {
+        byTarget[key] = [...new Set(byTarget[key])]
+      }
+      out[String(i)] = byTarget
+    }
+    trainGtEdgesCache = JSON.stringify(out)
+    return trainGtEdgesCache
+  } catch {
+    trainGtEdgesCache = null
+    return null
+  }
+}
 
 interface ModelInfo { slug: string; name: string }
 interface RawModelInfo { model_slug: string; model_name?: unknown }
@@ -107,6 +154,33 @@ function experimentDataPlugin(): Plugin {
     return readFileSync(filePath, 'utf-8')
   }
 
+  // The bundle without `embeddings`. Those vectors are ~99% of a payload — 9-10 MB
+  // for a 3584-dim sample, 250 MB for a 4096-dim probe — and nothing in the
+  // in-page plot reads them; they exist for TTAV's neighbour lines and refine.
+  //
+  // Prefer a projection.json written at build time and stream it back untouched.
+  // The fallback strips the field out of the full payload, which means parsing the
+  // whole document on every request: fine for a 10 MB bundle, ruinous for a 250 MB
+  // one, and that cost lands on each click once probes are built on demand.
+  function readRealBundleProjection(sampleId: string): string | null {
+    if (!isSafeSegment(sampleId)) return null
+
+    const slimPath = join(REAL_BUNDLE_DIR, sampleId, 'projection.json')
+    if (existsSync(slimPath)) return readFileSync(slimPath, 'utf-8')
+
+    const raw = readRealBundlePayload(sampleId)
+    if (raw === null) return null
+    try {
+      const parsed = JSON.parse(raw) as { bundle?: Record<string, unknown> }
+      if (parsed.bundle && typeof parsed.bundle === 'object') {
+        delete parsed.bundle.embeddings
+      }
+      return JSON.stringify(parsed)
+    } catch {
+      return null
+    }
+  }
+
   function addMiddleware(server: MiddlewareServer) {
     server.middlewares.use((req, res, next) => {
       const reqUrl = req.url ?? ''
@@ -115,6 +189,15 @@ function experimentDataPlugin(): Plugin {
         res.setHeader('Cache-Control', 'no-cache')
         res.end(JSON.stringify(buildManifest()))
         return
+      }
+      if (reqUrl === '/data/train-gt-edges.json') {
+        const content = buildTrainGtEdgesPayload()
+        if (content !== null) {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(content)
+          return
+        }
       }
       // Model compare: /data/model-sample/<slug>/<sampleId>/latest_saliency.json
       const modelM = reqUrl.match(/^\/data\/model-sample\/([^/?]+)\/([^/?]+)\/latest_saliency\.json/)
@@ -138,7 +221,17 @@ function experimentDataPlugin(): Plugin {
           return
         }
       }
-      const realBundleM = reqUrl.match(/^\/data\/real-bundles\/([^/?]+)\/bundle_payload\.json/)
+      const projectionM = reqUrl.match(/^\/data\/real-bundles\/([^/?]+)\/projection\.json/)
+      if (projectionM) {
+        const content = readRealBundleProjection(decodeURIComponent(projectionM[1]))
+        if (content !== null) {
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.end(content)
+          return
+        }
+      }
+      const realBundleM = (req.url as string)?.match(/^\/data\/real-bundles\/([^/?]+)\/bundle_payload\.json/)
       if (realBundleM) {
         const content = readRealBundlePayload(decodeURIComponent(realBundleM[1]))
         if (content !== null) {
@@ -166,6 +259,15 @@ function experimentDataPlugin(): Plugin {
         source: JSON.stringify(manifest, null, 2),
       })
 
+      const trainGtEdges = buildTrainGtEdgesPayload()
+      if (trainGtEdges) {
+        this.emitFile({
+          type: 'asset',
+          fileName: 'data/train-gt-edges.json',
+          source: trainGtEdges,
+        })
+      }
+
       // All-tokens experiment files
       for (const exp of manifest.allTokensExperiments) {
         const content = readDataFile(exp.fileName)
@@ -182,6 +284,14 @@ function experimentDataPlugin(): Plugin {
             type: 'asset',
             fileName: `data/real-bundles/${sampleId}/bundle_payload.json`,
             source: content,
+          })
+        }
+        const projection = readRealBundleProjection(sampleId)
+        if (projection) {
+          this.emitFile({
+            type: 'asset',
+            fileName: `data/real-bundles/${sampleId}/projection.json`,
+            source: projection,
           })
         }
       }
@@ -205,6 +315,24 @@ function experimentDataPlugin(): Plugin {
   }
 }
 
+// Reverse-proxy /api/* to the EIF bundle API so the frontend can call it
+// same-origin (see getDefaultEifApiUrl). Works for both `vite` (dev) and
+// `vite preview`. In VS Code forwarded-localhost setups this means you only
+// need to forward the vite port — no separate 8766 forward, no port mismatch.
+const EIF_API_PROXY = {
+  '/api': {
+    target: 'http://127.0.0.1:8766',
+    changeOrigin: true,
+  },
+}
+
+// Pin a dedicated port so this app never collides with TTAV's vite (5173).
+// strictPort makes vite fail loudly instead of silently drifting to 5174,
+// which was causing "am I on the report or on TTAV?" confusion.
+const EIF_REPORT_PORT = 5273
+
 export default defineConfig({
   plugins: [react(), experimentDataPlugin()],
+  server: { port: EIF_REPORT_PORT, strictPort: true, proxy: EIF_API_PROXY },
+  preview: { port: EIF_REPORT_PORT, strictPort: true, proxy: EIF_API_PROXY },
 })

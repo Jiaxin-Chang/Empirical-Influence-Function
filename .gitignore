@@ -226,7 +226,17 @@ samples*.md
 *.json
 *.md
 !README.md
+# Runbooks are opt-in: *.md above exists to keep scratch notes and generated
+# reports out, not to hide docs people are meant to follow.
+!RUN_PAIR_BUNDLE.md
+!RUN_PROBE_FROM_PT.md
 .DS_Store
 reports/
 .vite/results.txt
 logs/
+
+ttav_bundles_real/
+ttav_bundles/
+correlation_matching_results/
+checkpoint-full
+token_embeddings/

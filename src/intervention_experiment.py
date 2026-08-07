@@ -1740,6 +1740,15 @@ def run_causal_intervention_experiment(
         )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if _saliency_mode == "last_layer":
+        # Bank grads leave the model in eval(), which disables checkpointing.
+        from src.loss import prepare_last_layer_grad_checkpointing
+        prepare_last_layer_grad_checkpointing(model)
+        print(
+            "[DEBUG] Restored train+grad-checkpointing after bank "
+            "(needed for long last_layer probe).",
+            flush=True,
+        )
 
     infer_fw = NewInferenceFunction(
         model=model, tokenizer=tokenizer,
@@ -1772,7 +1781,10 @@ def run_causal_intervention_experiment(
         flush=True,
     )
 
-    infer_fw.model.eval()
+    # Keep last_layer attribution in train+GC mode; do not flip to eval() here
+    # (eval disables checkpointing and OOMs near attr-max-seq-len≈3000).
+    if _saliency_mode != "last_layer":
+        infer_fw.model.eval()
     _compact_ids = _cur_test.get("input_ids")
     _compact_lbl = _cur_test.get("labels")
     _fixed_predict = _cur_test.get("predict")

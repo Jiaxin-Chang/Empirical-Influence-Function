@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import styles from './NewView.module.css';
+import { InlineVisualizer } from './InlineVisualizer';
+import {
+    loadInlineBundle,
+    type InlineBundle,
+    type TokenHoverTarget,
+} from './inlineBundle';
 
 const TTAV_PREFS_KEY = 'eif:ttav-launch-prefs';
 const TTAV_PREPARED_BUNDLES_KEY = 'eif:ttav-prepared-bundles';
+const INLINE_PLOT_SIZE_KEY = 'eif:inline-plot-size';
+const INLINE_PLOT_POS_KEY = 'eif:inline-plot-pos';
 const DEFAULT_TTAV_URL = 'http://1.94.115.154/';
 const DEFAULT_TTAV_CONTENT_PATH_TEMPLATE = '/root/project/Dataset/eif_bundles/{sampleId}';
-const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '/home/yilu/workspace/Empirical-Influence-Function/ttav_bundles/{sampleId}';
+// Empty by default: let the EIF bundle API resolve its own on-server cache
+// directory (ttav_bundles/{sampleId} relative to its repo root) instead of a
+// hardcoded absolute path that only exists on one developer's machine.
+const DEFAULT_EIF_BUNDLE_CACHE_TEMPLATE = '';
 const DEFAULT_TTAV_METHOD = 'TimeVis';
 const DEFAULT_TTAV_VIS_ID = '1';
 function getDefaultEifApiUrl(): string {
@@ -13,10 +24,11 @@ function getDefaultEifApiUrl(): string {
         return 'http://127.0.0.1:8766/api/prepare-ttav-bundle';
     }
 
-    const protocol = window.location.protocol || 'http:';
-    const hostname = window.location.hostname || '127.0.0.1';
-    const port = hostname === 'localhost' || hostname === '127.0.0.1' ? '8766' : '8765';
-    return `${protocol}//${hostname}:${port}/api/prepare-ttav-bundle`;
+    // Same-origin: the /api/* path is reverse-proxied to the EIF bundle API
+    // (127.0.0.1:8766) by the page server (vite dev/preview proxy, or nginx).
+    // Using window.location.origin avoids port-mismatch and mixed-content issues
+    // in VS Code forwarded-localhost and public-nginx setups alike.
+    return `${window.location.origin}/api/prepare-ttav-bundle`;
 }
 
 const DEFAULT_EIF_API_URL = getDefaultEifApiUrl();
@@ -29,7 +41,6 @@ interface TestCorrelation {
     target_token: string;
     target_token_index: number;
     saliency_score: number;
-    saliency_rank?: number;
 }
 
 interface TrainCorrelation {
@@ -86,7 +97,6 @@ interface TrainSampleDetail {
     answer_start_index: number;
     coarse_cos_sim: number;
     saliencies_by_token: Record<string, number[]>;
-    annotations_by_target?: Record<string, { src: number; subtype: string }[]>;
 }
 
 export interface AllTokensReport {
@@ -196,14 +206,12 @@ function normalizeTestCorrelation(value: unknown, tokens: string[], fallbackTarg
     if (sourceIdx === null || targetIdx === null || score === null) return null;
     const sourceIndex = Math.trunc(sourceIdx);
     const targetIndex = Math.trunc(targetIdx);
-    const rankRaw = asFiniteNumber(value.saliency_rank);
     return {
         source_token: asString(value.source_token) ?? tokens[sourceIndex] ?? '',
         source_token_index: sourceIndex,
         target_token: asString(value.target_token) ?? tokens[targetIndex] ?? '',
         target_token_index: targetIndex,
         saliency_score: score,
-        ...(rankRaw !== null ? { saliency_rank: Math.trunc(rankRaw) } : {}),
     };
 }
 
@@ -393,6 +401,16 @@ export function normalizeImportedReport(payload: unknown, sourceName: string): I
     throw new Error('Unsupported JSON format. Expected an all-token report, or tokens + prompt_len + saliency_list/saliency_by_target.');
 }
 
+// Where the visualizer shows up when Open Visualizer / Open Full Probe is used.
+// 'inline' renders the plot in this page; 'window' is the original behaviour —
+// open the TTAV web app in a new tab — kept intact so the full tool (neighbor
+// lines, refine, time travel) stays one click away.
+//
+// Prepare sample shows nothing in either mode: it only makes the bundle ready,
+// exactly as it did before.
+type VisualizerMode = 'inline' | 'window';
+const DEFAULT_VISUALIZER_MODE: VisualizerMode = 'inline';
+
 interface TtavLaunchPrefs {
     ttavUrl: string;
     contentPathTemplate: string;
@@ -400,6 +418,7 @@ interface TtavLaunchPrefs {
     visMethod: string;
     visId: string;
     eifApiUrl: string;
+    visualizerMode: VisualizerMode;
 }
 
 interface TtavJumpPayload {
@@ -414,6 +433,23 @@ interface TtavJumpPayload {
     targetIndex?: number;
     selectedSourceIndex?: number;
     promptLen: number;
+    // Probe launches only: which pairs the user ticked here, so the visualizer
+    // opens showing just those links. The bundle still carries every pair of the
+    // group — narrowing it would make each tick a different bundle to precompute,
+    // so the filtering is a display concern on the other side.
+    visiblePairIds?: string[];
+    // Each matched pair is two *edges* — one inside the train sample, one inside
+    // the test sample — plus the gradient similarity between them. cos_sim is the
+    // report's own verdict on the match and isn't in the bundle (pair_signature
+    // omits it), so it travels with the jump instead of forcing a regenerate.
+    probeEdges?: {
+        pairId: string;
+        cosSim: number;
+        trainSourceIndex: number;
+        trainTargetIndex: number;
+        testSourceIndex: number;
+        testTargetIndex: number;
+    }[];
 }
 
 interface TtavStaticBundlePayload {
@@ -457,6 +493,84 @@ interface EifPrepareStatusPayload {
     active: boolean;
     error: boolean;
     updatedAt: number;
+}
+
+// Floating-plot geometry the user dragged to. `width` is the panel, `height` is
+// the canvas alone (the header, legend and hint sit outside it).
+interface InlinePlotSize {
+    width: number;
+    height: number;
+}
+
+interface InlinePlotPos {
+    left: number;
+    top: number;
+}
+
+const INLINE_PLOT_MIN_SIDE = 280;
+// Header + hint strip under the canvas; subtracted so the *window* reads square.
+const INLINE_PLOT_CHROME = 96;
+
+function loadInlinePlotSize(): InlinePlotSize | null {
+    if (typeof window === 'undefined') return null;
+    try {
+        const raw = window.localStorage.getItem(INLINE_PLOT_SIZE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as Partial<InlinePlotSize>;
+        if (typeof parsed.width !== 'number' || typeof parsed.height !== 'number') return null;
+        // Migrate old wide rectangles to a square side.
+        const side = Math.max(INLINE_PLOT_MIN_SIDE, Math.min(parsed.width, parsed.height));
+        return { width: side, height: side };
+    } catch {
+        return null;
+    }
+}
+
+function saveInlinePlotSize(size: InlinePlotSize) {
+    if (typeof window === 'undefined') return;
+    try {
+        window.localStorage.setItem(INLINE_PLOT_SIZE_KEY, JSON.stringify(size));
+    } catch {
+        // Private-mode storage failures shouldn't break the plot.
+    }
+}
+
+function loadInlinePlotPos(): InlinePlotPos | null {
+    if (typeof window === 'undefined') return null;
+    try {
+        const raw = window.localStorage.getItem(INLINE_PLOT_POS_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as Partial<InlinePlotPos>;
+        if (typeof parsed.left !== 'number' || typeof parsed.top !== 'number') return null;
+        return { left: parsed.left, top: parsed.top };
+    } catch {
+        return null;
+    }
+}
+
+function saveInlinePlotPos(pos: InlinePlotPos | null) {
+    if (typeof window === 'undefined') return;
+    try {
+        if (pos === null) window.localStorage.removeItem(INLINE_PLOT_POS_KEY);
+        else window.localStorage.setItem(INLINE_PLOT_POS_KEY, JSON.stringify(pos));
+    } catch {
+        // ignore
+    }
+}
+
+function clampInlinePlotPos(
+    pos: InlinePlotPos,
+    panelWidth: number,
+    viewport: { width: number; height: number },
+): InlinePlotPos {
+    const margin = 8;
+    const maxLeft = Math.max(margin, viewport.width - panelWidth - margin);
+    // Keep at least the header bar on screen.
+    const maxTop = Math.max(margin, viewport.height - 48);
+    return {
+        left: Math.min(Math.max(margin, pos.left), maxLeft),
+        top: Math.min(Math.max(margin, pos.top), maxTop),
+    };
 }
 
 function loadPreparedTtavBundles(): Record<string, PreparedTtavBundleRecord> {
@@ -563,6 +677,7 @@ function loadTtavLaunchPrefs(): TtavLaunchPrefs {
         visMethod: DEFAULT_TTAV_METHOD,
         visId: DEFAULT_TTAV_VIS_ID,
         eifApiUrl: DEFAULT_EIF_API_URL,
+        visualizerMode: DEFAULT_VISUALIZER_MODE,
     };
 
     if (typeof window === 'undefined') {
@@ -604,6 +719,7 @@ function loadTtavLaunchPrefs(): TtavLaunchPrefs {
             visMethod: legacyMethod ? DEFAULT_TTAV_METHOD : (parsed.visMethod || DEFAULT_TTAV_METHOD),
             visId: parsed.visId || DEFAULT_TTAV_VIS_ID,
             eifApiUrl: legacyApiUrl ? DEFAULT_EIF_API_URL : (parsed.eifApiUrl || DEFAULT_EIF_API_URL),
+            visualizerMode: parsed.visualizerMode === 'window' ? 'window' : DEFAULT_VISUALIZER_MODE,
         };
     } catch {
         return fallbackPrefs;
@@ -617,22 +733,30 @@ function resolveContentPath(template: string, sampleId: string): string {
 }
 
 function inferSampleIdFromMeta(meta: AllTokensExperimentMeta, report?: AllTokensReport | null): string {
-    if (report?.experiment_meta.task_id) {
-        return report.experiment_meta.task_id;
-    }
+    // Same regex as infer_sample_id() in src/export_ttav_bundle.py — must stay in
+    // sync so the id the frontend asks for matches the directory name the backend
+    // actually wrote to ttav_bundles/ and ttav_bundles_real/. Non-greedy on the
+    // first group so it captures the full "{model}_{task}" prefix (e.g.
+    // "ce_only_codesearchnet_go_test_...") while still handling legacy filenames
+    // with a trailing suffix after "_all_tokens" (e.g. "..._all_tokens_new.json").
     const fileStem = meta.fileName.replace(/\.json$/i, '');
-    const modelName = report?.experiment_meta.model_name;
-    if (modelName) {
-        const prefix = `correlation_matching_results_${modelName}_`;
-        const suffix = '_all_tokens';
-        if (fileStem.startsWith(prefix) && fileStem.endsWith(suffix)) {
-            return fileStem.slice(prefix.length, -suffix.length);
-        }
+    const match = fileStem.match(/^correlation_matching_results_(.+?)_all_tokens(?:_(.+))?$/);
+    if (match) {
+        const [, prefix, suffix] = match;
+        // A trailing "salr5-8" records the attribution parameters, not which
+        // sample this is; the generator drops it when naming bundles, so keeping
+        // it would point every lookup at a directory that was never written.
+        // Other suffixes (e.g. "_new") do identify the sample and are kept.
+        if (!suffix || /^salr[\d-]+$/i.test(suffix)) return prefix;
+        return `${prefix}_${suffix}`;
     }
-    // Legacy: correlation_matching_results_{task}_all_tokens
-    const matchLegacy = fileStem.match(/^correlation_matching_results_(.+)_all_tokens$/);
-    if (matchLegacy) {
-        return matchLegacy[1];
+    // report.experiment_meta.task_id is model-agnostic (model lives separately in
+    // model_name) — only safe to use as a last resort when the filename doesn't
+    // follow the expected convention at all, since using it directly would drop
+    // the model prefix and collide ce_only/ce_saliency bundles for the same task.
+    if (report?.experiment_meta.task_id) {
+        const modelName = report.experiment_meta.model_name;
+        return modelName ? `${modelName}_${report.experiment_meta.task_id}` : report.experiment_meta.task_id;
     }
     return meta.taskId || meta.label || (report ? `test${report.experiment_meta.test_sample_index}` : fileStem);
 }
@@ -840,27 +964,75 @@ function downloadMarkdown(text: string, filename: string) {
 
 // ─── Token Renderer ───────────────────────────────────────────────────────────
 
-type TokenState = 'normal' | 'response' | 'selected' | 'source-highlight' | 'analyzed';
+type TokenState = 'normal' | 'response' | 'response-model' | 'response-gold' | 'selected' | 'source-highlight' | 'analyzed';
+type ResponseTone = 'default' | 'model' | 'gold';
 
 function TokenSpan({
     token,
     state,
     onClick,
     title,
-    className,
+    hovered = false,
+    located = false,
+    annotated = false,
+    onHoverChange,
 }: {
     token: string;
     state: TokenState;
     onClick?: () => void;
     title?: string;
-    className?: string;
+    /** Linked to the scatter plot: true when this token's point is hovered. */
+    hovered?: boolean;
+    /** An endpoint of the pair the reader just opened; scrolled to and ringed. */
+    located?: boolean;
+    /** GT annotation source for the current saliency target(s). */
+    annotated?: boolean;
+    onHoverChange?: (hovered: boolean) => void;
 }) {
     const display = token === '\n' ? '↵\n' : token === '  ' ? '→' : token;
+    const ref = useRef<HTMLSpanElement | null>(null);
+
+    // Code blocks scroll inside a fixed height, so the linked token is usually
+    // out of view — highlighting it without scrolling would look like nothing
+    // happened.
+    //
+    // scrollIntoView walks every scrollable ancestor, so this scrolls the <pre>
+    // *and* the page. That is wanted here: the plot is a floating panel pinned to
+    // the viewport, so the page is free to travel to the token without carrying
+    // the plot away. (It was briefly restricted to the <pre>'s own scrollTop,
+    // back when the plot sat in the document and page scrolling hid it.)
+    useEffect(() => {
+        if (hovered) ref.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }, [hovered]);
+
+    // Opening a pair scrolls its endpoints into view, centred — this is a jump to
+    // somewhere the reader was not looking, so showing the surrounding code helps.
+    //
+    // Only the listing's own box moves, unlike the hover case above. Expanding a
+    // card locates in two listings at once (the group's and the card's own), and
+    // scrollIntoView would have both of them yanking the page to different places.
+    // The reader just clicked; the page is already where they want it.
+    useEffect(() => {
+        if (!located) return;
+        const el = ref.current;
+        const box = el?.closest('pre');
+        if (!el || !box) return;
+        const elRect = el.getBoundingClientRect();
+        const boxRect = box.getBoundingClientRect();
+        box.scrollTop += (elRect.top - boxRect.top) - (boxRect.height - elRect.height) / 2;
+    }, [located]);
+
     return (
         <span
-            className={`${styles.token} ${styles[`token-${state}`]}${className ? ' ' + className : ''}`}
+            ref={ref}
+            className={`${styles.token} ${styles[`token-${state}`]}`
+                + (hovered ? ` ${styles['token-linked']}` : '')
+                + (located ? ` ${styles['token-located']}` : '')
+                + (annotated ? ` ${styles['token-annotated-source']}` : '')}
             onClick={onClick}
             title={title}
+            onMouseEnter={onHoverChange ? () => onHoverChange(true) : undefined}
+            onMouseLeave={onHoverChange ? () => onHoverChange(false) : undefined}
             style={{ cursor: onClick ? 'pointer' : 'default' }}
         >
             {display}
@@ -870,60 +1042,139 @@ function TokenSpan({
 
 // ─── Code Panel (tokens display) ─────────────────────────────────────────────
 
-function CodePanel({
-    label,
-    badge,
-    badgeColor,
+function resolveResponseState(tone: ResponseTone): TokenState {
+    if (tone === 'model') return 'response-model';
+    if (tone === 'gold') return 'response-gold';
+    return 'response';
+}
+
+function CodeTokenStream({
     tokens,
+    promptLen,
+    responseTone = 'default',
+    highlightSourceIndices,
+    selectedTargetIndex,
+    analyzedIndices,
+    onTokenClick,
+    linkedTokenIndex,
+    onTokenHover,
+    compact = false,
+}: {
+    tokens: string[];
+    promptLen: number;
+    responseTone?: ResponseTone;
+    highlightSourceIndices?: Set<number>;
+    selectedTargetIndex?: number;
+    analyzedIndices?: Set<number>;
+    onTokenClick?: (idx: number) => void;
+    linkedTokenIndex?: number | null;
+    onTokenHover?: (idx: number | null) => void;
+    compact?: boolean;
+}) {
+    const responseState = resolveResponseState(responseTone);
+    return (
+        <pre className={`${styles.codeBlock}${compact ? ` ${styles.codeBlockCompact}` : ''}`}>
+            <code>
+                {tokens.map((tok, i) => {
+                    const isResponse = i >= promptLen;
+                    const isSelected = i === selectedTargetIndex;
+                    const isSource = highlightSourceIndices?.has(i) ?? false;
+                    const isAnalyzed = analyzedIndices?.has(i) ?? false;
+
+                    let state: TokenState = 'normal';
+                    if (isSelected) state = 'selected';
+                    else if (isSource) state = 'source-highlight';
+                    else if (isAnalyzed && isResponse) state = 'analyzed';
+                    else if (isResponse) state = responseState;
+
+                    const clickable = isResponse && onTokenClick && !isTrivialToken(tok);
+                    return (
+                        <TokenSpan
+                            key={i}
+                            token={tok}
+                            state={state}
+                            onClick={clickable ? () => onTokenClick(i) : undefined}
+                            title={clickable ? `Token ${i}: "${decodeToken(tok)}"` : undefined}
+                            hovered={linkedTokenIndex === i}
+                            onHoverChange={onTokenHover
+                                ? (isHovered) => onTokenHover(isHovered ? i : null)
+                                : undefined}
+                        />
+                    );
+                })}
+            </code>
+        </pre>
+    );
+}
+
+/** Model (red) + Gold answer only (green) in one panel. */
+function OutputComparePanel({
+    modelTokens,
+    goldResponseTokens,
     promptLen,
     highlightSourceIndices,
     selectedTargetIndex,
     analyzedIndices,
     onTokenClick,
+    linkedTokenIndex,
+    onTokenHover,
 }: {
-    label: string;
-    badge: string;
-    badgeColor: string;
-    tokens: string[];
+    modelTokens: string[];
+    /** Gold answer tokens only — no prompt prefix. */
+    goldResponseTokens: string[];
     promptLen: number;
     highlightSourceIndices?: Set<number>;
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
+    linkedTokenIndex?: number | null;
+    onTokenHover?: (idx: number | null) => void;
 }) {
+    const hasGold = goldResponseTokens.length > 0;
     return (
         <div className={styles.codePanel}>
             <div className={styles.codePanelHeader}>
-                <span className={styles.badge} style={{ background: badgeColor }}>{badge}</span>
-                <span className={styles.codePanelLabel}>{label}</span>
+                <span className={styles.badge} style={{ background: '#dc2626' }}>MODEL</span>
+                <span className={styles.codePanelLabel}>
+                    {hasGold ? 'Model Output vs Gold' : 'Model Output'}
+                </span>
             </div>
-            <pre className={styles.codeBlock}>
-                <code>
-                    {tokens.map((tok, i) => {
-                        const isResponse = i >= promptLen;
-                        const isSelected = i === selectedTargetIndex;
-                        const isSource   = highlightSourceIndices?.has(i) ?? false;
-                        const isAnalyzed = analyzedIndices?.has(i) ?? false;
-
-                        let state: TokenState = 'normal';
-                        if (isSelected)  state = 'selected';
-                        else if (isSource)   state = 'source-highlight';
-                        else if (isAnalyzed && isResponse) state = 'analyzed';
-                        else if (isResponse) state = 'response';
-
-                        const clickable = isResponse && onTokenClick && !isTrivialToken(tok);
-                        return (
-                            <TokenSpan
-                                key={i}
-                                token={tok}
-                                state={state}
-                                onClick={clickable ? () => onTokenClick(i) : undefined}
-                                title={clickable ? `Token ${i}: "${decodeToken(tok)}"` : undefined}
-                            />
-                        );
-                    })}
-                </code>
-            </pre>
+            <div className={styles.outputCompareBody}>
+                <div className={styles.outputSection}>
+                    <div className={styles.outputSectionHeader}>
+                        <span className={`${styles.outputSectionTitle} ${styles.outputSectionTitleModel}`}>
+                            Model
+                        </span>
+                    </div>
+                    <CodeTokenStream
+                        tokens={modelTokens}
+                        promptLen={promptLen}
+                        responseTone="model"
+                        highlightSourceIndices={highlightSourceIndices}
+                        selectedTargetIndex={selectedTargetIndex}
+                        analyzedIndices={analyzedIndices}
+                        onTokenClick={onTokenClick}
+                        linkedTokenIndex={linkedTokenIndex}
+                        onTokenHover={onTokenHover}
+                        compact={hasGold}
+                    />
+                </div>
+                {hasGold && (
+                    <div className={styles.outputSection}>
+                        <div className={styles.outputSectionHeader}>
+                            <span className={`${styles.outputSectionTitle} ${styles.outputSectionTitleGold}`}>
+                                Gold
+                            </span>
+                        </div>
+                        <CodeTokenStream
+                            tokens={goldResponseTokens}
+                            promptLen={0}
+                            responseTone="gold"
+                            compact
+                        />
+                    </div>
+                )}
+            </div>
         </div>
     );
 }
@@ -948,51 +1199,46 @@ function ContextChip({ tokens }: { tokens: string[] }) {
 
 // ─── Train Sample Detail Viewer ───────────────────────────────────────────────
 
+/** GT annotation edges: trainId -> (targetIdx -> sourceIdx[]). */
+type TrainGtEdges = Record<string, Record<string, number[]>>;
+
+function annotatedSourcesForPairs(
+    edgesByTarget: Record<string, number[]> | undefined,
+    pairs: CorrelationPair[],
+): Set<number> {
+    const out = new Set<number>();
+    if (!edgesByTarget) return out;
+    for (const pair of pairs) {
+        const srcs = edgesByTarget[String(pair.train_correlation.target_token_index)];
+        if (!srcs) continue;
+        for (const src of srcs) out.add(src);
+    }
+    return out;
+}
+
 function TrainSampleViewer({
     detail,
     highlightPairs,
+    linkedTokenIndex,
+    locatedPair,
+    onTokenHover,
+    annotatedSourceIndices,
 }: {
     detail: TrainSampleDetail;
     highlightPairs: CorrelationPair[];
+    /** Train-side token currently hovered in the scatter plot, if any. */
+    linkedTokenIndex?: number | null;
+    /** Endpoints of the pair the reader expanded, to scroll to and ring. */
+    locatedPair?: { source: number; target: number } | null;
+    onTokenHover?: (idx: number | null) => void;
+    /** GT annotation sources for the highlighted pairs' train targets. */
+    annotatedSourceIndices?: Set<number>;
 }) {
     const tokens = useMemo(() => decodeTokens(detail.full_tokens), [detail]);
 
     // Collect all source + target indices to highlight from the pairs
     const sourceIndices = useMemo(() => new Set(highlightPairs.map(p => p.train_correlation.source_token_index)), [highlightPairs]);
     const targetIndices = useMemo(() => new Set(highlightPairs.map(p => p.train_correlation.target_token_index)), [highlightPairs]);
-
-    // Collect annotation source indices for all highlighted target tokens.
-    const annotationSourceIndices = useMemo(() => {
-        const set = new Set<number>();
-        const ann = detail.annotations_by_target;
-        if (!ann) return set;
-        for (const tgIdx of targetIndices) {
-            const sources = ann[String(tgIdx)];
-            if (sources) {
-                for (const s of sources) set.add(s.src);
-            }
-        }
-        return set;
-    }, [detail.annotations_by_target, targetIndices]);
-
-    // Build tooltip map for annotated tokens (shows subtype + target info).
-    const annotationSubtypes = useMemo(() => {
-        const map = new Map<number, string>();
-        const ann = detail.annotations_by_target;
-        if (!ann) return map;
-        for (const tgIdx of targetIndices) {
-            const sources = ann[String(tgIdx)];
-            if (sources) {
-                for (const s of sources) {
-                    const subtype = s.subtype || "annotated";
-                    const label = `annotation: ${subtype} → target @${tgIdx}`;
-                    const prev = map.get(s.src);
-                    map.set(s.src, prev ? `${prev} | ${label}` : label);
-                }
-            }
-        }
-        return map;
-    }, [detail.annotations_by_target, targetIndices]);
 
     return (
         <div className={styles.trainSampleViewer}>
@@ -1001,14 +1247,28 @@ function TrainSampleViewer({
                     {tokens.map((tok, i) => {
                         const isSrc = sourceIndices.has(i);
                         const isTgt = targetIndices.has(i);
-                        const isAnnSrc = annotationSourceIndices.has(i);
-                        // Base state (background / text color) — annotation underline is additive
+                        const isAnnotated = annotatedSourceIndices?.has(i) ?? false;
                         let state: TokenState = i >= detail.answer_start_index ? 'response' : 'normal';
                         if (isTgt) state = 'selected';
                         else if (isSrc) state = 'source-highlight';
-                        const annClass = isAnnSrc ? styles['token-annotated-source'] : undefined;
-                        const annSubtypes = annotationSubtypes.get(i);
-                        return <TokenSpan key={i} token={tok} state={state} title={annSubtypes} className={annClass} />;
+                        const isLocated = locatedPair != null
+                            && (i === locatedPair.source || i === locatedPair.target);
+                        return (
+                            <TokenSpan
+                                key={i}
+                                token={tok}
+                                state={state}
+                                hovered={linkedTokenIndex === i}
+                                located={isLocated}
+                                annotated={isAnnotated}
+                                title={isAnnotated
+                                    ? `GT annotation source → target @${[...targetIndices].join(',')}`
+                                    : undefined}
+                                onHoverChange={onTokenHover
+                                    ? (isHovered) => onTokenHover(isHovered ? i : null)
+                                    : undefined}
+                            />
+                        );
                     })}
                 </code>
             </pre>
@@ -1023,11 +1283,16 @@ function PairCard({
     detail,
     selected,
     onToggleSelect,
+    onLocate,
+    annotatedSourceIndices,
 }: {
     pair: CorrelationPair;
     detail?: TrainSampleDetail;
     selected?: boolean;
     onToggleSelect?: () => void;
+    /** Called when this card opens, so the full train listing can scroll to it. */
+    onLocate?: () => void;
+    annotatedSourceIndices?: Set<number>;
 }) {
     const [expanded, setExpanded] = useState(false);
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
@@ -1037,7 +1302,15 @@ function PairCard({
             className={styles.pairCard}
             style={selected ? { borderColor: '#7c3aed', boxShadow: '0 0 0 1px rgba(124,58,237,0.18)' } : undefined}
         >
-            <div className={styles.pairCardHeader} onClick={() => setExpanded(e => !e)}>
+            <div
+                className={styles.pairCardHeader}
+                onClick={() => setExpanded(e => {
+                    // Locate on open only. Firing on close would scroll the listing
+                    // just as the reader dismisses the card.
+                    if (!e) onLocate?.();
+                    return !e;
+                })}
+            >
                 {onToggleSelect && (
                     <button
                         type="button"
@@ -1103,7 +1376,19 @@ function PairCard({
                         </div>
                     </div>
                     {detail && (
-                        <TrainSampleViewer detail={detail} highlightPairs={[pair]} />
+                        // This listing exists to show one pair, so it opens scrolled
+                        // to it. Without a locate the reader lands at the top of a
+                        // 2500-token sample and has to hunt for the two tokens the
+                        // card is about.
+                        <TrainSampleViewer
+                            detail={detail}
+                            highlightPairs={[pair]}
+                            locatedPair={{
+                                source: pair.train_correlation.source_token_index,
+                                target: pair.train_correlation.target_token_index,
+                            }}
+                            annotatedSourceIndices={annotatedSourceIndices}
+                        />
                     )}
                 </div>
             )}
@@ -1122,6 +1407,9 @@ function TrainSampleGroup({
     selectedPairIds,
     onTogglePairSelection,
     comparisonSummary,
+    linkedTokenIndex,
+    onTokenHover,
+    gtEdgesByTarget,
 }: {
     trainIdx: number;
     pairs: CorrelationPair[];
@@ -1131,14 +1419,39 @@ function TrainSampleGroup({
     selectedPairIds?: string[];
     onTogglePairSelection?: (trainIdx: number, pairId: string) => void;
     comparisonSummary?: TrainProbeComparisonSummary;
+    /** Set only for the group the open probe belongs to. */
+    linkedTokenIndex?: number | null;
+    onTokenHover?: (idx: number | null) => void;
+    /** GT annotation edges for this train sample: targetIdx -> sourceIdx[]. */
+    gtEdgesByTarget?: Record<string, number[]>;
 }) {
     const [collapsed, setCollapsed] = useState(false);
+    // Which pair the reader last opened. Local to the group because the listing it
+    // scrolls and the cards that set it are both rendered here.
+    const [locatedPairId, setLocatedPairId] = useState<string | null>(null);
+    const locatedPair = useMemo(() => {
+        const found = pairs.find(p => p.id === locatedPairId);
+        return found
+            ? {
+                source: found.train_correlation.source_token_index,
+                target: found.train_correlation.target_token_index,
+            }
+            : null;
+    }, [pairs, locatedPairId]);
+    const annotatedSourceIndices = useMemo(
+        () => annotatedSourcesForPairs(gtEdgesByTarget, pairs),
+        [gtEdgesByTarget, pairs],
+    );
     const bestSim = Math.max(...pairs.map(p => p.cos_sim));
     const { bg, fg } = cosSimilarityColor(bestSim);
     const selectedPairIdSet = useMemo(() => new Set(selectedPairIds ?? []), [selectedPairIds]);
     const selectedPairCount = selectedPairIdSet.size;
     const comparisonTokens = comparisonSummary?.focusTokens ?? [];
-    const comparisonPairs = comparisonSummary?.pairwiseCosine ?? [];
+    // comparisonSummary.pairwiseCosine is intentionally not displayed: it measures
+    // token-to-token similarity *within the train sample*, which says nothing
+    // about whether a train↔test match is sound. Showing it next to the match
+    // invited reading it as the verdict — cos_sim is that, and it's already in the
+    // pair rows above. The field stays in the payload for other uses.
 
     return (
         <div className={styles.trainGroup}>
@@ -1179,13 +1492,24 @@ function TrainSampleGroup({
                 <div className={styles.trainGroupBody}>
                     {detail && (
                         <div className={styles.trainFullView}>
-                            <div className={styles.subLabel}>完整训练样本 — 全量 token 进入 probe，当前 correlation token 特殊标出，带红色下划线的为潜在的annotation edge，鼠标悬停以查看对应target</div>
-                            <TrainSampleViewer detail={detail} highlightPairs={pairs} />
+                            <div className={styles.subLabel}>
+                                完整训练样本 — 黄底=saliency source，橙底=target；
+                                红下划线=该 target 的 GT 标注 source
+                                {annotatedSourceIndices.size > 0 ? `（${annotatedSourceIndices.size}）` : ''}
+                            </div>
+                            <TrainSampleViewer
+                                detail={detail}
+                                highlightPairs={pairs}
+                                linkedTokenIndex={linkedTokenIndex}
+                                locatedPair={locatedPair}
+                                onTokenHover={onTokenHover}
+                                annotatedSourceIndices={annotatedSourceIndices}
+                            />
                         </div>
                     )}
                     {selectedPairCount > 0 && comparisonTokens.length > 0 && (
                         <div style={{ padding: '0 0 14px' }}>
-                            <div className={styles.subLabel}>已选 token（用于 probe 高亮与数值比较）</div>
+                            <div className={styles.subLabel}>已选 token（在 probe 中高亮）</div>
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
                                 {comparisonTokens.map(token => (
                                     <span
@@ -1204,27 +1528,6 @@ function TrainSampleGroup({
                                     </span>
                                 ))}
                             </div>
-                            {comparisonPairs.length > 0 && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
-                                    {comparisonPairs.map(pair => (
-                                        <div
-                                            key={`${pair.leftIndex}-${pair.rightIndex}`}
-                                            style={{
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                gap: 10,
-                                                fontSize: 12,
-                                                color: '#475569',
-                                            }}
-                                        >
-                                            <span style={{ fontFamily: 'monospace', color: '#7c2d12', minWidth: 200 }}>
-                                                {pair.leftTokenDisplay} @{pair.leftIndex} ↔ {pair.rightTokenDisplay} @{pair.rightIndex}
-                                            </span>
-                                            <span style={{ fontWeight: 700, color: '#b91c1c' }}>{pair.cosine.toFixed(4)}</span>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
                         </div>
                     )}
                     <div className={styles.pairList}>
@@ -1235,6 +1538,8 @@ function TrainSampleGroup({
                                 detail={detail}
                                 selected={selectedPairIdSet.has(pair.id)}
                                 onToggleSelect={onTogglePairSelection ? () => onTogglePairSelection(trainIdx, pair.id) : undefined}
+                                onLocate={() => setLocatedPairId(pair.id)}
+                                annotatedSourceIndices={annotatedSourcesForPairs(gtEdgesByTarget, [pair])}
                             />
                         ))}
                     </div>
@@ -1307,6 +1612,36 @@ export function ReportPanel({
     const [selectedTrainPairIdsByGroup, setSelectedTrainPairIdsByGroup] = useState<Record<number, string[]>>({});
     const [trainProbeComparisons, setTrainProbeComparisons] = useState<Record<number, TrainProbeComparisonSummary>>({});
     const [showAdvancedTtav, setShowAdvancedTtav] = useState(false);
+    const [visualizerMode, setVisualizerMode] = useState<VisualizerMode>(() => loadTtavLaunchPrefs().visualizerMode);
+    // GT annotation edges from smoke_train_data_oversample_llm.jsonl (train 0..4).
+    const [trainGtEdges, setTrainGtEdges] = useState<TrainGtEdges | null>(null);
+    // The in-page plot appears only after Prepare sample / Open Visualizer /
+    // Open Full Probe — nothing is probed eagerly on sample selection.
+    const [inlineBundle, setInlineBundle] = useState<InlineBundle | null>(null);
+    const [inlineBundleError, setInlineBundleError] = useState<string | null>(null);
+    const [inlineBundleLoading, setInlineBundleLoading] = useState(false);
+    const [hoverTarget, setHoverTarget] = useState<TokenHoverTarget | null>(null);
+    // The dock floats over the page, so it has to be dismissable without
+    // throwing the loaded bundle away.
+    const [inlinePlotCollapsed, setInlinePlotCollapsed] = useState(false);
+    // The floating plot is position:fixed, so it needs the model column's
+    // viewport coordinates to sit over that section. Measured rather than
+    // guessed: the page width comes from `width: 95vw` plus padding.
+    const bottomLeftRef = useRef<HTMLDivElement | null>(null);
+    const [dockRect, setDockRect] = useState<{ left: number; width: number } | null>(null);
+    // null until the user drags the handle, so the default keeps tracking the
+    // column width instead of freezing at whatever it was on first render.
+    const [inlinePlotSize, setInlinePlotSize] = useState<InlinePlotSize | null>(() => loadInlinePlotSize());
+    // null = docked to the left column's bottom-left; set after the user drags.
+    const [inlinePlotPos, setInlinePlotPos] = useState<InlinePlotPos | null>(() => loadInlinePlotPos());
+    const [inlinePlotMoving, setInlinePlotMoving] = useState(false);
+    const [viewport, setViewport] = useState(() => ({
+        width: typeof window === 'undefined' ? 800 : window.innerWidth,
+        height: typeof window === 'undefined' ? 900 : window.innerHeight,
+    }));
+    const resizeOriginRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+    const moveOriginRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+    const inlineVisualizerRef = useRef<HTMLDivElement | null>(null);
     const ttavWindowRef = useRef<Window | null>(null);
     const ttavWindowOriginRef = useRef<string | null>(null);
     const ttavWindowSampleIdRef = useRef<string | null>(null);
@@ -1318,6 +1653,21 @@ export function ReportPanel({
 
     // Reset secondary selection when selected token changes
     useEffect(() => { setSelectedTestCorrIdx(null); }, [selectedTokIdx]);
+
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const resp = await fetch('/data/train-gt-edges.json', { cache: 'no-store' });
+                if (!resp.ok) return;
+                const data = await resp.json() as TrainGtEdges;
+                if (!cancelled) setTrainGtEdges(data);
+            } catch {
+                // Annotation overlay is optional; missing file just skips the underline.
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     useEffect(() => {
         setSelectedTrainPairIdsByGroup({});
@@ -1333,16 +1683,68 @@ export function ReportPanel({
             visMethod: ttavVisMethod,
             visId: ttavVisId,
             eifApiUrl,
+            visualizerMode,
         } satisfies TtavLaunchPrefs));
-    }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl]);
+    }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl, visualizerMode]);
 
     const modelTokens   = useMemo(() => decodeTokens(report.test_sample_baseline.full_tokens), [report]);
     const correctTokens = useMemo(() => decodeTokens(report.test_sample_baseline.correct_full_tokens ?? []), [report]);
     const promptLen     = report?.test_sample_baseline.prompt_len ?? 0;
+    // Gold panel shows the answer only — same slice used by Markdown export.
+    const goldResponseTokens = useMemo(
+        () => (correctTokens.length > promptLen ? correctTokens.slice(promptLen) : correctTokens),
+        [correctTokens, promptLen],
+    );
     const selectedSampleId = inferSampleIdFromMeta(selectedMeta, report);
     const resolvedEifBundleCachePath = selectedSampleId
         ? resolveContentPath(eifBundleCacheTemplate, selectedSampleId)
         : '';
+
+    // Keep the floating plot aligned with the model/output section.
+    // ResizeObserver fires once on observe, so it supplies the initial
+    // measurement too.
+    //
+    // No scroll listener on purpose: the section's horizontal position only
+    // moves on resize, and measuring per scroll event would force a layout
+    // read on every frame of every scroll for a value that never changed.
+    useEffect(() => {
+        const node = bottomLeftRef.current;
+        if (!node) return;
+
+        const sync = () => {
+            const rect = node.getBoundingClientRect();
+            setDockRect(prev => (
+                prev && Math.abs(prev.left - rect.left) < 0.5 && Math.abs(prev.width - rect.width) < 0.5
+                    ? prev
+                    : { left: rect.left, width: rect.width }
+            ));
+            // Tracked so the size clamp re-runs on a vertical-only resize, which
+            // leaves the column's rect untouched but can still leave a dragged
+            // panel taller than the window.
+            setViewport(prev => (
+                prev.width === window.innerWidth && prev.height === window.innerHeight
+                    ? prev
+                    : { width: window.innerWidth, height: window.innerHeight }
+            ));
+        };
+
+        const observer = new ResizeObserver(sync);
+        observer.observe(node);
+        window.addEventListener('resize', sync);
+        return () => {
+            observer.disconnect();
+            window.removeEventListener('resize', sync);
+        };
+    }, []);
+
+    // Drop the plot when the report switches to another sample. Its points map to
+    // the previous sample's token indices, so leaving it up would highlight the
+    // wrong tokens in the code panels — silently, and convincingly.
+    useEffect(() => {
+        setInlineBundle(null);
+        setInlineBundleError(null);
+        setHoverTarget(null);
+    }, [selectedSampleId]);
 
     // Map from token index → PerTokenResult for quick lookup
     const perTokenMap = useMemo(() => {
@@ -1486,6 +1888,32 @@ export function ReportPanel({
         ttavWindow.postMessage(message, ttavOrigin);
     }, [buildCurrentTtavPayload]);
 
+    // Load a prepared bundle into the in-page plot. All three entry points route
+    // here when the mode is 'inline'; the window path below is left untouched.
+    //
+    // This only reads the precomputed bundle from disk, so it works under
+    // EIF_CACHE_ONLY and does not need the TTAV app or its backend to be running.
+    // A miss means the bundle was never prepared, which is what the error says.
+    const showInlineBundle = useCallback(async (
+        sampleId: string,
+        visiblePairIds: string[] = [],
+    ): Promise<InlineBundle | null> => {
+        setInlineBundleLoading(true);
+        setInlineBundleError(null);
+        setHoverTarget(null);
+        try {
+            const bundle = await loadInlineBundle(sampleId, visiblePairIds);
+            setInlineBundle(bundle);
+            return bundle;
+        } catch (error) {
+            setInlineBundle(null);
+            setInlineBundleError(error instanceof Error ? error.message : '加载 bundle 失败。');
+            return null;
+        } finally {
+            setInlineBundleLoading(false);
+        }
+    }, []);
+
     const handleExport = async () => {
         const md = generateExportMarkdown(report, {
             tokenRange: exportScope,
@@ -1602,6 +2030,20 @@ export function ReportPanel({
         const trimmedUrl = ttavUrl.trim();
         const visMethod = ttavVisMethod.trim() || DEFAULT_TTAV_METHOD;
         const visId = ttavVisId.trim() || DEFAULT_TTAV_VIS_ID;
+        // Inline mode reads the prepared bundle straight from disk — no window,
+        // no TTAV round trip. Everything below stays the original window path.
+        if (visualizerMode === 'inline') {
+            setTtavLaunchError(null);
+            setTtavLaunchStatus(`正在本页加载 ${sampleId} 的投影图…`);
+            void (async () => {
+                const bundle = await showInlineBundle(sampleId);
+                setTtavLaunchStatus(bundle
+                    ? `已在本页显示 ${sampleId}（${bundle.projection.length} 个 token）。`
+                    : null);
+            })();
+            return;
+        }
+
         if (!trimmedUrl) {
             setTtavLaunchError('TTAV URL is required.');
             return;
@@ -1719,8 +2161,12 @@ export function ReportPanel({
             return;
         }
 
-        const openedWindow = window.open(trimmedUrl, '_blank');
-        if (!openedWindow) {
+        // The probe API runs in both modes — it is what computes the probe bundle.
+        // Only what happens with the result differs: inline renders it here,
+        // window navigates the tab opened below.
+        const inline = visualizerMode === 'inline';
+        const openedWindow = inline ? null : window.open(trimmedUrl, '_blank');
+        if (!inline && !openedWindow) {
             setTtavLaunchError('Browser blocked the probe window. Please allow pop-ups for this page.');
             return;
         }
@@ -1754,6 +2200,15 @@ export function ReportPanel({
                         contextRadius: 1,
                         includeFullTrain: true,
                         focusTrainIndices,
+                        // Lets the API skip the TTAV upload when this page is going
+                        // to draw the probe itself — it reads the projection off
+                        // disk, so shipping the bundle to TTAV would be wasted work.
+                        renderTarget: visualizerMode,
+                        // Which pairs get ringed in the plot. The bundle still holds
+                        // every pair of the group; this only says which endpoints
+                        // are the ones the user asked about, so a 100+ pair group
+                        // doesn't light up almost every point.
+                        focusPairIds: selectedPairs.map(pair => pair.id),
                         probePairs: pairs.map(pair => ({
                             id: pair.id,
                             trainSourceIndex: pair.train_correlation.source_token_index,
@@ -1793,6 +2248,26 @@ export function ReportPanel({
                     ...current,
                     [trainIdx]: comparisonSummary,
                 }));
+
+                // Inline mode stops here: the probe bundle now exists on disk, so
+                // the plot reads it directly. No TTAV upload, no window to drive.
+                //
+                // It has to be the *pregenerated* id — apiJson.sampleId is a hash
+                // of the request parameters, while the file on disk is named after
+                // the anchoring edge (see _stable_probe_sample_id in the API).
+                if (inline) {
+                    const probeSampleId = typeof apiJson.pregeneratedSampleId === 'string'
+                        ? apiJson.pregeneratedSampleId
+                        : null;
+                    if (!probeSampleId) {
+                        throw new Error('EIF API 未返回 pregeneratedSampleId，无法在本页加载 probe。请更新 EIF bundle API 后重试。');
+                    }
+                    const bundle = await showInlineBundle(probeSampleId, selectedPairs.map(pair => pair.id));
+                    setTtavLaunchStatus(bundle
+                        ? `已在本页显示 TRAIN #${trainIdx} 的 probe（${bundle.projection.length} 个点）。`
+                        : null);
+                    return;
+                }
 
                 const browserUploadRequired = apiJson.browserUploadRequired === true;
                 let resolvedSampleId = typeof apiJson.sampleId === 'string'
@@ -1867,9 +2342,18 @@ export function ReportPanel({
                         : [],
                     targetIndex: typeof apiJson.targetIndex === 'number' ? apiJson.targetIndex : undefined,
                     promptLen: typeof apiJson.promptLen === 'number' ? apiJson.promptLen : 0,
+                    visiblePairIds: selectedPairs.map(pair => pair.id),
+                    probeEdges: pairs.map(pair => ({
+                        pairId: pair.id,
+                        cosSim: pair.cos_sim,
+                        trainSourceIndex: pair.train_correlation.source_token_index,
+                        trainTargetIndex: pair.train_correlation.target_token_index,
+                        testSourceIndex: pair.test_correlation.source_token_index,
+                        testTargetIndex: pair.test_correlation.target_token_index,
+                    })),
                 };
 
-                navigateTtavWindow(openedWindow, payload);
+                if (openedWindow) navigateTtavWindow(openedWindow, payload);
                 setTtavLaunchStatus(browserUploadRequired
                     ? `Full-train probe opened for TRAIN #${trainIdx} using browser upload fallback.`
                     : `Full-train probe opened for TRAIN #${trainIdx}.`);
@@ -1877,7 +2361,7 @@ export function ReportPanel({
                 const msg = error instanceof Error ? error.message : 'Failed to open embedding probe';
                 setTtavLaunchError(msg);
                 setTtavLaunchStatus(null);
-                if (!openedWindow.closed) {
+                if (openedWindow && !openedWindow.closed) {
                     openedWindow.close();
                 }
             } finally {
@@ -2030,6 +2514,169 @@ export function ReportPanel({
         }
     };
 
+    // ── Hover linking ──
+    //
+    // One hover state drives both directions. A point hovered in the plot resolves
+    // to a token, which lights up in whichever code panel owns that side; hovering
+    // a token instead produces the same shape and the plot highlights its point.
+    // Square plot confined to the left column. Default side = column width;
+    // drag keeps 1:1 so it never stretches into a wide rectangle again.
+    const inlinePlotGeometry = useMemo(() => {
+        if (!dockRect) return { width: 0, height: INLINE_PLOT_MIN_SIDE, canvasHeight: INLINE_PLOT_MIN_SIDE };
+        const maxSide = Math.max(
+            INLINE_PLOT_MIN_SIDE,
+            Math.min(dockRect.width, viewport.height - 160),
+        );
+        const rawSide = inlinePlotSize?.width ?? maxSide;
+        const side = Math.min(Math.max(rawSide, INLINE_PLOT_MIN_SIDE), maxSide);
+        return {
+            width: side,
+            height: side,
+            canvasHeight: Math.max(INLINE_PLOT_MIN_SIDE - INLINE_PLOT_CHROME, side - INLINE_PLOT_CHROME),
+        };
+    }, [dockRect, inlinePlotSize, viewport]);
+
+    // Resize from the top-right corner: keep a square, grow/shrink by the
+    // larger of the two deltas so the grip still feels natural.
+    const handleResizePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        resizeOriginRef.current = {
+            x: event.clientX,
+            y: event.clientY,
+            width: inlinePlotGeometry.width,
+            height: inlinePlotGeometry.height,
+        };
+    }, [inlinePlotGeometry]);
+
+    const handleResizePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const origin = resizeOriginRef.current;
+        if (!origin) return;
+        const delta = Math.max(event.clientX - origin.x, origin.y - event.clientY);
+        const side = origin.width + delta;
+        setInlinePlotSize({ width: side, height: side });
+    }, []);
+
+    const handleResizePointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (!resizeOriginRef.current) return;
+        resizeOriginRef.current = null;
+        event.currentTarget.releasePointerCapture(event.pointerId);
+        // Persist the clamped square, not the raw drag.
+        saveInlinePlotSize({ width: inlinePlotGeometry.width, height: inlinePlotGeometry.height });
+    }, [inlinePlotGeometry]);
+
+    // Drag the header to reposition. Starts from the panel's current screen
+    // rect so the first move doesn't jump, whether it was docked (bottom) or
+    // already free-floating (top/left).
+    const handleMovePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const target = event.target as HTMLElement;
+        if (target.closest('button') || target.closest(`.${styles.inlineVisualizerResizeGrip}`)) return;
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        const panel = inlineVisualizerRef.current;
+        if (!panel) return;
+        const rect = panel.getBoundingClientRect();
+        moveOriginRef.current = {
+            x: event.clientX,
+            y: event.clientY,
+            left: rect.left,
+            top: rect.top,
+        };
+        setInlinePlotMoving(true);
+        setInlinePlotPos({ left: rect.left, top: rect.top });
+    }, []);
+
+    const handleMovePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const origin = moveOriginRef.current;
+        if (!origin) return;
+        setInlinePlotPos(clampInlinePlotPos(
+            {
+                left: origin.left + (event.clientX - origin.x),
+                top: origin.top + (event.clientY - origin.y),
+            },
+            inlinePlotGeometry.width,
+            viewport,
+        ));
+    }, [inlinePlotGeometry.width, viewport]);
+
+    const handleMovePointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (!moveOriginRef.current) return;
+        moveOriginRef.current = null;
+        setInlinePlotMoving(false);
+        try {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+        } catch {
+            // already released
+        }
+        setInlinePlotPos(prev => {
+            if (!prev) return prev;
+            const next = clampInlinePlotPos(prev, inlinePlotGeometry.width, viewport);
+            saveInlinePlotPos(next);
+            return next;
+        });
+    }, [inlinePlotGeometry.width, viewport]);
+
+    const resetInlinePlotPos = useCallback(() => {
+        setInlinePlotPos(null);
+        saveInlinePlotPos(null);
+    }, []);
+
+    // Keep a free-floated panel on-screen when the window or plot size changes.
+    useEffect(() => {
+        setInlinePlotPos(prev => {
+            if (!prev) return prev;
+            const next = clampInlinePlotPos(prev, inlinePlotGeometry.width, viewport);
+            if (next.left === prev.left && next.top === prev.top) return prev;
+            saveInlinePlotPos(next);
+            return next;
+        });
+    }, [inlinePlotGeometry.width, viewport]);
+
+    // Which points the plot rings and labels. A probe ships its own focus set
+    // (the matched pairs' tokens); a plain bundle has none, so it gets the same
+    // live selection the code panel highlights — target token plus its
+    // attribution sources — and follows along as the user clicks around.
+    const inlinePlotSelection = useMemo(() => {
+        if (!inlineBundle) return [];
+        if (inlineBundle.kind === 'probe') return inlineBundle.selectedPoints;
+        return ttavSelectedIndices.filter(idx => idx < inlineBundle.projection.length);
+    }, [inlineBundle, ttavSelectedIndices]);
+
+    const linkedTestTokenIndex = hoverTarget?.side === 'test' ? hoverTarget.tokenIndex : null;
+    const linkedTrainTokenIndex = hoverTarget?.side === 'train' ? hoverTarget.tokenIndex : null;
+    const linkedTrainSampleId = hoverTarget?.side === 'train' ? hoverTarget.trainSampleId : null;
+
+    const handleTestTokenHover = useCallback((idx: number | null) => {
+        if (idx === null) {
+            setHoverTarget(current => (current?.side === 'test' ? null : current));
+            return;
+        }
+        if (!inlineBundle) return;
+        setHoverTarget({
+            side: 'test',
+            tokenIndex: idx,
+            trainSampleId: null,
+            role: null,
+            token: report.test_sample_baseline.full_tokens[idx] ?? '',
+        });
+    }, [inlineBundle, report]);
+
+    const makeTrainTokenHoverHandler = useCallback((trainIdx: number, tokens: string[]) =>
+        (idx: number | null) => {
+            if (idx === null) {
+                setHoverTarget(current => (current?.side === 'train' ? null : current));
+                return;
+            }
+            if (!inlineBundle || inlineBundle.trainSampleId !== trainIdx) return;
+            setHoverTarget({
+                side: 'train',
+                tokenIndex: idx,
+                trainSampleId: trainIdx,
+                role: null,
+                token: tokens[idx] ?? '',
+            });
+        }, [inlineBundle]);
+
     // ── Render ──
 
     return (
@@ -2044,31 +2691,19 @@ export function ReportPanel({
                 </span>
             </div>
 
-                    {/* ── Top: Ground Truth (Full width, scrolls normally) ── */}
-                    <div className={styles.topPanel}>
-                        <CodePanel
-                            label="Correct Output (Ground Truth)"
-                            badge="GT"
-                            badgeColor="#16a34a"
-                            tokens={correctTokens}
-                            promptLen={promptLen}
-                        />
-                    </div>
-
-                    {/* ── Bottom Section: Left Sticky, Right Scroll ── */}
+                    {/* ── Left: Model+Gold · Right: Train matches ── */}
                     <div className={styles.bottomSection}>
-                        {/* ── Left Column: Model Output & Correlations ── */}
-                        <div className={styles.bottomLeft}>
-                            <CodePanel
-                                label="Model Output (Incorrect)"
-                                badge="MODEL"
-                                badgeColor="#dc2626"
-                                tokens={modelTokens}
+                        <div className={styles.bottomLeft} ref={bottomLeftRef}>
+                            <OutputComparePanel
+                                modelTokens={modelTokens}
+                                goldResponseTokens={goldResponseTokens}
                                 promptLen={promptLen}
                                 highlightSourceIndices={sourceHighlightIndices}
                                 selectedTargetIndex={selectedTokIdx ?? undefined}
                                 analyzedIndices={analyzedIndices}
                                 onTokenClick={idx => setSelectedTokIdx(prev => prev === idx ? null : idx)}
+                                linkedTokenIndex={linkedTestTokenIndex}
+                                onTokenHover={inlineBundle ? handleTestTokenHover : undefined}
                             />
 
                             {selectedResult && (
@@ -2078,17 +2713,9 @@ export function ReportPanel({
                                     </div>
                                     <div className={styles.correlationListHint}>
                                         Click one source→target edge to load its Top-10 training matches on the right.
-                                        {selectedResult.top_correlations.some(c => c.saliency_rank != null) && (
-                                            <> Showing saliency ranks{' '}
-                                                {Math.min(...selectedResult.top_correlations.map(c => c.saliency_rank ?? 0))}
-                                                –
-                                                {Math.max(...selectedResult.top_correlations.map(c => c.saliency_rank ?? 0))}
-                                                .
-                                            </>
-                                        )}
                                     </div>
                                     <div className={styles.correlationListItems}>
-                                        {selectedResult.top_correlations.map(c => (
+                                        {selectedResult.top_correlations.slice(0, 4).map(c => (
                                             <button
                                                 key={c.source_token_index}
                                                 type="button"
@@ -2099,9 +2726,7 @@ export function ReportPanel({
                                                 )}
                                             >
                                                 <div className={styles.corrBtnLeft}>
-                                                    <span className={styles.corrLabel}>
-                                                        {c.saliency_rank != null ? `#${c.saliency_rank} source → target` : 'source → target'}
-                                                    </span>
+                                                    <span className={styles.corrLabel}>source → target</span>
                                                     <span className={styles.corrSourceTok}>
                                                         {(decodeToken(c.source_token).trim() || '·')}
                                                         <span className={styles.corrArrow}>→</span>
@@ -2117,6 +2742,7 @@ export function ReportPanel({
                                     </div>
                                 </div>
                             )}
+
                         </div>
 
                         {/* ── Right Column: Training pairs ── */}
@@ -2222,6 +2848,32 @@ export function ReportPanel({
                                                 <div style={{ display: 'grid', gap: 4 }}>
                                                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                                                         <span style={{ fontWeight: 700, color: '#374151' }}>TTAV Jump</span>
+                                                        <span className={styles.modeSwitch}>
+                                                            <button
+                                                                type="button"
+                                                                className={`${styles.modeSwitchBtn} ${visualizerMode === 'inline' ? styles.modeSwitchBtnActive : ''}`}
+                                                                onClick={() => setVisualizerMode('inline')}
+                                                                title="在本页下方直接画出投影图，不打开新标签页"
+                                                            >
+                                                                本页显示
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                className={`${styles.modeSwitchBtn} ${visualizerMode === 'window' ? styles.modeSwitchBtnActive : ''}`}
+                                                                onClick={() => {
+                                                                    // Switching away means the user wants the standalone
+                                                                    // app; leaving the in-page plot behind would just be
+                                                                    // a stale panel nothing updates any more.
+                                                                    setVisualizerMode('window');
+                                                                    setInlineBundle(null);
+                                                                    setInlineBundleError(null);
+                                                                    setHoverTarget(null);
+                                                                }}
+                                                                title="打开 TTAV 网页版，功能完整（邻居线、refine、时间轴）"
+                                                            >
+                                                                新窗口
+                                                            </button>
+                                                        </span>
                                                         <span style={{
                                                             padding: '2px 8px',
                                                         borderRadius: 999,
@@ -2349,7 +3001,9 @@ export function ReportPanel({
                                         <div style={{ fontSize: 11, color: ttavLaunchError ? '#b91c1c' : '#6b7280' }}>
                                             {ttavLaunchError
                                                 ? ttavLaunchError
-                                                : (ttavLaunchStatus ?? '默认配置已经指向公网 TTAV。通常先点 “Prepare sample”，再点 “Open TTAV”。')}
+                                                : (ttavLaunchStatus ?? (visualizerMode === 'inline'
+                                                    ? '本页显示模式：先 “Prepare sample” 备好 bundle，再点 “Open Visualizer” 在下方画出投影图；probe 则点各 TRAIN 分组里的 “Open Full Probe”。'
+                                                    : '新窗口模式：通常先点 “Prepare sample”，再点 “Open Visualizer” 打开 TTAV 网页版。'))}
                                         </div>
                                         {preparingTtavBundle && ttavPrepareDetail && (
                                             <div style={{ fontSize: 11, color: '#0f766e' }}>
@@ -2377,6 +3031,11 @@ export function ReportPanel({
                                                 selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
                                                 onTogglePairSelection={toggleTrainPairSelection}
                                                 comparisonSummary={trainProbeComparisons[id]}
+                                                linkedTokenIndex={linkedTrainSampleId === id ? linkedTrainTokenIndex : null}
+                                                onTokenHover={inlineBundle?.trainSampleId === id
+                                                    ? makeTrainTokenHoverHandler(id, report.train_sample_details[String(id)]?.full_tokens ?? [])
+                                                    : undefined}
+                                                gtEdgesByTarget={trainGtEdges?.[String(id)]}
                                             />
                                         ))}
                                     </div>
@@ -2385,6 +3044,128 @@ export function ReportPanel({
                         </div>
                     </div>
                 
+            {/* ── Embedding plot: floats over the left column, above everything ── */}
+            {(inlineBundle || inlineBundleError || inlineBundleLoading) && (
+                <div
+                    ref={inlineVisualizerRef}
+                    className={`${styles.inlineVisualizer}${inlinePlotCollapsed ? ` ${styles.inlineVisualizerCollapsed}` : ''}${inlinePlotMoving ? ` ${styles.inlineVisualizerMoving}` : ''}`}
+                    style={!compact && dockRect
+                        ? (inlinePlotPos
+                            ? {
+                                left: inlinePlotPos.left,
+                                top: inlinePlotPos.top,
+                                bottom: 'auto',
+                                width: inlinePlotGeometry.width,
+                            }
+                            : { left: dockRect.left, width: inlinePlotGeometry.width })
+                        : undefined}
+                >
+                    {/* Top-right grip. The panel is anchored bottom-left, so this
+                        corner is the one that grows it in both axes. */}
+                    {!compact && !inlinePlotCollapsed && (
+                        <div
+                            className={styles.inlineVisualizerResizeGrip}
+                            onPointerDown={handleResizePointerDown}
+                            onPointerMove={handleResizePointerMove}
+                            onPointerUp={handleResizePointerUp}
+                            onPointerCancel={handleResizePointerUp}
+                            onDoubleClick={() => {
+                                // Back to a square that fits the left column.
+                                setInlinePlotSize(null);
+                                if (typeof window !== 'undefined') {
+                                    window.localStorage.removeItem(INLINE_PLOT_SIZE_KEY);
+                                }
+                            }}
+                            title="拖动调整正方形大小；双击恢复默认"
+                        />
+                    )}
+                    <div
+                        className={styles.inlineVisualizerHeader}
+                        onPointerDown={!compact ? handleMovePointerDown : undefined}
+                        onPointerMove={!compact ? handleMovePointerMove : undefined}
+                        onPointerUp={!compact ? handleMovePointerUp : undefined}
+                        onPointerCancel={!compact ? handleMovePointerUp : undefined}
+                        onDoubleClick={!compact ? (event) => {
+                            const target = event.target as HTMLElement;
+                            if (target.closest('button')) return;
+                            resetInlinePlotPos();
+                        } : undefined}
+                        title={!compact ? '拖动标题栏移动浮窗；双击恢复默认位置' : undefined}
+                    >
+                        <span className={styles.badge} style={{ background: '#7c3aed' }}>PLOT</span>
+                        <span className={styles.codePanelLabel}>
+                            {inlineBundle?.kind === 'probe'
+                                ? `Full Probe · TRAIN #${inlineBundle.trainSampleId ?? '?'}`
+                                : 'Sample Embedding'}
+                        </span>
+                        {inlineBundle && (
+                            <span className={styles.inlineVisualizerMeta}>
+                                {inlineBundle.projection.length} 点
+                                {inlineBundle.links.length > 0
+                                    ? ` · ${inlineBundle.links.length} 条边`
+                                    : ''}
+                            </span>
+                        )}
+                        {/* Hover readout lives in the header while collapsed, so the
+                            code↔point link still says something with the plot shut. */}
+                        {inlinePlotCollapsed && hoverTarget && (
+                            <span className={styles.inlineVisualizerMeta}>
+                                {hoverTarget.side === 'train'
+                                    ? `TRAIN #${hoverTarget.trainSampleId ?? '?'}`
+                                    : 'TEST'} · @{hoverTarget.tokenIndex} · "{decodeToken(hoverTarget.token)}"
+                            </span>
+                        )}
+                        <button
+                            type="button"
+                            className={styles.inlineVisualizerDockBtn}
+                            onClick={() => setInlinePlotCollapsed(v => !v)}
+                            title={inlinePlotCollapsed ? '展开投影图' : '收起投影图（保留已加载的 bundle）'}
+                        >
+                            {inlinePlotCollapsed ? '展开 ▲' : '收起 ▼'}
+                        </button>
+                        <button
+                            type="button"
+                            className={styles.inlineVisualizerClose}
+                            onClick={() => {
+                                setInlineBundle(null);
+                                setInlineBundleError(null);
+                                setHoverTarget(null);
+                            }}
+                        >
+                            关闭
+                        </button>
+                    </div>
+                    {inlineBundleLoading && (
+                        <div className={styles.inlineVisualizerNotice}>正在加载 bundle…</div>
+                    )}
+                    {inlineBundleError && !inlineBundleLoading && (
+                        <div className={`${styles.inlineVisualizerNotice} ${styles.inlineVisualizerError}`}>
+                            {inlineBundleError}
+                        </div>
+                    )}
+                    {inlineBundle && !inlineBundleLoading && (
+                        <>
+                            <InlineVisualizer
+                                key={inlineBundle.sampleId}
+                                bundle={inlineBundle}
+                                hoverTarget={hoverTarget}
+                                onHoverTargetChange={setHoverTarget}
+                                selectedPoints={inlinePlotSelection}
+                                canvasHeight={inlinePlotGeometry.canvasHeight}
+                            />
+                            <div className={styles.inlineVisualizerHint}>
+                                {hoverTarget
+                                    ? `${hoverTarget.side === 'train'
+                                        ? `TRAIN #${hoverTarget.trainSampleId ?? '?'}`
+                                        : 'TEST'} · @${hoverTarget.tokenIndex}`
+                                        + `${hoverTarget.role ? ` · ${hoverTarget.role}` : ''}`
+                                        + ` · "${decodeToken(hoverTarget.token)}"`
+                                    : '鼠标划过任意一个点，即可在上方代码中定位它；反之亦然。'}
+                            </div>
+                        </>
+                    )}
+                </div>
+            )}
         </div>
     );
 }

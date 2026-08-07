@@ -1286,6 +1286,27 @@ def compute_alti_correlation_gradient(
 
 # ── viz-aligned last-layer ALTI (cheaper temporary path) ─────────────────────
 
+def prepare_last_layer_grad_checkpointing(model) -> None:
+    """Enable activation checkpointing for long-seq last-layer probe grads.
+
+    HuggingFace only applies gradient checkpointing in ``model.training`` mode.
+    Bank / probe helpers often call ``model.eval()``, which silently disables GC
+    and OOMs at seq≈3k. Mirror viz/data_attribution: train + freeze dropout.
+    """
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    try:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    except TypeError:
+        model.gradient_checkpointing_enable()
+    model.train()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.eval()
+
+
 def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     """Recompute last-layer attention probs from layer input hidden states.
 
@@ -1456,7 +1477,7 @@ def compute_last_layer_match_and_probe_gradients(
         )
 
     def _flat_grad(objective: str):
-        model.eval()
+        prepare_last_layer_grad_checkpointing(model)
         model.zero_grad(set_to_none=True)
 
         target_params = []
@@ -1582,7 +1603,7 @@ def compute_last_layer_topk_probe_gradient(
             f"source indices {srcs} must be in [0, {target_idx_in_seq})"
         )
 
-    model.eval()
+    prepare_last_layer_grad_checkpointing(model)
     model.zero_grad(set_to_none=True)
     target_params = []
     original_flags = []

@@ -32,9 +32,7 @@
 ```bash
 cd tools/annotation-viewer
 # 终端 1：后端（只用 tokenizer 解码 input_ids，不加载 GPU 模型）
-python -m server.main \
-  --data "D:\AAAworks\annotation\code-corr-annotation\data\annotated\smoke_train_data_oversample_mid_edges.jsonl" \
-  --tokenizer "D:\AAAworks\Qwen3-8B"
+python -m server.main --data "D:\AAAworks\embedding_viz\Empirical-Influence-Function\smoke_train_data.jsonl"  --tokenizer "D:\AAAworks\Qwen3-8B"
 
 # 终端 2：前端
 npm run dev
