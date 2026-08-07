@@ -29,9 +29,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_DATA = REPO_ROOT / "go_single_train_v2_graphsignal_10k_compact.json.bak"
-# Decode-only default (no GPU / no live saliency). Override with --tokenizer.
-DEFAULT_TOKENIZER = Path(r"D:\AAAworks\Qwen3-8B")
+VIEWER_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_dotenv(path: Path) -> None:
+    """Minimal .env loader (KEY=VALUE); does not override existing env vars."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(VIEWER_ROOT / ".env")
+
+
+def _default_data_path() -> Path:
+    raw = (os.environ.get("ANNOTATION_TRAIN_DATA") or "").strip()
+    if not raw:
+        raise SystemExit(
+            "ANNOTATION_TRAIN_DATA is not set. "
+            "Put it in tools/annotation-viewer/.env or pass --data."
+        )
+    p = Path(raw).expanduser()
+    return p.resolve() if p.is_absolute() else (VIEWER_ROOT / p).resolve()
+
+
+DEFAULT_DATA = _default_data_path()
+# Decode-only tokenizer. Empty means "must pass --tokenizer" unless env is set.
+_TOKENIZER_RAW = (os.environ.get("ANNOTATION_TOKENIZER") or "").strip()
+DEFAULT_TOKENIZER = Path(_TOKENIZER_RAW).expanduser() if _TOKENIZER_RAW else Path()
 
 SUBTYPES = [
     "bracket",
@@ -160,7 +193,9 @@ def _resolve_tokenizer_path() -> str:
         return _tokenizer_path
     if _model_path:
         return _model_path
-    return str(DEFAULT_TOKENIZER)
+    if _TOKENIZER_RAW:
+        return str(DEFAULT_TOKENIZER.expanduser().resolve())
+    return ""
 
 
 def _get_tokenizer():
@@ -170,11 +205,11 @@ def _get_tokenizer():
     from transformers import AutoTokenizer
 
     path = _resolve_tokenizer_path()
-    if not Path(path).exists():
+    if not path or not Path(path).exists():
         raise HTTPException(
             500,
-            f"Tokenizer path not found: {path}. "
-            "Pass --tokenizer D:\\AAAworks\\Qwen3-8B (decode-only; no saliency).",
+            "Tokenizer path not found. Set ANNOTATION_TOKENIZER in "
+            "tools/annotation-viewer/.env or pass --tokenizer <path>.",
         )
     _tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     return _tokenizer
@@ -549,7 +584,7 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help=(
             "Tokenizer-only path for decoding input_ids (no GPU / no live saliency). "
-            f"Default: {DEFAULT_TOKENIZER}"
+            "Default: ANNOTATION_TOKENIZER from .env"
         ),
     )
     parser.add_argument(
@@ -570,6 +605,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     global _data_path, _offsets, _model_path, _tokenizer_path, _saliency_cache_dir
+    print(f"Data from .env/CLI: {args.data}", flush=True)
     data = Path(args.data).expanduser().resolve()
     if not data.exists():
         print(f"[WARN] data file not found yet: {data}", flush=True)
@@ -592,26 +628,27 @@ def main(argv: list[str] | None = None) -> None:
         _model_path = str(Path(args.model).expanduser().resolve())
         print(f"Saliency model: {_model_path}", flush=True)
     elif not args.tokenizer:
-        if DEFAULT_TOKENIZER.exists():
+        if _TOKENIZER_RAW and DEFAULT_TOKENIZER.expanduser().exists():
             print(
-                f"Tokenizer default: {DEFAULT_TOKENIZER} "
+                f"Tokenizer from .env: {DEFAULT_TOKENIZER.expanduser().resolve()} "
                 f"(live saliency {'disk_cache' if _saliency_cache_dir else 'off'})",
                 flush=True,
             )
         else:
             print(
-                f"[WARN] default tokenizer missing: {DEFAULT_TOKENIZER}. "
-                "Pass --tokenizer <path> to decode tokens.",
+                "[WARN] No tokenizer configured. "
+                "Set ANNOTATION_TOKENIZER in .env or pass --tokenizer <path>.",
                 flush=True,
             )
 
     # Eager-load tokenizer for faster first sample
     try:
-        tok_path = Path(_resolve_tokenizer_path())
-        if tok_path.exists():
+        tok_path_str = _resolve_tokenizer_path()
+        tok_path = Path(tok_path_str) if tok_path_str else Path()
+        if tok_path_str and tok_path.exists():
             _get_tokenizer()
             print(f"Tokenizer ready: {tok_path}", flush=True)
-        else:
+        elif tok_path_str:
             print(f"[WARN] tokenizer path not found: {tok_path}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[WARN] tokenizer not loaded: {exc}", flush=True)

@@ -9,7 +9,17 @@ const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
-const TRAIN_GT_EDGES_JSONL = resolve(DATA_ROOT, 'smoke_train_data_oversample_llm.jsonl')
+// Prefer explicit env, then the smoke file that lives in this repo, then the
+// older oversample name used on some machines.
+const TRAIN_GT_EDGES_JSONL = (() => {
+  const fromEnv = process.env.TRAIN_GT_JSONL || process.env.VITE_TRAIN_GT_JSONL
+  if (fromEnv) return resolve(DATA_ROOT, fromEnv)
+  const candidates = [
+    resolve(DATA_ROOT, 'smoke_train_data.jsonl'),
+    resolve(DATA_ROOT, 'smoke_train_data_oversample_llm.jsonl'),
+  ]
+  return candidates.find(existsSync) ?? candidates[0]
+})()
 
 /** targetIdx -> sourceIdx[] for each train sample id (line index in the jsonl). */
 type TrainGtEdges = Record<string, Record<string, number[]>>
@@ -19,6 +29,7 @@ let trainGtEdgesCache: string | null | undefined
 function buildTrainGtEdgesPayload(): string | null {
   if (trainGtEdgesCache !== undefined) return trainGtEdgesCache
   if (!existsSync(TRAIN_GT_EDGES_JSONL)) {
+    console.warn(`[train-gt-edges] missing ${TRAIN_GT_EDGES_JSONL} — red annotation underlines disabled`)
     trainGtEdgesCache = null
     return null
   }
@@ -49,9 +60,11 @@ function buildTrainGtEdgesPayload(): string | null {
       }
       out[String(i)] = byTarget
     }
+    console.info(`[train-gt-edges] loaded ${Object.keys(out).length} samples from ${TRAIN_GT_EDGES_JSONL}`)
     trainGtEdgesCache = JSON.stringify(out)
     return trainGtEdgesCache
-  } catch {
+  } catch (err) {
+    console.warn('[train-gt-edges] failed to parse GT jsonl', err)
     trainGtEdgesCache = null
     return null
   }

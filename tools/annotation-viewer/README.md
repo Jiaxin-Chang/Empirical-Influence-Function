@@ -29,19 +29,34 @@
 
 ## 启动（只看 / 改 annotation，不需要 saliency）
 
-```bash
-cd tools/annotation-viewer
-# 终端 1：后端（只用 tokenizer 解码 input_ids，不加载 GPU 模型）
-python -m server.main --data "D:\AAAworks\embedding_viz\Empirical-Influence-Function\smoke_train_data.jsonl"  --tokenizer "D:\AAAworks\Qwen3-8B"
+在 `tools/annotation-viewer/.env` 里配置训练数据路径（仓库已带示例）：
 
-# 终端 2：前端
-npm run dev
+```env
+ANNOTATION_TRAIN_DATA=../../smoke_train_data.jsonl
 ```
 
-默认 tokenizer 也是 `D:\AAAworks\Qwen3-8B`；路径存在时可省略 `--tokenizer`。  
-**不要**加 `--model`，除非你要本机算 ALTI 蓝底（会占 GPU）。
+```bash
+cd tools/annotation-viewer
+# 终端 1：后端（读 .env 的 ANNOTATION_TRAIN_DATA；只用 tokenizer 解码，不加载 GPU）
+python -m server.main
 
-打开页面后：**点左侧样本** → 右侧出现 token；再点 answer 区 token → 看彩色下划线 annotation。
+# 终端 2：前端
+pnpm dev
+```
+
+也可显式传参覆盖 `.env`：
+
+```bash
+python -m server.main --data "D:\AAAworks\Empirical-Influence-Function\smoke_train_data.jsonl" --tokenizer "D:\AAAworks\Qwen3-8B"
+```
+
+### 从 correlation-report 跳转
+
+报告页点击 pair 上的 `TRAIN #N` 会打开：
+
+`http://127.0.0.1:5174/?sample=N&target=<train_target_idx>`
+
+自动加载该样本并选中对应 target（只展示 annotation，不强制算 saliency）。
 
 ## Saliency（蓝底 top-6，可选）
 

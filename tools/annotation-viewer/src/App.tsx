@@ -11,8 +11,10 @@ import {
 
 type Mode = 'inspect' | 'add'
 
+// Prefer .env (VITE_ANNOTATION_TRAIN_DATA). After backend connects, health.data_path
+// overwrites this — no machine-specific absolute path in code.
 const DEFAULT_DATA =
-  'd:/AAAworks/Empirical-Influence-Function/go_single_train_v2_graphsignal_10k_compact.json.bak'
+  (import.meta.env.VITE_ANNOTATION_TRAIN_DATA as string | undefined)?.trim() || ''
 
 function displayToken(tok: string): string {
   return tok.replace(/\r/g, '␍').replace(/\n/g, '↵\n').replace(/\t/g, '⇥')
@@ -65,6 +67,31 @@ export default function App() {
     }
   }, [dataPath, query, refreshList])
 
+  const loadSample = useCallback(async (idx: number, initialTarget?: number | null) => {
+    setBusy(true)
+    setError('')
+    try {
+      const detail = await api.getSample(idx)
+      setSelectedIdx(idx)
+      setSample(detail)
+      setTarget(initialTarget ?? null)
+      setSaliency([])
+      setSaliencyMsg('')
+      setPendingEdge(null)
+      setAddSrc(null)
+      setJumpIdx(String(idx))
+      const edgeNote =
+        initialTarget != null
+          ? ` · target @${initialTarget} · ${detail.attention_edges.filter(e => e.dst === initialTarget).length} ann edges`
+          : ` · ${detail.attention_edges.length} edges`
+      setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
   useEffect(() => {
     ;(async () => {
       try {
@@ -80,32 +107,28 @@ export default function App() {
                 : ' · 仅展示 annotation（未开 saliency）'),
           )
           await refreshList('', 0, false)
+
+          // Deep link from correlation-report: ?sample=0&target=123
+          const params = new URLSearchParams(window.location.search)
+          const sampleRaw = params.get('sample')
+          const targetRaw = params.get('target')
+          if (sampleRaw != null && sampleRaw !== '') {
+            const sampleIdx = Number(sampleRaw)
+            const targetIdx =
+              targetRaw != null && targetRaw !== '' ? Number(targetRaw) : null
+            if (Number.isInteger(sampleIdx) && sampleIdx >= 0) {
+              await loadSample(
+                sampleIdx,
+                targetIdx != null && Number.isInteger(targetIdx) ? targetIdx : null,
+              )
+            }
+          }
         }
       } catch {
         setError('无法连接后端。请先启动: python -m server.main')
       }
     })()
-  }, [refreshList])
-
-  const loadSample = useCallback(async (idx: number) => {
-    setBusy(true)
-    setError('')
-    try {
-      const detail = await api.getSample(idx)
-      setSelectedIdx(idx)
-      setSample(detail)
-      setTarget(null)
-      setSaliency([])
-      setSaliencyMsg('')
-      setPendingEdge(null)
-      setAddSrc(null)
-      setStatus(`样本 #${idx} · ${detail.uid} · ${detail.attention_edges.length} edges`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }, [])
+  }, [refreshList, loadSample])
 
   const relatedEdges = useMemo(() => {
     if (!sample || target == null) return [] as Edge[]

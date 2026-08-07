@@ -1357,6 +1357,7 @@ function PairCard({
     onUnlearn,
     unlearnBusy,
     unlearnResult,
+    onOpenAnnotationViewer,
 }: {
     pair: CorrelationPair;
     detail?: TrainSampleDetail;
@@ -1368,6 +1369,8 @@ function PairCard({
     onUnlearn?: () => void;
     unlearnBusy?: boolean;
     unlearnResult?: UnlearnPairResult | null;
+    /** Open annotation-viewer focused on this train sample + target. */
+    onOpenAnnotationViewer?: () => void;
 }) {
     const [expanded, setExpanded] = useState(false);
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
@@ -1458,7 +1461,25 @@ function PairCard({
                     <span className={styles.offset}>+{pair.train_correlation.response_token_offset}</span>
                 </span>
 
-                <span className={styles.trainBadge}>TRAIN #{pair.train_sample_id}</span>
+                <span
+                    className={styles.trainBadge}
+                    role="link"
+                    tabIndex={0}
+                    title="在 annotation-viewer 中打开该 train 样本并选中本 pair 的 target"
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        onOpenAnnotationViewer?.();
+                    }}
+                    onKeyDown={(event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onOpenAnnotationViewer?.();
+                    }}
+                    style={onOpenAnnotationViewer ? { cursor: 'pointer', textDecoration: 'underline' } : undefined}
+                >
+                    TRAIN #{pair.train_sample_id}
+                </span>
                 <span className={styles.expandIcon}>{expanded ? '▼' : '▶'}</span>
             </div>
 
@@ -1548,6 +1569,7 @@ function TrainSampleGroup({
     onUnlearnPair,
     unlearningPairId,
     unlearnResults,
+    onOpenAnnotationViewer,
 }: {
     trainIdx: number;
     pairs: CorrelationPair[];
@@ -1565,6 +1587,7 @@ function TrainSampleGroup({
     onUnlearnPair?: (pair: CorrelationPair) => void;
     unlearningPairId?: string | null;
     unlearnResults?: Record<string, UnlearnPairResult>;
+    onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
 }) {
     const [collapsed, setCollapsed] = useState(false);
     // Which pair the reader last opened. Local to the group because the listing it
@@ -1684,6 +1707,11 @@ function TrainSampleGroup({
                                 onUnlearn={onUnlearnPair ? () => onUnlearnPair(pair) : undefined}
                                 unlearnBusy={unlearningPairId === pair.id}
                                 unlearnResult={unlearnResults?.[pair.id] ?? null}
+                                onOpenAnnotationViewer={
+                                    onOpenAnnotationViewer
+                                        ? () => onOpenAnnotationViewer(pair)
+                                        : undefined
+                                }
                             />
                         ))}
                     </div>
@@ -2006,6 +2034,16 @@ export function ReportPanel({
             delete next[trainIdx];
             return next;
         });
+    };
+
+    const handleOpenAnnotationViewer = (pair: CorrelationPair) => {
+        const base = (
+            import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
+        )?.trim() || 'http://127.0.0.1:5174';
+        const url = new URL(base);
+        url.searchParams.set('sample', String(pair.train_sample_id));
+        url.searchParams.set('target', String(pair.train_correlation.target_token_index));
+        window.open(url.toString(), '_blank', 'noopener,noreferrer');
     };
 
     const handleUnlearnPair = (pair: CorrelationPair) => {
@@ -2474,6 +2512,7 @@ export function ReportPanel({
                                                 onUnlearnPair={importedReportActive ? undefined : handleUnlearnPair}
                                                 unlearningPairId={unlearningPairId}
                                                 unlearnResults={unlearnResultsByPairId}
+                                                onOpenAnnotationViewer={handleOpenAnnotationViewer}
                                             />
                                         ))}
                                     </div>
