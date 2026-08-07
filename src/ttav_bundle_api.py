@@ -14,6 +14,7 @@ from src.export_real_ttav_bundle import DEFAULT_MODEL_PATH, build_real_bundle_pa
 from src.export_probe_bundle_from_pt import build_probe_payload as build_probe_from_pt
 from src.export_train_probe_bundle import build_train_probe_bundle_payload
 from src.export_ttav_bundle import build_bundle_payload, infer_sample_id, upload_bundle
+from src.unlearn_pair_probe import run_unlearn_pair_probe
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +23,9 @@ EIF_BUNDLE_CACHE_ROOT = REPO_ROOT / "ttav_bundles"
 PREGENERATED_REAL_BUNDLE_ROOT = REPO_ROOT / "ttav_bundles_real"
 PREPARE_STATUS_LOCK = Lock()
 PREPARE_STATUS: dict[str, dict] = {}
+# Serializes weight-mutating probes so concurrent Unlearn clicks don't race the
+# shared in-process model cache.
+UNLEARN_PROBE_LOCK = Lock()
 
 # Server-side kill switch for live model loading. Independent of (and stronger
 # than) the per-request `requireCached` flag: that one is client-supplied and
@@ -424,6 +428,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/prepare-ttav-train-probe":
             self._handle_prepare_train_probe()
             return
+        if parsed.path == "/api/unlearn-pair-probe":
+            self._handle_unlearn_pair_probe()
+            return
         if parsed.path != "/api/prepare-ttav-bundle":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -574,6 +581,106 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "statusMessage": upload_result.get("statusMessage"),
         }
         self._send_json(200, response)
+
+    def _handle_unlearn_pair_probe(self):
+        """One-step lm_head unlearning probe for a single correlation pair."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": (
+                    "Unlearn probe needs a live model, but this server has "
+                    "EIF_CACHE_ONLY=1. Restart without that flag (and with GPU) to run it."
+                ),
+            })
+            return
+
+        report_file_name = str(req.get("reportFileName", "")).strip()
+        if not report_file_name:
+            self._send_json(400, {"status": "error", "message": "reportFileName is required"})
+            return
+
+        report_json_path = CORR_RESULTS_DIR / report_file_name
+        if not report_json_path.exists():
+            self._send_json(404, {
+                "status": "error",
+                "message": f"Report JSON not found: {report_file_name}",
+            })
+            return
+
+        try:
+            report = json.loads(report_json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Report JSON is invalid"})
+            return
+
+        try:
+            train_sample_id = int(req["trainSampleId"])
+            test_source_index = int(req["testSourceIndex"])
+            test_target_index = int(req["testTargetIndex"])
+            train_source_index = int(req["trainSourceIndex"])
+            train_target_index = int(req["trainTargetIndex"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {
+                "status": "error",
+                "message": (
+                    "trainSampleId, testSourceIndex, testTargetIndex, "
+                    "trainSourceIndex, trainTargetIndex are required integers"
+                ),
+            })
+            return
+
+        pair_id = str(req.get("pairId", "")).strip() or None
+        raw_model_path = req.get("modelPath")
+        model_path = str(raw_model_path).strip() if raw_model_path else None
+        raw_base_path = req.get("baseModelPath")
+        base_model_path = str(raw_base_path).strip() if raw_base_path else None
+        unlearn_lr = float(req.get("unlearnLr", 1.0))
+        normalize_grad = not bool(req.get("noNormalizeGrad", False))
+        recompute_saliency = bool(req.get("recomputeSaliency", True))
+
+        print(
+            f"[unlearn] pair={pair_id or '?'} train={train_sample_id} "
+            f"test={test_source_index}->{test_target_index} lr={unlearn_lr} "
+            f"adapter={model_path or '(env/report)'} base={base_model_path or '(auto/env)'}",
+            flush=True,
+        )
+
+        try:
+            with UNLEARN_PROBE_LOCK:
+                result = run_unlearn_pair_probe(
+                    report,
+                    train_sample_id=train_sample_id,
+                    test_source_index=test_source_index,
+                    test_target_index=test_target_index,
+                    train_source_index=train_source_index,
+                    train_target_index=train_target_index,
+                    pair_id=pair_id,
+                    model_path=model_path,
+                    base_model_path=base_model_path,
+                    unlearn_lr=unlearn_lr,
+                    normalize_grad=normalize_grad,
+                    recompute_saliency=recompute_saliency,
+                )
+        except Exception as exc:
+            print(f"[unlearn] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+
+        print(
+            f"[unlearn] done verdict={result.get('verdict')} "
+            f"dLogP={result.get('delta', {}).get('logprob')} "
+            f"dSal={result.get('delta', {}).get('saliency')}",
+            flush=True,
+        )
+        self._send_json(200, result)
 
     def _handle_prepare_train_probe(self):
         content_length = int(self.headers.get("Content-Length", "0"))

@@ -50,6 +50,11 @@ export interface PlotOverlayProps {
     hoveredPoint: number | null;
     /** Points the report considers in focus — ringed, and always labelled. */
     selectedPoints: number[];
+    /**
+     * When set, links whose key is missing are drawn almost invisible so the
+     * selected pairs stay readable against the full cloud.
+     */
+    emphasizedLinkKeys?: Set<string> | null;
     /** The bundle's text_list, e.g. "P131: \n" or "XS60:  error". */
     textList: string[];
     showLabel: boolean;
@@ -160,7 +165,7 @@ export class PlotOverlay {
     }
 
     private renderLinks() {
-        const { links, hoveredPoint } = this.props;
+        const { links, hoveredPoint, emphasizedLinkKeys } = this.props;
         if (!this.svg || links.length === 0) return;
 
         const group = document.createElementNS(SVG_NS, 'g');
@@ -168,6 +173,8 @@ export class PlotOverlay {
         // Draw the hovered point's own links last so they end up on top.
         const touchesHover = (link: ProbeLink) =>
             hoveredPoint !== null && (link.fromPoint === hoveredPoint || link.toPoint === hoveredPoint);
+        const linkKeyOf = (link: ProbeLink) =>
+            `${link.side}:${link.fromPoint}->${link.toPoint}:${link.pairId}`;
         const ordered = [...links].sort((a, b) => Number(touchesHover(a)) - Number(touchesHover(b)));
 
         for (const link of ordered) {
@@ -187,7 +194,11 @@ export class PlotOverlay {
             const cos = typeof link.cosSim === 'number' ? link.cosSim : null;
             const strength = cos === null ? 0.35 : Math.min(1, Math.abs(cos) / 0.35);
             const colour = cos === null ? '#7F8C8D' : (cos >= 0 ? '#D35400' : '#2471A3');
-            const dimmed = hoveredPoint !== null && !touchesHover(link);
+            const selectionDimmed = Boolean(
+                emphasizedLinkKeys && emphasizedLinkKeys.size > 0 && !emphasizedLinkKeys.has(linkKeyOf(link)),
+            );
+            const dimmed = selectionDimmed || (hoveredPoint !== null && !touchesHover(link));
+            const opacityScale = selectionDimmed ? 0.06 : (dimmed ? 0.25 : 1);
 
             const line = document.createElementNS(SVG_NS, 'line');
             line.setAttribute('x1', String(from.x));
@@ -195,8 +206,8 @@ export class PlotOverlay {
             line.setAttribute('x2', String(to.x));
             line.setAttribute('y2', String(to.y));
             line.setAttribute('stroke', colour);
-            line.setAttribute('stroke-width', String(1.2 + strength * 3.3));
-            line.setAttribute('stroke-opacity', String((0.5 + strength * 0.45) * (dimmed ? 0.25 : 1)));
+            line.setAttribute('stroke-width', String(selectionDimmed ? 1 : (1.2 + strength * 3.3)));
+            line.setAttribute('stroke-opacity', String((0.5 + strength * 0.45) * opacityScale));
             line.setAttribute('stroke-linecap', 'round');
             // Dashed marks the test-sample edge, so a pair's two edges stay
             // tellable apart when they share a colour and width.
@@ -205,7 +216,7 @@ export class PlotOverlay {
 
             // Edges are directed (source → target); without an arrow the reader
             // can't tell which token influences which.
-            if (!dimmed) this.drawMidpointArrow(group, from.x, from.y, to.x, to.y, colour, 7);
+            if (!dimmed && !selectionDimmed) this.drawMidpointArrow(group, from.x, from.y, to.x, to.y, colour, 7);
         }
 
         this.svg.appendChild(group);

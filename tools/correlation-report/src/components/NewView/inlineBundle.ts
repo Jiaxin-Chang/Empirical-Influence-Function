@@ -259,3 +259,99 @@ export function resolveTokenToPoint(bundle: InlineBundle, target: TokenHoverTarg
         : null;
 }
 
+/** One correlation pair's four endpoints, used to light them up in the probe. */
+export interface ProbeEmphasisPair {
+    id: string;
+    trainSourceIndex: number;
+    trainTargetIndex: number;
+    testSourceIndex: number;
+    testTargetIndex: number;
+}
+
+export interface ProbeEmphasis {
+    /** Points that stay full-colour / ringed; everything else is washed out. */
+    points: Set<number>;
+    /** Links drawn at full strength; others are almost invisible. */
+    linkKeys: Set<string>;
+}
+
+function linkKey(link: ProbeLink): string {
+    return `${link.side}:${link.fromPoint}->${link.toPoint}:${link.pairId}`;
+}
+
+function findProbePoint(
+    bundle: InlineBundle,
+    side: 'train' | 'test',
+    tokenIndex: number,
+): number | null {
+    const rec = bundle.pointRecords?.find(r => r.side === side && r.token_index === tokenIndex);
+    return rec ? rec.point_index : null;
+}
+
+/**
+ * Which probe points/links the Model / pair 「选择」 ticks should emphasize.
+ * Returns null when nothing is ticked — the plot stays in its default full view.
+ *
+ * Resolves endpoints via token indices (not only link.pairId), so Model-only or
+ * train-only selection still finds the right points even when the shared test
+ * edge was stored under a different pair's id.
+ */
+export function collectProbeEmphasis(
+    bundle: InlineBundle,
+    opts: {
+        selectedPairs: ProbeEmphasisPair[];
+        includeTestSaliency: boolean;
+        testSourceIndex: number | null;
+        testTargetIndex: number | null;
+    },
+): ProbeEmphasis | null {
+    if (bundle.kind !== 'probe') return null;
+
+    const hasPairs = opts.selectedPairs.length > 0;
+    const includeTest = opts.includeTestSaliency
+        && opts.testSourceIndex != null
+        && opts.testTargetIndex != null;
+    if (!hasPairs && !includeTest) return null;
+
+    const points = new Set<number>();
+    const linkKeys = new Set<string>();
+    const pairIdSet = new Set(opts.selectedPairs.map(p => p.id));
+
+    const addEndpoint = (side: 'train' | 'test', tokenIndex: number) => {
+        const idx = findProbePoint(bundle, side, tokenIndex);
+        if (idx !== null) points.add(idx);
+    };
+
+    for (const pair of opts.selectedPairs) {
+        addEndpoint('train', pair.trainSourceIndex);
+        addEndpoint('train', pair.trainTargetIndex);
+        addEndpoint('test', pair.testSourceIndex);
+        addEndpoint('test', pair.testTargetIndex);
+    }
+
+    if (includeTest) {
+        addEndpoint('test', opts.testSourceIndex!);
+        addEndpoint('test', opts.testTargetIndex!);
+    }
+
+    for (const link of bundle.links) {
+        const byPairId = hasPairs && pairIdSet.has(link.pairId);
+        const bothEndsHot = points.has(link.fromPoint) && points.has(link.toPoint);
+        const modelTestEdge = includeTest
+            && link.side === 'test'
+            && bothEndsHot;
+        // Train-only: pairId may not match the single stored test-edge row, so
+        // also accept any link whose endpoints we already resolved from tokens.
+        if (byPairId || modelTestEdge || (hasPairs && bothEndsHot)) {
+            linkKeys.add(linkKey(link));
+            points.add(link.fromPoint);
+            points.add(link.toPoint);
+        }
+    }
+
+    if (points.size === 0) return null;
+    return { points, linkKeys };
+}
+
+export { linkKey as probeLinkKey };
+

@@ -38,12 +38,16 @@ function describeToken(token: string): string {
 }
 
 const POINT_SIZE = 2;
+/** Unselected points when a Model/pair tick is active — barely visible cloud. */
+const SELECTION_DIM_ALPHA = 0.045;
 
 export function InlineVisualizer({
     bundle,
     hoverTarget,
     onHoverTargetChange,
     selectedPoints,
+    emphasizedPoints,
+    emphasizedLinkKeys,
     canvasHeight,
 }: {
     bundle: InlineBundle;
@@ -58,6 +62,13 @@ export function InlineVisualizer({
      * clicking a different token in the code updates the plot.
      */
     selectedPoints: number[];
+    /**
+     * When non-null, points outside this set are washed out so the selection
+     * reads against the full embedding cloud instead of replacing it.
+     */
+    emphasizedPoints?: Set<number> | null;
+    /** Matching link keys for the overlay; same selection as emphasizedPoints. */
+    emphasizedLinkKeys?: Set<string> | null;
 }) {
     const containerRef = useRef<HTMLDivElement | null>(null);
     const [size, setSize] = useState({ width: 0, height: 0 });
@@ -89,27 +100,29 @@ export function InlineVisualizer({
         const y = new Float32Array(n);
         const category = new Uint8Array(n);
         const categoryColors: string[] = [];
-        const labelToCategory = new Map<number, number>();
+        const slotByKey = new Map<string, number>();
         const dataPoints: DataPoint[] = [];
+        const selectionActive = Boolean(emphasizedPoints && emphasizedPoints.size > 0);
 
         for (let i = 0; i < n; i++) {
             x[i] = bundle.projection[i][0];
             y[i] = bundle.projection[i][1];
 
-            // Slots are assigned in first-appearance order, the same way TTAV
-            // builds its category list, so identical data yields identical colours.
             const label = bundle.labels[i] ?? 0;
-            let slot = labelToCategory.get(label);
+            const isContext = (bundle.classes[label] ?? '').endsWith('_context');
+            const isHot = !selectionActive || emphasizedPoints!.has(i);
+            // Per-(label, hot/dim) slots so selection can wash out points without
+            // hiding them — EmbeddingView colours by category, not per point.
+            const slotKey = `${label}:${isHot ? 'hot' : 'dim'}`;
+            let slot = slotByKey.get(slotKey);
             if (slot === undefined) {
                 slot = categoryColors.length;
-                labelToCategory.set(label, slot);
-                // Context points get faded. A full-token probe is ~99.9% context
-                // (5288 of 5292 in one measured case), so at equal weight the four
-                // points the probe is actually about vanish into the crowd. Fading
-                // rather than hiding keeps the shape of the distribution readable,
-                // which is what the context is there to show.
-                const isContext = (bundle.classes[label] ?? '').endsWith('_context');
-                categoryColors.push(withAlpha(TAB10[label] ?? FALLBACK_COLOR, isContext ? 0.28 : 1));
+                slotByKey.set(slotKey, slot);
+                const base = TAB10[label] ?? FALLBACK_COLOR;
+                const alpha = !isHot
+                    ? SELECTION_DIM_ALPHA
+                    : (isContext ? 0.28 : 1);
+                categoryColors.push(withAlpha(base, alpha));
             }
             category[i] = slot;
 
@@ -128,17 +141,19 @@ export function InlineVisualizer({
             count: bundle.labels.filter(l => l === label).length,
         })).filter(entry => entry.count > 0);
 
-        // Who gets a label first when space runs out. Sources and targets are what
-        // a probe is about, so they precede context; without this the budget went
-        // to whichever tokens happened to sit early in the train sample.
+        // Who gets a label first when space runs out. Emphasized / non-context
+        // points come first so a selection isn't drowned by the cloud.
         const labelOrder = Array.from({ length: n }, (_, i) => i).sort((a, b) => {
+            const hotA = selectionActive && emphasizedPoints!.has(a) ? 0 : 1;
+            const hotB = selectionActive && emphasizedPoints!.has(b) ? 0 : 1;
+            if (hotA !== hotB) return hotA - hotB;
             const ctxA = (bundle.classes[bundle.labels[a] ?? 0] ?? '').endsWith('_context') ? 1 : 0;
             const ctxB = (bundle.classes[bundle.labels[b] ?? 0] ?? '').endsWith('_context') ? 1 : 0;
             return ctxA - ctxB || a - b;
         });
 
         return { data: { x, y, category }, categoryColors, dataPoints, legend, labelOrder };
-    }, [bundle]);
+    }, [bundle, emphasizedPoints]);
 
     // One hover state, two directions: a point hover reports the token upward,
     // and a token hover from the report comes back down as a highlighted point.
@@ -180,13 +195,14 @@ export function InlineVisualizer({
             pointY: prepared.data.y,
             hoveredPoint,
             selectedPoints,
+            emphasizedLinkKeys: emphasizedLinkKeys ?? null,
             textList: bundle.textList,
             showLabel: showLabels,
             showIndex: showLabels,
             labelOrder: prepared.labelOrder,
             pointSize: POINT_SIZE,
         },
-    }), [bundle.links, bundle.textList, prepared, hoveredPoint, selectedPoints, showLabels]);
+    }), [bundle.links, bundle.textList, prepared, hoveredPoint, selectedPoints, emphasizedLinkKeys, showLabels]);
 
     return (
         <div className={styles.inlineVisualizerBody}>
