@@ -89,7 +89,15 @@ function isRawModelInfo(value: unknown): value is RawModelInfo {
 }
 
 function isSafeSegment(value: string): boolean {
-  return /^[\w-]+$/.test(value)
+  // Task / probe ids may include non-ASCII (e.g. Chinese org names in
+  // Coding-CC-L2-Go_分组核心网...). Reject only path traversal / separators.
+  // Old /^[\w-]+$/ treated those ids as unsafe → middleware fell through to the
+  // SPA index.html, and the frontend then failed with
+  // `Unexpected token '<', "<!doctype "...`.
+  if (!value || value.length > 512) return false
+  if (value.includes('/') || value.includes('\\') || value.includes('\0')) return false
+  if (value === '.' || value === '..' || value.includes('..')) return false
+  return /^[\p{L}\p{N}_.-]+$/u.test(value)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

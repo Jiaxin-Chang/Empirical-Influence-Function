@@ -34,7 +34,6 @@ from src.loss import (
     compute_last_layer_correlation_gradient,
     compute_last_layer_match_and_probe_gradients,
     compute_last_layer_saliency_vector,
-    compute_last_layer_topk_probe_gradient,
     compute_lm_head_ce_gradient_no_backward,
     compute_lm_head_ce_gradient_scores_no_backward,
     compute_lm_head_ce_gradient_sketches_no_backward,
@@ -2756,30 +2755,29 @@ def run_causal_intervention_experiment(
                             )
                         torch.cuda.empty_cache()
                         continue
-                    src_list = [int(it["source_token_index"]) for it in top_test_correlations]
+                    # Per-edge ∇C / L_probe (same as full_alti). A previous
+                    # optimization reused one top-k-mean probe for every source,
+                    # which made UI edge switches show identical trains + cos_sim.
                     print(
-                        f"  Computing viz last_layer top-{len(src_list)} probe "
-                        f"(hidden_states forward + recompute last attn only)...",
+                        f"  Computing {len(top_test_correlations)} test "
+                        f"last_layer match/probe features (per source→target edge)...",
                         flush=True,
                     )
-                    try:
-                        feat_probe, _ = compute_last_layer_topk_probe_gradient(
+                    for item in top_test_correlations:
+                        p_idx = item["source_token_index"]
+                        pair = _compute_alti_match_and_probe_retry(
                             model=model,
                             batch=test_batch,
                             target_idx_in_seq=t,
-                            source_indices=src_list,
+                            source_idx_in_seq=p_idx,
                             param_filter_fn=fine_param_filter,
                             device=accelerator.device,
                         )
-                    except torch.OutOfMemoryError as exc:
-                        torch.cuda.empty_cache()
-                        raise RuntimeError(
-                            f"last_layer top-k probe OOM at target={t}: {exc}"
-                        ) from exc
-                    for item in top_test_correlations:
-                        p_idx = item["source_token_index"]
+                        if pair is None:
+                            continue
+                        feat_match, feat_probe = pair
                         test_corr_features[p_idx] = (
-                            feat_probe, feat_probe, item["source_token"], item["saliency_score"],
+                            feat_match, feat_probe, item["source_token"], item["saliency_score"],
                         )
                 else:
                     sal_vec = _saliency_fn(
@@ -2847,15 +2845,10 @@ def run_causal_intervention_experiment(
                 torch.cuda.empty_cache()
                 continue
 
-            # Stage 2: retrieve Top-K trains with viz L_probe gradient vs train bank
+            # Stage 2: per-edge bank Top-K (L_probe) → Stage 3 pair matching (∇C)
             token_pair_records: list = []
-            if _saliency_mode == "last_layer":
-                # One bank query per target (shared probe); Stage3 still walks edges for UI.
-                any_feat = next(iter(test_corr_features.values()))
-                feat_probe = any_feat[1]
-                probe_sketch = _project_flat_grad(
-                    feat_probe, prescreen_sketch_dim, prescreen_sketch_seed
-                )
+            for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
+                probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
                 edge_scores = _score_prescreen_sketch_cache(
                     probe_sketch,
                     saliency_train_bank,
@@ -2863,62 +2856,27 @@ def run_causal_intervention_experiment(
                 )
                 related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
                 print(
-                    f"  Target '{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} trains (shared L_probe): "
+                    f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
                     f"{[(i, round(s, 4)) for i, s in related_samples]}",
                     flush=True,
                 )
-                # Pass all edges once so Stage3 pair records cover each saliency source.
-                multi_edge_features = {
-                    p_idx: (feat_match, src_text, sal_score)
-                    for p_idx, (feat_match, _fp, src_text, sal_score) in test_corr_features.items()
-                }
+                single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
                 for rank, (train_idx, probe_score) in enumerate(related_samples):
                     print(
-                        f"\n  --- Train {train_idx} (rank={rank + 1}, "
-                        f"probe_cos={probe_score:.4f}) ---"
+                        f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
+                        f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
                     )
                     cached = train_sample_cache.get(str(train_idx))
                     detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                        train_idx, probe_score, multi_edge_features,
+                        train_idx, probe_score, single_edge_features,
                         target_tok_text, t,
-                        f"t{t}", pair_id_counter,
+                        f"t{t}_s{p_idx}", pair_id_counter,
                         cached_detail=cached,
                     )
                     if detail is not None:
                         train_sample_cache[str(train_idx)] = detail
                         token_pair_records.extend(pairs)
                 del probe_sketch, edge_scores
-            else:
-                for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
-                    probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
-                    edge_scores = _score_prescreen_sketch_cache(
-                        probe_sketch,
-                        saliency_train_bank,
-                        accelerator.device,
-                    )
-                    related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
-                    print(
-                        f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
-                        f"{[(i, round(s, 4)) for i, s in related_samples]}",
-                        flush=True,
-                    )
-                    single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
-                    for rank, (train_idx, probe_score) in enumerate(related_samples):
-                        print(
-                            f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
-                            f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
-                        )
-                        cached = train_sample_cache.get(str(train_idx))
-                        detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                            train_idx, probe_score, single_edge_features,
-                            target_tok_text, t,
-                            f"t{t}_s{p_idx}", pair_id_counter,
-                            cached_detail=cached,
-                        )
-                        if detail is not None:
-                            train_sample_cache[str(train_idx)] = detail
-                            token_pair_records.extend(pairs)
-                    del probe_sketch, edge_scores
 
             token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
             per_token_results.append({

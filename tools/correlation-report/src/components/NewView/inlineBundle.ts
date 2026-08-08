@@ -123,7 +123,22 @@ export async function loadInlineBundle(
         throw new Error(`未找到 ${sampleId} 的预计算 bundle (HTTP ${resp.status})。`);
     }
 
-    const raw = await resp.json() as RawBundle;
+    const contentType = resp.headers.get('content-type') || '';
+    const text = await resp.text();
+    if (!contentType.includes('application/json') || text.trimStart().startsWith('<')) {
+        throw new Error(
+            `加载 ${sampleId} 的 projection 时收到 HTML 而非 JSON（常见于 Vite 把未知路径回退成 index.html）。` +
+            `请确认 ttav_bundles_real/${sampleId}/projection.json 存在，且报告 UI 跑在 5273（带 /data 中间件）。`,
+        );
+    }
+    let raw: RawBundle;
+    try {
+        raw = JSON.parse(text) as RawBundle;
+    } catch (exc) {
+        throw new Error(
+            `解析 ${sampleId} 的 projection.json 失败: ${exc instanceof Error ? exc.message : String(exc)}`,
+        );
+    }
     const bundle = raw.bundle;
     if (!bundle) throw new Error(`${sampleId} 的 bundle 结构异常：缺少 bundle 字段。`);
 
