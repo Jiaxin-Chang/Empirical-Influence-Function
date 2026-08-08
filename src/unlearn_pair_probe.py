@@ -16,6 +16,7 @@ masked to -100).
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 from pathlib import Path
@@ -355,6 +356,42 @@ def _prepare_model_for_intervention_saliency(model, saliency_mode: str) -> None:
             m.eval()
 
 
+def _release_cuda_memory(model=None, *, reason: str = "") -> None:
+    """Drop transient graphs / allocator cache after each probe.
+
+    Unlearn does not write adapter junk to disk; OOM after a few clicks is
+    almost always VRAM fragmentation from long-seq last-layer attn (HxTxT)
+    plus the process-cached model. Call this in a ``finally`` every time.
+    """
+    if model is not None:
+        try:
+            model.eval()
+            model.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        if reason:
+            try:
+                free_b, total_b = torch.cuda.mem_get_info()
+                print(
+                    f"[unlearn] cuda after {reason}: "
+                    f"free={free_b / 1e9:.2f}G / total={total_b / 1e9:.2f}G",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+
 def _score_edge_saliency(
     model,
     batch: dict[str, torch.Tensor],
@@ -365,11 +402,14 @@ def _score_edge_saliency(
     source_index: int,
 ) -> float | None:
     _prepare_model_for_intervention_saliency(model, saliency_mode)
-    sal_vec = saliency_fn(model, batch, target_index)
+    # Ranking path is forward-only; keep activations off the autograd tape.
+    with torch.inference_mode():
+        sal_vec = saliency_fn(model, batch, target_index)
     score = None
     if 0 <= source_index < len(sal_vec):
         score = float(sal_vec[source_index])
     del sal_vec
+    _release_cuda_memory(model, reason="saliency")
     return score
 
 
@@ -725,9 +765,10 @@ def run_unlearn_pair_probe(
     finally:
         if params is not None and deltas is not None:
             _restore_filtered_ascent(params, deltas)
-        model.eval()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Drop ascent bookkeeping + any leftover activation refs.
+        params = None
+        deltas = None
+        _release_cuda_memory(model, reason="unlearn_finally")
 
     delta_ce = after_ce - base_ce
     delta_logprob = after_logprob - base_logprob
@@ -747,7 +788,7 @@ def run_unlearn_pair_probe(
     elif delta_ce < -1e-4:
         verdict = "opposite_effect"
 
-    return {
+    result = {
         "status": "success",
         "pairId": pair_id,
         "trainSampleId": int(train_sample_id),
@@ -796,3 +837,7 @@ def run_unlearn_pair_probe(
         "verdict": verdict,
         "restored": True,
     }
+    # Batches / report tensors can pin allocator pages until the request returns.
+    del test_batch, train_batch
+    _release_cuda_memory(model, reason="unlearn_return")
+    return result

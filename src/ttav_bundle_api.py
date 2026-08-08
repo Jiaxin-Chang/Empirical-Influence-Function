@@ -673,6 +673,11 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 )
         except Exception as exc:
             print(f"[unlearn] failed: {exc}", flush=True)
+            try:
+                from src.unlearn_pair_probe import _release_cuda_memory
+                _release_cuda_memory(reason="unlearn_api_error")
+            except Exception:
+                pass
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
 
