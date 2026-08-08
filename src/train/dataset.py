@@ -42,12 +42,40 @@ class AnnotatedSFTDataset(Dataset):
                  token_select: bool = False, token_select_threshold: float = 2.0,
                  token_select_keep_special: bool = True,
                  annot_skip: bool = False, annot_skip_keep_first: int = 2,
-                 annot_skip_keep_special: bool = True):
+                 annot_skip_keep_special: bool = True,
+                 supervise_eos: bool = True,
+                 raw_prompt_response: bool = False,
+                 raw_max_samples: int = 0):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.language = (language or "go").lower()
         self.items: list[dict] = []
+        # If compact labels mask the trailing <|im_end|>/EOS after the mid
+        # completion, unmask it so the model is trained to stop. Default ON —
+        # HuaWei oneshot compact currently leaves im_end as -100.
+        self.supervise_eos = bool(supervise_eos)
+        self._stop_token_ids = self._collect_stop_token_ids(tokenizer)
+        self._eos_fixed = 0
+        if self.supervise_eos:
+            logger.info(
+                f"supervise_eos ON: unmask trailing stop ids {sorted(self._stop_token_ids)} "
+                f"immediately after the last supervised completion token"
+            )
+
+        # TEMP debug path: {prompt, response, task_id} JSONL without compact
+        # tokenization / annotations. Intended for quick ce_only smoke runs on
+        # the raw enterprise-Go FIM dump; discard once proper compact data is back.
+        self.raw_prompt_response = bool(raw_prompt_response)
+        self.raw_max_samples = int(raw_max_samples or 0)
+        self._raw_skipped = 0
+        if self.raw_prompt_response:
+            logger.warning(
+                "raw_prompt_response ON (TEMPORARY DEBUG): tokenizing "
+                "{prompt,response} on the fly; no attention_edges. Prefer "
+                "loss_mode=ce_only. raw_max_samples=%s",
+                self.raw_max_samples or "all",
+            )
 
         # ── Edge-label augmentation (config-gated, default OFF) ────────────────
         self.edge_augment = bool(edge_augment)
@@ -84,40 +112,63 @@ class AnnotatedSFTDataset(Dataset):
         self.annot_skip_keep_special = bool(annot_skip_keep_special)
         self._as_excluded = 0
         self._as_total = 0
+        self._left_truncated = 0
+        self._edges_dropped_by_trunc = 0
         if self.annot_skip:
             logger.info(
                 f"Annot-skip ON: drop unannotated completion tokens "
                 f"(keep_first={self.annot_skip_keep_first}, "
                 f"keep_special={self.annot_skip_keep_special}, language={self.language})"
             )
+        logger.info(
+            f"Overlong sequences: left-truncate to max_len={max_len} "
+            f"(keep suffix; remap attention_edges; drop edges that fall outside)"
+        )
 
         with open(data_path, encoding="utf-8") as f:
             for line in f:
+                if self.raw_max_samples > 0 and len(self.items) >= self.raw_max_samples:
+                    break
                 line = line.strip()
                 if not line:
                     continue
                 entry = json.loads(line)
+
+                # TEMP: raw enterprise-Go FIM rows {prompt, response, task_id}.
+                if self.raw_prompt_response and "prompt" in entry and "response" in entry:
+                    built = self._build_from_raw_prompt_response(entry)
+                    if built is None:
+                        self._raw_skipped += 1
+                        continue
+                    input_ids, labels = built
+                    # No annotations on this path; empty edge list.
+                    self.items.append(self._make_item(input_ids, labels, []))
+                    continue
 
                 if "input_ids" in entry and ("label" in entry or "labels" in entry):
                     input_ids = [int(x) for x in entry["input_ids"]]
                     labels = [int(x) for x in entry.get("label", entry.get("labels", []))]
                     if not input_ids or len(input_ids) != len(labels):
                         continue
-                    if len(input_ids) > max_len:
+                    edges = entry.get("attention_edges", []) or []
+                    input_ids, labels, edges = self._left_truncate_align_edges(
+                        input_ids, labels, edges, max_len
+                    )
+                    if not input_ids or all(l == IGNORE_INDEX for l in labels):
                         continue
 
                     if self.token_select:
                         self._apply_token_select(entry, input_ids, labels)
                     if self.annot_skip:
-                        self._apply_annot_skip(
-                            input_ids, labels, entry.get("attention_edges", []),
-                        )
+                        self._apply_annot_skip(input_ids, labels, edges)
+                    if self.supervise_eos:
+                        self._ensure_eos_supervised(input_ids, labels)
 
-                    self.items.append(
-                        self._make_item(input_ids, labels, entry.get("attention_edges", []))
-                    )
+                    self.items.append(self._make_item(input_ids, labels, edges))
                     continue
 
+                if "task_id" not in entry:
+                    continue
                 task_id = entry["task_id"]
                 lang = task_id.split("/")[0]
                 if language is not None and lang.lower() != language.lower():
@@ -131,9 +182,6 @@ class AnnotatedSFTDataset(Dataset):
                     continue
 
                 input_ids = [t["token_id"] for t in tokens]
-                if len(input_ids) > max_len:
-                    continue
-
                 output_char_start = len(CHAT_PREFIX) + len(sft_input) + len(CHAT_MIDDLE)
 
                 output_token_start = len(input_ids)
@@ -143,13 +191,30 @@ class AnnotatedSFTDataset(Dataset):
                         break
 
                 labels = [IGNORE_INDEX] * output_token_start + input_ids[output_token_start:]
+                input_ids, labels, annotated_edges = self._left_truncate_align_edges(
+                    input_ids, labels, annotated_edges or [], max_len
+                )
+                if not input_ids or all(l == IGNORE_INDEX for l in labels):
+                    continue
 
                 if self.annot_skip:
                     self._apply_annot_skip(input_ids, labels, annotated_edges)
+                if self.supervise_eos:
+                    self._ensure_eos_supervised(input_ids, labels)
 
                 self.items.append(self._make_item(input_ids, labels, annotated_edges))
 
         logger.info(f"Loaded {len(self.items)} samples from {data_path}")
+        if self._left_truncated:
+            logger.info(
+                f"Left-truncated {self._left_truncated} overlong samples to max_len={max_len}; "
+                f"dropped {self._edges_dropped_by_trunc} edges that fell outside the kept window"
+            )
+        if self.raw_prompt_response:
+            logger.info(
+                f"raw_prompt_response: kept={len(self.items)} skipped={self._raw_skipped} "
+                f"(empty/too-long response or overlong after budget)"
+            )
         if self.token_select and self._ts_total:
             logger.info(
                 f"Token selection: excluded {self._ts_excluded}/{self._ts_total} scored "
@@ -162,6 +227,129 @@ class AnnotatedSFTDataset(Dataset):
                 f"tokens ({100*self._as_excluded/self._as_total:.1f}%) as unannotated "
                 f"(kept first {self.annot_skip_keep_first} + keyword/punct/whitespace)"
             )
+        if self.supervise_eos and self._eos_fixed:
+            logger.info(
+                f"supervise_eos: unmasked trailing stop token on {self._eos_fixed}/{len(self.items)} samples"
+            )
+
+    def _build_from_raw_prompt_response(self, entry) -> tuple[list[int], list[int]] | None:
+        """Tokenize a raw FIM row: prompt (context) + response (mid) + EOS.
+
+        Prompt already carries <PRE>/<SUF>/<MID> + ``### Response:`` — no chat
+        template is added (matches eval / newgo compact builder). Labels ignore
+        the prompt and supervise response + EOS. Prompt is left-truncated if needed.
+        """
+        prompt = entry.get("prompt", "") or ""
+        resp = entry.get("response", "") or ""
+        if not prompt or not resp.strip():
+            return None
+        tok = self.tokenizer
+        eos_id = tok.eos_token_id
+        if eos_id is None:
+            # Qwen chat end as last resort
+            eos_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if not isinstance(eos_id, int) or eos_id < 0:
+            raise RuntimeError("tokenizer has no usable eos_token_id for raw_prompt_response")
+
+        prompt_ids = tok(prompt, add_special_tokens=False).input_ids
+        resp_ids = tok(resp, add_special_tokens=False).input_ids
+        if not resp_ids:
+            return None
+        budget = self.max_len - len(resp_ids) - 1
+        if budget <= 0:
+            return None
+        if len(prompt_ids) > budget:
+            prompt_ids = prompt_ids[-budget:]
+        n_prompt = len(prompt_ids)
+        input_ids = prompt_ids + resp_ids + [int(eos_id)]
+        labels = [IGNORE_INDEX] * n_prompt + list(resp_ids) + [int(eos_id)]
+        return input_ids, labels
+
+    def _left_truncate_align_edges(self, input_ids, labels, edges, max_len):
+        """Keep the last ``max_len`` tokens; shift edge endpoints by the drop.
+
+        Edges whose src/dst land outside ``[0, new_len)`` after the shift are
+        dropped (typically context→context that lived entirely in the cropped
+        prefix). Completion tokens usually sit near the end, so left-truncate
+        preserves MID supervision more often than right-truncate / skip.
+        """
+        n = len(input_ids)
+        if n <= max_len:
+            return input_ids, labels, list(edges or [])
+
+        drop = n - max_len
+        input_ids = input_ids[drop:]
+        labels = labels[drop:]
+        new_len = len(input_ids)
+        kept_edges = []
+        n_in = 0
+        for e in edges or []:
+            n_in += 1
+            qi = e.get("src", e.get("source", e.get("token_i_idx", -1)))
+            qj = e.get("dst", e.get("target", e.get("token_j_idx", -1)))
+            try:
+                qi = int(qi) - drop
+                qj = int(qj) - drop
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= qi < qj < new_len):
+                continue
+            ne = dict(e)
+            if "src" in ne or "dst" in ne:
+                ne["src"] = qi
+                ne["dst"] = qj
+            if "source" in ne or "target" in ne:
+                ne["source"] = qi
+                ne["target"] = qj
+            if "token_i_idx" in ne or "token_j_idx" in ne:
+                ne["token_i_idx"] = qi
+                ne["token_j_idx"] = qj
+            kept_edges.append(ne)
+
+        self._left_truncated += 1
+        self._edges_dropped_by_trunc += max(0, n_in - len(kept_edges))
+        return input_ids, labels, kept_edges
+
+    @staticmethod
+    def _collect_stop_token_ids(tokenizer) -> set[int]:
+        ids: set[int] = set()
+        for tok in ("<|im_end|>", getattr(tokenizer, "eos_token", None)):
+            if not tok:
+                continue
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0 and tid != getattr(tokenizer, "unk_token_id", None):
+                ids.add(int(tid))
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(eos_id, int) and eos_id >= 0:
+            ids.add(int(eos_id))
+        return ids
+
+    def _ensure_eos_supervised(self, input_ids, labels):
+        """Unmask the stop token right after the last supervised completion token.
+
+        Many compact builders put ``<|im_end|>`` in ``input_ids`` but leave its
+        label as IGNORE_INDEX, so CE never teaches the model to stop. If the
+        token immediately following the last non-IGNORE label is a known stop
+        id and currently ignored, set ``labels[j] = input_ids[j]``.
+        """
+        if not self._stop_token_ids:
+            return
+        last = -1
+        for i in range(len(labels) - 1, -1, -1):
+            if labels[i] != IGNORE_INDEX:
+                last = i
+                break
+        if last < 0:
+            return
+        j = last + 1
+        if j >= len(labels):
+            return
+        if labels[j] != IGNORE_INDEX:
+            return
+        if int(input_ids[j]) not in self._stop_token_ids:
+            return
+        labels[j] = int(input_ids[j])
+        self._eos_fixed += 1
 
     def _apply_token_select(self, entry, input_ids, labels):
         """Exclude 'missing-info' completion tokens from the loss in-place."""

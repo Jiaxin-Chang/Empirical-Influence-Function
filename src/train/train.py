@@ -10,6 +10,7 @@ from typing import Optional, Literal
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import transformers
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_callback import TrainerCallback
@@ -209,8 +210,29 @@ class AnnotatedSFTTrainer(Trainer):
                  edge_temperature: float = 1.0,
                  edge_layer: int = -1,
                  attn_bias_init: float = 1.0,
+                 eos_loss_weight: float = 1.0,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        self.eos_loss_weight = float(eos_loss_weight if eos_loss_weight is not None else 1.0)
+        tok = (
+            getattr(self, "processing_class", None)
+            or getattr(self, "tokenizer", None)
+            or kwargs.get("processing_class")
+            or kwargs.get("tokenizer")
+        )
+        self._stop_token_ids: set[int] = set()
+        if tok is not None:
+            for name in ("<|im_end|>", getattr(tok, "eos_token", None)):
+                if not name:
+                    continue
+                tid = tok.convert_tokens_to_ids(name)
+                if isinstance(tid, int) and tid >= 0 and tid != getattr(tok, "unk_token_id", None):
+                    self._stop_token_ids.add(int(tid))
+            if getattr(tok, "eos_token_id", None) is not None:
+                self._stop_token_ids.add(int(tok.eos_token_id))
+        # Hardcode Qwen chat end id as fallback (common in this repo's compact data).
+        if not self._stop_token_ids:
+            self._stop_token_ids.add(151645)
         self.saliency_lambda = saliency_lambda
         self.saliency_alpha = saliency_alpha
         self.saliency_eps = saliency_eps
@@ -333,6 +355,32 @@ class AnnotatedSFTTrainer(Trainer):
             logger.info("Added %d auxiliary (edge/attn-bias) params to the optimizer.", len(extra))
         self._extra_optim_params_added = True
         return optimizer
+
+    def _ntp_loss_from_outputs(self, outputs, labels: torch.Tensor) -> torch.Tensor:
+        """Standard mean CE, optionally up-weighting stop tokens (``eos_loss_weight``)."""
+        if self.eos_loss_weight == 1.0 or not self._stop_token_ids:
+            loss = outputs.loss
+            if loss.dim() > 0:
+                loss = loss.mean()
+            return loss
+        logits = outputs.logits
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        vocab = shift_logits.size(-1)
+        token_loss = F.cross_entropy(
+            shift_logits.view(-1, vocab),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+        ).view_as(shift_labels)
+        weights = torch.ones_like(token_loss)
+        stop = torch.zeros_like(shift_labels, dtype=torch.bool)
+        for sid in self._stop_token_ids:
+            stop |= shift_labels.eq(sid)
+        weights = torch.where(stop, weights * self.eos_loss_weight, weights)
+        valid = shift_labels.ne(IGNORE_INDEX)
+        denom = valid.sum().clamp_min(1)
+        return (token_loss * weights * valid).sum() / denom
 
     def _build_exclude_source_mask(self, input_ids):
         """[B, T] bool mask: True = drop this source token from the saliency
@@ -669,6 +717,8 @@ class AnnotatedSFTTrainer(Trainer):
             "output_attentions": needs_saliency,
             "output_hidden_states": needs_saliency,
         }
+        # Always pass labels for CE modes; when eos_loss_weight != 1 we recompute
+        # a weighted NTP from logits so HF's mean CE is not used as-is.
         if self.loss_mode != "saliency_only":
             forward_kwargs["labels"] = inputs["labels"]
         outputs = model(**forward_kwargs)
@@ -676,9 +726,7 @@ class AnnotatedSFTTrainer(Trainer):
         if self.loss_mode == "saliency_only":
             ntp_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
         else:
-            ntp_loss = outputs.loss
-            if ntp_loss.dim() > 0:
-                ntp_loss = ntp_loss.mean()
+            ntp_loss = self._ntp_loss_from_outputs(outputs, inputs["labels"])
 
         diag = None
         saliency_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
@@ -952,10 +1000,26 @@ class DataArguments:
         default=True,
         metadata={"help": "[annot_skip] Never drop special tokens (EOS/im_end) even if unannotated."},
     )
+    supervise_eos: bool = field(
+        default=True,
+        metadata={"help": "If True, unmask a trailing <|im_end|>/EOS that sits right after the last supervised completion token but is labeled -100. Fixes compact data that never trains the model to stop. Set False for legacy label behavior."},
+    )
+    raw_prompt_response: bool = field(
+        default=False,
+        metadata={"help": "TEMPORARY DEBUG: load raw {prompt,response,task_id} JSONL (no compact / no annotations), tokenize on the fly for ce_only smoke runs. Default OFF."},
+    )
+    raw_max_samples: int = field(
+        default=0,
+        metadata={"help": "TEMPORARY DEBUG: if >0 with raw_prompt_response, only keep the first N valid raw rows (0 = all)."},
+    )
 
 
 @dataclass
 class SFTTrainingArguments(TrainingArguments):
+    eos_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "Multiply CE loss on stop tokens (<|im_end|>/EOS). 1.0 = uniform CE (default). Try 2~5 if the model over-generates past mid."},
+    )
     saliency_lambda: float = field(
         default=0.1,
         metadata={"help": "Weight γ in L_total = L_next + γ·L_contrib."}
@@ -1187,7 +1251,16 @@ def train():
         annot_skip=data_args.annot_skip,
         annot_skip_keep_first=data_args.annot_skip_keep_first,
         annot_skip_keep_special=data_args.annot_skip_keep_special,
+        supervise_eos=data_args.supervise_eos,
+        raw_prompt_response=data_args.raw_prompt_response,
+        raw_max_samples=data_args.raw_max_samples,
     )
+    if data_args.raw_prompt_response and training_args.loss_mode not in ("ce_only",):
+        logger.warning(
+            "raw_prompt_response=True but loss_mode=%s: raw rows have no "
+            "attention_edges; saliency/cfmask will be a no-op or weak. Prefer ce_only.",
+            training_args.loss_mode,
+        )
     eval_dataset = None
     if data_args.eval_data_path:
         eval_dataset = AnnotatedSFTDataset(
@@ -1203,6 +1276,9 @@ def train():
             annot_skip=data_args.annot_skip,
             annot_skip_keep_first=data_args.annot_skip_keep_first,
             annot_skip_keep_special=data_args.annot_skip_keep_special,
+            supervise_eos=data_args.supervise_eos,
+            raw_prompt_response=data_args.raw_prompt_response,
+            raw_max_samples=data_args.raw_max_samples,
         )
         if data_args.eval_max_samples > 0 and len(eval_dataset) > data_args.eval_max_samples:
             # Deterministic first-N subsample. Direct slice of internal list keeps
@@ -1325,6 +1401,7 @@ def train():
         edge_temperature=training_args.edge_temperature,
         edge_layer=training_args.edge_layer,
         attn_bias_init=training_args.attn_bias_init,
+        eos_loss_weight=training_args.eos_loss_weight,
         callbacks=callbacks,
     )
     if eval_breakdown_cb is not None:

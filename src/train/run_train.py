@@ -37,10 +37,24 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
     data = cfg.get("data", {})
     model = cfg.get("model", default_model())
 
-    train_ds = get_dataset(data["train"])
-    if train_ds.format != "compact":
-        raise ValueError(f"train dataset {train_ds.name} must be compact, got {train_ds.format}")
-    n = train_ds.n or sum(1 for _ in open(train_ds.path))
+    # TEMP DEBUG: data.raw_path + raw_prompt_response bypasses the compact registry.
+    raw_path = data.get("raw_path")
+    use_raw = bool(data.get("raw_prompt_response") or raw_path)
+    if use_raw:
+        if not raw_path:
+            raise ValueError("data.raw_prompt_response requires data.raw_path to a {prompt,response} JSONL")
+        train_path = Path(raw_path)
+        if not train_path.is_absolute():
+            train_path = (REPO / train_path).resolve()
+        n = int(data.get("raw_max_samples") or 0) or sum(1 for _ in open(train_path, encoding="utf-8"))
+        train_ds_path = str(train_path)
+        train_ds = None
+    else:
+        train_ds = get_dataset(data["train"])
+        if train_ds.format != "compact":
+            raise ValueError(f"train dataset {train_ds.name} must be compact, got {train_ds.format}")
+        n = train_ds.n or sum(1 for _ in open(train_ds.path))
+        train_ds_path = str(train_ds.path)
 
     bs = int(t.get("batch_size", 1))
     ga = int(t.get("grad_accum", 8))
@@ -61,7 +75,7 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
     argv = [
         *launcher, str(TRAIN_PY),
         "--model_name_or_path", str(model),
-        "--data_path", str(train_ds.path),
+        "--data_path", train_ds_path,
         "--output_dir", str(paths.checkpoints),
         "--use_peft", "False" if full_ft else "True",
         "--loss_mode", str(t.get("loss_mode", "ce_only")),
@@ -131,7 +145,23 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
             "--annot_skip_keep_special", "True" if ask.get("keep_special", True) else "False",
         ]
 
+    # ---- trailing EOS supervision (default ON; set supervise_eos: false to disable)
+    if "supervise_eos" in data:
+        argv += ["--supervise_eos", "True" if data.get("supervise_eos") else "False"]
+    elif "supervise_eos" in t:
+        argv += ["--supervise_eos", "True" if t.get("supervise_eos") else "False"]
+
+    if t.get("eos_loss_weight") is not None:
+        argv += ["--eos_loss_weight", str(t.get("eos_loss_weight"))]
+
+    if use_raw:
+        argv += ["--raw_prompt_response", "True"]
+        if data.get("raw_max_samples"):
+            argv += ["--raw_max_samples", str(int(data["raw_max_samples"]))]
+
     valid_name = data.get("valid")
+    if use_raw:
+        valid_name = None  # raw debug path has no registry valid set
     if valid_name:
         valid_ds = get_dataset(valid_name)
         argv += [
