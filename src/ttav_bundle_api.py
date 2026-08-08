@@ -642,7 +642,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         model_path = str(raw_model_path).strip() if raw_model_path else None
         raw_base_path = req.get("baseModelPath")
         base_model_path = str(raw_base_path).strip() if raw_base_path else None
-        unlearn_lr = float(req.get("unlearnLr", 1.0))
+        unlearn_lr = float(req.get("unlearnLr", 20.0))
         normalize_grad = not bool(req.get("noNormalizeGrad", False))
         recompute_saliency = bool(req.get("recomputeSaliency", True))
 
@@ -668,6 +668,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     unlearn_lr=unlearn_lr,
                     normalize_grad=normalize_grad,
                     recompute_saliency=recompute_saliency,
+                    sample_id=str(req.get("sampleId", "")).strip() or None,
+                    report_json_path=str(report_json_path),
                 )
         except Exception as exc:
             print(f"[unlearn] failed: {exc}", flush=True)

@@ -653,16 +653,138 @@ def _safe_filename_token(value: str | None, fallback: str = "x") -> str:
     return tag or fallback
 
 
+def _report_base_dir() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _write_json_report(report_json: dict, report_filename: str, accelerator) -> str | None:
-    """Write a report JSON from the main process and return its path."""
+    """Atomically write a report JSON from the main process and return its path."""
     if not accelerator.is_main_process:
         return None
     report_json = round_floats(report_json, 5)
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    report_path = os.path.join(base_dir, report_filename)
-    with open(report_path, "w", encoding="utf-8") as f:
+    report_path = os.path.join(_report_base_dir(), report_filename)
+    tmp_path = report_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(report_json, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, report_path)
     return report_path
+
+
+def _public_train_sample_details(train_sample_cache: dict) -> dict:
+    """Strip in-memory Stage3 keys (tensors / candidate lists) before JSON dump."""
+    return {
+        k: {fk: fv for fk, fv in v.items() if not fk.startswith("_")}
+        for k, v in train_sample_cache.items()
+    }
+
+
+def _resume_fingerprint(
+    *,
+    task_id: str,
+    model_path: str | None,
+    model_tag: str,
+    test_index: int,
+    prompt_len: int,
+    full_token_ids: list,
+    max_output_tokens: int,
+    saliency_mode: str,
+    bank_loss_mode: str,
+    top_k_prompt: int,
+    top_k_prompt_offset: int,
+    top_k_train: int,
+) -> dict:
+    """Stable fields used to decide whether an on-disk report can be resumed."""
+    ids = list(full_token_ids or [])
+    return {
+        "task_id": task_id,
+        "model_path": str(model_path or ""),
+        "model_name": model_tag,
+        "test_sample_index": int(test_index),
+        "prompt_len": int(prompt_len),
+        "attr_token_count": max(0, len(ids) - int(prompt_len)),
+        "attr_sha1_12": hashlib.sha1(
+            ",".join(str(i) for i in ids[int(prompt_len):]).encode("utf-8")
+        ).hexdigest()[:12],
+        "max_output_tokens": int(max_output_tokens),
+        "saliency_mode": str(saliency_mode),
+        "bank_loss_mode": str(bank_loss_mode),
+        "top_k_prompt_tokens": int(top_k_prompt),
+        "top_k_prompt_offset": int(top_k_prompt_offset),
+        "top_k_train_samples": int(top_k_train),
+    }
+
+
+def _try_load_all_tokens_progress(
+    report_filename: str,
+    expected_fp: dict,
+) -> tuple[list, dict, set[int]] | None:
+    """Load partial/final report for resume if fingerprint matches.
+
+    Returns ``(per_token_results, train_sample_details, done_target_indices)``
+    or ``None`` when missing / incompatible / complete with nothing left.
+    """
+    report_path = os.path.join(_report_base_dir(), report_filename)
+    if not os.path.isfile(report_path):
+        return None
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[resume] ignore unreadable report {report_path}: {exc}", flush=True)
+        return None
+
+    meta = data.get("experiment_meta") or {}
+    cfg = meta.get("config") or {}
+    baseline = data.get("test_sample_baseline") or {}
+    ids = baseline.get("full_token_ids") or []
+    prompt_len = int(baseline.get("prompt_len") or 0)
+    got_fp = {
+        "task_id": meta.get("task_id"),
+        "model_path": str(meta.get("model_path") or ""),
+        "model_name": meta.get("model_name"),
+        "test_sample_index": int(meta.get("test_sample_index") or -1),
+        "prompt_len": prompt_len,
+        "attr_token_count": max(0, len(ids) - prompt_len),
+        "attr_sha1_12": hashlib.sha1(
+            ",".join(str(i) for i in ids[prompt_len:]).encode("utf-8")
+        ).hexdigest()[:12],
+        "max_output_tokens": int(meta.get("max_output_tokens") or 0),
+        "saliency_mode": str(cfg.get("SALIENCY_MODE") or ""),
+        "bank_loss_mode": str(cfg.get("BANK_LOSS_MODE") or ""),
+        "top_k_prompt_tokens": int(cfg.get("TOP_K_PROMPT_TOKENS") or 0),
+        "top_k_prompt_offset": int(cfg.get("TOP_K_PROMPT_OFFSET") or 0),
+        "top_k_train_samples": int(cfg.get("TOP_K_TRAIN_SAMPLES") or 0),
+    }
+    mismatches = [k for k in expected_fp if expected_fp[k] != got_fp.get(k)]
+    if mismatches:
+        print(
+            f"[resume] existing report fingerprint mismatch "
+            f"({', '.join(mismatches)}); starting fresh → {report_path}",
+            flush=True,
+        )
+        return None
+
+    per_token = list(data.get("per_token_results") or [])
+    details = dict(data.get("train_sample_details") or {})
+    done = {
+        int(r["target_token_index"])
+        for r in per_token
+        if isinstance(r, dict) and "target_token_index" in r
+    }
+    if not done:
+        return None
+    is_partial = bool(meta.get("is_partial") or meta.get("is_checkpoint"))
+    if not is_partial and meta.get("stage") not in (None, "all_tokens_partial"):
+        # Finished report with same fingerprint: still allow resume if caller
+        # expects more tokens (e.g. raised --max-output-tokens).
+        pass
+    print(
+        f"[resume] loaded {len(done)} finished target token(s) from {report_path}",
+        flush=True,
+    )
+    return per_token, details, done
 
 
 def _flat_grad_on_device(
@@ -1546,6 +1668,7 @@ def run_causal_intervention_experiment(
     attr_max_seq_len: int | None = ATTR_MAX_SEQ_LEN,
     bank_left_truncate: bool = True,
     bank_max_seq_len: int | None = None,
+    resume: bool = True,
 ):
     import sys; sys.stdout.reconfigure(line_buffering=True)
     print("[DEBUG] Initializing Accelerator...", flush=True)
@@ -1677,6 +1800,21 @@ def run_causal_intervention_experiment(
         print(f"[DEBUG] Limiting train samples: {len(train_samples)} -> {train_limit}", flush=True)
         train_samples = train_samples[:train_limit]
     print(f"[DEBUG] Loaded {len(train_samples)} train, {len(test_samples)} test samples.", flush=True)
+    if not train_samples:
+        raise ValueError(
+            f"No train samples loaded from {train_data!r}. "
+            "Compact graphsignal JSONL (input_ids/label only) is not accepted directly — "
+            "convert first, e.g.\n"
+            "  python tools/compact_to_chat_jsonl.py \\\n"
+            "    --tokenizer <Qwen3-8B> \\\n"
+            "    --input smoke_train_data.jsonl \\\n"
+            "    --output smoke_train_data_chat.jsonl"
+        )
+    if not test_samples:
+        raise ValueError(
+            f"No test samples loaded from {test_data!r}. "
+            "Need messages[], or prompt+label/response/predict fields."
+        )
 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer, model=model,
@@ -2026,6 +2164,7 @@ def run_causal_intervention_experiment(
         correct_full_tokens = gen_result.get("full_tokens", [pred_full_tokens])[0]
     gen_result = {
         "pred_full_tokens": [pred_full_tokens],
+        "pred_full_token_ids": [_prompt_id_list + _pred_id_list],
         "full_tokens": [correct_full_tokens],
     }
 
@@ -2149,7 +2288,8 @@ def run_causal_intervention_experiment(
 
             response_start = find_first_valid_token_index(tokenizer, tr_batch["input_ids"], start_sys)
             tr_seq_len     = tr_batch["input_ids"].size(1)
-            full_tokens    = [tokenizer.decode([i]) for i in tr_batch["input_ids"][0].tolist()]
+            full_token_ids = [int(i) for i in tr_batch["input_ids"][0].tolist()]
+            full_tokens    = [tokenizer.decode([i]) for i in full_token_ids]
             target_saliencies: dict[int, list[float]] = {}
             candidate_pairs: list[tuple[float, int, int]] = []
 
@@ -2210,6 +2350,7 @@ def run_causal_intervention_experiment(
 
             cached_detail = {
                 "full_tokens":             full_tokens,
+                "full_token_ids":          full_token_ids,
                 "answer_start_index":      response_start,
                 "coarse_cos_sim":          float(coarse_score),
                 "saliencies_by_token":     {str(k): v for k, v in target_saliencies.items()},
@@ -2367,12 +2508,15 @@ def run_causal_intervention_experiment(
     # ── ALL-TOKENS MODE ──────────────────────────────────────────────────────
     # ════════════════════════════════════════════════════════════════════════════
     max_end = min(prompt_len + MAX_OUTPUT_TOKENS, seq_len)
-    valid_test_tokens = [
-        t for t in range(prompt_len, max_end)
-        if not is_trivial_token(tokenizer, int(test_batch["input_ids"][0, t].item()))
-    ]
-    print(f"\nAll-tokens mode: {len(valid_test_tokens)} semantic tokens "
-          f"(from {max_end - prompt_len} response tokens, trivial skipped)")
+    # Every completion token in the window is a target (including `}`, `)`,
+    # whitespace, etc.). Trivial filtering still applies to *source* ranking
+    # via top_nontrivial_saliency_sources, and to Stage3 train-answer scan.
+    valid_test_tokens = list(range(prompt_len, max_end))
+    print(
+        f"\nAll-tokens mode: {len(valid_test_tokens)} target tokens "
+        f"(all response tokens in window; trivial NOT skipped as targets)",
+        flush=True,
+    )
 
     # ── Bank checkpoint (replaces CE global pre-screen) ──────────────────────
     # Top-K trains are retrieved per test edge (s→t) via cos(sketch(f_test), bank).
@@ -2427,6 +2571,7 @@ def run_causal_intervention_experiment(
         },
         "test_sample_baseline": {
             "full_tokens": gen_result["pred_full_tokens"][0],
+            "full_token_ids": gen_result["pred_full_token_ids"][0],
             "correct_full_tokens": gen_result["full_tokens"][0],
             "prompt_len": prompt_len,
         },
@@ -2437,189 +2582,280 @@ def run_causal_intervention_experiment(
     prescreen_filename = (
         f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens{_sal_tag}_prescreen.json"
     )
+    report_filename = (
+        f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens"
+        f"{saliency_rank_filename_tag()}.json"
+    )
     prescreen_path = _write_json_report(prescreen_report_json, prescreen_filename, accelerator)
     if prescreen_path is not None:
         print(f"  Bank checkpoint saved → {prescreen_path}", flush=True)
 
     # ── Per-token loop: ALTI → per-edge bank Top-K → Stage 3 pair matching ──
-    per_token_results: list  = []
+    per_token_results: list = []
     train_sample_cache: dict = {}   # str(train_idx) → detail dict (with _candidate_pairs, _tr_batch_cpu)
+    prior_train_details: dict = {}  # public details restored from a partial report
     pair_id_counter = 0
+    done_target_indices: set[int] = set()
 
-    for t in tqdm(valid_test_tokens, desc="Test tokens",
-                  disable=not accelerator.is_local_main_process):
-        target_tok_id   = int(test_batch["input_ids"][0, t].item())
-        target_tok_text = tokenizer.decode([target_tok_id])
-        print(f"\n=== Token {t}: '{target_tok_text}' ===")
-
-        # Stage 1: saliency sources + probe features
-        test_corr_features: dict = {}
-        with torch.inference_mode(False):
-            if _saliency_mode == "last_layer":
-                # Ranking uses a cheap no-grad forward (hidden_states only, no all-layer attn).
-                sal_vec = _saliency_fn(
-                    model,
-                    test_batch,
-                    t,
-                    chunk_size=ALTI_CHUNK_SIZE,
-                )
-                top_test_corr = top_nontrivial_saliency_sources(
-                    tokenizer,
-                    test_batch["input_ids"][0],
-                    sal_vec,
-                    TOP_K_PROMPT_TOKENS,
-                    offset=TOP_K_PROMPT_OFFSET,
-                )
-                top_test_correlations = [
-                    {
-                        "source_token_index": idx,
-                        "source_token": tokenizer.decode(
-                            [int(test_batch["input_ids"][0, idx].item())]
-                        ),
-                        "target_token_index": t,
-                        "target_token": target_tok_text,
-                        "saliency_score": float(score),
-                        "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
-                    }
-                    for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
-                ]
-                if not top_test_correlations:
-                    per_token_results.append({
-                        "target_token_index": t,
-                        "target_token": target_tok_text,
-                        "top_correlations": [],
-                        "correlation_pairs": [],
-                    })
-                    torch.cuda.empty_cache()
-                    continue
-                src_list = [int(it["source_token_index"]) for it in top_test_correlations]
-                print(
-                    f"  Computing viz last_layer top-{len(src_list)} probe "
-                    f"(hidden_states forward + recompute last attn only)...",
-                    flush=True,
-                )
-                try:
-                    feat_probe, _ = compute_last_layer_topk_probe_gradient(
-                        model=model,
-                        batch=test_batch,
-                        target_idx_in_seq=t,
-                        source_indices=src_list,
-                        param_filter_fn=fine_param_filter,
-                        device=accelerator.device,
-                    )
-                except torch.OutOfMemoryError as exc:
-                    torch.cuda.empty_cache()
-                    raise RuntimeError(
-                        f"last_layer top-k probe OOM at target={t}: {exc}"
-                    ) from exc
-                for item in top_test_correlations:
-                    p_idx = item["source_token_index"]
-                    test_corr_features[p_idx] = (
-                        feat_probe, feat_probe, item["source_token"], item["saliency_score"],
-                    )
-            else:
-                sal_vec = _saliency_fn(
-                    model,
-                    test_batch,
-                    t,
-                    chunk_size=ALTI_CHUNK_SIZE,
-                )
-                top_test_corr = top_nontrivial_saliency_sources(
-                    tokenizer,
-                    test_batch["input_ids"][0],
-                    sal_vec,
-                    TOP_K_PROMPT_TOKENS,
-                    offset=TOP_K_PROMPT_OFFSET,
-                )
-                top_test_correlations = [
-                    {
-                        "source_token_index": idx,
-                        "source_token": tokenizer.decode(
-                            [int(test_batch["input_ids"][0, idx].item())]
-                        ),
-                        "target_token_index": t,
-                        "target_token": target_tok_text,
-                        "saliency_score": float(score),
-                        "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
-                    }
-                    for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
-                ]
-                print(
-                    f"  Computing {len(top_test_correlations)} test "
-                    f"{_saliency_mode} match/probe features..."
-                )
-                for item in top_test_correlations:
-                    p_idx = item["source_token_index"]
-                    pair = _compute_alti_match_and_probe_retry(
-                        model=model,
-                        batch=test_batch,
-                        target_idx_in_seq=t,
-                        source_idx_in_seq=p_idx,
-                        param_filter_fn=fine_param_filter,
-                        device=accelerator.device,
-                    )
-                    if pair is None:
-                        continue
-                    feat_match, feat_probe = pair
-                    test_corr_features[p_idx] = (
-                        feat_match, feat_probe, item["source_token"], item["saliency_score"],
-                    )
-
-        if not test_corr_features:
-            print(f"  No ALTI-gradient test features survived for token {t}; skipping retrieval/Stage 3.")
-            per_token_results.append({
-                "target_token_index": t,
-                "target_token":       target_tok_text,
-                "top_correlations":   top_test_correlations,
-                "correlation_pairs":  [],
-            })
-            torch.cuda.empty_cache()
-            continue
-
-        # Stage 2: retrieve Top-K trains with viz L_probe gradient vs train bank
-        token_pair_records: list = []
-        if _saliency_mode == "last_layer":
-            # One bank query per target (shared probe); Stage3 still walks edges for UI.
-            any_feat = next(iter(test_corr_features.values()))
-            feat_probe = any_feat[1]
-            probe_sketch = _project_flat_grad(
-                feat_probe, prescreen_sketch_dim, prescreen_sketch_seed
-            )
-            edge_scores = _score_prescreen_sketch_cache(
-                probe_sketch,
-                saliency_train_bank,
-                accelerator.device,
-            )
-            related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
+    resume_fp = _resume_fingerprint(
+        task_id=_task_id,
+        model_path=model_path,
+        model_tag=model_tag,
+        test_index=SELECTED_TEST_SAMPLE_INDEX,
+        prompt_len=prompt_len,
+        full_token_ids=gen_result["pred_full_token_ids"][0],
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        saliency_mode=_saliency_mode,
+        bank_loss_mode=bank_cfg.loss_mode,
+        top_k_prompt=TOP_K_PROMPT_TOKENS,
+        top_k_prompt_offset=TOP_K_PROMPT_OFFSET,
+        top_k_train=TOP_K_TRAIN_SAMPLES,
+    )
+    if resume:
+        loaded = _try_load_all_tokens_progress(report_filename, resume_fp)
+        if loaded is not None:
+            per_token_results, prior_train_details, done_target_indices = loaded
+            pending = [t for t in valid_test_tokens if int(t) not in done_target_indices]
             print(
-                f"  Target '{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} trains (shared L_probe): "
-                f"{[(i, round(s, 4)) for i, s in related_samples]}",
+                f"[resume] skip {len(done_target_indices)} done; "
+                f"{len(pending)}/{len(valid_test_tokens)} target token(s) remaining "
+                f"→ {report_filename}",
                 flush=True,
             )
-            # Pass all edges once so Stage3 pair records cover each saliency source.
-            multi_edge_features = {
-                p_idx: (feat_match, src_text, sal_score)
-                for p_idx, (feat_match, _fp, src_text, sal_score) in test_corr_features.items()
-            }
-            for rank, (train_idx, probe_score) in enumerate(related_samples):
-                print(
-                    f"\n  --- Train {train_idx} (rank={rank + 1}, "
-                    f"probe_cos={probe_score:.4f}) ---"
+            if not pending:
+                print("[resume] all target tokens already present; rewriting final report.", flush=True)
+
+    def _flush_all_tokens_report(*, partial: bool) -> str | None:
+        """Persist current per-token progress into the main report JSON."""
+        per_token_results.sort(
+            key=lambda r: int(r.get("target_token_index", -1))
+            if isinstance(r, dict) else -1
+        )
+        merged_details = {
+            **prior_train_details,
+            **_public_train_sample_details(train_sample_cache),
+        }
+        payload = {
+            "experiment_meta": {
+                "test_sample_index": SELECTED_TEST_SAMPLE_INDEX,
+                "task_id": _task_id,
+                "model_name": model_tag,
+                "model_path": model_path,
+                "mode": "all_tokens",
+                "stage": "all_tokens_partial" if partial else "all_tokens",
+                "is_partial": bool(partial),
+                "is_checkpoint": bool(partial),
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+                "tokens_analyzed": len(per_token_results),
+                "tokens_expected": len(valid_test_tokens),
+                "screening": TRAIN_RETRIEVAL_METHOD,
+                "config": {
+                    "TOP_K_PROMPT_TOKENS": TOP_K_PROMPT_TOKENS,
+                    "TOP_K_PROMPT_OFFSET": TOP_K_PROMPT_OFFSET,
+                    "SALIENCY_RANKS": (
+                        f"{TOP_K_PROMPT_OFFSET + 1}-"
+                        f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
+                    ),
+                    "TOP_K_TRAIN_SAMPLES": TOP_K_TRAIN_SAMPLES,
+                    "TOP_TARGETS": TOP_TARGETS,
+                    "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
+                    "SALIENCY_MODE": _saliency_mode,
+                    "CONTEXT_WINDOW_SIZE": CONTEXT_WINDOW_SIZE,
+                    "SALIENCY_METHOD": (
+                        "alti_last_layer" if _saliency_mode == "last_layer" else "alti_full"
+                    ),
+                    "MATCHING_METHOD": match_desc,
+                    "GRAD_SPACE": grad_space,
+                    "TRAIN_RETRIEVAL_METHOD": TRAIN_RETRIEVAL_METHOD,
+                    "BANK_LOSS_MODE": bank_cfg.loss_mode,
+                    "BANK_LOSS_TAG": bank_cfg.cache_tag,
+                    "PROBE": "L_probe=-log(C+eps)",
+                    "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
+                    "FINE_MATCH_PROJ": fine_match_proj,
+                    "ALTI_CHUNK_SIZE": ALTI_CHUNK_SIZE,
+                    "ALTI_GRAD_CHUNK_SIZE": alti_grad_chunk_size,
+                    "ALTI_GRAD_MAX_SEQ_LEN": alti_grad_max_seq_len,
+                    "prescreen_max_seq_len": prescreen_max_seq_len,
+                    "prescreen_batch_size": prescreen_batch_size,
+                    "PRESCREEN_BATCH_SIZE": prescreen_batch_size,
+                    "PRESCREEN_SAMPLE_LIMIT": prescreen_limit,
+                    "PRESCREEN_MAX_SEQ_LEN": prescreen_max_seq_len,
+                    "PRESCREEN_LENGTH_SWEEP": prescreen_length_sweep_stats,
+                    "PRESCREEN_SKETCH_DIM": prescreen_sketch_dim,
+                    "PRESCREEN_SKETCH_SEED": prescreen_sketch_seed,
+                    "SALIENCY_TRAIN_BANK_SIZE": bank_n,
+                    "SALIENCY_TRAIN_BANK_CACHE": True,
+                },
+            },
+            "test_sample_baseline": {
+                "full_tokens": gen_result["pred_full_tokens"][0],
+                "full_token_ids": gen_result["pred_full_token_ids"][0],
+                "correct_full_tokens": gen_result["full_tokens"][0],
+                "prompt_len": prompt_len,
+            },
+            "per_token_results": per_token_results,
+            "train_sample_details": merged_details,
+        }
+        return _write_json_report(payload, report_filename, accelerator)
+
+    tokens_to_run = [
+        t for t in valid_test_tokens if int(t) not in done_target_indices
+    ]
+
+    try:
+        for t in tqdm(tokens_to_run, desc="Test tokens",
+                      disable=not accelerator.is_local_main_process):
+            target_tok_id   = int(test_batch["input_ids"][0, t].item())
+            target_tok_text = tokenizer.decode([target_tok_id])
+            print(f"\n=== Token {t}: '{target_tok_text}' ===")
+
+            # Stage 1: saliency sources + probe features
+            test_corr_features: dict = {}
+            with torch.inference_mode(False):
+                if _saliency_mode == "last_layer":
+                    # Ranking uses a cheap no-grad forward (hidden_states only, no all-layer attn).
+                    sal_vec = _saliency_fn(
+                        model,
+                        test_batch,
+                        t,
+                        chunk_size=ALTI_CHUNK_SIZE,
+                    )
+                    top_test_corr = top_nontrivial_saliency_sources(
+                        tokenizer,
+                        test_batch["input_ids"][0],
+                        sal_vec,
+                        TOP_K_PROMPT_TOKENS,
+                        offset=TOP_K_PROMPT_OFFSET,
+                    )
+                    top_test_correlations = [
+                        {
+                            "source_token_index": idx,
+                            "source_token": tokenizer.decode(
+                                [int(test_batch["input_ids"][0, idx].item())]
+                            ),
+                            "target_token_index": t,
+                            "target_token": target_tok_text,
+                            "saliency_score": float(score),
+                            "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
+                        }
+                        for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
+                    ]
+                    if not top_test_correlations:
+                        per_token_results.append({
+                            "target_token_index": t,
+                            "target_token": target_tok_text,
+                            "top_correlations": [],
+                            "correlation_pairs": [],
+                        })
+                        path = _flush_all_tokens_report(partial=True)
+                        if path is not None:
+                            print(
+                                f"  [checkpoint] {len(per_token_results)}/"
+                                f"{len(valid_test_tokens)} tokens → {path}",
+                                flush=True,
+                            )
+                        torch.cuda.empty_cache()
+                        continue
+                    src_list = [int(it["source_token_index"]) for it in top_test_correlations]
+                    print(
+                        f"  Computing viz last_layer top-{len(src_list)} probe "
+                        f"(hidden_states forward + recompute last attn only)...",
+                        flush=True,
+                    )
+                    try:
+                        feat_probe, _ = compute_last_layer_topk_probe_gradient(
+                            model=model,
+                            batch=test_batch,
+                            target_idx_in_seq=t,
+                            source_indices=src_list,
+                            param_filter_fn=fine_param_filter,
+                            device=accelerator.device,
+                        )
+                    except torch.OutOfMemoryError as exc:
+                        torch.cuda.empty_cache()
+                        raise RuntimeError(
+                            f"last_layer top-k probe OOM at target={t}: {exc}"
+                        ) from exc
+                    for item in top_test_correlations:
+                        p_idx = item["source_token_index"]
+                        test_corr_features[p_idx] = (
+                            feat_probe, feat_probe, item["source_token"], item["saliency_score"],
+                        )
+                else:
+                    sal_vec = _saliency_fn(
+                        model,
+                        test_batch,
+                        t,
+                        chunk_size=ALTI_CHUNK_SIZE,
+                    )
+                    top_test_corr = top_nontrivial_saliency_sources(
+                        tokenizer,
+                        test_batch["input_ids"][0],
+                        sal_vec,
+                        TOP_K_PROMPT_TOKENS,
+                        offset=TOP_K_PROMPT_OFFSET,
+                    )
+                    top_test_correlations = [
+                        {
+                            "source_token_index": idx,
+                            "source_token": tokenizer.decode(
+                                [int(test_batch["input_ids"][0, idx].item())]
+                            ),
+                            "target_token_index": t,
+                            "target_token": target_tok_text,
+                            "saliency_score": float(score),
+                            "saliency_rank": TOP_K_PROMPT_OFFSET + rank_i,
+                        }
+                        for rank_i, (idx, score) in enumerate(top_test_corr, start=1)
+                    ]
+                    print(
+                        f"  Computing {len(top_test_correlations)} test "
+                        f"{_saliency_mode} match/probe features..."
+                    )
+                    for item in top_test_correlations:
+                        p_idx = item["source_token_index"]
+                        pair = _compute_alti_match_and_probe_retry(
+                            model=model,
+                            batch=test_batch,
+                            target_idx_in_seq=t,
+                            source_idx_in_seq=p_idx,
+                            param_filter_fn=fine_param_filter,
+                            device=accelerator.device,
+                        )
+                        if pair is None:
+                            continue
+                        feat_match, feat_probe = pair
+                        test_corr_features[p_idx] = (
+                            feat_match, feat_probe, item["source_token"], item["saliency_score"],
+                        )
+
+            if not test_corr_features:
+                print(f"  No ALTI-gradient test features survived for token {t}; skipping retrieval/Stage 3.")
+                per_token_results.append({
+                    "target_token_index": t,
+                    "target_token":       target_tok_text,
+                    "top_correlations":   top_test_correlations,
+                    "correlation_pairs":  [],
+                })
+                path = _flush_all_tokens_report(partial=True)
+                if path is not None:
+                    print(
+                        f"  [checkpoint] {len(per_token_results)}/"
+                        f"{len(valid_test_tokens)} tokens → {path}",
+                        flush=True,
+                    )
+                torch.cuda.empty_cache()
+                continue
+
+            # Stage 2: retrieve Top-K trains with viz L_probe gradient vs train bank
+            token_pair_records: list = []
+            if _saliency_mode == "last_layer":
+                # One bank query per target (shared probe); Stage3 still walks edges for UI.
+                any_feat = next(iter(test_corr_features.values()))
+                feat_probe = any_feat[1]
+                probe_sketch = _project_flat_grad(
+                    feat_probe, prescreen_sketch_dim, prescreen_sketch_seed
                 )
-                cached = train_sample_cache.get(str(train_idx))
-                detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                    train_idx, probe_score, multi_edge_features,
-                    target_tok_text, t,
-                    f"t{t}", pair_id_counter,
-                    cached_detail=cached,
-                )
-                if detail is not None:
-                    train_sample_cache[str(train_idx)] = detail
-                    token_pair_records.extend(pairs)
-            del probe_sketch, edge_scores
-        else:
-            for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
-                probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
                 edge_scores = _score_prescreen_sketch_cache(
                     probe_sketch,
                     saliency_train_bank,
@@ -2627,109 +2863,94 @@ def run_causal_intervention_experiment(
                 )
                 related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
                 print(
-                    f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
+                    f"  Target '{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} trains (shared L_probe): "
                     f"{[(i, round(s, 4)) for i, s in related_samples]}",
                     flush=True,
                 )
-                single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
+                # Pass all edges once so Stage3 pair records cover each saliency source.
+                multi_edge_features = {
+                    p_idx: (feat_match, src_text, sal_score)
+                    for p_idx, (feat_match, _fp, src_text, sal_score) in test_corr_features.items()
+                }
                 for rank, (train_idx, probe_score) in enumerate(related_samples):
                     print(
-                        f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
-                        f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
+                        f"\n  --- Train {train_idx} (rank={rank + 1}, "
+                        f"probe_cos={probe_score:.4f}) ---"
                     )
                     cached = train_sample_cache.get(str(train_idx))
                     detail, pairs, pair_id_counter = _process_train_sample_stage3(
-                        train_idx, probe_score, single_edge_features,
+                        train_idx, probe_score, multi_edge_features,
                         target_tok_text, t,
-                        f"t{t}_s{p_idx}", pair_id_counter,
+                        f"t{t}", pair_id_counter,
                         cached_detail=cached,
                     )
                     if detail is not None:
                         train_sample_cache[str(train_idx)] = detail
                         token_pair_records.extend(pairs)
                 del probe_sketch, edge_scores
+            else:
+                for p_idx, (feat_match, feat_probe, src_text, sal_score) in test_corr_features.items():
+                    probe_sketch = _project_flat_grad(feat_probe, prescreen_sketch_dim, prescreen_sketch_seed)
+                    edge_scores = _score_prescreen_sketch_cache(
+                        probe_sketch,
+                        saliency_train_bank,
+                        accelerator.device,
+                    )
+                    related_samples = nlargest(TOP_K_TRAIN_SAMPLES, edge_scores, key=lambda x: x[1])
+                    print(
+                        f"  Edge '{src_text}'→'{target_tok_text}' Top-{TOP_K_TRAIN_SAMPLES} (L_probe): "
+                        f"{[(i, round(s, 4)) for i, s in related_samples]}",
+                        flush=True,
+                    )
+                    single_edge_features = {p_idx: (feat_match, src_text, sal_score)}
+                    for rank, (train_idx, probe_score) in enumerate(related_samples):
+                        print(
+                            f"\n  --- Train {train_idx} (edge_rank={rank + 1}, "
+                            f"probe_cos={probe_score:.4f}, src={src_text!r}) ---"
+                        )
+                        cached = train_sample_cache.get(str(train_idx))
+                        detail, pairs, pair_id_counter = _process_train_sample_stage3(
+                            train_idx, probe_score, single_edge_features,
+                            target_tok_text, t,
+                            f"t{t}_s{p_idx}", pair_id_counter,
+                            cached_detail=cached,
+                        )
+                        if detail is not None:
+                            train_sample_cache[str(train_idx)] = detail
+                            token_pair_records.extend(pairs)
+                    del probe_sketch, edge_scores
 
-        token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
-        per_token_results.append({
-            "target_token_index": t,
-            "target_token":       target_tok_text,
-            "top_correlations":   top_test_correlations,
-            "correlation_pairs":  token_pair_records,
-        })
+            token_pair_records.sort(key=lambda x: x["cos_sim"], reverse=True)
+            per_token_results.append({
+                "target_token_index": t,
+                "target_token":       target_tok_text,
+                "top_correlations":   top_test_correlations,
+                "correlation_pairs":  token_pair_records,
+            })
+            path = _flush_all_tokens_report(partial=True)
+            if path is not None:
+                print(
+                    f"  [checkpoint] {len(per_token_results)}/"
+                    f"{len(valid_test_tokens)} tokens → {path}",
+                    flush=True,
+                )
 
-        # Free test-side features before next token
-        del test_corr_features
-        torch.cuda.empty_cache()
+            # Free test-side features before next token
+            del test_corr_features
+            torch.cuda.empty_cache()
+    except BaseException as exc:
+        if accelerator.is_main_process and per_token_results:
+            print(
+                f"\n[checkpoint] interrupted ({type(exc).__name__}) after "
+                f"{len(per_token_results)}/{len(valid_test_tokens)} tokens; "
+                f"partial report kept at {report_filename}. "
+                f"Re-run the same command to resume (default --resume).",
+                flush=True,
+            )
+        raise
 
-    # Clean internal cache keys before saving
-    train_sample_details = {
-        k: {fk: fv for fk, fv in v.items() if not fk.startswith("_")}
-        for k, v in train_sample_cache.items()
-    }
-
-    report_json = {
-        "experiment_meta": {
-            "test_sample_index":  SELECTED_TEST_SAMPLE_INDEX,
-            "task_id":            _task_id,
-            "model_name":         model_tag,
-            "model_path":         model_path,
-            "mode":               "all_tokens",
-            "max_output_tokens":  MAX_OUTPUT_TOKENS,
-            "tokens_analyzed":    len(per_token_results),
-            "screening":          TRAIN_RETRIEVAL_METHOD,
-            "config": {
-                "TOP_K_PROMPT_TOKENS":     TOP_K_PROMPT_TOKENS,
-                "TOP_K_PROMPT_OFFSET":     TOP_K_PROMPT_OFFSET,
-                "SALIENCY_RANKS": (
-                    f"{TOP_K_PROMPT_OFFSET + 1}-{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
-                ),
-                "TOP_K_TRAIN_SAMPLES":     TOP_K_TRAIN_SAMPLES,
-                "TOP_TARGETS":             TOP_TARGETS,
-                "TOP_K_SOURCE_PER_TARGET": TOP_K_SOURCE_PER_TARGET,
-                "SALIENCY_MODE":           _saliency_mode,
-                "CONTEXT_WINDOW_SIZE":     CONTEXT_WINDOW_SIZE,
-                "SALIENCY_METHOD": (
-                    "alti_last_layer" if _saliency_mode == "last_layer" else "alti_full"
-                ),
-                "MATCHING_METHOD":         match_desc,
-                "GRAD_SPACE":              grad_space,
-                "TRAIN_RETRIEVAL_METHOD":  TRAIN_RETRIEVAL_METHOD,
-                "BANK_LOSS_MODE":          bank_cfg.loss_mode,
-                "BANK_LOSS_TAG":           bank_cfg.cache_tag,
-                "PROBE":                  "L_probe=-log(C+eps)",
-                "FINE_MATCH_LAST_N_LAYERS": FINE_MATCH_LAST_N_LAYERS,
-                "FINE_MATCH_PROJ":         fine_match_proj,
-                "ALTI_CHUNK_SIZE":         ALTI_CHUNK_SIZE,
-                "ALTI_GRAD_CHUNK_SIZE":    alti_grad_chunk_size,
-                "ALTI_GRAD_MAX_SEQ_LEN":   alti_grad_max_seq_len,
-                "prescreen_max_seq_len":   prescreen_max_seq_len,
-                "prescreen_batch_size":    prescreen_batch_size,
-                "PRESCREEN_BATCH_SIZE":    prescreen_batch_size,
-                "PRESCREEN_SAMPLE_LIMIT":  prescreen_limit,
-                "PRESCREEN_MAX_SEQ_LEN":   prescreen_max_seq_len,
-                "PRESCREEN_LENGTH_SWEEP":  prescreen_length_sweep_stats,
-                "PRESCREEN_SKETCH_DIM":    prescreen_sketch_dim,
-                "PRESCREEN_SKETCH_SEED":   prescreen_sketch_seed,
-                "SALIENCY_TRAIN_BANK_SIZE": bank_n,
-                "SALIENCY_TRAIN_BANK_CACHE": True,
-            },
-        },
-        "test_sample_baseline": {
-            "full_tokens":         gen_result["pred_full_tokens"][0],  # prompt + model output (clickable)
-            "correct_full_tokens": gen_result["full_tokens"][0],       # prompt + ground truth answer
-            "prompt_len":          prompt_len,
-        },
-        "per_token_results":    per_token_results,
-        "train_sample_details": train_sample_details,
-    }
-
-    report_filename = (
-        f"correlation_matching_results_{model_tag}_{_task_id}_all_tokens"
-        f"{saliency_rank_filename_tag()}.json"
-    )
-
-    # ── Save (main process only in multi-GPU) ────────────────────────────────
-    report_path = _write_json_report(report_json, report_filename, accelerator)
+    # ── Final save (clears is_partial) ───────────────────────────────────────
+    report_path = _flush_all_tokens_report(partial=False)
     if report_path is not None:
         print(f"\nExperiment completed. Results → {report_path}")
         print(
@@ -2971,8 +3192,19 @@ if __name__ == "__main__":
         default=None,
         help=(
             "How many response tokens (from prompt_len) to analyze in all-tokens mode "
-            f"(default {MAX_OUTPUT_TOKENS}). Trivial tokens inside the window are skipped. "
+            f"(default {MAX_OUTPUT_TOKENS}). Every token in the window is a target "
+            "(punctuation like }} / ) included). "
             "Use e.g. 250 to cover a longer predict; runtime scales roughly with this."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After each finished target token, atomically update the main report JSON "
+            "(is_partial=true). On restart with the same fingerprint, skip done tokens. "
+            "Use --no-resume to ignore an existing report and overwrite from scratch."
         ),
     )
     args = parser.parse_args()
@@ -3035,4 +3267,5 @@ if __name__ == "__main__":
         attr_max_seq_len=args.attr_max_seq_len,
         bank_left_truncate=args.bank_left_truncate,
         bank_max_seq_len=args.bank_max_seq_len,
+        resume=args.resume,
     )

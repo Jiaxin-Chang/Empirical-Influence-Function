@@ -221,6 +221,28 @@ def _decode_tokens(input_ids: list[int]) -> list[str]:
     return [tok.decode([int(i)], skip_special_tokens=False) for i in input_ids]
 
 
+def _surface_tokens_from_obj(obj: dict[str, Any], input_ids: list[int]) -> list[str]:
+    """Decode input_ids for display. Prefer live tokenizer; else JSONL qwen_tokens."""
+    try:
+        return _decode_tokens(input_ids)
+    except HTTPException:
+        pass
+
+    # smoke / graphsignal JSONL already stores Qwen-aligned surfaces.
+    qwen = obj.get("qwen_tokens") or []
+    if isinstance(qwen, list) and len(qwen) == len(input_ids):
+        out: list[str] = []
+        for t in qwen:
+            if isinstance(t, dict):
+                out.append(str(t.get("surface") or ""))
+            else:
+                out.append(str(t))
+        return out
+
+    # Last resort: numeric placeholders (editing still works by index).
+    return [f"<{tid}>" for tid in input_ids]
+
+
 def _answer_start(labels: list[int]) -> int:
     for i, lab in enumerate(labels):
         if int(lab) != -100:
@@ -373,11 +395,7 @@ def get_sample(idx: int):
         obj = _read_sample(idx)
     input_ids = [int(x) for x in (obj.get("input_ids") or [])]
     labels = [int(x) for x in (obj.get("label") or [])]
-    try:
-        tokens = _decode_tokens(input_ids)
-    except HTTPException:
-        # Fallback: show id placeholders so editing still works without tokenizer.
-        tokens = [f"<{tid}>" for tid in input_ids]
+    tokens = _surface_tokens_from_obj(obj, input_ids)
 
     edges = []
     for e in obj.get("attention_edges") or []:

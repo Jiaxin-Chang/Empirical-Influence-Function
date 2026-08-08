@@ -157,19 +157,14 @@ def _contextual_hidden_rows(model, batch: dict, device) -> torch.Tensor:
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
-    base_model = getattr(model, "model", None)
-    if base_model is None:
-        raise RuntimeError("Expected a HuggingFace causal LM with .model.")
+    from src.loss import _forward_decoder_hidden
 
-    outputs = base_model(
+    hidden = _forward_decoder_hidden(
+        model,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        use_cache=False,
-        return_dict=True,
     )
-    hidden = outputs.last_hidden_state[0].detach()
-    del outputs
-    return hidden
+    return hidden[0].detach()
 
 
 @torch.no_grad()
@@ -1381,9 +1376,11 @@ def _apply_lm_head_ascent_update(
     lr: float,
     normalize: bool,
 ) -> torch.Tensor:
-    lm_head = model.get_output_embeddings()
+    from src.loss import _get_lm_head
+
+    lm_head = _get_lm_head(model)
     if lm_head is None:
-        raise RuntimeError("Model does not expose output embeddings.")
+        raise RuntimeError("Model does not expose output embeddings / lm_head.")
 
     delta = grad.to(device=lm_head.weight.device, dtype=torch.float32)
     if normalize:
@@ -1395,7 +1392,11 @@ def _apply_lm_head_ascent_update(
 
 @torch.no_grad()
 def _restore_lm_head_ascent_update(model, delta: torch.Tensor) -> None:
-    lm_head = model.get_output_embeddings()
+    from src.loss import _get_lm_head
+
+    lm_head = _get_lm_head(model)
+    if lm_head is None:
+        raise RuntimeError("Model does not expose output embeddings / lm_head.")
     lm_head.weight.data.sub_(delta.to(device=lm_head.weight.device, dtype=lm_head.weight.dtype))
 
 

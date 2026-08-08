@@ -103,19 +103,15 @@ def compute_lm_head_ce_gradient_no_backward(
     inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
     labels = inputs["labels"]
 
-    base_model = getattr(model, "model", None)
-    get_output_embeddings = getattr(model, "get_output_embeddings", None)
-    lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
-    if base_model is None or lm_head is None:
-        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+    lm_head = _get_lm_head(model)
+    if lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with output embeddings / lm_head.")
 
-    outputs = base_model(
+    hidden = _forward_decoder_hidden(
+        model,
         input_ids=inputs["input_ids"],
         attention_mask=inputs.get("attention_mask"),
-        use_cache=False,
-        return_dict=True,
     )
-    hidden = outputs.last_hidden_state
 
     shift_hidden = hidden[..., :-1, :]
     shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
@@ -164,19 +160,15 @@ def compute_lm_head_ce_gradient_scores_no_backward(
     inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
     labels = inputs["labels"]
 
-    base_model = getattr(model, "model", None)
-    get_output_embeddings = getattr(model, "get_output_embeddings", None)
-    lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
-    if base_model is None or lm_head is None:
-        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+    lm_head = _get_lm_head(model)
+    if lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with output embeddings / lm_head.")
 
-    outputs = base_model(
+    hidden = _forward_decoder_hidden(
+        model,
         input_ids=inputs["input_ids"],
         attention_mask=inputs.get("attention_mask"),
-        use_cache=False,
-        return_dict=True,
     )
-    hidden = outputs.last_hidden_state
     shift_hidden = hidden[..., :-1, :]
     shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
 
@@ -208,7 +200,7 @@ def compute_lm_head_ce_gradient_scores_no_backward(
 
         del valid_hidden, valid_labels, logits, grad_logits, grad
 
-    del outputs, hidden, shift_hidden, shift_labels
+    del hidden, shift_hidden, shift_labels
     torch.cuda.empty_cache()
     return scores
 
@@ -297,19 +289,15 @@ def compute_lm_head_ce_gradient_sketches_no_backward(
     inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
     labels = inputs["labels"]
 
-    base_model = getattr(model, "model", None)
-    get_output_embeddings = getattr(model, "get_output_embeddings", None)
-    lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
-    if base_model is None or lm_head is None:
-        raise RuntimeError("Expected a HuggingFace causal LM with .model and output embeddings.")
+    lm_head = _get_lm_head(model)
+    if lm_head is None:
+        raise RuntimeError("Expected a HuggingFace causal LM with output embeddings / lm_head.")
 
-    outputs = base_model(
+    hidden = _forward_decoder_hidden(
+        model,
         input_ids=inputs["input_ids"],
         attention_mask=inputs.get("attention_mask"),
-        use_cache=False,
-        return_dict=True,
     )
-    hidden = outputs.last_hidden_state
     shift_hidden = hidden[..., :-1, :]
     shift_labels = labels[..., 1:].clone().to(shift_hidden.device)
 
@@ -483,6 +471,55 @@ def _unwrap_qwen_decoder(model):
     raise ValueError(
         f"Expected a Qwen-style model.model.layers stack; got {type(model).__name__}."
     )
+
+
+def _get_lm_head(model):
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
+    if lm_head is not None:
+        return lm_head
+    # PeftModel → base CausalLM.lm_head
+    if hasattr(model, "get_base_model"):
+        try:
+            base = model.get_base_model()
+        except Exception:
+            base = None
+        if base is not None:
+            get_output_embeddings = getattr(base, "get_output_embeddings", None)
+            lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
+            if lm_head is not None:
+                return lm_head
+            lm_head = getattr(base, "lm_head", None)
+            if lm_head is not None:
+                return lm_head
+    return getattr(model, "lm_head", None)
+
+
+def _forward_decoder_hidden(model, *, input_ids, attention_mask=None):
+    """Run the transformer backbone only; return last hidden states [B, T, H].
+
+    Peft wrappers make ``model.model`` the CausalLM (returns CausalLMOutputWithPast
+    without ``last_hidden_state``). Always unwrap to the decoder stack that owns
+    ``.layers``.
+    """
+    decoder = _unwrap_qwen_decoder(model)
+    outputs = decoder(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        hs = getattr(outputs, "hidden_states", None)
+        if hs:
+            hidden = hs[-1]
+    if hidden is None:
+        raise RuntimeError(
+            f"Decoder forward returned {type(outputs).__name__} without "
+            "last_hidden_state (and no hidden_states fallback)."
+        )
+    return hidden
 
 @torch.no_grad()
 def _compute_qwen_alti_layer_matrix(
@@ -1328,6 +1365,10 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     decoder = _unwrap_to_decoder_stack(model)
     layer = decoder.layers[-1]
     attn = layer.self_attn
+    # device_map=auto may place last layer on cuda:N while hidden_states[-2]
+    # was gathered on another GPU — pin everything to the layer device.
+    layer_device = next(layer.parameters()).device
+    hid_in = hid_in.to(layer_device)
     B, T, _ = hid_in.shape
     device = hid_in.device
     dtype = hid_in.dtype
@@ -1347,13 +1388,20 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
         if rotary is None:
             raise RuntimeError("Cannot locate rotary_emb to recompute last-layer attention.")
         cos, sin = rotary(normed, position_ids)
+    cos = cos.to(device=device, dtype=dtype)
+    sin = sin.to(device=device, dtype=dtype)
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     key_states = repeat_kv(key_states, attn.num_key_value_groups)
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn.scaling
-    # Causal mask (additive)
+    # Causal mask (additive) — must live on attn_weights' device under multi-GPU.
     causal = torch.triu(
-        torch.full((T, T), torch.finfo(attn_weights.dtype).min, device=device, dtype=attn_weights.dtype),
+        torch.full(
+            (T, T),
+            torch.finfo(attn_weights.dtype).min,
+            device=attn_weights.device,
+            dtype=attn_weights.dtype,
+        ),
         diagonal=1,
     )
     attn_weights = attn_weights + causal.view(1, 1, T, T)
@@ -1403,14 +1451,29 @@ def _last_layer_contribution_row(
             use_cache=False,
             return_dict=True,
         )
-        # viz: hid = input to last decoder layer = hidden_states[-2]
-        hid = outputs.hidden_states[-2]
+        hs = outputs.hidden_states
         # Drop the big tuple ASAP (keep only `hid` for autograd).
         outputs.hidden_states = None
         del outputs
-        if hid is None:
+        if not hs:
             raise RuntimeError("Model did not return hidden_states for last-layer ALTI.")
+        # Must match intervention_experiment / historical reports: viz uses
+        # hidden_states[-2] as input to the last decoder layer.
+        # (Standard layout len=n_layers+1 ⇒ [-2] == [n_layers-1].)
+        decoder = _unwrap_qwen_decoder(model)
+        n_layers = len(decoder.layers)
+        if len(hs) != n_layers + 1:
+            print(
+                f"[saliency][WARN] hidden_states len={len(hs)} n_layers={n_layers} "
+                f"(expected {n_layers + 1}); still using hs[-2] for report parity.",
+                flush=True,
+            )
+        hid = hs[-2]
+        del hs
         att = _recompute_last_layer_attn_probs(model, hid)
+        # hid may still sit on an earlier shard; att is on last-layer GPU.
+        if hid.device != att.device:
+            hid = hid.to(att.device)
         row_batch = torch.zeros(1, dtype=torch.long, device=hid.device)
         row_qry = torch.tensor([q], dtype=torch.long, device=hid.device)
         C_rows = build_contribution_rows(

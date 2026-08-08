@@ -1,38 +1,46 @@
 """One-step unlearning probe for a single train↔test saliency correlation pair.
 
 Uses the same model loading path as ``intervention_experiment`` (full checkpoint
-OR base + LoRA adapter). The update itself mirrors the data-attribution oracle:
+OR base + LoRA adapter). The update uses the **same parameter subspace as pair
+matching** (default: last-1-layer LoRA):
 
-    θ ← θ + η · normalize(∇_{lm_head} L_train)
+    θ ← θ + η · normalize(∇_θ CE_train_target)
 
 then measures how the *test* target token's CE / log-prob and ALTI saliency
 change. Weights are restored afterwards — this is a probe, not a permanent edit
 of the adapter on disk.
 
 The train loss is restricted to the pair's train *target* token (other labels
-masked to -100), so the ascent is aimed at that saliency edge rather than the
-whole sample.
+masked to -100).
 """
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import torch
 
-from src.attribution_evaluation import (
-    _apply_lm_head_ascent_update,
-    _restore_lm_head_ascent_update,
-    _target_token_losses,
-)
+from src.attribution_evaluation import _target_token_losses
 from src.export_real_ttav_bundle import (
     convert_report_tokens_to_ids,
     validate_roundtrip_tokens,
 )
-from src.intervention_experiment import load_model_and_tokenizer
-from src.loss import compute_alti_saliency_vector, compute_lm_head_ce_gradient_no_backward
+from src.export_ttav_bundle import infer_sample_id
+from src.intervention_experiment import (
+    load_model_and_tokenizer,
+    make_attention_projection_filter,
+    make_lora_param_filter,
+)
+from src.loss import (
+    compute_alti_saliency_vector,
+    compute_last_layer_saliency_vector,
+)
 
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Reuse one loaded model across Unlearn clicks in the same API process.
 _MODEL_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
@@ -84,16 +92,200 @@ def _get_model(model_path: str, base_model_path: str | None):
     return model, tokenizer
 
 
+def _hydrate_annotation_viewer_env() -> None:
+    """Pull ANNOTATION_TRAIN_DATA from tools/annotation-viewer/.env if unset."""
+    env_path = REPO_ROOT / "tools" / "annotation-viewer" / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _resolve_existing_path(raw: str) -> Path | None:
+    p = Path(raw).expanduser()
+    candidates = [p] if p.is_absolute() else [
+        Path.cwd() / p,
+        REPO_ROOT / p,
+        REPO_ROOT / "tools" / "annotation-viewer" / p,
+    ]
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _train_jsonl_path() -> Path | None:
+    _hydrate_annotation_viewer_env()
+    for key in ("EIF_TRAIN_DATA", "ANNOTATION_TRAIN_DATA"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        found = _resolve_existing_path(raw)
+        if found is not None:
+            return found
+    smoke = REPO_ROOT / "smoke_train_data.jsonl"
+    return smoke if smoke.is_file() else None
+
+
+def _read_jsonl_input_ids(path: Path, index: int) -> list[int] | None:
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if not line.strip():
+                continue
+            if i != index:
+                continue
+            obj = json.loads(line)
+            ids = obj.get("input_ids")
+            if isinstance(ids, list) and ids:
+                return [int(x) for x in ids]
+            return None
+    return None
+
+
+def _token_matches_id(tokenizer, token: str, token_id: int) -> bool:
+    decoded = tokenizer.decode([int(token_id)])
+    if token == decoded:
+        return True
+    vocab_tok = tokenizer.convert_ids_to_tokens(int(token_id))
+    if token == vocab_tok:
+        return True
+    # Report JSON sometimes shows U+FFFD for byte-fallback pieces; allow soft match.
+    if "\ufffd" in token and len(token) == len(decoded):
+        return all(
+            token[j] == decoded[j]
+            for j in range(len(token))
+            if token[j] != "\ufffd"
+        )
+    return False
+
+
+def _ids_match_tokens(
+    tokenizer,
+    ids: list[int],
+    tokens: list[str],
+    *,
+    check_n: int | None = None,
+) -> bool:
+    if len(ids) != len(tokens):
+        return False
+    limit = len(tokens) if check_n is None else min(check_n, len(tokens))
+    return all(_token_matches_id(tokenizer, tokens[i], ids[i]) for i in range(limit))
+
+
+def _align_pt_ids_to_tokens(tokenizer, ids: list[int], tokens: list[str]) -> list[int] | None:
+    """Find a contiguous window in ``ids`` whose decode matches report tokens."""
+    n = len(tokens)
+    if n == 0:
+        return []
+    if len(ids) == n and _ids_match_tokens(tokenizer, ids, tokens):
+        return ids
+    if len(ids) < n:
+        return None
+    for start in range(len(ids) - n + 1):
+        window = ids[start : start + n]
+        if not _ids_match_tokens(tokenizer, window, tokens, check_n=min(32, n)):
+            continue
+        if _ids_match_tokens(tokenizer, window, tokens):
+            return window
+    return None
+
+
+def _load_ids_from_embedding_pt(
+    tokenizer,
+    pt_path: Path,
+    tokens: list[str],
+) -> list[int] | None:
+    try:
+        blob = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        blob = torch.load(pt_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(blob, dict) or "input_ids" not in blob:
+        return None
+    raw = blob["input_ids"]
+    if torch.is_tensor(raw):
+        ids = [int(x) for x in raw.tolist()]
+    else:
+        ids = [int(x) for x in raw]
+    return _align_pt_ids_to_tokens(tokenizer, ids, tokens)
+
+
+def _embedding_pt_paths(sample_id: str | None, train_sample_id: int) -> tuple[Path | None, Path | None]:
+    if not sample_id:
+        return None, None
+    root = Path(
+        (os.environ.get("EIF_TOKEN_EMBEDDING_ROOT") or "").strip()
+        or (REPO_ROOT / "token_embeddings")
+    )
+    test_pt = root / sample_id / "test.pt"
+    train_pt = root / sample_id / f"train_{train_sample_id}.pt"
+    return (
+        test_pt if test_pt.is_file() else None,
+        train_pt if train_pt.is_file() else None,
+    )
+
+
+def _resolve_token_ids(
+    tokenizer,
+    tokens: list[str],
+    *,
+    stored_ids: list[int] | None = None,
+    jsonl_ids: list[int] | None = None,
+    pt_ids: list[int] | None = None,
+    side: str = "tokens",
+) -> list[int]:
+    """Resolve ids: report → embedding .pt → train JSONL → surface remap."""
+    if stored_ids is not None and len(stored_ids) == len(tokens) and stored_ids:
+        return [int(x) for x in stored_ids]
+    if pt_ids is not None and len(pt_ids) == len(tokens) and pt_ids:
+        return [int(x) for x in pt_ids]
+    if jsonl_ids is not None and len(jsonl_ids) == len(tokens) and jsonl_ids:
+        if _ids_match_tokens(tokenizer, jsonl_ids, tokens):
+            return [int(x) for x in jsonl_ids]
+    try:
+        token_ids = convert_report_tokens_to_ids(tokenizer, tokens)
+        validate_roundtrip_tokens(tokenizer, token_ids, tokens)
+        return token_ids
+    except ValueError as exc:
+        raise ValueError(
+            f"Failed to resolve {side} token ids ({exc}). "
+            "Set EIF_TRAIN_DATA / ANNOTATION_TRAIN_DATA to the original train JSONL, "
+            "or ensure token_embeddings/<sample_id>/{test,train_N}.pt exist."
+        ) from exc
+
+
 def _batch_from_tokens(
     tokenizer,
     tokens: list[str],
     *,
     answer_start_index: int,
     labeled_positions: set[int] | None = None,
+    stored_ids: list[int] | None = None,
+    jsonl_ids: list[int] | None = None,
+    pt_ids: list[int] | None = None,
+    side: str = "tokens",
 ) -> dict[str, torch.Tensor]:
-    """Build a single-row causal-LM batch from report token surfaces."""
-    token_ids = convert_report_tokens_to_ids(tokenizer, tokens)
-    validate_roundtrip_tokens(tokenizer, token_ids, tokens)
+    """Build a single-row causal-LM batch from report token surfaces / ids."""
+    token_ids = _resolve_token_ids(
+        tokenizer,
+        tokens,
+        stored_ids=stored_ids,
+        jsonl_ids=jsonl_ids,
+        pt_ids=pt_ids,
+        side=side,
+    )
     input_ids = torch.tensor([token_ids], dtype=torch.long)
     attention_mask = torch.ones_like(input_ids)
 
@@ -117,6 +309,195 @@ def _logprob_from_ce(ce: float) -> float:
     return float(-ce)
 
 
+def _resolve_saliency_fn(report: dict[str, Any]):
+    """Match intervention_experiment saliency (default last_layer, not full ALTI)."""
+    meta = report.get("experiment_meta") or {}
+    cfg = meta.get("config") or {}
+    mode = (
+        str(cfg.get("SALIENCY_MODE") or meta.get("saliency_mode") or "last_layer")
+        .strip()
+        .lower()
+    )
+    if mode in {"full_alti", "alti_full", "full"}:
+        return compute_alti_saliency_vector, "full_alti"
+    return compute_last_layer_saliency_vector, "last_layer"
+
+
+def _prepare_model_for_intervention_saliency(model, saliency_mode: str) -> None:
+    """Mirror intervention_experiment last_layer setup before scoring saliency.
+
+    Report generation puts the model in ``train()`` with Dropout frozen to
+    ``eval()`` (and grad-checkpointing enabled). Plain ``model.eval()`` can
+    change Peft / checkpointing behavior enough to shift ALTI magnitudes.
+    """
+    if saliency_mode != "last_layer":
+        model.eval()
+        return
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception:
+            pass
+    try:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    except TypeError:
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    model.train()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.eval()
+
+
+def _score_edge_saliency(
+    model,
+    batch: dict[str, torch.Tensor],
+    *,
+    saliency_fn,
+    saliency_mode: str,
+    target_index: int,
+    source_index: int,
+) -> float | None:
+    _prepare_model_for_intervention_saliency(model, saliency_mode)
+    sal_vec = saliency_fn(model, batch, target_index)
+    score = None
+    if 0 <= source_index < len(sal_vec):
+        score = float(sal_vec[source_index])
+    del sal_vec
+    return score
+
+
+def _resolve_match_param_filter(
+    model,
+    report: dict[str, Any],
+) -> tuple[Callable[[str, Any], bool], str, int]:
+    """Same θ filter as intervention Stage-3 matching (LoRA / fine-attn last-N)."""
+    meta = report.get("experiment_meta") or {}
+    cfg = meta.get("config") or {}
+    last_n = int(cfg.get("FINE_MATCH_LAST_N_LAYERS") or 1)
+    if last_n <= 0:
+        last_n = 1
+    proj = str(cfg.get("FINE_MATCH_PROJ") or "qk").strip().lower() or "qk"
+
+    model_space = str(getattr(model, "_eif_grad_space", "") or "").strip().lower()
+    report_space = str(cfg.get("GRAD_SPACE") or meta.get("grad_space") or "").strip().lower()
+    space = model_space or report_space or "lora"
+
+    if space == "lora" or "lora" in space:
+        filt = make_lora_param_filter(model, last_n_layers=last_n)
+        tag = f"lora_L{last_n}"
+    else:
+        filt = make_attention_projection_filter(model, last_n, proj)
+        tag = f"fineattn_{proj}_L{last_n}"
+    return filt, tag, last_n
+
+
+def _batch_to_device(batch: dict[str, torch.Tensor], device) -> dict[str, torch.Tensor]:
+    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def _compute_filtered_ce_grads(
+    model,
+    batch: dict[str, torch.Tensor],
+    param_filter: Callable[[str, Any], bool],
+    device,
+) -> tuple[list[torch.nn.Parameter], list[torch.Tensor]]:
+    """∇_θ CE on filtered params for the labeled tokens in ``batch``."""
+    named = [(n, p) for n, p in model.named_parameters() if param_filter(n, p)]
+    if not named:
+        raise RuntimeError(
+            "No parameters matched the match-space filter "
+            "(expected last-N LoRA or fine-attn projections)."
+        )
+    params = [p for _, p in named]
+    n_elems = sum(p.numel() for p in params)
+    print(
+        f"[unlearn] match-space grad: {len(params)} tensors, {n_elems / 1e6:.3f}M elems "
+        f"(e.g. {named[0][0]})",
+        flush=True,
+    )
+
+    local = _batch_to_device(batch, device)
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    original_flags = [(p, p.requires_grad) for p in model.parameters()]
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in params:
+        p.requires_grad_(True)
+
+    try:
+        with torch.enable_grad():
+            outputs = model(
+                input_ids=local["input_ids"],
+                attention_mask=local.get("attention_mask"),
+                labels=local["labels"],
+                use_cache=False,
+                return_dict=True,
+            )
+            loss = outputs.loss
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError(f"Train CE loss invalid: {loss}")
+            grads = torch.autograd.grad(
+                loss,
+                params,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=True,
+            )
+        out_grads: list[torch.Tensor] = []
+        for p, g in zip(params, grads):
+            if g is None:
+                out_grads.append(torch.zeros_like(p, dtype=torch.float32))
+            else:
+                out_grads.append(g.detach().to(dtype=torch.float32))
+        return params, out_grads
+    finally:
+        for p, flag in original_flags:
+            p.requires_grad_(flag)
+        model.zero_grad(set_to_none=True)
+        del local
+
+
+def _apply_filtered_ascent(
+    params: list[torch.nn.Parameter],
+    grads: list[torch.Tensor],
+    *,
+    lr: float,
+    normalize: bool,
+) -> list[torch.Tensor]:
+    flat = torch.cat([g.reshape(-1) for g in grads]).float()
+    if flat.numel() == 0:
+        raise RuntimeError("Empty gradient for ascent update.")
+    if normalize:
+        flat = flat / flat.norm().clamp_min(1e-12)
+    flat = flat * float(lr)
+
+    deltas: list[torch.Tensor] = []
+    offset = 0
+    for p, g in zip(params, grads):
+        n = int(g.numel())
+        chunk = flat[offset : offset + n].reshape_as(p).to(device=p.device, dtype=p.dtype)
+        p.data.add_(chunk)
+        deltas.append(chunk)
+        offset += n
+    return deltas
+
+
+def _restore_filtered_ascent(
+    params: list[torch.nn.Parameter],
+    deltas: list[torch.Tensor],
+) -> None:
+    for p, d in zip(params, deltas):
+        p.data.sub_(d.to(device=p.device, dtype=p.dtype))
+
+
 def run_unlearn_pair_probe(
     report: dict[str, Any],
     *,
@@ -128,9 +509,11 @@ def run_unlearn_pair_probe(
     pair_id: str | None = None,
     model_path: str | None = None,
     base_model_path: str | None = None,
-    unlearn_lr: float = 1.0,
+    unlearn_lr: float = 20.0,
     normalize_grad: bool = True,
     recompute_saliency: bool = True,
+    sample_id: str | None = None,
+    report_json_path: str | None = None,
 ) -> dict[str, Any]:
     """Run the probe and return before/after metrics (model weights restored)."""
     baseline = report.get("test_sample_baseline") or {}
@@ -160,22 +543,72 @@ def run_unlearn_pair_probe(
         )
 
     resolved_model, resolved_base = _resolve_paths(report, model_path, base_model_path)
+    meta_model = str((report.get("experiment_meta") or {}).get("model_path") or "").strip()
+    if meta_model and os.path.abspath(resolved_model) != os.path.abspath(meta_model):
+        print(
+            f"[unlearn][WARN] loaded model differs from report meta:\n"
+            f"  loaded: {resolved_model}\n"
+            f"  report: {meta_model}",
+            flush=True,
+        )
     model, tokenizer = _get_model(resolved_model, resolved_base)
     device = _device_of(model)
     grad_space = getattr(model, "_eif_grad_space", "unknown")
     resolved_base_used = getattr(model, "_eif_base_model_path", resolved_base)
+
+    test_ids_stored = baseline.get("full_token_ids")
+    if not isinstance(test_ids_stored, list):
+        test_ids_stored = None
+    train_ids_stored = train_detail.get("full_token_ids")
+    if not isinstance(train_ids_stored, list):
+        train_ids_stored = None
+
+    resolved_sample_id = (sample_id or "").strip() or None
+    if not resolved_sample_id and report_json_path:
+        resolved_sample_id = infer_sample_id(str(report_json_path))
+
+    test_pt, train_pt = _embedding_pt_paths(resolved_sample_id, train_sample_id)
+    test_pt_ids = (
+        _load_ids_from_embedding_pt(tokenizer, test_pt, test_tokens) if test_pt else None
+    )
+    train_pt_ids = (
+        _load_ids_from_embedding_pt(tokenizer, train_pt, train_tokens) if train_pt else None
+    )
+
+    train_jsonl = _train_jsonl_path()
+    train_jsonl_ids = (
+        _read_jsonl_input_ids(train_jsonl, train_sample_id) if train_jsonl else None
+    )
+    if train_jsonl_ids is not None and len(train_jsonl_ids) != len(train_tokens):
+        train_jsonl_ids = None
+
+    print(
+        f"[unlearn] id sources: sample={resolved_sample_id or '-'} "
+        f"test_pt={'yes' if test_pt_ids else 'no'} "
+        f"train_pt={'yes' if train_pt_ids else 'no'} "
+        f"train_jsonl={train_jsonl or '-'} "
+        f"({'aligned' if train_jsonl_ids else 'skip'})",
+        flush=True,
+    )
 
     test_batch = _batch_from_tokens(
         tokenizer,
         test_tokens,
         answer_start_index=test_prompt_len,
         labeled_positions=None,
+        stored_ids=test_ids_stored,
+        pt_ids=test_pt_ids,
+        side="test",
     )
     train_batch = _batch_from_tokens(
         tokenizer,
         train_tokens,
         answer_start_index=answer_start,
         labeled_positions={train_target_index},
+        stored_ids=train_ids_stored,
+        pt_ids=train_pt_ids,
+        jsonl_ids=train_jsonl_ids,
+        side="train",
     )
 
     reported_saliency = None
@@ -201,44 +634,98 @@ def run_unlearn_pair_probe(
     base_ce = float(base_losses[0].item())
     base_logprob = _logprob_from_ce(base_ce)
 
-    base_saliency = None
-    if recompute_saliency:
-        sal_vec = compute_alti_saliency_vector(model, test_batch, test_target_index)
-        if 0 <= test_source_index < len(sal_vec):
-            base_saliency = float(sal_vec[test_source_index])
-        del sal_vec
-
-    grad = compute_lm_head_ce_gradient_no_backward(
-        model=model,
-        batch=train_batch,
-        device=device,
-        ignored_token_ids=torch.tensor([], device=device),
+    saliency_fn, saliency_mode = _resolve_saliency_fn(report)
+    print(f"[unlearn] saliency_mode={saliency_mode}", flush=True)
+    # Sanity: same indices/tokens the report used for this edge.
+    print(
+        f"[unlearn] test edge src={test_source_index} "
+        f"{test_tokens[test_source_index]!r} -> tgt={test_target_index} "
+        f"{test_tokens[test_target_index]!r} "
+        f"id_src={int(test_batch['input_ids'][0, test_source_index])} "
+        f"id_tgt={int(test_batch['input_ids'][0, test_target_index])}",
+        flush=True,
     )
 
-    delta = None
-    try:
-        delta = _apply_lm_head_ascent_update(
+    base_saliency = None
+    if recompute_saliency:
+        base_saliency = _score_edge_saliency(
             model,
-            grad,
+            test_batch,
+            saliency_fn=saliency_fn,
+            saliency_mode=saliency_mode,
+            target_index=test_target_index,
+            source_index=test_source_index,
+        )
+        if (
+            reported_saliency is not None
+            and base_saliency is not None
+            and abs(base_saliency - reported_saliency) > max(1e-3, 0.05 * abs(reported_saliency))
+        ):
+            print(
+                f"[unlearn][WARN] recomputed saliency {base_saliency:.6g} differs from "
+                f"report {reported_saliency:.6g} (mode={saliency_mode}). "
+                f"Check model_path/base_path match the report run.",
+                flush=True,
+            )
+        elif reported_saliency is not None and base_saliency is not None:
+            print(
+                f"[unlearn] saliency OK vs report: {base_saliency:.6g} ≈ {reported_saliency:.6g}",
+                flush=True,
+            )
+
+    param_filter, param_space_tag, last_n_layers = _resolve_match_param_filter(model, report)
+    print(
+        f"[unlearn] param_space={param_space_tag} (aligned with pair matching; "
+        f"model_grad_space={grad_space})",
+        flush=True,
+    )
+
+    params = None
+    deltas = None
+    try:
+        # Pair-matching subspace (last-N LoRA / fine-attn), not lm_head.
+        params, grads = _compute_filtered_ce_grads(
+            model, train_batch, param_filter, device
+        )
+        grad_norm = float(torch.cat([g.reshape(-1) for g in grads]).float().norm().item())
+        deltas = _apply_filtered_ascent(
+            params,
+            grads,
             lr=float(unlearn_lr),
             normalize=bool(normalize_grad),
         )
+        delta_norm = float(torch.cat([d.reshape(-1).float() for d in deltas]).norm().item())
+        print(
+            f"[unlearn] grad_norm={grad_norm:.6g} step_norm={delta_norm:.6g} lr={unlearn_lr}",
+            flush=True,
+        )
+        del grads
+
         after_losses = _target_token_losses(model, test_batch, [test_target_index], device)
         if after_losses.numel() == 0:
             raise RuntimeError("Could not score post-unlearn CE at the test target.")
         after_ce = float(after_losses[0].item())
         after_logprob = _logprob_from_ce(after_ce)
+        print(
+            f"[unlearn] CE before={base_ce:.8g} after={after_ce:.8g} "
+            f"dCE={after_ce - base_ce:.8g}",
+            flush=True,
+        )
 
         after_saliency = None
         if recompute_saliency:
-            sal_vec = compute_alti_saliency_vector(model, test_batch, test_target_index)
-            if 0 <= test_source_index < len(sal_vec):
-                after_saliency = float(sal_vec[test_source_index])
-            del sal_vec
+            after_saliency = _score_edge_saliency(
+                model,
+                test_batch,
+                saliency_fn=saliency_fn,
+                saliency_mode=saliency_mode,
+                target_index=test_target_index,
+                source_index=test_source_index,
+            )
     finally:
-        if delta is not None:
-            _restore_lm_head_ascent_update(model, delta)
-        del grad
+        if params is not None and deltas is not None:
+            _restore_filtered_ascent(params, deltas)
+        model.eval()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -252,6 +739,9 @@ def run_unlearn_pair_probe(
     verdict = "inconclusive"
     if delta_ce > 1e-4 and (delta_saliency is None or delta_saliency < -1e-8):
         verdict = "supports_causal"
+    elif abs(delta_ce) <= 1e-4 and delta_saliency is not None and delta_saliency < -1e-4:
+        # Test token often already has CE~0; LoRA can move ALTI without moving CE yet.
+        verdict = "saliency_only"
     elif abs(delta_ce) <= 1e-4:
         verdict = "no_effect"
     elif delta_ce < -1e-4:
@@ -265,7 +755,8 @@ def run_unlearn_pair_probe(
         "baseModelPath": resolved_base_used,
         "gradSpace": grad_space,
         "update": {
-            "paramSpace": "lm_head.weight",
+            "paramSpace": param_space_tag,
+            "lastNLayers": int(last_n_layers),
             "rule": (
                 "theta <- theta + eta * normalized(grad_train_ce)"
                 if normalize_grad
@@ -285,6 +776,7 @@ def run_unlearn_pair_probe(
             "sourceToken": test_tokens[test_source_index],
             "targetToken": test_tokens[test_target_index],
             "reportedSaliency": reported_saliency,
+            "saliencyMode": saliency_mode,
         },
         "before": {
             "ce": base_ce,

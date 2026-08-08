@@ -80,9 +80,16 @@ export default function App() {
       setPendingEdge(null)
       setAddSrc(null)
       setJumpIdx(String(idx))
+      const nToTarget =
+        initialTarget != null
+          ? detail.attention_edges.filter(e => e.dst === initialTarget).length
+          : null
       const edgeNote =
         initialTarget != null
-          ? ` · target @${initialTarget} · ${detail.attention_edges.filter(e => e.dst === initialTarget).length} ann edges`
+          ? ` · target @${initialTarget} · ${nToTarget} ann edges` +
+            (nToTarget === 0
+              ? '（该 target 无标注边，请点其它 token，例如有边的 Type 等）'
+              : '')
           : ` · ${detail.attention_edges.length} edges`
       setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}`)
     } catch (e) {
@@ -409,8 +416,8 @@ export default function App() {
 
               <p className="hint">
                 {mode === 'inspect'
-                  ? `点击 token 设为 target。当前 target: ${target ?? '无'}。${
-                      saliencyAvailable ? '' : '（未启用模型 saliency）'
+                  ? `点击 token 设为 target。当前 target: ${target ?? '无'}（指向它的标注边: ${relatedEdges.length}）。${
+                      saliencyAvailable ? '' : '（未启用模型 saliency，不影响看标注下划线）'
                     } ${saliencyMsg}`
                   : `添加模式：先点 source${addSrc != null ? `（已选 @${addSrc}）` : ''}，再点 target，类型=${addSubtype}`}
               </p>

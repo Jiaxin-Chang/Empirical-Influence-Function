@@ -179,17 +179,13 @@ def _cache_response_hidden(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
-    base_model = getattr(model, "model", None)
-    if base_model is None:
-        raise RuntimeError("Expected a HuggingFace causal LM with .model.")
+    from src.loss import _forward_decoder_hidden
 
-    outputs = base_model(
+    hidden = _forward_decoder_hidden(
+        model,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        use_cache=False,
-        return_dict=True,
     )
-    hidden = outputs.last_hidden_state
     row_positions = []
     labels = []
     for pos in target_positions:

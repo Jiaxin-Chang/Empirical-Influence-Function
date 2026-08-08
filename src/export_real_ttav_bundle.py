@@ -28,8 +28,69 @@ def load_report(report_json_path: str) -> dict:
         return json.load(f)
 
 
+def _fffd_decode_index(tokenizer) -> dict[str, list[int]]:
+    """Map decode(id) → [ids] for vocab entries whose decode contains U+FFFD."""
+    cached = getattr(tokenizer, "_eif_fffd_decode_index", None)
+    if cached is not None:
+        return cached
+    index: dict[str, list[int]] = {}
+    for tid in range(len(tokenizer)):
+        dec = tokenizer.decode([tid])
+        if "\ufffd" in dec:
+            index.setdefault(dec, []).append(tid)
+    setattr(tokenizer, "_eif_fffd_decode_index", index)
+    return index
+
+
+def _lookup_report_token_id(tokenizer, tok: str, *, vocab: dict, unk_id, unk_token) -> int | None:
+    """Map one report token surface back to a vocab id.
+
+    Reports from ``intervention_experiment`` store ``tokenizer.decode([id])``
+    strings (e.g. ``'\\n'``, Chinese chars), not SentencePiece piece names
+    (``Ċ``, …). ``convert_tokens_to_ids`` only handles the latter, so we fall
+    back to single-piece ``encode``. Surfaces containing U+FFFD must NOT use
+    encode (it collapses many byte-tokens to one fake id); use a unique reverse
+    decode hit instead.
+    """
+    token_id = tokenizer.convert_tokens_to_ids(tok)
+    is_missing = token_id is None
+    if not is_missing and unk_id is not None and token_id == unk_id and tok != unk_token:
+        is_missing = tok not in vocab
+    if not is_missing:
+        return int(token_id)
+
+    vocab_id = vocab.get(tok)
+    if vocab_id is not None:
+        return int(vocab_id)
+
+    if "\ufffd" in tok:
+        hits = _fffd_decode_index(tokenizer).get(tok) or []
+        if len(hits) == 1:
+            return int(hits[0])
+        return None
+
+    # Display / decode surfaces → single model token.
+    encoded = tokenizer.encode(tok, add_special_tokens=False)
+    if len(encoded) == 1:
+        return int(encoded[0])
+
+    # Older reports sometimes keep GPT-2/Qwen marker forms.
+    alts: list[str] = []
+    if " " in tok or "\n" in tok or "\t" in tok:
+        alts.append(tok.replace(" ", "Ġ").replace("\n", "Ċ").replace("\t", "ĉ"))
+    if tok and not tok.startswith(("Ġ", "Ċ", "ĉ")):
+        alts.extend([f"Ġ{tok}", f"Ċ{tok}", f"ĉ{tok}"])
+    for alt in alts:
+        if alt in vocab:
+            return int(vocab[alt])
+        enc = tokenizer.encode(alt, add_special_tokens=False)
+        if len(enc) == 1:
+            return int(enc[0])
+
+    return None
+
+
 def convert_report_tokens_to_ids(tokenizer, report_tokens: list[str]) -> list[int]:
-    ids = tokenizer.convert_tokens_to_ids(report_tokens)
     vocab = tokenizer.get_vocab()
     unk_id = getattr(tokenizer, "unk_token_id", None)
     unk_token = getattr(tokenizer, "unk_token", None)
@@ -37,22 +98,22 @@ def convert_report_tokens_to_ids(tokenizer, report_tokens: list[str]) -> list[in
     missing: list[tuple[int, str]] = []
     recovered_ids: list[int] = []
 
-    for idx, (tok, token_id) in enumerate(zip(report_tokens, ids)):
-        is_missing = token_id is None
-        if not is_missing and unk_id is not None and token_id == unk_id and tok != unk_token:
-            is_missing = tok not in vocab
-
-        if is_missing:
-            vocab_id = vocab.get(tok)
-            if vocab_id is None:
-                missing.append((idx, tok))
-                recovered_ids.append(-1)
-            else:
-                recovered_ids.append(vocab_id)
+    for idx, tok in enumerate(report_tokens):
+        resolved = _lookup_report_token_id(
+            tokenizer, tok, vocab=vocab, unk_id=unk_id, unk_token=unk_token
+        )
+        if resolved is None:
+            missing.append((idx, tok))
+            recovered_ids.append(-1)
         else:
-            recovered_ids.append(int(token_id))
+            recovered_ids.append(resolved)
 
     if missing:
+        # Last resort: re-tokenize the joined surfaces when length is preserved.
+        joined = "".join(report_tokens)
+        all_ids = tokenizer.encode(joined, add_special_tokens=False)
+        if len(all_ids) == len(report_tokens):
+            return [int(x) for x in all_ids]
         preview = ", ".join(f"{idx}:{repr(tok)}" for idx, tok in missing[:10])
         raise ValueError(
             "Failed to map some report tokens back to tokenizer ids. "
@@ -63,12 +124,17 @@ def convert_report_tokens_to_ids(tokenizer, report_tokens: list[str]) -> list[in
 
 
 def validate_roundtrip_tokens(tokenizer, token_ids: list[int], report_tokens: list[str]):
-    roundtrip = tokenizer.convert_ids_to_tokens(token_ids)
-    mismatches = [
-        (idx, src, back, token_ids[idx])
-        for idx, (src, back) in enumerate(zip(report_tokens, roundtrip))
-        if src != back
-    ]
+    """Accept either vocab-piece equality or decode-surface equality."""
+    mismatches: list[tuple[int, str, str, int]] = []
+    for idx, (src, tid) in enumerate(zip(report_tokens, token_ids)):
+        vocab_tok = tokenizer.convert_ids_to_tokens(int(tid))
+        decoded = tokenizer.decode([int(tid)])
+        if src == vocab_tok or src == decoded:
+            continue
+        # Corrupted replacement chars in old JSON cannot round-trip; skip soft.
+        if "\ufffd" in src:
+            continue
+        mismatches.append((idx, src, decoded, int(tid)))
     if mismatches:
         preview = ", ".join(
             f"{idx}:{repr(src)}->{repr(back)}(id={tok_id})"

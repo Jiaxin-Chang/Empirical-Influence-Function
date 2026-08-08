@@ -93,6 +93,8 @@ interface UnlearnPairResult {
     before?: { ce?: number; logprob?: number; saliency?: number | null };
     after?: { ce?: number; logprob?: number; saliency?: number | null };
     delta?: { ce?: number; logprob?: number; saliency?: number | null };
+    update?: { paramSpace?: string; lastNLayers?: number };
+    testEdge?: { reportedSaliency?: number | null; saliencyMode?: string };
 }
 
 interface PerTokenResult {
@@ -1338,6 +1340,8 @@ function unlearnVerdictLabel(verdict: string | undefined): { text: string; color
     switch (verdict) {
         case 'supports_causal':
             return { text: '像真因果：遗忘后 target 更难', color: '#166534' };
+        case 'saliency_only':
+            return { text: 'saliency 下降但 CE 几乎不动（test 已近满分）', color: '#a16207' };
         case 'no_effect':
             return { text: '几乎无影响', color: '#64748b' };
         case 'opposite_effect':
@@ -1422,7 +1426,7 @@ function PairCard({
                             onUnlearn();
                         }}
                         disabled={unlearnBusy}
-                        title="对该 train 边做一步 lm_head unlearn，看 test target 的 logP / saliency 是否下降"
+                        title="对该 train target 在匹配参数空间（默认 last-1 LoRA）做一步 CE ascent，看 test 的 logP / saliency 是否变化"
                         style={{
                             border: '1px solid #fda4af',
                             background: unlearnBusy ? '#ffe4e6' : '#fff1f2',
@@ -1509,8 +1513,31 @@ function PairCard({
                             <> · sal {formatSigned(unlearnResult.before.saliency, 6)} → {formatSigned(unlearnResult.after?.saliency, 6)}</>
                         )}
                     </div>
+                    {unlearnResult.testEdge?.reportedSaliency != null && (
+                        <div style={{ color: '#a8a29e' }}>
+                            报告里该边 saliency = {formatSigned(unlearnResult.testEdge.reportedSaliency, 4)}
+                            {unlearnResult.before?.saliency != null && (
+                                <>
+                                    {' · '}重算 before = {formatSigned(unlearnResult.before.saliency, 4)}
+                                    {Math.abs(
+                                        (unlearnResult.before.saliency ?? 0)
+                                        - (unlearnResult.testEdge.reportedSaliency ?? 0),
+                                    ) > Math.max(0.5, 0.2 * Math.abs(unlearnResult.testEdge.reportedSaliency ?? 0))
+                                        ? ' ⚠ 与报告不一致（多为 checkpoint 不同或 hidden 层索引）'
+                                        : ''}
+                                </>
+                            )}
+                        </div>
+                    )}
                     <div style={{ color: '#a8a29e' }}>
-                        一步 lm_head 探针 · 已 restore · 不写回 adapter
+                        一步 {unlearnResult.update?.paramSpace || 'match-space'} 探针
+                        {unlearnResult.update?.lastNLayers != null
+                            ? ` · last-${unlearnResult.update.lastNLayers}`
+                            : ''}
+                        {unlearnResult.testEdge?.saliencyMode
+                            ? ` · ${unlearnResult.testEdge.saliencyMode}`
+                            : ''}
+                        {' · '}已 restore · 不写回 adapter
                     </div>
                     {unlearnResult.error && (
                         <div style={{ color: '#b91c1c' }}>{unlearnResult.error}</div>
@@ -2069,7 +2096,9 @@ export function ReportPanel({
                         trainTargetIndex: pair.train_correlation.target_token_index,
                         modelPath: report.experiment_meta.model_path ?? null,
                         baseModelPath: report.experiment_meta.base_model_path ?? null,
-                        unlearnLr: 1.0,
+                        // LoRA last-layer is high-dimensional; unit-normalized η=1
+                        // barely moves CE when the test token is already near-perfect.
+                        unlearnLr: 20.0,
                         recomputeSaliency: true,
                     }),
                 });
