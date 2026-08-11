@@ -327,6 +327,8 @@
     border-radius: 12px;
     overflow: hidden;
     box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    /* Prevent flex-shrink crush when prob chart appears in bottomLeft. */
+    flex-shrink: 0;
 }
 .codePanelHeader {
     display: flex;
@@ -356,6 +358,7 @@
 .outputSection {
     display: flex;
     flex-direction: column;
+    flex-shrink: 0;
 }
 .outputSection + .outputSection {
     border-top: 1px solid #313244;
@@ -367,6 +370,7 @@
     padding: 8px 14px;
     background: #181825;
     border-bottom: 1px solid #313244;
+    flex-shrink: 0;
 }
 .outputSectionTitle {
     font-size: 11px;
@@ -389,6 +393,7 @@
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
+    flex-shrink: 0;
 }
 .codeBlockCompact {
     max-height: 280px;
@@ -515,6 +520,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    flex-shrink: 0;
 }
 .correlationListTitle {
     font-size: 11px;
@@ -959,6 +965,7 @@
     border: 1px solid #313244;
     border-radius: 8px;
     overflow: hidden;
+    flex-shrink: 0;
 }
 .probPanelHeader {
     display: flex;
