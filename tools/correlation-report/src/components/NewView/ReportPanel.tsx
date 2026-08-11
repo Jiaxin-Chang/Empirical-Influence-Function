@@ -2031,12 +2031,22 @@ export function ReportPanel({
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
     ]);
 
+    // Gold saliency sources → yellow highlight on Model stream (shared prompt indices).
+    // Same behavior as predict: all top sources, or only the clicked edge.
+    const goldModelHighlightSourceIndices = useMemo(() => {
+        if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
+        const abs = goldSelectedCorrIdx !== null
+            ? [goldSelectedCorrIdx]
+            : goldTopCorrelations.map(c => c.source_token_index);
+        return new Set(abs.filter(i => i >= 0 && i < modelTokens.length));
+    }, [attrMode, goldTopCorrelations, goldSelectedCorrIdx, modelTokens.length]);
+
+    // Gold answer panel: only answer-local sources (prompt has no tokens there).
     const goldHighlightSourceIndices = useMemo(() => {
         if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
         const abs = goldSelectedCorrIdx !== null
             ? [goldSelectedCorrIdx]
             : goldTopCorrelations.map(c => c.source_token_index);
-        // Gold panel uses local indices (answer-only). Prompt sources are skipped.
         return new Set(
             abs
                 .filter(i => i >= promptLen)
@@ -2605,7 +2615,13 @@ export function ReportPanel({
                                 modelTokens={modelTokens}
                                 goldResponseTokens={goldResponseTokens}
                                 promptLen={promptLen}
-                                highlightSourceIndices={attrMode === 'predict' ? sourceHighlightIndices : undefined}
+                                highlightSourceIndices={
+                                    attrMode === 'predict'
+                                        ? sourceHighlightIndices
+                                        : attrMode === 'gold'
+                                            ? goldModelHighlightSourceIndices
+                                            : undefined
+                                }
                                 selectedTargetIndex={attrMode === 'predict' ? (selectedTokIdx ?? undefined) : undefined}
                                 analyzedIndices={analyzedIndices}
                                 onTokenClick={idx => {

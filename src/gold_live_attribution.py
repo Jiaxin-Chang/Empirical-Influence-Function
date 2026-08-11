@@ -321,7 +321,7 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     )
 
     print(f"[gold-live] loading train data {train_path}", flush=True)
-    train_samples = load_samples(str(train_path), is_train=True)
+    train_samples = load_samples(str(train_path))
     if not train_samples:
         raise ValueError(f"No train samples loaded from {train_path}")
 
