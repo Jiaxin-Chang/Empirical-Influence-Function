@@ -81,12 +81,19 @@ def _is_placeholder_path(value: str) -> bool:
     )
 
 
-def _hydrate_eif_env() -> Path | None:
-    """Load repo-root eif_api.env into os.environ (do not override existing).
+def _hydrate_eif_env(*, force_file: bool = True) -> Path | None:
+    """Load repo-root ``eif_api.env`` into ``os.environ``.
 
-    Placeholder values like ``/path/to/...`` are skipped so we do not poison
-    resolution and then fall through to a Linux report path on Windows.
+    By default, ``EIF_*`` / path keys from the file **overwrite** stale shell
+    values so editing the file + restart (or next gold call) actually sticks.
+    Placeholder ``/path/to/...`` values are never applied.
+    Set ``EIF_ENV_NO_OVERRIDE=1`` to keep the old "shell wins" behavior.
     """
+    no_override = (
+        not force_file
+        or os.environ.get("EIF_ENV_NO_OVERRIDE", "").strip().lower() in ("1", "true", "yes")
+    )
+
     def _apply(path: Path) -> None:
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
@@ -95,11 +102,16 @@ def _hydrate_eif_env() -> Path | None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if not key or key in os.environ:
+            if not key:
                 continue
             if key.endswith("_PATH") or key.endswith("_DATA") or key.endswith("_ROOT"):
                 if _is_placeholder_path(value):
+                    # Drop stale placeholder previously injected into the process.
+                    if key in os.environ and _is_placeholder_path(os.environ.get(key, "")):
+                        del os.environ[key]
                     continue
+            if no_override and key in os.environ:
+                continue
             os.environ[key] = value
 
     for name in ("eif_api.env", ".env"):
@@ -107,7 +119,6 @@ def _hydrate_eif_env() -> Path | None:
         if path.is_file():
             _apply(path)
             return path
-    # Also pull annotation-viewer train path if present
     viewer_env = REPO_ROOT / "tools" / "annotation-viewer" / ".env"
     if viewer_env.is_file():
         _apply(viewer_env)
@@ -146,32 +157,41 @@ def _device_of(model) -> torch.device:
 
 
 def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
+    """Prefer ``eif_api.env``; do not silently use a different report checkpoint."""
+    _hydrate_eif_env(force_file=True)
     meta = report.get("experiment_meta") or {}
     env_model = (
         (os.environ.get("EIF_ADAPTER_PATH") or os.environ.get("EIF_MODEL_PATH") or "").strip()
     )
     report_model = str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
-    model = env_model or report_model
-    if not model:
-        raise ValueError(
-            "No model path. Set EIF_ADAPTER_PATH (and EIF_BASE_MODEL_PATH for LoRA) "
-            "in eif_api.env, or put model_path in the report."
+
+    if env_model and not _is_placeholder_path(env_model):
+        model = env_model
+        src = "EIF_ADAPTER_PATH"
+    elif report_model and not _is_placeholder_path(report_model):
+        # Only fall back when env is unset — make it obvious in logs/errors.
+        model = report_model
+        src = "report experiment_meta.model_path"
+        print(
+            f"[gold-live] WARNING: EIF_ADAPTER_PATH unset/placeholder; "
+            f"falling back to {src}={report_model!r}. "
+            f"Set eif_api.env and restart ttav_bundle_api.",
+            flush=True,
         )
-    if _is_placeholder_path(model):
+    else:
         raise ValueError(
-            f"Model path still looks like a placeholder: {model!r}. "
-            "Edit repo-root eif_api.env: set EIF_ADAPTER_PATH / EIF_BASE_MODEL_PATH "
-            "to real directories on the machine running ttav_bundle_api, then restart the API."
+            "No usable model path. Set EIF_ADAPTER_PATH (and EIF_BASE_MODEL_PATH for LoRA) "
+            f"in {REPO_ROOT / 'eif_api.env'} on the API host. "
+            f"Current EIF_ADAPTER_PATH={env_model!r}, report model_path={report_model!r}."
         )
+
     if not os.path.isdir(model):
         hint = ""
         if model.startswith("/") and os.name == "nt":
             hint = (
-                " (this looks like a Linux path but the API is on Windows — "
-                "set EIF_ADAPTER_PATH in eif_api.env to a path that exists here, "
-                "or run the API on the Ubuntu host that has the checkpoint)"
+                " (Linux path on Windows — run API on the Ubuntu host with /mnt/md124, "
+                "or point EIF_ADAPTER_PATH at a local directory)"
             )
-        src = "EIF_ADAPTER_PATH" if env_model else "report experiment_meta.model_path"
         raise FileNotFoundError(
             f"{src} is not a local directory: {model!r}.{hint} "
             "Gold live only loads local checkpoints (not HuggingFace hub repo ids)."
@@ -189,13 +209,13 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
         if not base:
             raise ValueError(
                 f"{model} looks like a LoRA adapter but EIF_BASE_MODEL_PATH is empty. "
-                "Set the base CausalLM directory in eif_api.env "
-                "(must exist on the API host)."
+                f"Set it in {REPO_ROOT / 'eif_api.env'}."
             )
         if not os.path.isdir(base):
             raise FileNotFoundError(
                 f"EIF_BASE_MODEL_PATH is not a local directory: {base!r}"
             )
+    print(f"[gold-live] using model from {src}: {model}", flush=True)
     return os.path.abspath(model), (os.path.abspath(base) if base else None)
 
 
