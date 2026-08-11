@@ -1,14 +1,15 @@
-"""One-step unlearning probe for a single train↔test saliency correlation pair.
+"""One-step learn/unlearn probe for a single train↔test saliency correlation pair.
 
 Uses the same model loading path as ``intervention_experiment`` (full checkpoint
 OR base + LoRA adapter). The update uses the **same parameter subspace as pair
 matching** (default: last-1-layer LoRA):
 
-    θ ← θ + η · normalize(∇_θ CE_train_target)
+    unlearn: θ ← θ + η · normalize(∇_θ CE_train_target)   # ascent
+    learn:   θ ← θ − η · normalize(∇_θ CE_train_target)   # descent
 
 then measures how the *test* target token's CE / log-prob and ALTI saliency
-change. Weights are restored afterwards — this is a probe, not a permanent edit
-of the adapter on disk.
+change. By default weights are restored afterwards (probe). With
+``persist=True`` the step stays applied until ``recover_pair_intervention``.
 
 The train loss is restricted to the pair's train *target* token (other labels
 masked to -100).
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 
 from src.attribution_evaluation import _target_token_losses
 from src.export_real_ttav_bundle import (
@@ -43,8 +45,11 @@ from src.loss import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Reuse one loaded model across Unlearn clicks in the same API process.
+# Reuse one loaded model across Unlearn/Learn clicks in the same API process.
 _MODEL_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
+
+# Persistent one-step intervention (until recover).
+_INTERVENTION: dict[str, Any] | None = None
 
 
 def _device_of(model) -> torch.device:
@@ -81,6 +86,20 @@ def _resolve_paths(
 
 
 def _get_model(model_path: str, base_model_path: str | None):
+    # Prefer an already-loaded gold-live session when paths match (save VRAM).
+    try:
+        from src.gold_live_attribution import _SESSION as _GOLD_SESSION
+        if _GOLD_SESSION is not None:
+            g_model = str(_GOLD_SESSION.get("model_path") or "")
+            g_base = str(_GOLD_SESSION.get("base_path") or "")
+            if (
+                os.path.abspath(g_model) == os.path.abspath(model_path)
+                and os.path.abspath(g_base or "") == os.path.abspath(base_model_path or "")
+            ):
+                return _GOLD_SESSION["model"], _GOLD_SESSION["tokenizer"]
+    except Exception:
+        pass
+
     key = (os.path.abspath(model_path), os.path.abspath(base_model_path) if base_model_path else "")
     cached = _MODEL_CACHE.get(key)
     if cached is not None:
@@ -91,6 +110,41 @@ def _get_model(model_path: str, base_model_path: str | None):
     )
     _MODEL_CACHE[key] = (model, tokenizer)
     return model, tokenizer
+
+
+def intervention_status() -> dict[str, Any]:
+    if _INTERVENTION is None:
+        return {"active": False}
+    return {
+        "active": True,
+        "direction": _INTERVENTION.get("direction"),
+        "pairId": _INTERVENTION.get("pair_id"),
+        "trainSampleId": _INTERVENTION.get("train_sample_id"),
+    }
+
+
+def recover_pair_intervention() -> dict[str, Any]:
+    """Undo a persisted learn/unlearn step (if any)."""
+    global _INTERVENTION
+    state = _INTERVENTION
+    if state is None:
+        return {"status": "success", "recovered": False, "message": "No active intervention."}
+    params = state.get("params") or []
+    deltas = state.get("deltas") or []
+    if params and deltas:
+        _restore_filtered_ascent(params, deltas)
+    direction = state.get("direction")
+    pair_id = state.get("pair_id")
+    model = state.get("model")
+    _INTERVENTION = None
+    _release_cuda_memory(model, reason="intervene_recover")
+    return {
+        "status": "success",
+        "recovered": True,
+        "direction": direction,
+        "pairId": pair_id,
+        "intervention": intervention_status(),
+    }
 
 
 def _hydrate_annotation_viewer_env() -> None:
@@ -554,12 +608,37 @@ def run_unlearn_pair_probe(
     recompute_saliency: bool = True,
     sample_id: str | None = None,
     report_json_path: str | None = None,
+    direction: str = "unlearn",
+    persist: bool = False,
+    completion_mode: str = "predict",
+    train_sample_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run the probe and return before/after metrics (model weights restored)."""
+    """Run learn/unlearn step; optionally persist until ``recover_pair_intervention``."""
+    global _INTERVENTION
+
+    direction_norm = (direction or "unlearn").strip().lower()
+    if direction_norm not in {"unlearn", "learn"}:
+        raise ValueError(f"direction must be 'unlearn' or 'learn', got {direction!r}")
+    completion_norm = (completion_mode or "predict").strip().lower()
+    if completion_norm not in {"predict", "gold"}:
+        raise ValueError(f"completion_mode must be predict|gold, got {completion_mode!r}")
+    # Unlearn = ascent (+lr); Learn = descent (-lr).
+    signed_lr = float(unlearn_lr) if direction_norm == "unlearn" else -float(unlearn_lr)
+
     baseline = report.get("test_sample_baseline") or {}
-    test_tokens = list(baseline.get("full_tokens") or [])
+    if completion_norm == "gold":
+        test_tokens = list(baseline.get("correct_full_tokens") or [])
+        test_ids_key = "correct_full_token_ids"
+    else:
+        test_tokens = list(baseline.get("full_tokens") or [])
+        test_ids_key = "full_token_ids"
     if not test_tokens:
-        raise ValueError("Report is missing test_sample_baseline.full_tokens.")
+        raise ValueError(f"Report is missing test tokens for completion_mode={completion_norm}.")
+
+    if train_sample_detail is not None:
+        details = dict(report.get("train_sample_details") or {})
+        details[str(train_sample_id)] = train_sample_detail
+        report = {**report, "train_sample_details": details}
 
     train_detail = (report.get("train_sample_details") or {}).get(str(train_sample_id))
     if not isinstance(train_detail, dict):
@@ -582,6 +661,10 @@ def run_unlearn_pair_probe(
             f"target={train_target_index}, seq_len={len(train_tokens)}."
         )
 
+    # New persist step replaces any previous one.
+    if _INTERVENTION is not None:
+        recover_pair_intervention()
+
     resolved_model, resolved_base = _resolve_paths(report, model_path, base_model_path)
     meta_model = str((report.get("experiment_meta") or {}).get("model_path") or "").strip()
     if meta_model and os.path.abspath(resolved_model) != os.path.abspath(meta_model):
@@ -596,7 +679,7 @@ def run_unlearn_pair_probe(
     grad_space = getattr(model, "_eif_grad_space", "unknown")
     resolved_base_used = getattr(model, "_eif_base_model_path", resolved_base)
 
-    test_ids_stored = baseline.get("full_token_ids")
+    test_ids_stored = baseline.get(test_ids_key)
     if not isinstance(test_ids_stored, list):
         test_ids_stored = None
     train_ids_stored = train_detail.get("full_token_ids")
@@ -623,7 +706,7 @@ def run_unlearn_pair_probe(
         train_jsonl_ids = None
 
     print(
-        f"[unlearn] id sources: sample={resolved_sample_id or '-'} "
+        f"[{direction_norm}] id sources: sample={resolved_sample_id or '-'} "
         f"test_pt={'yes' if test_pt_ids else 'no'} "
         f"train_pt={'yes' if train_pt_ids else 'no'} "
         f"train_jsonl={train_jsonl or '-'} "
@@ -675,10 +758,9 @@ def run_unlearn_pair_probe(
     base_logprob = _logprob_from_ce(base_ce)
 
     saliency_fn, saliency_mode = _resolve_saliency_fn(report)
-    print(f"[unlearn] saliency_mode={saliency_mode}", flush=True)
-    # Sanity: same indices/tokens the report used for this edge.
+    print(f"[{direction_norm}] saliency_mode={saliency_mode}", flush=True)
     print(
-        f"[unlearn] test edge src={test_source_index} "
+        f"[{direction_norm}] test edge src={test_source_index} "
         f"{test_tokens[test_source_index]!r} -> tgt={test_target_index} "
         f"{test_tokens[test_target_index]!r} "
         f"id_src={int(test_batch['input_ids'][0, test_source_index])} "
@@ -702,28 +784,28 @@ def run_unlearn_pair_probe(
             and abs(base_saliency - reported_saliency) > max(1e-3, 0.05 * abs(reported_saliency))
         ):
             print(
-                f"[unlearn][WARN] recomputed saliency {base_saliency:.6g} differs from "
+                f"[{direction_norm}][WARN] recomputed saliency {base_saliency:.6g} differs from "
                 f"report {reported_saliency:.6g} (mode={saliency_mode}). "
                 f"Check model_path/base_path match the report run.",
                 flush=True,
             )
         elif reported_saliency is not None and base_saliency is not None:
             print(
-                f"[unlearn] saliency OK vs report: {base_saliency:.6g} ≈ {reported_saliency:.6g}",
+                f"[{direction_norm}] saliency OK vs report: {base_saliency:.6g} ≈ {reported_saliency:.6g}",
                 flush=True,
             )
 
     param_filter, param_space_tag, last_n_layers = _resolve_match_param_filter(model, report)
     print(
-        f"[unlearn] param_space={param_space_tag} (aligned with pair matching; "
+        f"[{direction_norm}] param_space={param_space_tag} (aligned with pair matching; "
         f"model_grad_space={grad_space})",
         flush=True,
     )
 
     params = None
     deltas = None
+    restored = True
     try:
-        # Pair-matching subspace (last-N LoRA / fine-attn), not lm_head.
         params, grads = _compute_filtered_ce_grads(
             model, train_batch, param_filter, device
         )
@@ -731,23 +813,24 @@ def run_unlearn_pair_probe(
         deltas = _apply_filtered_ascent(
             params,
             grads,
-            lr=float(unlearn_lr),
+            lr=signed_lr,
             normalize=bool(normalize_grad),
         )
         delta_norm = float(torch.cat([d.reshape(-1).float() for d in deltas]).norm().item())
         print(
-            f"[unlearn] grad_norm={grad_norm:.6g} step_norm={delta_norm:.6g} lr={unlearn_lr}",
+            f"[{direction_norm}] grad_norm={grad_norm:.6g} step_norm={delta_norm:.6g} "
+            f"lr={signed_lr} persist={persist}",
             flush=True,
         )
         del grads
 
         after_losses = _target_token_losses(model, test_batch, [test_target_index], device)
         if after_losses.numel() == 0:
-            raise RuntimeError("Could not score post-unlearn CE at the test target.")
+            raise RuntimeError(f"Could not score post-{direction_norm} CE at the test target.")
         after_ce = float(after_losses[0].item())
         after_logprob = _logprob_from_ce(after_ce)
         print(
-            f"[unlearn] CE before={base_ce:.8g} after={after_ce:.8g} "
+            f"[{direction_norm}] CE before={base_ce:.8g} after={after_ce:.8g} "
             f"dCE={after_ce - base_ce:.8g}",
             flush=True,
         )
@@ -762,13 +845,26 @@ def run_unlearn_pair_probe(
                 target_index=test_target_index,
                 source_index=test_source_index,
             )
+
+        if persist:
+            _INTERVENTION = {
+                "direction": direction_norm,
+                "pair_id": pair_id,
+                "train_sample_id": int(train_sample_id),
+                "params": params,
+                "deltas": deltas,
+                "model": model,
+            }
+            restored = False
+            params = None
+            deltas = None
     finally:
-        if params is not None and deltas is not None:
+        if restored and params is not None and deltas is not None:
             _restore_filtered_ascent(params, deltas)
-        # Drop ascent bookkeeping + any leftover activation refs.
-        params = None
-        deltas = None
-        _release_cuda_memory(model, reason="unlearn_finally")
+        if restored:
+            params = None
+            deltas = None
+            _release_cuda_memory(model, reason=f"{direction_norm}_finally")
 
     delta_ce = after_ce - base_ce
     delta_logprob = after_logprob - base_logprob
@@ -777,20 +873,40 @@ def run_unlearn_pair_probe(
         else after_saliency - base_saliency
     )
 
-    verdict = "inconclusive"
-    if delta_ce > 1e-4 and (delta_saliency is None or delta_saliency < -1e-8):
-        verdict = "supports_causal"
-    elif abs(delta_ce) <= 1e-4 and delta_saliency is not None and delta_saliency < -1e-4:
-        # Test token often already has CE~0; LoRA can move ALTI without moving CE yet.
-        verdict = "saliency_only"
-    elif abs(delta_ce) <= 1e-4:
-        verdict = "no_effect"
-    elif delta_ce < -1e-4:
-        verdict = "opposite_effect"
+    if direction_norm == "unlearn":
+        verdict = "inconclusive"
+        if delta_ce > 1e-4 and (delta_saliency is None or delta_saliency < -1e-8):
+            verdict = "supports_causal"
+        elif abs(delta_ce) <= 1e-4 and delta_saliency is not None and delta_saliency < -1e-4:
+            verdict = "saliency_only"
+        elif abs(delta_ce) <= 1e-4:
+            verdict = "no_effect"
+        elif delta_ce < -1e-4:
+            verdict = "opposite_effect"
+    else:
+        # Learn: expect test CE ↓ / logP ↑ if the train edge helps the target.
+        verdict = "inconclusive"
+        if delta_ce < -1e-4 and (delta_saliency is None or delta_saliency > 1e-8):
+            verdict = "supports_causal"
+        elif abs(delta_ce) <= 1e-4 and delta_saliency is not None and delta_saliency > 1e-4:
+            verdict = "saliency_only"
+        elif abs(delta_ce) <= 1e-4:
+            verdict = "no_effect"
+        elif delta_ce > 1e-4:
+            verdict = "opposite_effect"
+
+    rule = (
+        "theta <- theta + eta * normalized(grad_train_ce)"
+        if direction_norm == "unlearn"
+        else "theta <- theta - eta * normalized(grad_train_ce)"
+    )
+    if not normalize_grad:
+        rule = rule.replace("normalized(", "").replace(")", "", 1)
 
     result = {
         "status": "success",
         "pairId": pair_id,
+        "direction": direction_norm,
         "trainSampleId": int(train_sample_id),
         "modelPath": resolved_model,
         "baseModelPath": resolved_base_used,
@@ -798,14 +914,13 @@ def run_unlearn_pair_probe(
         "update": {
             "paramSpace": param_space_tag,
             "lastNLayers": int(last_n_layers),
-            "rule": (
-                "theta <- theta + eta * normalized(grad_train_ce)"
-                if normalize_grad
-                else "theta <- theta + eta * grad_train_ce"
-            ),
+            "rule": rule,
+            "direction": direction_norm,
             "unlearnLr": float(unlearn_lr),
+            "signedLr": float(signed_lr),
             "normalizeGrad": bool(normalize_grad),
             "steps": 1,
+            "persist": bool(persist),
             "persistsToDisk": False,
             "trainLossScope": "train_target_token_only",
             "trainTargetIndex": int(train_target_index),
@@ -835,9 +950,98 @@ def run_unlearn_pair_probe(
             "saliency": delta_saliency,
         },
         "verdict": verdict,
-        "restored": True,
+        "restored": restored,
+        "intervention": intervention_status(),
     }
-    # Batches / report tensors can pin allocator pages until the request returns.
     del test_batch, train_batch
-    _release_cuda_memory(model, reason="unlearn_return")
+    if restored:
+        _release_cuda_memory(model, reason=f"{direction_norm}_return")
+    else:
+        _release_cuda_memory(model, reason=f"{direction_norm}_persist")
     return result
+
+
+@torch.inference_mode()
+def compute_next_token_probs(
+    report: dict[str, Any],
+    *,
+    mode: str,
+    target_index: int,
+    top_k: int = 10,
+    model_path: str | None = None,
+    base_model_path: str | None = None,
+) -> dict[str, Any]:
+    """Top-k next-token distribution that produces ``tokens[target_index]``.
+
+    ``mode=predict`` uses model completion tokens; ``mode=gold`` uses teacher-forced
+    gold tokens. Prefix is ``ids[:target_index]`` (causal LM predicts position t
+    from tokens 0..t-1).
+    """
+    mode_norm = (mode or "predict").strip().lower()
+    if mode_norm not in {"predict", "gold"}:
+        raise ValueError(f"mode must be 'predict' or 'gold', got {mode!r}")
+
+    baseline = report.get("test_sample_baseline") or {}
+    if mode_norm == "gold":
+        tokens = list(baseline.get("correct_full_tokens") or [])
+        stored_ids = baseline.get("correct_full_token_ids")
+    else:
+        tokens = list(baseline.get("full_tokens") or [])
+        stored_ids = baseline.get("full_token_ids")
+    if not tokens:
+        raise ValueError(f"Report missing tokens for mode={mode_norm}.")
+
+    resolved_model, resolved_base = _resolve_paths(report, model_path, base_model_path)
+    model, tokenizer = _get_model(resolved_model, resolved_base)
+    device = _device_of(model)
+
+    if isinstance(stored_ids, list) and len(stored_ids) == len(tokens):
+        ids = [int(x) for x in stored_ids]
+    else:
+        ids = convert_report_tokens_to_ids(tokenizer, tokens)
+        if len(ids) != len(tokens):
+            raise ValueError(
+                f"Could not align token ids ({len(ids)}) to surfaces ({len(tokens)})."
+            )
+
+    t = int(target_index)
+    if not (0 < t < len(ids)):
+        raise ValueError(
+            f"target_index={t} out of range for next-token probs "
+            f"(need 0 < t < {len(ids)})."
+        )
+
+    prefix = torch.tensor([ids[:t]], dtype=torch.long, device=device)
+    attn = torch.ones_like(prefix)
+    outputs = model(input_ids=prefix, attention_mask=attn, use_cache=False)
+    logits = outputs.logits[0, -1].float()
+    probs = F.softmax(logits, dim=-1)
+    k = max(1, min(int(top_k), int(probs.numel())))
+    values, indices = torch.topk(probs, k=k)
+
+    actual_id = int(ids[t])
+    actual_prob = float(probs[actual_id].item())
+    top_rows = []
+    for p, tid in zip(values.tolist(), indices.tolist()):
+        tid_i = int(tid)
+        top_rows.append({
+            "token": tokenizer.decode([tid_i]),
+            "tokenId": tid_i,
+            "prob": float(p),
+            "isActual": tid_i == actual_id,
+        })
+
+    del outputs, logits, probs, prefix, attn
+    _release_cuda_memory(model, reason="next_token_probs")
+
+    return {
+        "status": "success",
+        "mode": mode_norm,
+        "targetIndex": t,
+        "actualToken": tokens[t],
+        "actualTokenId": actual_id,
+        "actualProb": actual_prob,
+        "top": top_rows,
+        "intervention": intervention_status(),
+        "modelPath": resolved_model,
+    }

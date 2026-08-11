@@ -14,7 +14,11 @@ from src.export_real_ttav_bundle import DEFAULT_MODEL_PATH, build_real_bundle_pa
 from src.export_probe_bundle_from_pt import build_probe_payload as build_probe_from_pt
 from src.export_train_probe_bundle import build_train_probe_bundle_payload
 from src.export_ttav_bundle import build_bundle_payload, infer_sample_id, upload_bundle
-from src.unlearn_pair_probe import run_unlearn_pair_probe
+from src.unlearn_pair_probe import (
+    compute_next_token_probs,
+    recover_pair_intervention,
+    run_unlearn_pair_probe,
+)
 from src.gold_live_attribution import (
     _hydrate_eif_env,
     gold_retrieve_and_stage3,
@@ -439,6 +443,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/unlearn-pair-probe":
             self._handle_unlearn_pair_probe()
             return
+        if parsed.path == "/api/pair-intervene-recover":
+            self._handle_pair_intervene_recover()
+            return
+        if parsed.path == "/api/next-token-probs":
+            self._handle_next_token_probs()
+            return
         if parsed.path == "/api/gold-saliency":
             self._handle_gold_saliency()
             return
@@ -759,10 +769,18 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         unlearn_lr = float(req.get("unlearnLr", 20.0))
         normalize_grad = not bool(req.get("noNormalizeGrad", False))
         recompute_saliency = bool(req.get("recomputeSaliency", True))
+        direction = str(req.get("direction", "unlearn") or "unlearn").strip().lower()
+        # UI learn/unlearn keeps the step applied so the prob chart can refresh.
+        persist = bool(req.get("persist", True))
+        completion_mode = str(req.get("completionMode", "predict") or "predict").strip().lower()
+        train_detail = req.get("trainSampleDetail")
+        if train_detail is not None and not isinstance(train_detail, dict):
+            train_detail = None
 
         print(
-            f"[unlearn] pair={pair_id or '?'} train={train_sample_id} "
+            f"[{direction}] pair={pair_id or '?'} train={train_sample_id} "
             f"test={test_source_index}->{test_target_index} lr={unlearn_lr} "
+            f"persist={persist} mode={completion_mode} "
             f"adapter={model_path or '(env/report)'} base={base_model_path or '(auto/env)'}",
             flush=True,
         )
@@ -784,9 +802,13 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     recompute_saliency=recompute_saliency,
                     sample_id=str(req.get("sampleId", "")).strip() or None,
                     report_json_path=str(report_json_path),
+                    direction=direction,
+                    persist=persist,
+                    completion_mode=completion_mode,
+                    train_sample_detail=train_detail,
                 )
         except Exception as exc:
-            print(f"[unlearn] failed: {exc}", flush=True)
+            print(f"[{direction}] failed: {exc}", flush=True)
             try:
                 from src.unlearn_pair_probe import _release_cuda_memory
                 _release_cuda_memory(reason="unlearn_api_error")
@@ -796,11 +818,92 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             return
 
         print(
-            f"[unlearn] done verdict={result.get('verdict')} "
+            f"[{direction}] done verdict={result.get('verdict')} "
             f"dLogP={result.get('delta', {}).get('logprob')} "
-            f"dSal={result.get('delta', {}).get('saliency')}",
+            f"dSal={result.get('delta', {}).get('saliency')} "
+            f"restored={result.get('restored')}",
             flush=True,
         )
+        self._send_json(200, result)
+
+    def _handle_pair_intervene_recover(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length:
+            self.rfile.read(content_length)
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Recover needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+        try:
+            with UNLEARN_PROBE_LOCK:
+                result = recover_pair_intervention()
+        except Exception as exc:
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        print(
+            f"[recover] recovered={result.get('recovered')} "
+            f"direction={result.get('direction')} pair={result.get('pairId')}",
+            flush=True,
+        )
+        self._send_json(200, result)
+
+    def _handle_next_token_probs(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Next-token probs need a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+
+        try:
+            target_index = int(req["targetIndex"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {
+                "status": "error",
+                "message": "targetIndex is required (int > 0)",
+            })
+            return
+
+        mode = str(req.get("mode", "predict") or "predict").strip().lower()
+        top_k = int(req.get("topK", 10) or 10)
+        raw_model_path = req.get("modelPath")
+        model_path = str(raw_model_path).strip() if raw_model_path else None
+        raw_base_path = req.get("baseModelPath")
+        base_model_path = str(raw_base_path).strip() if raw_base_path else None
+
+        print(
+            f"[probs] mode={mode} targetIndex={target_index} topK={top_k}",
+            flush=True,
+        )
+        try:
+            with UNLEARN_PROBE_LOCK:
+                result = compute_next_token_probs(
+                    report,
+                    mode=mode,
+                    target_index=target_index,
+                    top_k=top_k,
+                    model_path=model_path,
+                    base_model_path=base_model_path,
+                )
+        except Exception as exc:
+            print(f"[probs] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
         self._send_json(200, result)
 
     def _handle_prepare_train_probe(self):

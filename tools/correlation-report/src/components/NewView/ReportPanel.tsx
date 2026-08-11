@@ -90,11 +90,32 @@ interface UnlearnPairResult {
     status?: string;
     verdict?: string;
     error?: string;
+    direction?: 'unlearn' | 'learn' | string;
+    restored?: boolean;
     before?: { ce?: number; logprob?: number; saliency?: number | null };
     after?: { ce?: number; logprob?: number; saliency?: number | null };
     delta?: { ce?: number; logprob?: number; saliency?: number | null };
-    update?: { paramSpace?: string; lastNLayers?: number };
+    update?: { paramSpace?: string; lastNLayers?: number; direction?: string };
     testEdge?: { reportedSaliency?: number | null; saliencyMode?: string };
+    intervention?: { active?: boolean; direction?: string; pairId?: string | null };
+}
+
+interface NextTokenProbRow {
+    token: string;
+    tokenId: number;
+    prob: number;
+    isActual?: boolean;
+}
+
+interface NextTokenProbResult {
+    status?: string;
+    mode?: 'predict' | 'gold' | string;
+    targetIndex?: number;
+    actualToken?: string;
+    actualProb?: number;
+    top?: NextTokenProbRow[];
+    intervention?: { active?: boolean; direction?: string; pairId?: string | null };
+    error?: string;
 }
 
 interface PerTokenResult {
@@ -106,6 +127,7 @@ interface PerTokenResult {
 
 interface TrainSampleDetail {
     full_tokens: string[];
+    full_token_ids?: number[];
     answer_start_index: number;
     coarse_cos_sim: number;
     saliencies_by_token: Record<string, number[]>;
@@ -1333,19 +1355,127 @@ function formatSigned(value: number | null | undefined, digits = 4): string {
     return `${sign}${value.toFixed(digits)}`;
 }
 
-function unlearnVerdictLabel(verdict: string | undefined): { text: string; color: string } {
+function unlearnVerdictLabel(verdict: string | undefined, direction?: string): { text: string; color: string } {
+    const isLearn = direction === 'learn';
     switch (verdict) {
         case 'supports_causal':
-            return { text: '像真因果：遗忘后 target 更难', color: '#166534' };
+            return {
+                text: isLearn
+                    ? '像真因果：学习后 target 更容易'
+                    : '像真因果：遗忘后 target 更难',
+                color: '#166534',
+            };
         case 'saliency_only':
-            return { text: 'saliency 下降但 CE 几乎不动（test 已近满分）', color: '#a16207' };
+            return {
+                text: isLearn
+                    ? 'saliency 上升但 CE 几乎不动'
+                    : 'saliency 下降但 CE 几乎不动（test 已近满分）',
+                color: '#a16207',
+            };
         case 'no_effect':
             return { text: '几乎无影响', color: '#64748b' };
         case 'opposite_effect':
-            return { text: '反向：遗忘后 target 反而更容易', color: '#9a3412' };
+            return {
+                text: isLearn
+                    ? '反向：学习后 target 反而更难'
+                    : '反向：遗忘后 target 反而更容易',
+                color: '#9a3412',
+            };
         default:
             return { text: '结果不明确', color: '#6b7280' };
     }
+}
+
+function formatProbPct(p: number): string {
+    if (!Number.isFinite(p)) return '—';
+    const pct = p * 100;
+    if (pct >= 10) return `${pct.toFixed(1)}%`;
+    if (pct >= 1) return `${pct.toFixed(2)}%`;
+    return `${pct.toFixed(2)}%`;
+}
+
+function NextTokenProbPanel({
+    result,
+    busy,
+    error,
+    interventionActive,
+    interventionDirection,
+    onRecover,
+    recoverBusy,
+}: {
+    result: NextTokenProbResult | null;
+    busy?: boolean;
+    error?: string | null;
+    interventionActive?: boolean;
+    interventionDirection?: string | null;
+    onRecover?: () => void;
+    recoverBusy?: boolean;
+}) {
+    const rows = result?.top ?? [];
+    const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
+    const modeLabel = result?.mode === 'gold' ? 'teacher-forced' : 'model predict';
+
+    return (
+        <div className={styles.probPanel}>
+            <div className={styles.probPanelHeader}>
+                <div className={styles.probPanelTitle}>
+                    top next-token probabilities
+                    {result?.targetIndex != null
+                        ? ` · ${modeLabel} @ ${result.targetIndex}`
+                        : ' (distribution that produced this token)'}
+                </div>
+                {result?.actualProb != null && (
+                    <span className={styles.probPanelMeta}>
+                        P(actual={JSON.stringify(decodeToken(result.actualToken ?? ''))})={formatProbPct(result.actualProb)}
+                    </span>
+                )}
+                {interventionActive && onRecover && (
+                    <button
+                        type="button"
+                        className={styles.probRecoverBtn}
+                        disabled={recoverBusy}
+                        onClick={onRecover}
+                        title="撤销当前 Learn/Unlearn 一步，恢复原权重与概率"
+                    >
+                        {recoverBusy ? 'Recovering…' : 'Recover'}
+                    </button>
+                )}
+            </div>
+            {interventionActive && (
+                <div className={styles.probInterveneBanner}>
+                    Active {interventionDirection === 'learn' ? 'Learn' : 'Unlearn'} step
+                    — probabilities reflect modified weights. Click Recover to restore.
+                </div>
+            )}
+            <div className={styles.probPanelBody}>
+                {busy && <div className={styles.probEmpty}>Loading next-token distribution…</div>}
+                {!busy && error && <div className={styles.probEmpty} style={{ color: '#f38ba8' }}>{error}</div>}
+                {!busy && !error && rows.length === 0 && (
+                    <div className={styles.probEmpty}>
+                        Click a Model or Gold answer token to show the next-token distribution.
+                    </div>
+                )}
+                {!busy && rows.map((row, i) => {
+                    const width = `${Math.max(2, (row.prob / maxP) * 100)}%`;
+                    const display = decodeToken(row.token).replace(/\n/g, '\\n');
+                    return (
+                        <div key={`${row.tokenId}-${i}`} className={styles.probRow}>
+                            <span className={`${styles.probTok}${row.isActual ? ` ${styles.probTokActual}` : ''}`}>
+                                {display || '·'}
+                            </span>
+                            <span className={styles.probPct}>{formatProbPct(row.prob)}</span>
+                            <div className={styles.probBarTrack}>
+                                <div
+                                    className={`${styles.probBarFill}${row.isActual ? ` ${styles.probBarFillTop}` : ''}`}
+                                    style={{ width }}
+                                />
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
 }
 
 function PairCard({
@@ -1355,8 +1485,13 @@ function PairCard({
     onToggleSelect,
     annotatedSourceIndices,
     onUnlearn,
+    onLearn,
+    onRecover,
     unlearnBusy,
+    learnBusy,
+    recoverBusy,
     unlearnResult,
+    interveneActiveForPair,
     onOpenAnnotationViewer,
 }: {
     pair: CorrelationPair;
@@ -1365,14 +1500,20 @@ function PairCard({
     onToggleSelect?: () => void;
     annotatedSourceIndices?: Set<number>;
     onUnlearn?: () => void;
+    onLearn?: () => void;
+    onRecover?: () => void;
     unlearnBusy?: boolean;
+    learnBusy?: boolean;
+    recoverBusy?: boolean;
     unlearnResult?: UnlearnPairResult | null;
+    interveneActiveForPair?: boolean;
     /** Open annotation-viewer focused on this train sample + target. */
     onOpenAnnotationViewer?: () => void;
 }) {
     const [expanded, setExpanded] = useState(false);
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
-    const verdict = unlearnVerdictLabel(unlearnResult?.verdict);
+    const verdict = unlearnVerdictLabel(unlearnResult?.verdict, unlearnResult?.direction);
+    const busy = Boolean(unlearnBusy || learnBusy || recoverBusy);
 
     return (
         <div
@@ -1414,8 +1555,8 @@ function PairCard({
                             event.stopPropagation();
                             onUnlearn();
                         }}
-                        disabled={unlearnBusy}
-                        title="对该 train target 在匹配参数空间（默认 last-1 LoRA）做一步 CE ascent，看 test 的 logP / saliency 是否变化"
+                        disabled={busy}
+                        title="对该 train target 做一步 CE ascent（Unlearn），权重保持修改直到 Recover"
                         style={{
                             border: '1px solid #fda4af',
                             background: unlearnBusy ? '#ffe4e6' : '#fff1f2',
@@ -1424,10 +1565,58 @@ function PairCard({
                             padding: '2px 8px',
                             fontSize: 11,
                             fontWeight: 700,
-                            cursor: unlearnBusy ? 'wait' : 'pointer',
+                            cursor: busy ? 'wait' : 'pointer',
                         }}
                     >
                         {unlearnBusy ? 'Unlearning…' : 'Unlearn'}
+                    </button>
+                )}
+
+                {onLearn && (
+                    <button
+                        type="button"
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onLearn();
+                        }}
+                        disabled={busy}
+                        title="对该 train target 做一步 CE descent（Learn，与 Unlearn 相反），权重保持修改直到 Recover"
+                        style={{
+                            border: '1px solid #86efac',
+                            background: learnBusy ? '#dcfce7' : '#f0fdf4',
+                            color: '#15803d',
+                            borderRadius: 999,
+                            padding: '2px 8px',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: busy ? 'wait' : 'pointer',
+                        }}
+                    >
+                        {learnBusy ? 'Learning…' : 'Learn'}
+                    </button>
+                )}
+
+                {interveneActiveForPair && onRecover && (
+                    <button
+                        type="button"
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onRecover();
+                        }}
+                        disabled={busy}
+                        title="恢复 Learn/Unlearn 之前的权重"
+                        style={{
+                            border: '1px solid #67e8f9',
+                            background: recoverBusy ? '#cffafe' : '#ecfeff',
+                            color: '#0e7490',
+                            borderRadius: 999,
+                            padding: '2px 8px',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: busy ? 'wait' : 'pointer',
+                        }}
+                    >
+                        {recoverBusy ? 'Recovering…' : 'Recover'}
                     </button>
                 )}
 
@@ -1519,14 +1708,17 @@ function PairCard({
                         </div>
                     )}
                     <div style={{ color: '#a8a29e' }}>
-                        一步 {unlearnResult.update?.paramSpace || 'match-space'} 探针
+                        一步 {unlearnResult.direction === 'learn' ? 'Learn' : 'Unlearn'}{' '}
+                        {unlearnResult.update?.paramSpace || 'match-space'}
                         {unlearnResult.update?.lastNLayers != null
                             ? ` · last-${unlearnResult.update.lastNLayers}`
                             : ''}
                         {unlearnResult.testEdge?.saliencyMode
                             ? ` · ${unlearnResult.testEdge.saliencyMode}`
                             : ''}
-                        {' · '}已 restore · 不写回 adapter
+                        {unlearnResult.restored === false
+                            ? ' · 权重已修改（可 Recover）'
+                            : ' · 已 restore · 不写回 adapter'}
                     </div>
                     {unlearnResult.error && (
                         <div style={{ color: '#b91c1c' }}>{unlearnResult.error}</div>
@@ -1575,7 +1767,12 @@ function TrainSampleGroup({
     onTokenHover,
     gtEdgesByTarget,
     onUnlearnPair,
-    unlearningPairId,
+    onLearnPair,
+    onRecoverIntervention,
+    interveningPairId,
+    interveningDirection,
+    recoverBusy,
+    activeInterventionPairId,
     unlearnResults,
     onOpenAnnotationViewer,
 }: {
@@ -1593,7 +1790,12 @@ function TrainSampleGroup({
     /** GT annotation edges for this train sample: targetIdx -> sourceIdx[]. */
     gtEdgesByTarget?: Record<string, number[]>;
     onUnlearnPair?: (pair: CorrelationPair) => void;
-    unlearningPairId?: string | null;
+    onLearnPair?: (pair: CorrelationPair) => void;
+    onRecoverIntervention?: () => void;
+    interveningPairId?: string | null;
+    interveningDirection?: 'unlearn' | 'learn' | null;
+    recoverBusy?: boolean;
+    activeInterventionPairId?: string | null;
     unlearnResults?: Record<string, UnlearnPairResult>;
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
 }) {
@@ -1699,8 +1901,13 @@ function TrainSampleGroup({
                                 onToggleSelect={onTogglePairSelection ? () => onTogglePairSelection(trainIdx, pair.id) : undefined}
                                 annotatedSourceIndices={annotatedSourcesForPairs(gtEdgesByTarget, [pair])}
                                 onUnlearn={onUnlearnPair ? () => onUnlearnPair(pair) : undefined}
-                                unlearnBusy={unlearningPairId === pair.id}
+                                onLearn={onLearnPair ? () => onLearnPair(pair) : undefined}
+                                onRecover={onRecoverIntervention}
+                                unlearnBusy={interveningPairId === pair.id && interveningDirection === 'unlearn'}
+                                learnBusy={interveningPairId === pair.id && interveningDirection === 'learn'}
+                                recoverBusy={recoverBusy}
                                 unlearnResult={unlearnResults?.[pair.id] ?? null}
+                                interveneActiveForPair={activeInterventionPairId === pair.id}
                                 onOpenAnnotationViewer={
                                     onOpenAnnotationViewer
                                         ? () => onOpenAnnotationViewer(pair)
@@ -1790,8 +1997,16 @@ export function ReportPanel({
     /** Model-side tick: current test saliency edge participates in probe filtering. */
     const [modelSaliencySelected, setModelSaliencySelected] = useState(false);
     const [visualizerMode] = useState<VisualizerMode>('inline');
-    const [unlearningPairId, setUnlearningPairId] = useState<string | null>(null);
+    const [interveningPairId, setInterveningPairId] = useState<string | null>(null);
+    const [interveningDirection, setInterveningDirection] = useState<'unlearn' | 'learn' | null>(null);
+    const [recoverBusy, setRecoverBusy] = useState(false);
+    const [activeInterventionPairId, setActiveInterventionPairId] = useState<string | null>(null);
+    const [activeInterventionDirection, setActiveInterventionDirection] = useState<string | null>(null);
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
+    const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
+    const [tokenProbBusy, setTokenProbBusy] = useState(false);
+    const [tokenProbError, setTokenProbError] = useState<string | null>(null);
+    const [tokenProbFocus, setTokenProbFocus] = useState<{ mode: 'predict' | 'gold'; index: number } | null>(null);
     // GT annotation edges from smoke_train_data_oversample_llm.jsonl (train 0..4).
     const [trainGtEdges, setTrainGtEdges] = useState<TrainGtEdges | null>(null);
     // The in-page plot appears only after Prepare sample / Open Visualizer /
@@ -1856,7 +2071,8 @@ export function ReportPanel({
         setSelectedTrainPairIdsByGroup({});
         setTrainProbeComparisons({});
         setUnlearnResultsByPairId({});
-        setUnlearningPairId(null);
+        setInterveningPairId(null);
+        setInterveningDirection(null);
     }, [selectedTokIdx, selectedTestCorrIdx]);
 
     useEffect(() => {
@@ -2236,12 +2452,93 @@ export function ReportPanel({
         window.open(url.toString(), '_blank', 'noopener,noreferrer');
     };
 
-    const handleUnlearnPair = (pair: CorrelationPair) => {
+    const fetchTokenProbs = useCallback((mode: 'predict' | 'gold', targetIndex: number) => {
+        if (!report || !selectedMeta || importedReportActive) return;
+        if (!(targetIndex > 0)) {
+            setTokenProbError('Cannot score next-token probs at index 0.');
+            setTokenProbResult(null);
+            return;
+        }
+        setTokenProbFocus({ mode, index: targetIndex });
+        setTokenProbBusy(true);
+        setTokenProbError(null);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/next-token-probs'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        mode,
+                        targetIndex,
+                        topK: 10,
+                        // Prefer eif_api.env (same as gold live); do not force report checkpoint.
+                        modelPath: null,
+                        baseModelPath: null,
+                    }),
+                });
+                const rawText = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (rawText.trim()) {
+                    try {
+                        parsed = JSON.parse(rawText) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(
+                            `Probs API returned non-JSON (HTTP ${resp.status}): ${rawText.slice(0, 240)}`,
+                        );
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    const message = typeof parsed.message === 'string'
+                        ? parsed.message
+                        : `Probs API failed (HTTP ${resp.status})`;
+                    throw new Error(message);
+                }
+                const result = parsed as NextTokenProbResult;
+                setTokenProbResult(result);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Failed to load next-token probs';
+                setTokenProbError(msg);
+                setTokenProbResult(null);
+            } finally {
+                setTokenProbBusy(false);
+            }
+        })();
+    }, [report, selectedMeta, importedReportActive, eifApiUrl]);
+
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode === 'predict' && selectedTokIdx != null && selectedTokIdx > 0) {
+            fetchTokenProbs('predict', selectedTokIdx);
+        }
+    }, [attrMode, selectedTokIdx, importedReportActive, fetchTokenProbs]);
+
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode === 'gold' && goldLocalIdx != null) {
+            const abs = promptLen + goldLocalIdx;
+            if (abs > 0) fetchTokenProbs('gold', abs);
+        }
+    }, [attrMode, goldLocalIdx, promptLen, importedReportActive, fetchTokenProbs]);
+
+    const refreshTokenProbs = useCallback(() => {
+        if (tokenProbFocus) fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index);
+    }, [tokenProbFocus, fetchTokenProbs]);
+
+    const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {
         if (!report || !selectedMeta || importedReportActive) return;
 
-        setUnlearningPairId(pair.id);
+        setInterveningPairId(pair.id);
+        setInterveningDirection(direction);
         setTtavLaunchError(null);
-        setTtavLaunchStatus(`Unlearning probe for pair ${pair.id}…`);
+        const verb = direction === 'learn' ? 'Learning' : 'Unlearning';
+        setTtavLaunchStatus(`${verb} pair ${pair.id}…`);
+
+        const trainDetail =
+            attrMode === 'gold'
+                ? (goldTrainDetails[String(pair.train_sample_id)]
+                    ?? report.train_sample_details[String(pair.train_sample_id)])
+                : report.train_sample_details[String(pair.train_sample_id)];
 
         void (async () => {
             try {
@@ -2257,12 +2554,14 @@ export function ReportPanel({
                         testTargetIndex: pair.test_correlation.target_token_index,
                         trainSourceIndex: pair.train_correlation.source_token_index,
                         trainTargetIndex: pair.train_correlation.target_token_index,
-                        modelPath: report.experiment_meta.model_path ?? null,
-                        baseModelPath: report.experiment_meta.base_model_path ?? null,
-                        // LoRA last-layer is high-dimensional; unit-normalized η=1
-                        // barely moves CE when the test token is already near-perfect.
+                        modelPath: null,
+                        baseModelPath: null,
                         unlearnLr: 20.0,
                         recomputeSaliency: true,
+                        direction,
+                        persist: true,
+                        completionMode: attrMode === 'gold' ? 'gold' : 'predict',
+                        trainSampleDetail: trainDetail ?? null,
                     }),
                 });
                 const rawText = await resp.text();
@@ -2272,36 +2571,93 @@ export function ReportPanel({
                         parsed = JSON.parse(rawText) as Record<string, unknown>;
                     } catch {
                         throw new Error(
-                            `Unlearn API returned non-JSON (HTTP ${resp.status}): ${rawText.slice(0, 240)}`,
+                            `${verb} API returned non-JSON (HTTP ${resp.status}): ${rawText.slice(0, 240)}`,
                         );
                     }
                 }
                 if (!resp.ok || parsed.status !== 'success') {
                     const message = typeof parsed.message === 'string'
                         ? parsed.message
-                        : `Unlearn API failed (HTTP ${resp.status})`;
+                        : `${verb} API failed (HTTP ${resp.status})`;
                     throw new Error(message);
                 }
 
                 const result = parsed as UnlearnPairResult;
                 setUnlearnResultsByPairId(current => ({ ...current, [pair.id]: result }));
+                if (result.restored === false) {
+                    setActiveInterventionPairId(pair.id);
+                    setActiveInterventionDirection(direction);
+                } else {
+                    setActiveInterventionPairId(null);
+                    setActiveInterventionDirection(null);
+                }
                 const dLog = typeof result.delta?.logprob === 'number'
                     ? result.delta.logprob.toFixed(4)
                     : '?';
-                setTtavLaunchStatus(`Unlearn ${pair.id} 完成 · ΔlogP=${dLog} · ${result.verdict ?? ''}`);
+                setTtavLaunchStatus(
+                    `${direction === 'learn' ? 'Learn' : 'Unlearn'} ${pair.id} 完成 · ΔlogP=${dLog} · ${result.verdict ?? ''}`,
+                );
+                refreshTokenProbs();
             } catch (error) {
-                const msg = error instanceof Error ? error.message : 'Unlearn probe failed';
+                const msg = error instanceof Error ? error.message : `${verb} failed`;
                 setUnlearnResultsByPairId(current => ({
                     ...current,
-                    [pair.id]: { status: 'error', error: msg, verdict: 'inconclusive' },
+                    [pair.id]: { status: 'error', error: msg, verdict: 'inconclusive', direction },
                 }));
                 setTtavLaunchError(msg);
                 setTtavLaunchStatus(null);
             } finally {
-                setUnlearningPairId(current => (current === pair.id ? null : current));
+                setInterveningPairId(null);
+                setInterveningDirection(null);
             }
         })();
-    };
+    }, [
+        report, selectedMeta, importedReportActive, eifApiUrl, selectedSampleId,
+        attrMode, goldTrainDetails, refreshTokenProbs,
+    ]);
+
+    const handleRecoverIntervention = useCallback(() => {
+        setRecoverBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('Recovering model weights…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/pair-intervene-recover'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}',
+                });
+                const rawText = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (rawText.trim()) {
+                    try {
+                        parsed = JSON.parse(rawText) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Recover API returned non-JSON (HTTP ${resp.status})`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Recover failed (HTTP ${resp.status})`,
+                    );
+                }
+                setActiveInterventionPairId(null);
+                setActiveInterventionDirection(null);
+                setTtavLaunchStatus(
+                    parsed.recovered ? 'Recovered to original weights.' : 'No active intervention to recover.',
+                );
+                refreshTokenProbs();
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Recover failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setRecoverBusy(false);
+            }
+        })();
+    }, [eifApiUrl, refreshTokenProbs]);
 
     const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
         if (!report || !selectedMeta) return;
@@ -2714,6 +3070,16 @@ export function ReportPanel({
                                 </div>
                             )}
 
+                            <NextTokenProbPanel
+                                result={tokenProbResult}
+                                busy={tokenProbBusy}
+                                error={tokenProbError}
+                                interventionActive={Boolean(activeInterventionPairId)}
+                                interventionDirection={activeInterventionDirection}
+                                onRecover={importedReportActive ? undefined : handleRecoverIntervention}
+                                recoverBusy={recoverBusy}
+                            />
+
                         </div>
 
                         {/* ── Right Column: Training pairs ── */}
@@ -2756,8 +3122,13 @@ export function ReportPanel({
                                                     ? makeTrainTokenHoverHandler(id, report.train_sample_details[String(id)]?.full_tokens ?? [])
                                                     : undefined}
                                                 gtEdgesByTarget={trainGtEdges?.[String(id)]}
-                                                onUnlearnPair={importedReportActive ? undefined : handleUnlearnPair}
-                                                unlearningPairId={unlearningPairId}
+                                                onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}
+                                                onLearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'learn')}
+                                                onRecoverIntervention={importedReportActive ? undefined : handleRecoverIntervention}
+                                                interveningPairId={interveningPairId}
+                                                interveningDirection={interveningDirection}
+                                                recoverBusy={recoverBusy}
+                                                activeInterventionPairId={activeInterventionPairId}
                                                 unlearnResults={unlearnResultsByPairId}
                                                 onOpenAnnotationViewer={handleOpenAnnotationViewer}
                                             />
