@@ -15,9 +15,16 @@ from src.export_probe_bundle_from_pt import build_probe_payload as build_probe_f
 from src.export_train_probe_bundle import build_train_probe_bundle_payload
 from src.export_ttav_bundle import build_bundle_payload, infer_sample_id, upload_bundle
 from src.unlearn_pair_probe import run_unlearn_pair_probe
+from src.gold_live_attribution import (
+    _hydrate_eif_env,
+    gold_retrieve_and_stage3,
+    gold_saliency_top_k,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Load eif_api.env early so CACHE_ONLY_MODE / model paths see it.
+_hydrate_eif_env()
 CORR_RESULTS_DIR = REPO_ROOT / "correlation_matching_results"
 EIF_BUNDLE_CACHE_ROOT = REPO_ROOT / "ttav_bundles"
 PREGENERATED_REAL_BUNDLE_ROOT = REPO_ROOT / "ttav_bundles_real"
@@ -26,6 +33,7 @@ PREPARE_STATUS: dict[str, dict] = {}
 # Serializes weight-mutating probes so concurrent Unlearn clicks don't race the
 # shared in-process model cache.
 UNLEARN_PROBE_LOCK = Lock()
+GOLD_LIVE_LOCK = Lock()
 
 # Server-side kill switch for live model loading. Independent of (and stronger
 # than) the per-request `requireCached` flag: that one is client-supplied and
@@ -431,6 +439,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/unlearn-pair-probe":
             self._handle_unlearn_pair_probe()
             return
+        if parsed.path == "/api/gold-saliency":
+            self._handle_gold_saliency()
+            return
+        if parsed.path == "/api/gold-retrieve-stage3":
+            self._handle_gold_retrieve_stage3()
+            return
         if parsed.path != "/api/prepare-ttav-bundle":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -582,6 +596,113 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         }
         self._send_json(200, response)
 
+    def _load_report_from_req(self, req: dict) -> tuple[dict | None, str | None]:
+        report_file_name = str(req.get("reportFileName", "")).strip()
+        if not report_file_name:
+            return None, "reportFileName is required"
+        report_json_path = CORR_RESULTS_DIR / report_file_name
+        if not report_json_path.exists():
+            alt = REPO_ROOT / report_file_name
+            if alt.exists():
+                report_json_path = alt
+        if not report_json_path.exists():
+            return None, f"Report JSON not found: {report_file_name}"
+        try:
+            return json.loads(report_json_path.read_text(encoding="utf-8")), None
+        except json.JSONDecodeError:
+            return None, "Report JSON is invalid"
+
+    def _handle_gold_saliency(self):
+        """Stage1: teacher-force gold → top-k saliency sources for one gold target."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Gold live attribution needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+        try:
+            target_index = int(req["targetIndex"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {"status": "error", "message": "targetIndex is required"})
+            return
+        top_k = req.get("topK")
+        print(f"[gold] saliency targetIndex={target_index}", flush=True)
+        try:
+            with GOLD_LIVE_LOCK:
+                result = gold_saliency_top_k(
+                    report,
+                    target_index=target_index,
+                    top_k=int(top_k) if top_k is not None else None,
+                )
+        except Exception as exc:
+            print(f"[gold] saliency failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _handle_gold_retrieve_stage3(self):
+        """Stage2+3: bank Top-K trains + Stage3 pairs for one gold saliency edge."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Gold live attribution needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+        try:
+            source_index = int(req["sourceIndex"])
+            target_index = int(req["targetIndex"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {
+                "status": "error",
+                "message": "sourceIndex and targetIndex are required integers",
+            })
+            return
+        top_trains = req.get("topTrains")
+        print(
+            f"[gold] retrieve+stage3 source={source_index} target={target_index}",
+            flush=True,
+        )
+        try:
+            with GOLD_LIVE_LOCK:
+                result = gold_retrieve_and_stage3(
+                    report,
+                    source_index=source_index,
+                    target_index=target_index,
+                    top_trains=int(top_trains) if top_trains is not None else None,
+                )
+        except Exception as exc:
+            print(f"[gold] retrieve/stage3 failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        print(
+            f"[gold] done trains={len(result.get('relatedTrains') or [])} "
+            f"pairs={len(result.get('correlationPairs') or [])}",
+            flush=True,
+        )
+        self._send_json(200, result)
+
     def _handle_unlearn_pair_probe(self):
         """One-step lm_head unlearning probe for a single correlation pair."""
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -602,24 +723,17 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
-        report_file_name = str(req.get("reportFileName", "")).strip()
-        if not report_file_name:
-            self._send_json(400, {"status": "error", "message": "reportFileName is required"})
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
             return
-
+        # Keep local name used below for report_json_path / unlearn call.
+        report_file_name = str(req.get("reportFileName", "")).strip()
         report_json_path = CORR_RESULTS_DIR / report_file_name
         if not report_json_path.exists():
-            self._send_json(404, {
-                "status": "error",
-                "message": f"Report JSON not found: {report_file_name}",
-            })
-            return
-
-        try:
-            report = json.loads(report_json_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            self._send_json(400, {"status": "error", "message": "Report JSON is invalid"})
-            return
+            alt = REPO_ROOT / report_file_name
+            if alt.exists():
+                report_json_path = alt
 
         try:
             train_sample_id = int(req["trainSampleId"])

@@ -154,6 +154,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+eif_api.env
 .venv
 env/
 venv/

@@ -444,22 +444,6 @@
     border-radius: 3px;
 }
 
-/* The endpoints of the pair whose card is open, scrolled to in the full listing.
-   Its own colour again: cyan already means "the plot's cursor is on this token",
-   and the two can be true at once. Animated because the jump moves the panel
-   under the reader — the pulse says which two tokens the jump was for. */
-.token-located {
-    outline: 2px solid #c084fc;
-    outline-offset: 1px;
-    background: rgba(192, 132, 252, 0.3);
-    border-radius: 3px;
-    animation: token-located-pulse 1.4s ease-out 2;
-}
-@keyframes token-located-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(192, 132, 252, 0); }
-    35%      { box-shadow: 0 0 0 4px rgba(192, 132, 252, 0.55); }
-}
-
 /* ── Bottom Section: Model left, Train right — each scrolls on its own ── */
 .bottomSection {
     display: flex;

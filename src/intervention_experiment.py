@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import torch
 import torch.nn.functional as F
 import hashlib
@@ -657,17 +658,51 @@ def _report_base_dir() -> str:
 
 
 def _write_json_report(report_json: dict, report_filename: str, accelerator) -> str | None:
-    """Atomically write a report JSON from the main process and return its path."""
+    """Atomically write a report JSON from the main process and return its path.
+
+    Uses a unique ``.tmp`` name then ``os.replace``. On NFS (e.g. /mnt/md*),
+    replace can race / lose the temp file; fall back to a direct rewrite so a
+    checkpoint flush never aborts a long all-tokens run.
+    """
     if not accelerator.is_main_process:
         return None
     report_json = round_floats(report_json, 5)
     report_path = os.path.join(_report_base_dir(), report_filename)
-    tmp_path = report_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(report_json, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, report_path)
+    os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+
+    tmp_path = (
+        f"{report_path}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(report_json, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp_path, report_path)
+        except OSError as exc:
+            # NFS / concurrent cleaner: temp vanished or replace refused.
+            print(
+                f"[checkpoint][WARN] atomic replace failed ({exc}); "
+                f"writing directly → {report_path}",
+                flush=True,
+            )
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report_json, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except Exception:
+        if os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
     return report_path
 
 

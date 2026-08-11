@@ -785,16 +785,6 @@ function decodeTokens(tokens: string[]): string[] {
     return tokens.map(decodeToken);
 }
 
-const TRIVIAL_STRIPPED = new Set(['{', '}', '(', ')', '[', ']', ',', ';']);
-
-function isTrivialToken(t: string): boolean {
-    const stripped = decodeToken(t).trim();
-    if (!stripped) return true;
-    if (TRIVIAL_STRIPPED.has(stripped)) return true;
-    if (stripped.length === 1 && !/[a-zA-Z0-9_]/.test(stripped)) return true;
-    return false;
-}
-
 function cosSimilarityColor(s: number): { bg: string; fg: string } {
     if (s > 0.6) return { bg: '#dcfce7', fg: '#15803d' };
     if (s > 0.3) return { bg: '#fef9c3', fg: '#854d0e' };
@@ -987,7 +977,6 @@ function TokenSpan({
     onClick,
     title,
     hovered = false,
-    located = false,
     annotated = false,
     onHoverChange,
 }: {
@@ -997,8 +986,6 @@ function TokenSpan({
     title?: string;
     /** Linked to the scatter plot: true when this token's point is hovered. */
     hovered?: boolean;
-    /** An endpoint of the pair the reader just opened; scrolled to and ringed. */
-    located?: boolean;
     /** GT annotation source for the current saliency target(s). */
     annotated?: boolean;
     onHoverChange?: (hovered: boolean) => void;
@@ -1019,29 +1006,11 @@ function TokenSpan({
         if (hovered) ref.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     }, [hovered]);
 
-    // Opening a pair scrolls its endpoints into view, centred — this is a jump to
-    // somewhere the reader was not looking, so showing the surrounding code helps.
-    //
-    // Only the listing's own box moves, unlike the hover case above. Expanding a
-    // card locates in two listings at once (the group's and the card's own), and
-    // scrollIntoView would have both of them yanking the page to different places.
-    // The reader just clicked; the page is already where they want it.
-    useEffect(() => {
-        if (!located) return;
-        const el = ref.current;
-        const box = el?.closest('pre');
-        if (!el || !box) return;
-        const elRect = el.getBoundingClientRect();
-        const boxRect = box.getBoundingClientRect();
-        box.scrollTop += (elRect.top - boxRect.top) - (boxRect.height - elRect.height) / 2;
-    }, [located]);
-
     return (
         <span
             ref={ref}
             className={`${styles.token} ${styles[`token-${state}`]}`
                 + (hovered ? ` ${styles['token-linked']}` : '')
-                + (located ? ` ${styles['token-located']}` : '')
                 + (annotated ? ` ${styles['token-annotated-source']}` : '')}
             onClick={onClick}
             title={title}
@@ -1101,7 +1070,9 @@ function CodeTokenStream({
                     else if (isAnalyzed && isResponse) state = 'analyzed';
                     else if (isResponse) state = responseState;
 
-                    const clickable = isResponse && onTokenClick && !isTrivialToken(tok);
+                    // Clickable iff this index has per_token_results. Do NOT gate on
+                    // isTrivialToken: intervention now attributes punctuation (}, ), …).
+                    const clickable = Boolean(onTokenClick && isAnalyzed);
                     return (
                         <TokenSpan
                             key={i}
@@ -1130,6 +1101,9 @@ function OutputComparePanel({
     selectedTargetIndex,
     analyzedIndices,
     onTokenClick,
+    goldSelectedLocalIndex,
+    goldHighlightSourceIndices,
+    onGoldTokenClick,
     linkedTokenIndex,
     onTokenHover,
     saliencySelected,
@@ -1144,6 +1118,9 @@ function OutputComparePanel({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
+    goldSelectedLocalIndex?: number | null;
+    goldHighlightSourceIndices?: Set<number>;
+    onGoldTokenClick?: (localIdx: number) => void;
     linkedTokenIndex?: number | null;
     onTokenHover?: (idx: number | null) => void;
     /** Whether the current test saliency edge is ticked for probe filtering. */
@@ -1152,6 +1129,10 @@ function OutputComparePanel({
     onToggleSaliencySelect?: () => void;
 }) {
     const hasGold = goldResponseTokens.length > 0;
+    const goldAnalyzed = useMemo(
+        () => new Set(goldResponseTokens.map((_, i) => i)),
+        [goldResponseTokens],
+    );
     return (
         <div className={styles.codePanel}>
             <div className={styles.codePanelHeader}>
@@ -1217,11 +1198,18 @@ function OutputComparePanel({
                             <span className={`${styles.outputSectionTitle} ${styles.outputSectionTitleGold}`}>
                                 Gold
                             </span>
+                            <span style={{ marginLeft: 8, fontSize: 11, color: '#64748b' }}>
+                                点击 → 现场 teacher-force 归因
+                            </span>
                         </div>
                         <CodeTokenStream
                             tokens={goldResponseTokens}
                             promptLen={0}
                             responseTone="gold"
+                            selectedTargetIndex={goldSelectedLocalIndex ?? undefined}
+                            highlightSourceIndices={goldHighlightSourceIndices}
+                            analyzedIndices={goldAnalyzed}
+                            onTokenClick={onGoldTokenClick}
                             compact
                         />
                     </div>
@@ -1272,7 +1260,6 @@ function TrainSampleViewer({
     detail,
     highlightPairs,
     linkedTokenIndex,
-    locatedPair,
     onTokenHover,
     annotatedSourceIndices,
 }: {
@@ -1280,8 +1267,6 @@ function TrainSampleViewer({
     highlightPairs: CorrelationPair[];
     /** Train-side token currently hovered in the scatter plot, if any. */
     linkedTokenIndex?: number | null;
-    /** Endpoints of the pair the reader expanded, to scroll to and ring. */
-    locatedPair?: { source: number; target: number } | null;
     onTokenHover?: (idx: number | null) => void;
     /** GT annotation sources for the highlighted pairs' train targets. */
     annotatedSourceIndices?: Set<number>;
@@ -1303,15 +1288,12 @@ function TrainSampleViewer({
                         let state: TokenState = i >= detail.answer_start_index ? 'response' : 'normal';
                         if (isTgt) state = 'selected';
                         else if (isSrc) state = 'source-highlight';
-                        const isLocated = locatedPair != null
-                            && (i === locatedPair.source || i === locatedPair.target);
                         return (
                             <TokenSpan
                                 key={i}
                                 token={tok}
                                 state={state}
                                 hovered={linkedTokenIndex === i}
-                                located={isLocated}
                                 annotated={isAnnotated}
                                 title={isAnnotated
                                     ? `GT annotation source → target @${[...targetIndices].join(',')}`
@@ -1356,7 +1338,6 @@ function PairCard({
     detail,
     selected,
     onToggleSelect,
-    onLocate,
     annotatedSourceIndices,
     onUnlearn,
     unlearnBusy,
@@ -1367,8 +1348,6 @@ function PairCard({
     detail?: TrainSampleDetail;
     selected?: boolean;
     onToggleSelect?: () => void;
-    /** Called when this card opens, so the full train listing can scroll to it. */
-    onLocate?: () => void;
     annotatedSourceIndices?: Set<number>;
     onUnlearn?: () => void;
     unlearnBusy?: boolean;
@@ -1387,12 +1366,7 @@ function PairCard({
         >
             <div
                 className={styles.pairCardHeader}
-                onClick={() => setExpanded(e => {
-                    // Locate on open only. Firing on close would scroll the listing
-                    // just as the reader dismisses the card.
-                    if (!e) onLocate?.();
-                    return !e;
-                })}
+                onClick={() => setExpanded(e => !e)}
             >
                 {onToggleSelect && (
                     <button
@@ -1559,17 +1533,9 @@ function PairCard({
                         </div>
                     </div>
                     {detail && (
-                        // This listing exists to show one pair, so it opens scrolled
-                        // to it. Without a locate the reader lands at the top of a
-                        // 2500-token sample and has to hunt for the two tokens the
-                        // card is about.
                         <TrainSampleViewer
                             detail={detail}
                             highlightPairs={[pair]}
-                            locatedPair={{
-                                source: pair.train_correlation.source_token_index,
-                                target: pair.train_correlation.target_token_index,
-                            }}
                             annotatedSourceIndices={annotatedSourceIndices}
                         />
                     )}
@@ -1617,18 +1583,6 @@ function TrainSampleGroup({
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
 }) {
     const [collapsed, setCollapsed] = useState(false);
-    // Which pair the reader last opened. Local to the group because the listing it
-    // scrolls and the cards that set it are both rendered here.
-    const [locatedPairId, setLocatedPairId] = useState<string | null>(null);
-    const locatedPair = useMemo(() => {
-        const found = pairs.find(p => p.id === locatedPairId);
-        return found
-            ? {
-                source: found.train_correlation.source_token_index,
-                target: found.train_correlation.target_token_index,
-            }
-            : null;
-    }, [pairs, locatedPairId]);
     const annotatedSourceIndices = useMemo(
         () => annotatedSourcesForPairs(gtEdgesByTarget, pairs),
         [gtEdgesByTarget, pairs],
@@ -1692,7 +1646,6 @@ function TrainSampleGroup({
                                 detail={detail}
                                 highlightPairs={pairs}
                                 linkedTokenIndex={linkedTokenIndex}
-                                locatedPair={locatedPair}
                                 onTokenHover={onTokenHover}
                                 annotatedSourceIndices={annotatedSourceIndices}
                             />
@@ -1729,7 +1682,6 @@ function TrainSampleGroup({
                                 detail={detail}
                                 selected={selectedPairIdSet.has(pair.id)}
                                 onToggleSelect={onTogglePairSelection ? () => onTogglePairSelection(trainIdx, pair.id) : undefined}
-                                onLocate={() => setLocatedPairId(pair.id)}
                                 annotatedSourceIndices={annotatedSourcesForPairs(gtEdgesByTarget, [pair])}
                                 onUnlearn={onUnlearnPair ? () => onUnlearnPair(pair) : undefined}
                                 unlearnBusy={unlearningPairId === pair.id}
@@ -1788,6 +1740,23 @@ export function ReportPanel({
     };
     // Selected test correlation (source_token_index)
     const [selectedTestCorrIdx, setSelectedTestCorrIdx] = useState<number | null>(null);
+    // Gold live attribution (teacher-force API)
+    type AttrMode = 'predict' | 'gold';
+    const [attrMode, setAttrMode] = useState<AttrMode>('predict');
+    const [goldLocalIdx, setGoldLocalIdx] = useState<number | null>(null);
+    const [goldTopCorrelations, setGoldTopCorrelations] = useState<TestCorrelation[]>([]);
+    const [goldSelectedCorrIdx, setGoldSelectedCorrIdx] = useState<number | null>(null);
+    const [goldPairs, setGoldPairs] = useState<CorrelationPair[]>([]);
+    const [goldTrainDetails, setGoldTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
+    const [goldBusy, setGoldBusy] = useState(false);
+    const clearGoldLive = useCallback(() => {
+        setGoldLocalIdx(null);
+        setGoldTopCorrelations([]);
+        setGoldSelectedCorrIdx(null);
+        setGoldPairs([]);
+        setGoldTrainDetails({});
+        setGoldBusy(false);
+    }, []);
     // cos_sim filter defaults (UI controls removed with the old header)
     const threshold = 0.0;
     const hideZero = false;
@@ -1942,7 +1911,9 @@ export function ReportPanel({
         setInlineBundle(null);
         setInlineBundleError(null);
         setHoverTarget(null);
-    }, [selectedSampleId]);
+        setAttrMode('predict');
+        clearGoldLive();
+    }, [selectedSampleId, clearGoldLive]);
 
     // Map from token index → PerTokenResult for quick lookup
     const perTokenMap = useMemo(() => {
@@ -1975,6 +1946,15 @@ export function ReportPanel({
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
 
+        if (attrMode === 'gold') {
+            if (goldSelectedCorrIdx === null) return [];
+            return goldPairs
+                .filter(p =>
+                    keep(p) && p.test_correlation.source_token_index === goldSelectedCorrIdx
+                )
+                .sort((a, b) => b.cos_sim - a.cos_sim);
+        }
+
         // Require an explicit Top-Correlation click before showing train matches.
         if (!selectedResult || selectedTestCorrIdx === null) return [];
 
@@ -1983,7 +1963,10 @@ export function ReportPanel({
                 keep(p) && p.test_correlation.source_token_index === selectedTestCorrIdx
             )
             .sort((a, b) => b.cos_sim - a.cos_sim);
-    }, [selectedResult, selectedTestCorrIdx, threshold, hideZero]);
+    }, [
+        attrMode, selectedResult, selectedTestCorrIdx, threshold, hideZero,
+        goldPairs, goldSelectedCorrIdx,
+    ]);
 
     // Group pairs by train_sample_id; keep Top-10 trains by best pair cos for this edge.
     const trainGroups = useMemo(() => {
@@ -2003,6 +1986,21 @@ export function ReportPanel({
     }, [allDisplayPairs]);
 
     const trainPanelEmptyHint = useMemo(() => {
+        if (attrMode === 'gold') {
+            if (goldLocalIdx === null) {
+                return '点击右侧 Gold 答案中的任意 token，现场计算 teacher-force saliency。';
+            }
+            if (goldBusy && goldTopCorrelations.length === 0) {
+                return '正在计算 Gold saliency…（首次会加载模型/bank，可能较慢）';
+            }
+            if (goldSelectedCorrIdx === null) {
+                return '选择一条 Gold saliency 边，现场检索 Top-10 train 并跑 Stage3。';
+            }
+            if (goldBusy) {
+                return '正在检索 train + Stage3 matching…';
+            }
+            return 'No matching pairs for this gold edge. Try another source→target.';
+        }
         if (!selectedResult) {
             return 'Click an analyzed output token, then choose one Top Correlation (source→target) to retrieve related training samples.';
         }
@@ -2013,7 +2011,147 @@ export function ReportPanel({
             return 'No training correlation pairs are included for this selected source→target edge.';
         }
         return 'No matching pairs for this source→target edge. Try lowering the cos_sim threshold.';
-    }, [selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length]);
+    }, [
+        attrMode, goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
+        selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
+    ]);
+
+    const goldHighlightSourceIndices = useMemo(() => {
+        if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
+        const abs = goldSelectedCorrIdx !== null
+            ? [goldSelectedCorrIdx]
+            : goldTopCorrelations.map(c => c.source_token_index);
+        // Gold panel uses local indices (answer-only). Prompt sources are skipped.
+        return new Set(
+            abs
+                .filter(i => i >= promptLen)
+                .map(i => i - promptLen),
+        );
+    }, [attrMode, goldTopCorrelations, goldSelectedCorrIdx, promptLen]);
+
+    const handleGoldTokenClick = useCallback((localIdx: number) => {
+        if (importedReportActive) {
+            setTtavLaunchError('上传的报告不支持 Gold 现场归因（需要服务器上的模型与 train bank）。');
+            return;
+        }
+        const absIdx = promptLen + localIdx;
+        setAttrMode('gold');
+        setSelectedTokIdx(null);
+        setSelectedTestCorrIdx(null);
+        setGoldLocalIdx(localIdx);
+        setGoldSelectedCorrIdx(null);
+        setGoldPairs([]);
+        setGoldTrainDetails({});
+        setGoldTopCorrelations([]);
+        setGoldBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(`Gold live saliency @ ${absIdx}…`);
+
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/gold-saliency'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        targetIndex: absIdx,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                try {
+                    parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+                } catch {
+                    throw new Error(`Gold saliency API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Gold saliency failed (HTTP ${resp.status})`,
+                    );
+                }
+                const top = Array.isArray(parsed.topCorrelations)
+                    ? parsed.topCorrelations as TestCorrelation[]
+                    : [];
+                setGoldTopCorrelations(top);
+                setTtavLaunchStatus(
+                    `Gold saliency ready · ${top.length} sources @ idx ${absIdx}`,
+                );
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Gold saliency failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+                clearGoldLive();
+            } finally {
+                setGoldBusy(false);
+            }
+        })();
+    }, [
+        importedReportActive, promptLen, eifApiUrl, selectedMeta.fileName,
+        clearGoldLive, setSelectedTokIdx,
+    ]);
+
+    const handleGoldCorrClick = useCallback((sourceAbsIdx: number) => {
+        if (goldLocalIdx === null) return;
+        const absTarget = promptLen + goldLocalIdx;
+        const next = goldSelectedCorrIdx === sourceAbsIdx ? null : sourceAbsIdx;
+        setGoldSelectedCorrIdx(next);
+        setGoldPairs([]);
+        setGoldTrainDetails({});
+        if (next === null) return;
+
+        setGoldBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(
+            `Gold retrieve+Stage3 · src ${next} → tgt ${absTarget}…`,
+        );
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/gold-retrieve-stage3'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        sourceIndex: next,
+                        targetIndex: absTarget,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                try {
+                    parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+                } catch {
+                    throw new Error(`Gold Stage3 API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Gold Stage3 failed (HTTP ${resp.status})`,
+                    );
+                }
+                const pairs = Array.isArray(parsed.correlationPairs)
+                    ? parsed.correlationPairs as CorrelationPair[]
+                    : [];
+                const details = (
+                    typeof parsed.trainSampleDetails === 'object'
+                    && parsed.trainSampleDetails !== null
+                ) ? parsed.trainSampleDetails as Record<string, TrainSampleDetail> : {};
+                setGoldPairs(pairs);
+                setGoldTrainDetails(details);
+                setTtavLaunchStatus(
+                    `Gold Stage3 ready · ${pairs.length} pairs · ${Object.keys(details).length} trains`,
+                );
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Gold Stage3 failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setGoldBusy(false);
+            }
+        })();
+    }, [goldLocalIdx, goldSelectedCorrIdx, promptLen, eifApiUrl, selectedMeta.fileName]);
 
     // Load a prepared bundle into the in-page plot. All three entry points route
     // here when the mode is 'inline'; the window path below is left untouched.
@@ -2452,10 +2590,17 @@ export function ReportPanel({
                                 modelTokens={modelTokens}
                                 goldResponseTokens={goldResponseTokens}
                                 promptLen={promptLen}
-                                highlightSourceIndices={sourceHighlightIndices}
-                                selectedTargetIndex={selectedTokIdx ?? undefined}
+                                highlightSourceIndices={attrMode === 'predict' ? sourceHighlightIndices : undefined}
+                                selectedTargetIndex={attrMode === 'predict' ? (selectedTokIdx ?? undefined) : undefined}
                                 analyzedIndices={analyzedIndices}
-                                onTokenClick={idx => setSelectedTokIdx(prev => prev === idx ? null : idx)}
+                                onTokenClick={idx => {
+                                    setAttrMode('predict');
+                                    clearGoldLive();
+                                    setSelectedTokIdx(prev => prev === idx ? null : idx);
+                                }}
+                                goldSelectedLocalIndex={attrMode === 'gold' ? goldLocalIdx : null}
+                                goldHighlightSourceIndices={goldHighlightSourceIndices}
+                                onGoldTokenClick={handleGoldTokenClick}
                                 linkedTokenIndex={linkedTestTokenIndex}
                                 onTokenHover={inlineBundle ? handleTestTokenHover : undefined}
                                 saliencySelected={modelSaliencySelected}
@@ -2463,7 +2608,45 @@ export function ReportPanel({
                                 onToggleSaliencySelect={() => setModelSaliencySelected(v => !v)}
                             />
 
-                            {selectedResult && (
+                            {attrMode === 'gold' && goldLocalIdx !== null && (
+                                <div className={styles.correlationList}>
+                                    <div className={styles.correlationListTitle}>
+                                        Gold live · Top Correlations for "
+                                        {decodeToken(goldResponseTokens[goldLocalIdx] ?? '').trim()}"
+                                        {' '}@ idx {promptLen + goldLocalIdx}
+                                        {goldBusy ? ' …' : ''}
+                                    </div>
+                                    <div className={styles.correlationListHint}>
+                                        Teacher-force gold path. Click one edge to run bank Top-10 + Stage3.
+                                    </div>
+                                    <div className={styles.correlationListItems}>
+                                        {goldTopCorrelations.map(c => (
+                                            <button
+                                                key={c.source_token_index}
+                                                type="button"
+                                                disabled={goldBusy}
+                                                className={`${styles.corrBtn} ${c.source_token_index === goldSelectedCorrIdx ? styles.corrBtnActive : ''}`}
+                                                onClick={() => handleGoldCorrClick(c.source_token_index)}
+                                            >
+                                                <div className={styles.corrBtnLeft}>
+                                                    <span className={styles.corrLabel}>source → target</span>
+                                                    <span className={styles.corrSourceTok}>
+                                                        {(decodeToken(c.source_token).trim() || '·')}
+                                                        <span className={styles.corrArrow}>→</span>
+                                                        {decodeToken(c.target_token).trim() || '·'}
+                                                    </span>
+                                                </div>
+                                                <div className={styles.corrBtnRight}>
+                                                    <span className={styles.corrScoreLabel}>saliency</span>
+                                                    <span className={styles.sourceChipSal}>{c.saliency_score.toFixed(3)}</span>
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {attrMode === 'predict' && selectedResult && (
                                 <div className={styles.correlationList}>
                                     <div className={styles.correlationListTitle}>
                                         Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
@@ -2527,7 +2710,11 @@ export function ReportPanel({
                                                 key={id}
                                                 trainIdx={id}
                                                 pairs={pairs}
-                                                detail={report.train_sample_details[String(id)]}
+                                                detail={
+                                                    attrMode === 'gold'
+                                                        ? (goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)])
+                                                        : report.train_sample_details[String(id)]
+                                                }
                                                 onProbeEmbeddings={importedReportActive ? undefined : handleOpenTrainProbe}
                                                 probeBusy={probingTrainSampleId === id}
                                                 selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
