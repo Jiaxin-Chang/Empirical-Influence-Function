@@ -260,6 +260,13 @@ def load_model_and_tokenizer(
             os.path.dirname(__file__), "sft", "scripts", "nif-checkpoints", "checkpoint-full"
         )
 
+    model_path = os.path.abspath(os.path.expanduser(model_path))
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(
+            f"model_path is not a local directory: {model_path!r}. "
+            "Gold/Unlearn only load local checkpoints (not HuggingFace hub repo ids)."
+        )
+
     adapter_dir = _is_peft_adapter_dir(model_path)
     max_memory = (
         {i: max_gpu_memory for i in range(torch.cuda.device_count())}
@@ -290,7 +297,11 @@ def load_model_and_tokenizer(
             torch_dtype=torch.bfloat16,
             local_files_only=True,
         )
-        model = PeftModel.from_pretrained(base, os.path.abspath(model_path))
+        model = PeftModel.from_pretrained(
+            base,
+            os.path.abspath(model_path),
+            local_files_only=True,
+        )
         # Only LoRA params participate in attribution grads (matches viz).
         for n, p in model.named_parameters():
             p.requires_grad = ("lora_" in n)
@@ -349,7 +360,10 @@ def _resolve_base_model_path(adapter_path: str, base_model_path: str | None) -> 
 
     from peft import PeftConfig
 
-    cfg = PeftConfig.from_pretrained(adapter_path)
+    try:
+        cfg = PeftConfig.from_pretrained(adapter_path, local_files_only=True)
+    except TypeError:
+        cfg = PeftConfig.from_pretrained(adapter_path)
     recorded = getattr(cfg, "base_model_name_or_path", None) or ""
     candidates: list[str] = []
     if recorded and os.path.isdir(recorded):

@@ -67,12 +67,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _SESSION: dict[str, Any] | None = None
 
 
+def _is_placeholder_path(value: str) -> bool:
+    v = value.strip()
+    if not v:
+        return True
+    low = v.lower()
+    return (
+        low.startswith("/path/to/")
+        or low.startswith("d:/path")
+        or low.startswith("c:/path")
+        or "your/checkpoint" in low
+        or "/path/to/" in low
+    )
+
+
 def _hydrate_eif_env() -> Path | None:
-    """Load repo-root eif_api.env into os.environ (do not override existing)."""
-    for name in ("eif_api.env", ".env"):
-        path = REPO_ROOT / name
-        if not path.is_file():
-            continue
+    """Load repo-root eif_api.env into os.environ (do not override existing).
+
+    Placeholder values like ``/path/to/...`` are skipped so we do not poison
+    resolution and then fall through to a Linux report path on Windows.
+    """
+    def _apply(path: Path) -> None:
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -80,21 +95,23 @@ def _hydrate_eif_env() -> Path | None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-        return path
+            if not key or key in os.environ:
+                continue
+            if key.endswith("_PATH") or key.endswith("_DATA") or key.endswith("_ROOT"):
+                if _is_placeholder_path(value):
+                    continue
+            os.environ[key] = value
+
+    for name in ("eif_api.env", ".env"):
+        path = REPO_ROOT / name
+        if path.is_file():
+            _apply(path)
+            return path
     # Also pull annotation-viewer train path if present
     viewer_env = REPO_ROOT / "tools" / "annotation-viewer" / ".env"
     if viewer_env.is_file():
-        for raw in viewer_env.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
+        _apply(viewer_env)
+        return viewer_env
     return None
 
 
@@ -130,21 +147,56 @@ def _device_of(model) -> torch.device:
 
 def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
     meta = report.get("experiment_meta") or {}
-    model = (
+    env_model = (
         (os.environ.get("EIF_ADAPTER_PATH") or os.environ.get("EIF_MODEL_PATH") or "").strip()
-        or str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
     )
+    report_model = str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
+    model = env_model or report_model
     if not model:
         raise ValueError(
             "No model path. Set EIF_ADAPTER_PATH (and EIF_BASE_MODEL_PATH for LoRA) "
             "in eif_api.env, or put model_path in the report."
         )
+    if _is_placeholder_path(model):
+        raise ValueError(
+            f"Model path still looks like a placeholder: {model!r}. "
+            "Edit repo-root eif_api.env: set EIF_ADAPTER_PATH / EIF_BASE_MODEL_PATH "
+            "to real directories on the machine running ttav_bundle_api, then restart the API."
+        )
+    if not os.path.isdir(model):
+        hint = ""
+        if model.startswith("/") and os.name == "nt":
+            hint = (
+                " (this looks like a Linux path but the API is on Windows — "
+                "set EIF_ADAPTER_PATH in eif_api.env to a path that exists here, "
+                "or run the API on the Ubuntu host that has the checkpoint)"
+            )
+        src = "EIF_ADAPTER_PATH" if env_model else "report experiment_meta.model_path"
+        raise FileNotFoundError(
+            f"{src} is not a local directory: {model!r}.{hint} "
+            "Gold live only loads local checkpoints (not HuggingFace hub repo ids)."
+        )
+
     base = (
         (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
         or str(meta.get("base_model_path") or "").strip()
         or None
     )
-    return model, base or None
+    if base and _is_placeholder_path(base):
+        base = None
+    adapter_cfg = os.path.join(model, "adapter_config.json")
+    if os.path.isfile(adapter_cfg):
+        if not base:
+            raise ValueError(
+                f"{model} looks like a LoRA adapter but EIF_BASE_MODEL_PATH is empty. "
+                "Set the base CausalLM directory in eif_api.env "
+                "(must exist on the API host)."
+            )
+        if not os.path.isdir(base):
+            raise FileNotFoundError(
+                f"EIF_BASE_MODEL_PATH is not a local directory: {base!r}"
+            )
+    return os.path.abspath(model), (os.path.abspath(base) if base else None)
 
 
 def _resolve_train_data() -> Path:

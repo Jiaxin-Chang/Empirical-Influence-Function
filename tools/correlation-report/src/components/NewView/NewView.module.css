@@ -409,6 +409,13 @@
 }
 .token-analyzed:hover { background: rgba(137,180,250,0.2); }
 
+.token-analyzed-gold {
+    color: #a6e3a1;
+    border-bottom: 1.5px dashed #94e2d5;
+    cursor: pointer;
+}
+.token-analyzed-gold:hover { background: rgba(166,227,161,0.18); }
+
 .token-selected {
     background: #fab387;
     color: #1e1e2e;

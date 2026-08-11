@@ -968,8 +968,20 @@ export function downloadMarkdown(text: string, filename: string) {
 
 // ─── Token Renderer ───────────────────────────────────────────────────────────
 
-type TokenState = 'normal' | 'response' | 'response-model' | 'response-gold' | 'selected' | 'source-highlight' | 'analyzed';
+type TokenState = 'normal' | 'response' | 'response-model' | 'response-gold' | 'selected' | 'source-highlight' | 'analyzed' | 'analyzed-gold';
 type ResponseTone = 'default' | 'model' | 'gold';
+
+/** Static map so CSS-modules never drop dynamically accessed classes. */
+const TOKEN_STATE_CLASS: Record<TokenState, string> = {
+    normal: styles['token-normal'],
+    response: styles['token-response'],
+    'response-model': styles['token-response-model'],
+    'response-gold': styles['token-response-gold'],
+    selected: styles['token-selected'],
+    'source-highlight': styles['token-source-highlight'],
+    analyzed: styles['token-analyzed'],
+    'analyzed-gold': styles['token-analyzed-gold'],
+};
 
 function TokenSpan({
     token,
@@ -1009,7 +1021,7 @@ function TokenSpan({
     return (
         <span
             ref={ref}
-            className={`${styles.token} ${styles[`token-${state}`]}`
+            className={`${styles.token} ${TOKEN_STATE_CLASS[state]}`
                 + (hovered ? ` ${styles['token-linked']}` : '')
                 + (annotated ? ` ${styles['token-annotated-source']}` : '')}
             onClick={onClick}
@@ -1067,7 +1079,10 @@ function CodeTokenStream({
                     let state: TokenState = 'normal';
                     if (isSelected) state = 'selected';
                     else if (isSource) state = 'source-highlight';
-                    else if (isAnalyzed && isResponse) state = 'analyzed';
+                    else if (isAnalyzed && isResponse) {
+                        // Keep gold tokens green; model analyzed stays pink.
+                        state = responseTone === 'gold' ? 'analyzed-gold' : 'analyzed';
+                    }
                     else if (isResponse) state = responseState;
 
                     // Clickable iff this index has per_token_results. Do NOT gate on
@@ -1078,7 +1093,7 @@ function CodeTokenStream({
                             key={i}
                             token={tok}
                             state={state}
-                            onClick={clickable ? () => onTokenClick(i) : undefined}
+                            onClick={clickable && onTokenClick ? () => onTokenClick(i) : undefined}
                             title={clickable ? `Token ${i}: "${decodeToken(tok)}"` : undefined}
                             hovered={linkedTokenIndex === i}
                             onHoverChange={onTokenHover
