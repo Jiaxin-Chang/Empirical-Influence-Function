@@ -133,32 +133,56 @@ function experimentDataPlugin(): Plugin {
       } catch { return null }
     })()
 
-    let files: string[] = []
-    try { files = readdirSync(CORR_RESULTS_DIR) } catch { /* directory not present */ }
+    let files: { rel: string; family: string }[] = []
+    const families = ['ce', 'saliency'] as const
+    for (const family of families) {
+      const dir = join(CORR_RESULTS_DIR, family)
+      if (!existsSync(dir)) continue
+      try {
+        for (const f of readdirSync(dir)) {
+          if (!f.endsWith('.json') || f.includes('_prescreen')) continue
+          files.push({ rel: `${family}/${f}`, family })
+        }
+      } catch { /* ignore */ }
+    }
+    // Legacy flat files still under correlation_matching_results/*.json
+    try {
+      for (const f of readdirSync(CORR_RESULTS_DIR)) {
+        if (!f.endsWith('.json') || f.includes('_prescreen')) continue
+        files.push({ rel: f, family: 'legacy' })
+      }
+    } catch { /* directory not present */ }
 
-    for (const f of files) {
-      if (!f.endsWith('.json')) continue
-      if (f.includes('_prescreen')) continue
-      // Use stem as taskId; strip trailing _all_tokens if present for cleaner display
-      const stem = f.slice(0, -5)
+    for (const { rel, family } of files) {
+      const baseName = rel.includes('/') ? rel.slice(rel.lastIndexOf('/') + 1) : rel
+      const stem = baseName.slice(0, -5)
       const taskId = stem.endsWith('_all_tokens') ? stem.slice(0, -11) : stem
-      // Prefer showing model tag when filename is correlation_matching_results_{model}_{task}_all_tokens
       const m = stem.match(/^correlation_matching_results_(.+)_all_tokens$/)
-      const label = m ? m[1] : taskId
-      allTokensExperiments.push({ taskId, label, fileName: f })
+      const core = m ? m[1] : taskId
+      const label = family === 'legacy' ? core : `[${family}] ${core}`
+      allTokensExperiments.push({ taskId: `${family}:${taskId}`, label, fileName: rel })
     }
 
-    allTokensExperiments.sort((a, b) => a.taskId.localeCompare(b.taskId))
+    allTokensExperiments.sort((a, b) => a.label.localeCompare(b.label))
 
     return { allTokensExperiments, modelCompare }
   }
 
   function readDataFile(filename: string): string | null {
-    const safe = filename.replace(/[/\\]/g, '').replace(/\.\./g, '')
-    if (!safe.endsWith('.json') || safe.includes('/') || safe.includes('\\')) return null
-    const filePath = join(CORR_RESULTS_DIR, safe)
-    if (!existsSync(filePath)) return null
-    return readFileSync(filePath, 'utf-8')
+    const raw = decodeURIComponent(filename).replace(/\\/g, '/').replace(/\.\./g, '')
+    const parts = raw.split('/').filter(Boolean)
+    if (parts.length === 1) {
+      if (!parts[0].endsWith('.json')) return null
+      const filePath = join(CORR_RESULTS_DIR, parts[0])
+      if (!existsSync(filePath)) return null
+      return readFileSync(filePath, 'utf-8')
+    }
+    if (parts.length === 2 && (parts[0] === 'ce' || parts[0] === 'saliency') && parts[1].endsWith('.json')) {
+      const filePath = join(CORR_RESULTS_DIR, parts[0], parts[1])
+      if (!existsSync(filePath)) return null
+      return readFileSync(filePath, 'utf-8')
+    }
+    return null
   }
 
   function readModelSaliency(slug: string, sampleId: string): string | null {
@@ -231,10 +255,14 @@ function experimentDataPlugin(): Plugin {
           return
         }
       }
-      // All-tokens correlation files: /data/results/<filename>.json
-      const resultsM = reqUrl.match(/^\/data\/results\/([^/?]+\.json)/)
+      // All-tokens correlation files:
+      //   /data/results/<file>.json
+      //   /data/results/ce/<file>.json
+      //   /data/results/saliency/<file>.json
+      const resultsM = reqUrl.match(/^\/data\/results\/((?:ce|saliency)\/)?([^/?]+\.json)/)
       if (resultsM) {
-        const content = readDataFile(decodeURIComponent(resultsM[1]))
+        const rel = `${resultsM[1] ?? ''}${resultsM[2]}`
+        const content = readDataFile(decodeURIComponent(rel))
         if (content !== null) {
           res.setHeader('Content-Type', 'application/json')
           res.setHeader('Cache-Control', 'no-cache')

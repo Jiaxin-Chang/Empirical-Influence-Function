@@ -64,20 +64,33 @@ def _resolve_paths(
     model_path: str | None,
     base_model_path: str | None,
 ) -> tuple[str, str | None]:
+    from src.eif_adapter_env import (
+        adapter_path_for_family,
+        base_model_path_from_env,
+        infer_report_family,
+    )
+
     meta = report.get("experiment_meta") or {}
+    family = infer_report_family(
+        str(meta.get("report_file") or meta.get("fileName") or ""),
+        report,
+    )
+    family_adapter = adapter_path_for_family(family)
     resolved_model = (
         str(model_path or "").strip()
+        or family_adapter
         or str(os.environ.get("EIF_ADAPTER_PATH") or os.environ.get("EIF_MODEL_PATH") or "").strip()
         or str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
     )
     if not resolved_model:
         raise ValueError(
-            "No adapter/model path. Pass modelPath in the request, set "
-            "EIF_ADAPTER_PATH (or EIF_MODEL_PATH), or put model_path in the report meta."
+            "No adapter/model path. Set EIF_ADAPTER_PATH_CE / EIF_ADAPTER_PATH_SALIENCY "
+            "(or legacy EIF_ADAPTER_PATH), pass modelPath, or put model_path in the report meta."
         )
 
     resolved_base = (
         str(base_model_path or "").strip()
+        or base_model_path_from_env()
         or str(os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
         or str(meta.get("base_model_path") or "").strip()
         or None

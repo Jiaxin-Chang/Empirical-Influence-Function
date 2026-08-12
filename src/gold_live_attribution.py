@@ -157,32 +157,38 @@ def _device_of(model) -> torch.device:
 
 
 def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
-    """Prefer ``eif_api.env``; do not silently use a different report checkpoint."""
+    """Prefer family-specific env adapter from report folder (ce/ vs saliency/)."""
+    from src.eif_adapter_env import (
+        adapter_path_for_family,
+        base_model_path_from_env,
+        infer_report_family,
+    )
+
     _hydrate_eif_env(force_file=True)
     meta = report.get("experiment_meta") or {}
-    env_model = (
-        (os.environ.get("EIF_ADAPTER_PATH") or os.environ.get("EIF_MODEL_PATH") or "").strip()
+    family = infer_report_family(
+        str(meta.get("report_file") or meta.get("fileName") or ""),
+        report,
     )
+    env_model = adapter_path_for_family(family).strip()
     report_model = str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
 
     if env_model and not _is_placeholder_path(env_model):
         model = env_model
-        src = "EIF_ADAPTER_PATH"
+        src = f"EIF_ADAPTER_PATH_{family.upper()}" if family in ("ce", "saliency") else "EIF_ADAPTER_PATH"
     elif report_model and not _is_placeholder_path(report_model):
-        # Only fall back when env is unset — make it obvious in logs/errors.
         model = report_model
         src = "report experiment_meta.model_path"
         print(
-            f"[gold-live] WARNING: EIF_ADAPTER_PATH unset/placeholder; "
-            f"falling back to {src}={report_model!r}. "
-            f"Set eif_api.env and restart ttav_bundle_api.",
+            f"[gold-live] WARNING: env adapter unset for family={family}; "
+            f"falling back to {src}={report_model!r}.",
             flush=True,
         )
     else:
         raise ValueError(
-            "No usable model path. Set EIF_ADAPTER_PATH (and EIF_BASE_MODEL_PATH for LoRA) "
-            f"in {REPO_ROOT / 'eif_api.env'} on the API host. "
-            f"Current EIF_ADAPTER_PATH={env_model!r}, report model_path={report_model!r}."
+            "No usable model path. Set EIF_ADAPTER_PATH_CE / EIF_ADAPTER_PATH_SALIENCY "
+            f"(and EIF_BASE_MODEL_PATH) in {REPO_ROOT / 'eif_api.env'}. "
+            f"family={family!r} env={env_model!r} report={report_model!r}."
         )
 
     if not os.path.isdir(model):
@@ -190,7 +196,7 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
         if model.startswith("/") and os.name == "nt":
             hint = (
                 " (Linux path on Windows — run API on the Ubuntu host with /mnt/md124, "
-                "or point EIF_ADAPTER_PATH at a local directory)"
+                "or point the family adapter path at a local directory)"
             )
         raise FileNotFoundError(
             f"{src} is not a local directory: {model!r}.{hint} "
@@ -198,7 +204,7 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
         )
 
     base = (
-        (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
+        base_model_path_from_env().strip()
         or str(meta.get("base_model_path") or "").strip()
         or None
     )
@@ -215,7 +221,10 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
             raise FileNotFoundError(
                 f"EIF_BASE_MODEL_PATH is not a local directory: {base!r}"
             )
-    print(f"[gold-live] using model from {src}: {model}", flush=True)
+    print(
+        f"[gold-live] family={family} using model from {src}: {model}",
+        flush=True,
+    )
     return os.path.abspath(model), (os.path.abspath(base) if base else None)
 
 
@@ -314,10 +323,19 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         param_filter = make_attention_projection_filter(model, last_n, FINE_MATCH_PROJ)
         filter_tag = f"fineattn_{FINE_MATCH_PROJ}_L{last_n}"
 
+    bank_override = (os.environ.get("EIF_BANK_LOSS_MODE") or "").strip() or None
+    if not bank_override or bank_override.lower() in ("auto", "none"):
+        from src.eif_adapter_env import bank_loss_mode_for_family, infer_report_family
+        family = infer_report_family(
+            str((report.get("experiment_meta") or {}).get("report_file") or ""),
+            report,
+        )
+        bank_override = bank_loss_mode_for_family(family)
+
     bank_cfg = load_bank_loss_config(
         model_path,
         Path(model_path).name,
-        loss_mode_override=(os.environ.get("EIF_BANK_LOSS_MODE") or "").strip() or None,
+        loss_mode_override=bank_override,
     )
 
     print(f"[gold-live] loading train data {train_path}", flush=True)

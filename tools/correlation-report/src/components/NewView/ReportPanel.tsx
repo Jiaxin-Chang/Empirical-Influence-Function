@@ -2037,10 +2037,20 @@ export function ReportPanel({
     const moveOriginRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
     const inlineVisualizerRef = useRef<HTMLDivElement | null>(null);
 
-    const displayModelLabel = modelLabel
+    const familyPrefix = meta.fileName.startsWith('ce/')
+        ? '[ce] '
+        : meta.fileName.startsWith('saliency/')
+            ? '[saliency] '
+            : '';
+    const rawLabel = modelLabel
         || report.experiment_meta.model_name
         || meta.label
         || 'model';
+    const displayModelLabel = (
+        familyPrefix && !String(rawLabel).startsWith('[ce]') && !String(rawLabel).startsWith('[saliency]')
+            ? `${familyPrefix}${rawLabel}`
+            : rawLabel
+    );
 
     // Reset secondary selection when selected token changes
     useEffect(() => {

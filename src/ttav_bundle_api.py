@@ -32,6 +32,22 @@ _hydrate_eif_env()
 CORR_RESULTS_DIR = REPO_ROOT / "correlation_matching_results"
 EIF_BUNDLE_CACHE_ROOT = REPO_ROOT / "ttav_bundles"
 PREGENERATED_REAL_BUNDLE_ROOT = REPO_ROOT / "ttav_bundles_real"
+
+
+def _resolve_corr_report_path(report_file_name: str):
+    from src.eif_adapter_env import resolve_report_json_path
+    from pathlib import Path
+
+    p = resolve_report_json_path(CORR_RESULTS_DIR, report_file_name)
+    if p is not None:
+        return p
+    cand = CORR_RESULTS_DIR / report_file_name
+    if cand.exists():
+        return cand
+    alt = REPO_ROOT / report_file_name
+    if alt.exists():
+        return alt
+    return None
 PREPARE_STATUS_LOCK = Lock()
 PREPARE_STATUS: dict[str, dict] = {}
 # Serializes weight-mutating probes so concurrent Unlearn clicks don't race the
@@ -472,8 +488,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "message": "reportFileName is required"})
             return
 
-        report_json_path = CORR_RESULTS_DIR / report_file_name
-        if not report_json_path.exists():
+        report_json_path = _resolve_corr_report_path(report_file_name)
+        if report_json_path is None or not report_json_path.exists():
             self._send_json(404, {"status": "error", "message": f"Report JSON not found: {report_file_name}"})
             return
 
@@ -607,20 +623,34 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, response)
 
     def _load_report_from_req(self, req: dict) -> tuple[dict | None, str | None]:
+        from src.eif_adapter_env import resolve_report_json_path, stamp_report_family
+
         report_file_name = str(req.get("reportFileName", "")).strip()
         if not report_file_name:
             return None, "reportFileName is required"
-        report_json_path = CORR_RESULTS_DIR / report_file_name
-        if not report_json_path.exists():
-            alt = REPO_ROOT / report_file_name
-            if alt.exists():
-                report_json_path = alt
-        if not report_json_path.exists():
+        report_json_path = resolve_report_json_path(CORR_RESULTS_DIR, report_file_name)
+        if report_json_path is None:
+            # Legacy / absolute fallback
+            cand = CORR_RESULTS_DIR / report_file_name
+            if cand.exists():
+                report_json_path = cand
+            else:
+                alt = REPO_ROOT / report_file_name
+                if alt.exists():
+                    report_json_path = alt
+        if report_json_path is None or not report_json_path.exists():
             return None, f"Report JSON not found: {report_file_name}"
         try:
-            return json.loads(report_json_path.read_text(encoding="utf-8")), None
+            report = json.loads(report_json_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return None, "Report JSON is invalid"
+        family = stamp_report_family(report, report_file_name)
+        print(
+            f"[report] loaded {report_file_name} family={family} "
+            f"path={report_json_path}",
+            flush=True,
+        )
+        return report, None
 
     def _handle_gold_saliency(self):
         """Stage1: teacher-force gold → top-k saliency sources for one gold target."""
@@ -739,11 +769,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             return
         # Keep local name used below for report_json_path / unlearn call.
         report_file_name = str(req.get("reportFileName", "")).strip()
-        report_json_path = CORR_RESULTS_DIR / report_file_name
-        if not report_json_path.exists():
-            alt = REPO_ROOT / report_file_name
-            if alt.exists():
-                report_json_path = alt
+        report_json_path = _resolve_corr_report_path(report_file_name)
+        if report_json_path is None:
+            report_json_path = CORR_RESULTS_DIR / report_file_name
 
         try:
             train_sample_id = int(req["trainSampleId"])
@@ -920,8 +948,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "message": "reportFileName is required"})
             return
 
-        report_json_path = CORR_RESULTS_DIR / report_file_name
-        if not report_json_path.exists():
+        report_json_path = _resolve_corr_report_path(report_file_name)
+        if report_json_path is None or not report_json_path.exists():
             self._send_json(404, {"status": "error", "message": f"Report JSON not found: {report_file_name}"})
             return
 
