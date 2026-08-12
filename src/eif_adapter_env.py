@@ -11,6 +11,7 @@ Env (see ``eif_api.env.example``)::
     EIF_ADAPTER_PATH_SALIENCY
     EIF_BASE_MODEL_PATH
     EIF_ADAPTER_PATH          # legacy single-adapter fallback
+    EIF_SALIENCY_BANK_PATH_CE / _SALIENCY / legacy EIF_SALIENCY_BANK_PATH
 """
 
 from __future__ import annotations
@@ -116,6 +117,34 @@ def bank_loss_mode_for_family(family: ReportFamily) -> str | None:
         return "ce_only"
     if family == "saliency":
         return "ce_saliency"
+    return None
+
+
+def bank_path_for_family(family: ReportFamily) -> str:
+    """Optional pinned ``.pt`` bank path for a report family."""
+    if family == "ce":
+        return _env_path("EIF_SALIENCY_BANK_PATH_CE", "EIF_SALIENCY_BANK_PATH")
+    if family == "saliency":
+        return _env_path("EIF_SALIENCY_BANK_PATH_SALIENCY", "EIF_SALIENCY_BANK_PATH")
+    return _env_path("EIF_SALIENCY_BANK_PATH")
+
+
+def resolve_bank_file(raw: str, *, repo_root: Path | None = None) -> Path | None:
+    """Resolve a bank path (absolute, cwd-relative, or repo-relative)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    candidates: list[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append(Path.cwd() / p)
+        if repo_root is not None:
+            candidates.append(repo_root / p)
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
     return None
 
 

@@ -352,12 +352,17 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         filter_tag = f"fineattn_{FINE_MATCH_PROJ}_L{last_n}"
 
     bank_override = (os.environ.get("EIF_BANK_LOSS_MODE") or "").strip() or None
+    from src.eif_adapter_env import (
+        bank_loss_mode_for_family,
+        bank_path_for_family,
+        infer_report_family,
+        resolve_bank_file,
+    )
+    family = infer_report_family(
+        str((report.get("experiment_meta") or {}).get("report_file") or ""),
+        report,
+    )
     if not bank_override or bank_override.lower() in ("auto", "none"):
-        from src.eif_adapter_env import bank_loss_mode_for_family, infer_report_family
-        family = infer_report_family(
-            str((report.get("experiment_meta") or {}).get("report_file") or ""),
-            report,
-        )
         bank_override = bank_loss_mode_for_family(family)
 
     bank_cfg = load_bank_loss_config(
@@ -386,11 +391,26 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     )
     accel = _DummyAccelerator(device)
 
-    explicit_bank = (os.environ.get("EIF_SALIENCY_BANK_PATH") or "").strip()
-    if explicit_bank and Path(explicit_bank).is_file():
-        print(f"[gold-live] loading bank from EIF_SALIENCY_BANK_PATH={explicit_bank}", flush=True)
-        bank = torch.load(explicit_bank, map_location="cpu", weights_only=False)
+    bank_env_key = (
+        f"EIF_SALIENCY_BANK_PATH_{family.upper()}"
+        if family in ("ce", "saliency")
+        else "EIF_SALIENCY_BANK_PATH"
+    )
+    explicit_bank_raw = bank_path_for_family(family)
+    explicit_bank = resolve_bank_file(explicit_bank_raw, repo_root=REPO_ROOT)
+    if explicit_bank is not None:
+        print(
+            f"[gold-live] family={family} loading bank from {bank_env_key}={explicit_bank}",
+            flush=True,
+        )
+        bank = torch.load(str(explicit_bank), map_location="cpu", weights_only=False)
     else:
+        if explicit_bank_raw:
+            print(
+                f"[gold-live] WARNING: {bank_env_key}={explicit_bank_raw!r} not found; "
+                f"falling back to cache/build under {SALIENCY_TRAIN_BANK_CACHE_DIR}",
+                flush=True,
+            )
         print("[gold-live] load/build saliency train bank (may be slow on first call)…", flush=True)
         bank = _load_or_build_saliency_train_bank(
             model,
