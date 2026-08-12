@@ -1011,7 +1011,29 @@ def compute_next_token_probs(
     if isinstance(stored_ids, list) and len(stored_ids) == len(tokens):
         ids = [int(x) for x in stored_ids]
     else:
-        ids = convert_report_tokens_to_ids(tokenizer, tokens)
+        hint = None
+        hint_until = None
+        if mode_norm == "gold":
+            pred_ids = baseline.get("full_token_ids")
+            prompt_len = int(baseline.get("prompt_len") or 0)
+            if isinstance(pred_ids, list) and prompt_len > 0:
+                hint = [int(x) for x in pred_ids]
+                hint_until = prompt_len
+        try:
+            ids = convert_report_tokens_to_ids(
+                tokenizer, tokens, hint_ids=hint, hint_until=hint_until,
+            )
+        except ValueError:
+            if mode_norm != "gold" or hint is None or hint_until is None:
+                raise
+            prompt_ids = hint[:hint_until]
+            answer_surf = "".join(tokens[hint_until:])
+            answer_ids = [int(x) for x in tokenizer.encode(answer_surf, add_special_tokens=False)]
+            ids = prompt_ids + answer_ids
+            if len(ids) != len(tokens):
+                tokens = list(tokens[:hint_until]) + [
+                    tokenizer.decode([i]) for i in answer_ids
+                ]
         if len(ids) != len(tokens):
             raise ValueError(
                 f"Could not align token ids ({len(ids)}) to surfaces ({len(tokens)})."

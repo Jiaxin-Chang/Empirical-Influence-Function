@@ -2208,12 +2208,33 @@ def run_causal_intervention_experiment(
         correct_full_tokens = [
             tokenizer.decode([i]) for i in (_prompt_id_list + _gold_id_list)
         ]
+        correct_full_token_ids = _prompt_id_list + _gold_id_list
     else:
         correct_full_tokens = gen_result.get("full_tokens", [pred_full_tokens])[0]
+        # Prefer ids if the generate path carried them; else rebuild from surfaces later.
+        _maybe_ids = gen_result.get("full_token_ids")
+        if isinstance(_maybe_ids, list) and _maybe_ids and len(_maybe_ids[0]) == len(correct_full_tokens):
+            correct_full_token_ids = [int(x) for x in _maybe_ids[0]]
+        else:
+            # Same prompt + gold completion ids when available on gen_result.
+            _g = gen_result.get("gold_token_ids")
+            if isinstance(_g, list) and _g:
+                correct_full_token_ids = _prompt_id_list + [int(x) for x in _g]
+            else:
+                correct_full_token_ids = _prompt_id_list + [
+                    int(x) for x in tokenizer.encode(
+                        "".join(correct_full_tokens[prompt_len:]),
+                        add_special_tokens=False,
+                    )
+                ]
+                if len(correct_full_token_ids) != len(correct_full_tokens):
+                    # Fall back: keep surfaces; live gold will re-anchor via full_token_ids.
+                    correct_full_token_ids = []
     gen_result = {
         "pred_full_tokens": [pred_full_tokens],
         "pred_full_token_ids": [_prompt_id_list + _pred_id_list],
         "full_tokens": [correct_full_tokens],
+        "correct_full_token_ids": [correct_full_token_ids] if correct_full_token_ids else [[]],
     }
 
     new_input_ids      = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
@@ -2621,6 +2642,7 @@ def run_causal_intervention_experiment(
             "full_tokens": gen_result["pred_full_tokens"][0],
             "full_token_ids": gen_result["pred_full_token_ids"][0],
             "correct_full_tokens": gen_result["full_tokens"][0],
+            "correct_full_token_ids": (gen_result.get("correct_full_token_ids") or [[]])[0],
             "prompt_len": prompt_len,
         },
         "per_token_results": [],
@@ -2739,6 +2761,7 @@ def run_causal_intervention_experiment(
                 "full_tokens": gen_result["pred_full_tokens"][0],
                 "full_token_ids": gen_result["pred_full_token_ids"][0],
                 "correct_full_tokens": gen_result["full_tokens"][0],
+                "correct_full_token_ids": (gen_result.get("correct_full_token_ids") or [[]])[0],
                 "prompt_len": prompt_len,
             },
             "per_token_results": per_token_results,

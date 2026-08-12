@@ -90,18 +90,36 @@ def _lookup_report_token_id(tokenizer, tok: str, *, vocab: dict, unk_id, unk_tok
     return None
 
 
-def convert_report_tokens_to_ids(tokenizer, report_tokens: list[str]) -> list[int]:
+def convert_report_tokens_to_ids(
+    tokenizer,
+    report_tokens: list[str],
+    *,
+    hint_ids: list[int] | None = None,
+    hint_until: int | None = None,
+) -> list[int]:
+    """Map report token surfaces back to vocab ids.
+
+    ``hint_ids`` / ``hint_until``: when a surface cannot be mapped (common for
+    U+FFFD byte-fallback pieces), reuse ``hint_ids[i]`` for ``i < hint_until``
+    (typically the shared prompt from ``full_token_ids``).
+    """
     vocab = tokenizer.get_vocab()
     unk_id = getattr(tokenizer, "unk_token_id", None)
     unk_token = getattr(tokenizer, "unk_token", None)
 
     missing: list[tuple[int, str]] = []
     recovered_ids: list[int] = []
+    hint_cap = len(hint_ids) if hint_ids is not None else 0
+    if hint_until is not None:
+        hint_cap = min(hint_cap, int(hint_until))
 
     for idx, tok in enumerate(report_tokens):
         resolved = _lookup_report_token_id(
             tokenizer, tok, vocab=vocab, unk_id=unk_id, unk_token=unk_token
         )
+        if resolved is None and hint_ids is not None and idx < hint_cap:
+            recovered_ids.append(int(hint_ids[idx]))
+            continue
         if resolved is None:
             missing.append((idx, tok))
             recovered_ids.append(-1)
@@ -117,7 +135,10 @@ def convert_report_tokens_to_ids(tokenizer, report_tokens: list[str]) -> list[in
         preview = ", ".join(f"{idx}:{repr(tok)}" for idx, tok in missing[:10])
         raise ValueError(
             "Failed to map some report tokens back to tokenizer ids. "
-            f"Examples: {preview}"
+            f"Examples: {preview}. "
+            "Usually U+FFFD byte-fallback surfaces without stored token ids — "
+            "re-run intervention to write correct_full_token_ids, or ensure "
+            "full_token_ids covers the prompt prefix."
         )
 
     return recovered_ids

@@ -258,9 +258,37 @@ def _gold_tokens_and_ids(report: dict[str, Any], tokenizer) -> tuple[list[str], 
     stored = baseline.get("correct_full_token_ids")
     if isinstance(stored, list) and len(stored) == len(tokens):
         ids = [int(x) for x in stored]
-    else:
-        # Fall back: re-encode surfaces (may be imperfect for byte-fallback tokens).
-        ids = convert_report_tokens_to_ids(tokenizer, tokens)
+        return tokens, ids, prompt_len
+
+    # Prefer shared prompt ids from the predict path (always stored as full_token_ids).
+    pred_ids = baseline.get("full_token_ids")
+    hint = pred_ids if isinstance(pred_ids, list) else None
+
+    try:
+        ids = convert_report_tokens_to_ids(
+            tokenizer,
+            tokens,
+            hint_ids=[int(x) for x in hint] if hint is not None else None,
+            hint_until=prompt_len,
+        )
+    except ValueError:
+        # Rebuild answer ids by encoding the joined gold answer; keep prompt ids.
+        if hint is None or len(hint) < prompt_len:
+            raise
+        prompt_ids = [int(x) for x in hint[:prompt_len]]
+        answer_surf = "".join(tokens[prompt_len:])
+        answer_ids = [int(x) for x in tokenizer.encode(answer_surf, add_special_tokens=False)]
+        ids = prompt_ids + answer_ids
+        if len(ids) != len(tokens):
+            # Surfaces were lossy (U+FFFD); rebuild answer token list to match ids.
+            new_answer_tokens = [tokenizer.decode([i]) for i in answer_ids]
+            tokens = list(tokens[:prompt_len]) + new_answer_tokens
+            print(
+                f"[gold-live] WARNING: rebuilt gold answer tokens "
+                f"({len(new_answer_tokens)} vs report surfaces) after U+FFFD remap; "
+                f"click indices in the answer may shift slightly.",
+                flush=True,
+            )
         if len(ids) != len(tokens):
             raise ValueError(
                 f"Could not align gold token ids ({len(ids)}) to surfaces ({len(tokens)})."
