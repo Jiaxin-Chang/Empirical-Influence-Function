@@ -488,40 +488,18 @@ def gold_saliency_top_k(
     with torch.no_grad():
         sal_vec = compute_last_layer_saliency_vector(model, batch, target_index)
 
-    ranked = top_nontrivial_saliency_sources(
-        tokenizer,
-        batch["input_ids"][0],
-        sal_vec,
-        k,
-        offset=0,
-    )
-    # Drop sources that sit in the gold answer: they are valid causal context for
-    # later gold tokens, but the UI Model panel only shares the prompt prefix
-    # (through ``### Response`` / ``prompt_len``). Prefer prompt sources for Stage1.
+    # Prefer prompt-only sources for Stage1 (shared with Model panel through prompt_len).
     prompt_only = (os.environ.get("EIF_GOLD_SALIENCY_PROMPT_ONLY") or "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
-    if prompt_only:
-        ranked = [(idx, score) for idx, score in ranked if int(idx) < int(prompt_len)]
-        if len(ranked) < k:
-            # Refill from prompt-only pool (not just the global top-k that may be answer-side).
-            prompt_sal = list(sal_vec[:prompt_len]) if prompt_len > 0 else []
-            extra = top_nontrivial_saliency_sources(
-                tokenizer,
-                batch["input_ids"][0][:prompt_len] if prompt_len > 0 else batch["input_ids"][0][:0],
-                prompt_sal,
-                k,
-                offset=0,
-            )
-            seen = {int(i) for i, _ in ranked}
-            for idx, score in extra:
-                if int(idx) in seen:
-                    continue
-                ranked.append((idx, score))
-                seen.add(int(idx))
-                if len(ranked) >= k:
-                    break
-        ranked = ranked[:k]
+    sal_for_rank = sal_vec[:prompt_len] if prompt_only and prompt_len > 0 else sal_vec
+    ranked = top_nontrivial_saliency_sources(
+        tokenizer,
+        batch["input_ids"][0],
+        sal_for_rank,
+        k,
+        offset=0,
+    )
     target_tok = tokens[target_index]
     top = []
     for rank_i, (idx, score) in enumerate(ranked, start=1):

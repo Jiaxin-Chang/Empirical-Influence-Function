@@ -1368,7 +1368,11 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     # device_map=auto may place last layer on cuda:N while hidden_states[-2]
     # was gathered on another GPU — pin everything to the layer device.
     layer_device = next(layer.parameters()).device
-    hid_in = hid_in.to(layer_device)
+    layer_dtype = next(layer.parameters()).dtype
+    # Hidden can land in float32 (e.g. after mixed-precision / hook paths) while
+    # Qwen LoRA weights stay bf16 — cast before q/k_proj to avoid
+    # "mat1 float != mat2 BFloat16".
+    hid_in = hid_in.to(device=layer_device, dtype=layer_dtype)
     B, T, _ = hid_in.shape
     device = hid_in.device
     dtype = hid_in.dtype
@@ -1471,9 +1475,9 @@ def _last_layer_contribution_row(
         hid = hs[-2]
         del hs
         att = _recompute_last_layer_attn_probs(model, hid)
-        # hid may still sit on an earlier shard; att is on last-layer GPU.
-        if hid.device != att.device:
-            hid = hid.to(att.device)
+        # hid may still sit on an earlier shard / wider dtype; align to attn.
+        if hid.device != att.device or hid.dtype != att.dtype:
+            hid = hid.to(device=att.device, dtype=att.dtype)
         row_batch = torch.zeros(1, dtype=torch.long, device=hid.device)
         row_qry = torch.tensor([q], dtype=torch.long, device=hid.device)
         C_rows = build_contribution_rows(
