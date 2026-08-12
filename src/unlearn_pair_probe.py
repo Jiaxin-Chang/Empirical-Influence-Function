@@ -98,31 +98,84 @@ def _resolve_paths(
     return resolved_model, resolved_base
 
 
-def _get_model(model_path: str, base_model_path: str | None):
-    # Prefer an already-loaded gold-live session when paths match (save VRAM).
-    try:
-        from src.gold_live_attribution import _SESSION as _GOLD_SESSION
-        if _GOLD_SESSION is not None:
-            g_model = str(_GOLD_SESSION.get("model_path") or "")
-            g_base = str(_GOLD_SESSION.get("base_path") or "")
-            if (
-                os.path.abspath(g_model) == os.path.abspath(model_path)
-                and os.path.abspath(g_base or "") == os.path.abspath(base_model_path or "")
-            ):
-                return _GOLD_SESSION["model"], _GOLD_SESSION["tokenizer"]
-    except Exception:
-        pass
+def _model_has_inference_params(model) -> bool:
+    return any(torch.is_inference(p) for p in model.parameters())
 
-    key = (os.path.abspath(model_path), os.path.abspath(base_model_path) if base_model_path else "")
-    cached = _MODEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    model, tokenizer = load_model_and_tokenizer(
-        model_path=model_path,
-        base_model_path=base_model_path,
+
+def _get_model(model_path: str, base_model_path: str | None):
+    """Load/reuse model. Never construct weights under ``torch.inference_mode``."""
+    key = (
+        os.path.abspath(model_path),
+        os.path.abspath(base_model_path) if base_model_path else "",
     )
-    _MODEL_CACHE[key] = (model, tokenizer)
-    return model, tokenizer
+
+    def _store(model, tokenizer):
+        _MODEL_CACHE[key] = (model, tokenizer)
+        try:
+            from src.gold_live_attribution import _SESSION as _GOLD_SESSION
+            if _GOLD_SESSION is not None:
+                g_model = str(_GOLD_SESSION.get("model_path") or "")
+                g_base = str(_GOLD_SESSION.get("base_path") or "")
+                if (
+                    os.path.abspath(g_model) == key[0]
+                    and os.path.abspath(g_base or "") == key[1]
+                ):
+                    _GOLD_SESSION["model"] = model
+                    _GOLD_SESSION["tokenizer"] = tokenizer
+        except Exception:
+            pass
+        return model, tokenizer
+
+    with torch.inference_mode(False):
+        # Prefer an already-loaded gold-live session when paths match (save VRAM).
+        try:
+            from src.gold_live_attribution import _SESSION as _GOLD_SESSION
+            if _GOLD_SESSION is not None:
+                g_model = str(_GOLD_SESSION.get("model_path") or "")
+                g_base = str(_GOLD_SESSION.get("base_path") or "")
+                if (
+                    os.path.abspath(g_model) == key[0]
+                    and os.path.abspath(g_base or "") == key[1]
+                ):
+                    model = _GOLD_SESSION.get("model")
+                    if model is not None and not _model_has_inference_params(model):
+                        return model, _GOLD_SESSION["tokenizer"]
+                    if model is not None and _model_has_inference_params(model):
+                        print(
+                            "[unlearn][WARN] shared gold model has InferenceMode-tainted "
+                            "weights; reloading outside inference_mode…",
+                            flush=True,
+                        )
+                        _GOLD_SESSION["model"] = None
+                        _release_cuda_memory(model, reason="reload_tainted_gold")
+                        model, tokenizer = load_model_and_tokenizer(
+                            model_path=model_path,
+                            base_model_path=base_model_path,
+                        )
+                        _GOLD_SESSION["model"] = model
+                        _GOLD_SESSION["tokenizer"] = tokenizer
+                        return _store(model, tokenizer)
+        except Exception:
+            pass
+
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            model, tokenizer = cached
+            if not _model_has_inference_params(model):
+                return model, tokenizer
+            print(
+                "[unlearn][WARN] cached model has InferenceMode-tainted weights; "
+                "reloading outside inference_mode…",
+                flush=True,
+            )
+            del _MODEL_CACHE[key]
+            _release_cuda_memory(model, reason="reload_tainted_cache")
+
+        model, tokenizer = load_model_and_tokenizer(
+            model_path=model_path,
+            base_model_path=base_model_path,
+        )
+        return _store(model, tokenizer)
 
 
 def intervention_status() -> dict[str, Any]:
@@ -469,8 +522,9 @@ def _score_edge_saliency(
     source_index: int,
 ) -> float | None:
     _prepare_model_for_intervention_saliency(model, saliency_mode)
-    # Ranking path is forward-only; keep activations off the autograd tape.
-    with torch.inference_mode():
+    # Use no_grad (not inference_mode): IM can taint shared model weights if any
+    # param is (re)allocated / .data-assigned during the forward.
+    with torch.no_grad():
         sal_vec = saliency_fn(model, batch, target_index)
     score = None
     if 0 <= source_index < len(sal_vec):
@@ -516,60 +570,68 @@ def _compute_filtered_ce_grads(
     device,
 ) -> tuple[list[torch.nn.Parameter], list[torch.Tensor]]:
     """∇_θ CE on filtered params for the labeled tokens in ``batch``."""
-    named = [(n, p) for n, p in model.named_parameters() if param_filter(n, p)]
-    if not named:
+    if _model_has_inference_params(model):
         raise RuntimeError(
-            "No parameters matched the match-space filter "
-            "(expected last-N LoRA or fine-attn projections)."
+            "Model parameters are InferenceMode-tainted (often from loading under "
+            "@torch.inference_mode, e.g. next-token probs). Reload the API process "
+            "or call _get_model again so weights are reconstructed outside inference_mode."
         )
-    params = [p for _, p in named]
-    n_elems = sum(p.numel() for p in params)
-    print(
-        f"[unlearn] match-space grad: {len(params)} tensors, {n_elems / 1e6:.3f}M elems "
-        f"(e.g. {named[0][0]})",
-        flush=True,
-    )
 
-    local = _batch_to_device(batch, device)
-    model.eval()
-    model.zero_grad(set_to_none=True)
-    original_flags = [(p, p.requires_grad) for p in model.parameters()]
-    for p in model.parameters():
-        p.requires_grad_(False)
-    for p in params:
-        p.requires_grad_(True)
+    with torch.inference_mode(False):
+        named = [(n, p) for n, p in model.named_parameters() if param_filter(n, p)]
+        if not named:
+            raise RuntimeError(
+                "No parameters matched the match-space filter "
+                "(expected last-N LoRA or fine-attn projections)."
+            )
+        params = [p for _, p in named]
+        n_elems = sum(p.numel() for p in params)
+        print(
+            f"[unlearn] match-space grad: {len(params)} tensors, {n_elems / 1e6:.3f}M elems "
+            f"(e.g. {named[0][0]})",
+            flush=True,
+        )
 
-    try:
-        with torch.enable_grad():
-            outputs = model(
-                input_ids=local["input_ids"],
-                attention_mask=local.get("attention_mask"),
-                labels=local["labels"],
-                use_cache=False,
-                return_dict=True,
-            )
-            loss = outputs.loss
-            if loss is None or not torch.isfinite(loss):
-                raise RuntimeError(f"Train CE loss invalid: {loss}")
-            grads = torch.autograd.grad(
-                loss,
-                params,
-                create_graph=False,
-                retain_graph=False,
-                allow_unused=True,
-            )
-        out_grads: list[torch.Tensor] = []
-        for p, g in zip(params, grads):
-            if g is None:
-                out_grads.append(torch.zeros_like(p, dtype=torch.float32))
-            else:
-                out_grads.append(g.detach().to(dtype=torch.float32))
-        return params, out_grads
-    finally:
-        for p, flag in original_flags:
-            p.requires_grad_(flag)
+        local = _batch_to_device(batch, device)
+        model.eval()
         model.zero_grad(set_to_none=True)
-        del local
+        original_flags = [(p, p.requires_grad) for p in model.parameters()]
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in params:
+            p.requires_grad_(True)
+
+        try:
+            with torch.enable_grad():
+                outputs = model(
+                    input_ids=local["input_ids"],
+                    attention_mask=local.get("attention_mask"),
+                    labels=local["labels"],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                loss = outputs.loss
+                if loss is None or not torch.isfinite(loss):
+                    raise RuntimeError(f"Train CE loss invalid: {loss}")
+                grads = torch.autograd.grad(
+                    loss,
+                    params,
+                    create_graph=False,
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+            out_grads: list[torch.Tensor] = []
+            for p, g in zip(params, grads):
+                if g is None:
+                    out_grads.append(torch.zeros_like(p, dtype=torch.float32))
+                else:
+                    out_grads.append(g.detach().to(dtype=torch.float32))
+            return params, out_grads
+        finally:
+            for p, flag in original_flags:
+                p.requires_grad_(flag)
+            model.zero_grad(set_to_none=True)
+            del local
 
 
 def _apply_filtered_ascent(
@@ -974,7 +1036,6 @@ def run_unlearn_pair_probe(
     return result
 
 
-@torch.inference_mode()
 def compute_next_token_probs(
     report: dict[str, Any],
     *,
@@ -989,6 +1050,9 @@ def compute_next_token_probs(
     ``mode=predict`` uses model completion tokens; ``mode=gold`` uses teacher-forced
     gold tokens. Prefix is ``ids[:target_index]`` (causal LM predicts position t
     from tokens 0..t-1).
+
+    Model load must NOT run under ``torch.inference_mode`` — that permanently marks
+    Parameters as inference tensors and breaks later learn/unlearn grads.
     """
     mode_norm = (mode or "predict").strip().lower()
     if mode_norm not in {"predict", "gold"}:
@@ -1048,23 +1112,24 @@ def compute_next_token_probs(
 
     prefix = torch.tensor([ids[:t]], dtype=torch.long, device=device)
     attn = torch.ones_like(prefix)
-    outputs = model(input_ids=prefix, attention_mask=attn, use_cache=False)
-    logits = outputs.logits[0, -1].float()
-    probs = F.softmax(logits, dim=-1)
-    k = max(1, min(int(top_k), int(probs.numel())))
-    values, indices = torch.topk(probs, k=k)
+    with torch.no_grad():
+        outputs = model(input_ids=prefix, attention_mask=attn, use_cache=False)
+        logits = outputs.logits[0, -1].float()
+        probs = F.softmax(logits, dim=-1)
+        k = max(1, min(int(top_k), int(probs.numel())))
+        values, indices = torch.topk(probs, k=k)
 
-    actual_id = int(ids[t])
-    actual_prob = float(probs[actual_id].item())
-    top_rows = []
-    for p, tid in zip(values.tolist(), indices.tolist()):
-        tid_i = int(tid)
-        top_rows.append({
-            "token": tokenizer.decode([tid_i]),
-            "tokenId": tid_i,
-            "prob": float(p),
-            "isActual": tid_i == actual_id,
-        })
+        actual_id = int(ids[t])
+        actual_prob = float(probs[actual_id].item())
+        top_rows = []
+        for p, tid in zip(values.tolist(), indices.tolist()):
+            tid_i = int(tid)
+            top_rows.append({
+                "token": tokenizer.decode([tid_i]),
+                "tokenId": tid_i,
+                "prob": float(p),
+                "isActual": tid_i == actual_id,
+            })
 
     del outputs, logits, probs, prefix, attn
     _release_cuda_memory(model, reason="next_token_probs")

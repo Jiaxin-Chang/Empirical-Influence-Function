@@ -335,10 +335,11 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         return _SESSION
 
     print(f"[gold-live] loading model adapter={model_path} base={base_path or '-'}", flush=True)
-    model, tokenizer = load_model_and_tokenizer(
-        model_path=model_path,
-        base_model_path=base_path,
-    )
+    with torch.inference_mode(False):
+        model, tokenizer = load_model_and_tokenizer(
+            model_path=model_path,
+            base_model_path=base_path,
+        )
     device = _device_of(model)
     prepare_last_layer_grad_checkpointing(model)
 
@@ -484,7 +485,7 @@ def gold_saliency_top_k(
 
     batch = _batch_from_ids(ids, prompt_len, device)
     prepare_last_layer_grad_checkpointing(model)
-    with torch.inference_mode():
+    with torch.no_grad():
         sal_vec = compute_last_layer_saliency_vector(model, batch, target_index)
 
     ranked = top_nontrivial_saliency_sources(
@@ -725,7 +726,7 @@ def gold_retrieve_and_stage3(
     test_tgt_text = tokens[target_index]
 
     # Refresh saliency score for this edge (cheap vs match/probe).
-    with torch.inference_mode():
+    with torch.no_grad():
         sal_vec = compute_last_layer_saliency_vector(model, batch, target_index)
     test_sal = float(sal_vec[source_index]) if source_index < len(sal_vec) else 0.0
 
