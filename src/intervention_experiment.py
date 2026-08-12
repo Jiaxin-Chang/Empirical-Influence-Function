@@ -175,6 +175,83 @@ def _render_qwen_eval_prompt(
     )
 
 
+def _greedy_generate_on_prompt(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    *,
+    max_new_tokens: int,
+) -> tuple[list[int], str]:
+    """AI4Go-style greedy decode (``run_sample44_local.generate``).
+
+    Temporarily switches to ``eval()``: last_layer attribution keeps the model in
+    ``train()`` for checkpointing, which + ``use_cache=True`` often yields garbage
+    when used for ``generate``.
+    """
+    if prompt_ids.dim() == 1:
+        prompt_batch = prompt_ids.unsqueeze(0)
+    else:
+        prompt_batch = prompt_ids
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        eos_ids = sorted({
+            i for i in [tokenizer.eos_token_id, im_end] if i is not None
+        })
+        with torch.inference_mode():
+            gen_out = model.generate(
+                input_ids=prompt_batch,
+                attention_mask=torch.ones_like(prompt_batch),
+                max_new_tokens=max(1, int(max_new_tokens)),
+                do_sample=False,
+                num_beams=1,
+                use_cache=True,
+                eos_token_id=eos_ids if eos_ids else tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+        plen = int(prompt_batch.size(1))
+        new_ids = gen_out[0, plen:].tolist()
+        text = tokenizer.decode(new_ids, skip_special_tokens=False)
+        del gen_out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return new_ids, text
+    finally:
+        if was_training:
+            model.train()
+            for m in model.modules():
+                if isinstance(m, torch.nn.Dropout):
+                    m.eval()
+
+
+def _left_truncate_prompt_for_attr(
+    prompt_ids_list: list[int],
+    pred_ids_list: list[int],
+    attr_cap: int | None,
+) -> list[int]:
+    """Keep prompt+predict under ``attr_cap`` by left-truncating the prompt only."""
+    if attr_cap is None or int(attr_cap) <= 0:
+        return prompt_ids_list
+    n_pred = len(pred_ids_list)
+    if n_pred >= int(attr_cap):
+        raise ValueError(
+            f"completion tokens ({n_pred}) >= --attr-max-seq-len ({attr_cap}); "
+            "raise the cap or shorten the completion."
+        )
+    max_prompt = int(attr_cap) - n_pred
+    if len(prompt_ids_list) > max_prompt:
+        dropped = len(prompt_ids_list) - max_prompt
+        print(
+            f"[DEBUG] Left-truncated prompt by {dropped} tokens so "
+            f"prompt+completion <= {attr_cap} (train-aligned; "
+            f"attn memory scales with T^2).",
+            flush=True,
+        )
+        return prompt_ids_list[-max_prompt:]
+    return prompt_ids_list
+
+
 # ====== MODEL LOADING (generic — supports Qwen2, Qwen3, Qwen3-MoE, etc.) ======
 
 def _patch_model_with_attn_hook(model: torch.nn.Module) -> torch.nn.Module:
@@ -1993,6 +2070,9 @@ def run_causal_intervention_experiment(
         )
 
     live_gen_text = None  # optional diagnostic generate; never used for attribution when fixed
+    _attr_cap = None if not attr_max_seq_len or int(attr_max_seq_len) <= 0 else int(attr_max_seq_len)
+    _gen_max_new = max(128, int(MAX_OUTPUT_TOKENS))
+
     if _use_fixed_predict:
         # Teacher-force the eval completion for attribution; optionally also
         # generate once for log comparison (same eval-aligned prompt).
@@ -2003,7 +2083,7 @@ def run_causal_intervention_experiment(
             system=_cur_test.get("system") or "",
             enable_thinking=False,
         )
-        prompt_ids_list = tokenizer(
+        prompt_ids_full = tokenizer(
             prompt_text, add_special_tokens=False
         )["input_ids"]
         pred_ids_list = tokenizer(
@@ -2011,27 +2091,34 @@ def run_causal_intervention_experiment(
         )["input_ids"]
         if not pred_ids_list:
             raise ValueError("Tokenized predict is empty; cannot teacher-force attribution")
-        # Left-truncate prompt so prompt+predict fits training-like max_len.
-        # Eval chat prompts are often LONGER than train compact max_len → OOM
-        # even when saliency math matches training (attn memory ∝ T²).
-        _attr_cap = None if not attr_max_seq_len or int(attr_max_seq_len) <= 0 else int(attr_max_seq_len)
-        if _attr_cap is not None:
-            n_pred = len(pred_ids_list)
-            if n_pred >= _attr_cap:
-                raise ValueError(
-                    f"predict tokens ({n_pred}) >= --attr-max-seq-len ({_attr_cap}); "
-                    "raise the cap or shorten predict."
-                )
-            max_prompt = _attr_cap - n_pred
-            if len(prompt_ids_list) > max_prompt:
-                dropped = len(prompt_ids_list) - max_prompt
-                prompt_ids_list = prompt_ids_list[-max_prompt:]
-                print(
-                    f"[DEBUG] Left-truncated prompt by {dropped} tokens so "
-                    f"prompt+predict <= {_attr_cap} (train-aligned; "
-                    f"attn memory scales with T^2).",
-                    flush=True,
-                )
+
+        if live_generate_compare:
+            # Compare on the *full* eval prompt (not the attr-truncated one).
+            print(
+                "[DEBUG] Running live generate for log comparison "
+                f"(max_new_tokens={_gen_max_new}, AI4Go-style, not used for attribution)...",
+                flush=True,
+            )
+            _full_prompt_t = torch.tensor(prompt_ids_full, device=device, dtype=torch.long)
+            _live_ids, live_gen_text = _greedy_generate_on_prompt(
+                model, tokenizer, _full_prompt_t, max_new_tokens=_gen_max_new,
+            )
+            del _full_prompt_t
+            print(
+                f"[DEBUG] Live generate done: n_tokens={len(_live_ids)} "
+                f"(attribution still uses JSONL predict).",
+                flush=True,
+            )
+        else:
+            print(
+                "[DEBUG] Live generate compare disabled "
+                "(--no-live-generate-compare); attribution uses JSONL predict only.",
+                flush=True,
+            )
+
+        prompt_ids_list = _left_truncate_prompt_for_attr(
+            prompt_ids_full, pred_ids_list, _attr_cap,
+        )
         gold_text = _cur_test.get("output") or ""
         gold_ids_list = tokenizer(gold_text, add_special_tokens=False)["input_ids"] if gold_text else []
         prompt_len = len(prompt_ids_list)
@@ -2047,48 +2134,53 @@ def run_causal_intervention_experiment(
             f"attr_max_seq_len={_attr_cap}",
             flush=True,
         )
-        if live_generate_compare:
-            # Live generate for log contrast only (does not replace pred_ids).
-            _im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
-            _eos_ids = sorted({
-                i for i in [tokenizer.eos_token_id, _im_end] if i is not None
-            })
-            prompt_batch = prompt_ids.unsqueeze(0)
-            print(
-                "[DEBUG] Running live generate for log comparison "
-                f"(max_new_tokens={MAX_OUTPUT_TOKENS}, not used for attribution)...",
-                flush=True,
-            )
-            with torch.inference_mode():
-                gen_out = model.generate(
-                    input_ids=prompt_batch,
-                    attention_mask=torch.ones_like(prompt_batch),
-                    max_new_tokens=max(128, int(MAX_OUTPUT_TOKENS)),
-                    do_sample=False,
-                    num_beams=1,
-                    repetition_penalty=1.0,
-                    temperature=1.0,
-                    top_p=1.0,
-                    eos_token_id=_eos_ids,
-                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                    use_cache=True,
-                )
-            live_ids = gen_out[0, prompt_len:].tolist()
-            live_gen_text = tokenizer.decode(live_ids, skip_special_tokens=False)
-            del gen_out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(
-                f"[DEBUG] Live generate done: n_tokens={len(live_ids)} "
-                f"(attribution still uses JSONL predict).",
-                flush=True,
-            )
-        else:
-            print(
-                "[DEBUG] Live generate compare disabled "
-                "(--no-live-generate-compare); attribution uses JSONL predict only.",
-                flush=True,
-            )
+        print(
+            "[DEBUG] Tip: pass --completion-source generate to attribute the "
+            "current adapter's live greedy decode (AI4Go eval prompt) instead.",
+            flush=True,
+        )
+    elif _completion_source == "generate":
+        # AI4Go / run_sample44_local: test prompt → greedy generate → attribute.
+        device = accelerator.device
+        prompt_text = _render_qwen_eval_prompt(
+            tokenizer,
+            _cur_test["input"],
+            system=_cur_test.get("system") or "",
+            enable_thinking=False,
+        )
+        prompt_ids_full = tokenizer(
+            prompt_text, add_special_tokens=False
+        )["input_ids"]
+        print(
+            f"[DEBUG] AI4Go-style generate for attribution "
+            f"(completion_source=generate, enable_thinking=False, "
+            f"max_new_tokens={_gen_max_new}); "
+            f"prompt_tokens={len(prompt_ids_full)}",
+            flush=True,
+        )
+        _prompt_t = torch.tensor(prompt_ids_full, device=device, dtype=torch.long)
+        pred_ids_list, model_out_text = _greedy_generate_on_prompt(
+            model, tokenizer, _prompt_t, max_new_tokens=_gen_max_new,
+        )
+        del _prompt_t
+        if not pred_ids_list:
+            raise ValueError("Live generate produced an empty completion; cannot attribute.")
+        prompt_ids_list = _left_truncate_prompt_for_attr(
+            prompt_ids_full, pred_ids_list, _attr_cap,
+        )
+        gold_text = _cur_test.get("output") or ""
+        gold_ids_list = tokenizer(gold_text, add_special_tokens=False)["input_ids"] if gold_text else []
+        prompt_len = len(prompt_ids_list)
+        prompt_ids = torch.tensor(prompt_ids_list, device=device, dtype=torch.long)
+        pred_ids = torch.tensor(pred_ids_list, device=device, dtype=torch.long)
+        gen_source = "live_generate"
+        print(
+            f"[DEBUG] Live generate used for attribution: "
+            f"prompt_len={prompt_len} gen_tokens={len(pred_ids_list)} "
+            f"total={prompt_len + len(pred_ids_list)} "
+            f"attr_max_seq_len={_attr_cap}",
+            flush=True,
+        )
     elif (
         isinstance(_compact_ids, list)
         and isinstance(_compact_lbl, list)
@@ -2104,30 +2196,14 @@ def run_causal_intervention_experiment(
         gold_ans_ids = [int(tid) for tid, lab in zip(_compact_ids, _compact_lbl) if int(lab) != -100]
         device = accelerator.device
         prompt = torch.tensor([prompt_ids_list], device=device)
-        _im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        _eos_ids = sorted({i for i in [tokenizer.eos_token_id, _im_end] if i is not None})
         print("[DEBUG] Starting viz-style model.generate(prompt)...", flush=True)
-        with torch.inference_mode():
-            gen_out = model.generate(
-                input_ids=prompt,
-                attention_mask=torch.ones_like(prompt),
-                max_new_tokens=128,
-                do_sample=False,
-                num_beams=1,
-                repetition_penalty=1.0,
-                temperature=1.0,
-                top_p=1.0,
-                eos_token_id=_eos_ids,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                use_cache=True,
-            )
+        pred_ids_list, model_out_text = _greedy_generate_on_prompt(
+            model, tokenizer, prompt[0], max_new_tokens=128,
+        )
         print("[DEBUG] Inference done.", flush=True)
-        full_ids = gen_out[0].tolist()
         prompt_len = p0
-        pred_ids_list = full_ids[p0:]
         pred_ids = torch.tensor(pred_ids_list, device=device, dtype=torch.long)
         prompt_ids = torch.tensor(prompt_ids_list, device=device, dtype=torch.long)
-        model_out_text = tokenizer.decode(pred_ids_list, skip_special_tokens=False)
         gold_text = tokenizer.decode(gold_ans_ids, skip_special_tokens=False)
         gen_source = "compact_ids"
         gold_ids_list = gold_ans_ids
@@ -3056,9 +3132,10 @@ if __name__ == "__main__":
         choices=["auto", "predict", "generate"],
         help=(
             "Where the attributed completion comes from. "
-            "auto: use JSONL 'predict' when present, else model.generate; "
+            "auto: use JSONL 'predict' when present, else generate; "
             "predict: teacher-force JSONL predict (AI4Go eval-aligned prompt, thinking off); "
-            "generate: always re-generate (legacy)."
+            "generate: AI4Go-style greedy decode on the test prompt "
+            "(same as hw_test_data/run_sample44_local.py), then attribute that completion."
         ),
     )
     parser.add_argument(

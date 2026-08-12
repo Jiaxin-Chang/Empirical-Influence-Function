@@ -389,14 +389,14 @@
     font-size: 13px;
     line-height: 1.7;
     overflow-x: auto;
-    max-height: 420px;
+    max-height: 560px; /* was 420; temporary: show more Model lines */
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
     flex-shrink: 0;
 }
 .codeBlockCompact {
-    max-height: 280px;
+    max-height: 480px; /* was 280; Model+Gold split — raise Model viewport */
 }
 
 /* ── Token states ── */

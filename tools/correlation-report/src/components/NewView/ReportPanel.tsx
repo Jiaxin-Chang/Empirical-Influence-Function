@@ -2324,15 +2324,18 @@ export function ReportPanel({
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
     ]);
 
-    // Gold saliency sources → yellow highlight on Model stream (shared prompt indices).
-    // Same behavior as predict: all top sources, or only the clicked edge.
+    // Gold saliency sources → yellow on Model stream ONLY for the shared prompt.
+    // Indices >= promptLen refer to gold-answer tokens; the Model stream at the
+    // same index is predict text — painting those would falsely light model output.
     const goldModelHighlightSourceIndices = useMemo(() => {
         if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
         const abs = goldSelectedCorrIdx !== null
             ? [goldSelectedCorrIdx]
             : goldTopCorrelations.map(c => c.source_token_index);
-        return new Set(abs.filter(i => i >= 0 && i < modelTokens.length));
-    }, [attrMode, goldTopCorrelations, goldSelectedCorrIdx, modelTokens.length]);
+        return new Set(
+            abs.filter(i => i >= 0 && i < promptLen && i < modelTokens.length),
+        );
+    }, [attrMode, goldTopCorrelations, goldSelectedCorrIdx, promptLen, modelTokens.length]);
 
     // Gold answer panel: only answer-local sources (prompt has no tokens there).
     const goldHighlightSourceIndices = useMemo(() => {
