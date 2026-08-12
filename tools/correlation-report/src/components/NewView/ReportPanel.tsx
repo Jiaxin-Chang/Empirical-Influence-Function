@@ -146,6 +146,10 @@ export interface AllTokensReport {
     test_sample_baseline: {
         full_tokens: string[];
         correct_full_tokens: string[];
+        full_token_ids?: number[];
+        correct_full_token_ids?: number[];
+        full_tokens_display?: string[];
+        correct_full_tokens_display?: string[];
         prompt_len: number;
     };
     per_token_results: PerTokenResult[];
@@ -807,6 +811,12 @@ function decodeTokens(tokens: string[]): string[] {
     return tokens.map(decodeToken);
 }
 
+/** Prefer server-built display surfaces (byte-fallback merges); else raw tokens. */
+function pickDisplayTokens(raw: string[], display?: string[] | null): string[] {
+    if (display && display.length === raw.length) return decodeTokens(display);
+    return decodeTokens(raw);
+}
+
 function cosSimilarityColor(s: number): { bg: string; fg: string } {
     if (s > 0.6) return { bg: '#dcfce7', fg: '#15803d' };
     if (s > 0.3) return { bg: '#fef9c3', fg: '#854d0e' };
@@ -1024,7 +1034,7 @@ function TokenSpan({
     annotated?: boolean;
     onHoverChange?: (hovered: boolean) => void;
 }) {
-    const display = token === '\n' ? '↵\n' : token === '  ' ? '→' : token;
+    const display = token === '\n' ? '↵\n' : token === '  ' ? '→' : token === '' ? '\u200b' : token;
     const ref = useRef<HTMLSpanElement | null>(null);
 
     // Code blocks scroll inside a fixed height, so the linked token is usually
@@ -2098,8 +2108,65 @@ export function ReportPanel({
         } satisfies TtavLaunchPrefs));
     }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl, visualizerMode]);
 
-    const modelTokens   = useMemo(() => decodeTokens(report.test_sample_baseline.full_tokens), [report]);
-    const correctTokens = useMemo(() => decodeTokens(report.test_sample_baseline.correct_full_tokens ?? []), [report]);
+    const [fullTokensDisplay, setFullTokensDisplay] = useState<string[] | null>(
+        () => report.test_sample_baseline.full_tokens_display ?? null,
+    );
+    const [correctTokensDisplay, setCorrectTokensDisplay] = useState<string[] | null>(
+        () => report.test_sample_baseline.correct_full_tokens_display ?? null,
+    );
+
+    useEffect(() => {
+        setFullTokensDisplay(report.test_sample_baseline.full_tokens_display ?? null);
+        setCorrectTokensDisplay(report.test_sample_baseline.correct_full_tokens_display ?? null);
+    }, [report]);
+
+    useEffect(() => {
+        if (importedReportActive || !selectedMeta) return;
+        const baseline = report.test_sample_baseline;
+        const haveFull = (baseline.full_tokens_display?.length ?? 0) === baseline.full_tokens.length;
+        const goldRaw = baseline.correct_full_tokens ?? [];
+        const haveGold = goldRaw.length === 0
+            || (baseline.correct_full_tokens_display?.length ?? 0) === goldRaw.length;
+        if (haveFull && haveGold) return;
+        if (!baseline.full_token_ids?.length) return;
+
+        let cancelled = false;
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/token-display-surfaces'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reportFileName: selectedMeta.fileName }),
+                });
+                const raw = await resp.text();
+                const parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+                if (!resp.ok || parsed.status !== 'success' || cancelled) return;
+                const full = parsed.fullTokensDisplay;
+                const gold = parsed.correctFullTokensDisplay;
+                if (Array.isArray(full) && full.every(x => typeof x === 'string')) {
+                    setFullTokensDisplay(full as string[]);
+                }
+                if (Array.isArray(gold) && gold.every(x => typeof x === 'string')) {
+                    setCorrectTokensDisplay(gold as string[]);
+                }
+            } catch {
+                // Keep raw surfaces; attribution still works via ids on the server.
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [report, selectedMeta, importedReportActive, eifApiUrl]);
+
+    const modelTokens = useMemo(
+        () => pickDisplayTokens(report.test_sample_baseline.full_tokens, fullTokensDisplay),
+        [report, fullTokensDisplay],
+    );
+    const correctTokens = useMemo(
+        () => pickDisplayTokens(
+            report.test_sample_baseline.correct_full_tokens ?? [],
+            correctTokensDisplay,
+        ),
+        [report, correctTokensDisplay],
+    );
     const promptLen     = report?.test_sample_baseline.prompt_len ?? 0;
     // Gold panel shows the answer only — same slice used by Markdown export.
     const goldResponseTokens = useMemo(

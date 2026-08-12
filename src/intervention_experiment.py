@@ -28,6 +28,7 @@ from src.NIF import (
     _find_subseq_start,
 )
 from src.process_data import process_func_chatml
+from src.export_real_ttav_bundle import token_surfaces_for_display
 from src.loss import (
     compute_alti_correlation_gradient,
     compute_alti_match_and_probe_gradients,
@@ -2643,6 +2644,16 @@ def run_causal_intervention_experiment(
             "full_token_ids": gen_result["pred_full_token_ids"][0],
             "correct_full_tokens": gen_result["full_tokens"][0],
             "correct_full_token_ids": (gen_result.get("correct_full_token_ids") or [[]])[0],
+            "full_tokens_display": token_surfaces_for_display(
+                tokenizer, gen_result["pred_full_token_ids"][0]
+            ),
+            "correct_full_tokens_display": (
+                token_surfaces_for_display(
+                    tokenizer, (gen_result.get("correct_full_token_ids") or [[]])[0]
+                )
+                if (gen_result.get("correct_full_token_ids") or [[]])[0]
+                else []
+            ),
             "prompt_len": prompt_len,
         },
         "per_token_results": [],
@@ -2762,6 +2773,16 @@ def run_causal_intervention_experiment(
                 "full_token_ids": gen_result["pred_full_token_ids"][0],
                 "correct_full_tokens": gen_result["full_tokens"][0],
                 "correct_full_token_ids": (gen_result.get("correct_full_token_ids") or [[]])[0],
+                "full_tokens_display": token_surfaces_for_display(
+                    tokenizer, gen_result["pred_full_token_ids"][0]
+                ),
+                "correct_full_tokens_display": (
+                    token_surfaces_for_display(
+                        tokenizer, (gen_result.get("correct_full_token_ids") or [[]])[0]
+                    )
+                    if (gen_result.get("correct_full_token_ids") or [[]])[0]
+                    else []
+                ),
                 "prompt_len": prompt_len,
             },
             "per_token_results": per_token_results,

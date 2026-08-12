@@ -10,16 +10,23 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from src.export_real_ttav_bundle import DEFAULT_MODEL_PATH, build_real_bundle_payload
+from src.export_real_ttav_bundle import (
+    DEFAULT_MODEL_PATH,
+    build_real_bundle_payload,
+    token_surfaces_for_display,
+)
 from src.export_probe_bundle_from_pt import build_probe_payload as build_probe_from_pt
 from src.export_train_probe_bundle import build_train_probe_bundle_payload
 from src.export_ttav_bundle import build_bundle_payload, infer_sample_id, upload_bundle
 from src.unlearn_pair_probe import (
+    _get_model,
+    _resolve_paths,
     compute_next_token_probs,
     recover_pair_intervention,
     run_unlearn_pair_probe,
 )
 from src.gold_live_attribution import (
+    _gold_tokens_and_ids,
     _hydrate_eif_env,
     gold_retrieve_and_stage3,
     gold_saliency_top_k,
@@ -465,6 +472,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/next-token-probs":
             self._handle_next_token_probs()
             return
+        if parsed.path == "/api/token-display-surfaces":
+            self._handle_token_display_surfaces()
+            return
         if parsed.path == "/api/gold-saliency":
             self._handle_gold_saliency()
             return
@@ -876,6 +886,86 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             flush=True,
         )
         self._send_json(200, result)
+
+    def _handle_token_display_surfaces(self):
+        """Rebuild Model/Gold display strings from token ids (fix U+FFFD chips)."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "token-display-surfaces needs a live tokenizer (EIF_CACHE_ONLY=1).",
+            })
+            return
+
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+
+        baseline = report.get("test_sample_baseline") or {}
+        # Already written by newer intervention runs.
+        full_disp = baseline.get("full_tokens_display")
+        gold_disp = baseline.get("correct_full_tokens_display")
+        if (
+            isinstance(full_disp, list) and full_disp
+            and isinstance(gold_disp, list)
+        ):
+            self._send_json(200, {
+                "status": "success",
+                "fullTokensDisplay": full_disp,
+                "correctFullTokensDisplay": gold_disp,
+                "cached": True,
+            })
+            return
+
+        try:
+            with UNLEARN_PROBE_LOCK:
+                _hydrate_eif_env()
+                resolved_model, resolved_base = _resolve_paths(report, None, None)
+                _model, tokenizer = _get_model(resolved_model, resolved_base)
+
+                full_ids = baseline.get("full_token_ids")
+                if not isinstance(full_ids, list) or not full_ids:
+                    self._send_json(400, {
+                        "status": "error",
+                        "message": "Report missing full_token_ids; cannot rebuild display surfaces.",
+                    })
+                    return
+                full_out = token_surfaces_for_display(tokenizer, [int(x) for x in full_ids])
+
+                gold_out: list[str] = []
+                gold_ids = baseline.get("correct_full_token_ids")
+                if isinstance(gold_ids, list) and gold_ids:
+                    gold_out = token_surfaces_for_display(tokenizer, [int(x) for x in gold_ids])
+                else:
+                    try:
+                        _toks, g_ids, _pl = _gold_tokens_and_ids(report, tokenizer)
+                        gold_out = token_surfaces_for_display(tokenizer, g_ids)
+                    except Exception as exc:
+                        print(f"[display] gold surfaces fallback failed: {exc}", flush=True)
+                        gold_out = list(baseline.get("correct_full_tokens") or [])
+        except Exception as exc:
+            print(f"[display] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+
+        print(
+            f"[display] rebuilt full={len(full_out)} gold={len(gold_out)}",
+            flush=True,
+        )
+        self._send_json(200, {
+            "status": "success",
+            "fullTokensDisplay": full_out,
+            "correctFullTokensDisplay": gold_out,
+            "cached": False,
+        })
 
     def _handle_next_token_probs(self):
         content_length = int(self.headers.get("Content-Length", "0"))

@@ -90,6 +90,36 @@ def _lookup_report_token_id(tokenizer, tok: str, *, vocab: dict, unk_id, unk_tok
     return None
 
 
+def token_surfaces_for_display(tokenizer, token_ids: list[int]) -> list[str]:
+    """Build per-index display strings, merging U+FFFD byte-fallback runs.
+
+    ``tokenizer.decode([single_id])`` often yields ``�`` for Qwen byte pieces.
+    Decoding a short span of consecutive ids recovers the real character(s).
+    The merged text is shown on the first index; later indices in the run get
+    an empty string (still one chip per model token for click alignment).
+    """
+    ids = [int(x) for x in token_ids]
+    n = len(ids)
+    out = [""] * n
+    i = 0
+    while i < n:
+        j = i + 1
+        text = tokenizer.decode(ids[i:j])
+        # Grow until the span no longer needs replacement chars, or no gain.
+        while j < n and "\ufffd" in text:
+            nxt = tokenizer.decode(ids[i : j + 1])
+            if nxt == text and "\ufffd" in nxt:
+                # No progress (rare) — stop to avoid scanning forever.
+                break
+            j += 1
+            text = nxt
+        out[i] = text
+        for k in range(i + 1, j):
+            out[k] = ""
+        i = j
+    return out
+
+
 def convert_report_tokens_to_ids(
     tokenizer,
     report_tokens: list[str],
