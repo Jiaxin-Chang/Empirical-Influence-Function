@@ -100,8 +100,8 @@ interface UnlearnPairResult {
     intervention?: { active?: boolean; direction?: string; pairId?: string | null; steps?: number };
 }
 
-/** Normalized LoRA step size for Learn/Unlearn (||Δθ||₂ = η). */
-const PAIR_INTERVENE_LR = 0.05;
+/** Default normalized LoRA step size for Learn/Unlearn (||Δθ||₂ = η). */
+const DEFAULT_PAIR_INTERVENE_LR = 0.05;
 
 interface NextTokenProbRow {
     token: string;
@@ -1495,6 +1495,7 @@ function PairCard({
     unlearnResult,
     interveneActiveForPair,
     interventionSteps,
+    interveneLr,
     onOpenAnnotationViewer,
 }: {
     pair: CorrelationPair;
@@ -1511,6 +1512,7 @@ function PairCard({
     unlearnResult?: UnlearnPairResult | null;
     interveneActiveForPair?: boolean;
     interventionSteps?: number;
+    interveneLr?: number;
     /** Open annotation-viewer focused on this train sample + target. */
     onOpenAnnotationViewer?: () => void;
 }) {
@@ -1519,6 +1521,7 @@ function PairCard({
     const verdict = unlearnVerdictLabel(unlearnResult?.verdict, unlearnResult?.direction);
     const busy = Boolean(unlearnBusy || learnBusy || recoverBusy);
     const steps = Math.max(1, interventionSteps ?? 1);
+    const lr = interveneLr ?? DEFAULT_PAIR_INTERVENE_LR;
 
     return (
         <div
@@ -1561,7 +1564,7 @@ function PairCard({
                             onUnlearn();
                         }}
                         disabled={busy}
-                        title={`对该 train target 做一步 CE ascent（Unlearn，η=${PAIR_INTERVENE_LR} normalized）。可连点累加，Recover 一次回到最初。`}
+                        title={`对该 train target 做一步 CE ascent（Unlearn，η=${lr} normalized）。可连点累加，Recover 一次回到最初。`}
                         style={{
                             border: '1px solid #fda4af',
                             background: unlearnBusy ? '#ffe4e6' : '#fff1f2',
@@ -1585,7 +1588,7 @@ function PairCard({
                             onLearn();
                         }}
                         disabled={busy}
-                        title={`对该 train target 做一步 CE descent（Learn，η=${PAIR_INTERVENE_LR} normalized）。可连点累加，Recover 一次回到最初。`}
+                        title={`对该 train target 做一步 CE descent（Learn，η=${lr} normalized）。可连点累加，Recover 一次回到最初。`}
                         style={{
                             border: '1px solid #86efac',
                             background: learnBusy ? '#dcfce7' : '#f0fdf4',
@@ -1688,6 +1691,14 @@ function PairCard({
                         {' · '}
                         Δsaliency = <strong>{formatSigned(unlearnResult.delta?.saliency, 6)}</strong>
                     </div>
+                    <div style={{ color: '#78716c', fontSize: 10 }}>
+                        CE {formatSigned(unlearnResult.before?.ce)} → {formatSigned(unlearnResult.after?.ce)}
+                        {unlearnResult.before?.saliency != null && (
+                            <>
+                                {' · '}sal {formatSigned(unlearnResult.before.saliency, 6)} → {formatSigned(unlearnResult.after?.saliency, 6)}
+                            </>
+                        )}
+                    </div>
                     {unlearnResult.testEdge?.reportedSaliency != null && (
                         <div style={{ color: '#a8a29e' }}>
                             报告里该边 saliency = {formatSigned(unlearnResult.testEdge.reportedSaliency, 4)}
@@ -1774,6 +1785,7 @@ function TrainSampleGroup({
     recoverBusy,
     activeInterventionPairId,
     interventionSteps,
+    interveneLr,
     unlearnResults,
     onOpenAnnotationViewer,
 }: {
@@ -1798,6 +1810,7 @@ function TrainSampleGroup({
     recoverBusy?: boolean;
     activeInterventionPairId?: string | null;
     interventionSteps?: number;
+    interveneLr?: number;
     unlearnResults?: Record<string, UnlearnPairResult>;
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
 }) {
@@ -1913,6 +1926,7 @@ function TrainSampleGroup({
                                 interventionSteps={
                                     activeInterventionPairId === pair.id ? interventionSteps : undefined
                                 }
+                                interveneLr={interveneLr}
                                 onOpenAnnotationViewer={
                                     onOpenAnnotationViewer
                                         ? () => onOpenAnnotationViewer(pair)
@@ -2008,6 +2022,8 @@ export function ReportPanel({
     const [activeInterventionPairId, setActiveInterventionPairId] = useState<string | null>(null);
     const [activeInterventionDirection, setActiveInterventionDirection] = useState<string | null>(null);
     const [interventionSteps, setInterventionSteps] = useState(0);
+    const [pairInterveneLr, setPairInterveneLr] = useState(DEFAULT_PAIR_INTERVENE_LR);
+    const [pairInterveneLrInput, setPairInterveneLrInput] = useState(String(DEFAULT_PAIR_INTERVENE_LR));
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
     const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
@@ -2631,7 +2647,7 @@ export function ReportPanel({
                         trainTargetIndex: pair.train_correlation.target_token_index,
                         modelPath: null,
                         baseModelPath: null,
-                        unlearnLr: PAIR_INTERVENE_LR,
+                        unlearnLr: pairInterveneLr,
                         recomputeSaliency: true,
                         direction,
                         persist: true,
@@ -2699,7 +2715,7 @@ export function ReportPanel({
         })();
     }, [
         report, selectedMeta, importedReportActive, eifApiUrl, selectedSampleId,
-        attrMode, goldTrainDetails, refreshTokenProbs,
+        attrMode, goldTrainDetails, refreshTokenProbs, pairInterveneLr,
     ]);
 
     const handleRecoverIntervention = useCallback(() => {
@@ -3171,6 +3187,68 @@ export function ReportPanel({
                         {/* ── Right Column: Training pairs ── */}
                         <div className={styles.bottomRight}>
                             <div className={styles.bottomPanel}>
+                                {!importedReportActive && (
+                                    <div style={{
+                                        padding: '6px 12px',
+                                        fontSize: 11,
+                                        color: '#475569',
+                                        borderBottom: '1px solid #e5e7eb',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 8,
+                                        flexWrap: 'wrap',
+                                    }}>
+                                        <span style={{ fontWeight: 700 }}>Learn/Unlearn η</span>
+                                        <input
+                                            type="number"
+                                            min={0}
+                                            step="any"
+                                            value={pairInterveneLrInput}
+                                            disabled={Boolean(interveningPairId) || recoverBusy}
+                                            onChange={(e) => setPairInterveneLrInput(e.target.value)}
+                                            title="归一化 LoRA 步长 ||Δθ||₂ = η。改完后点「确认」生效。"
+                                            style={{
+                                                width: 72,
+                                                padding: '2px 6px',
+                                                borderRadius: 6,
+                                                border: '1px solid #cbd5e1',
+                                                fontSize: 11,
+                                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                            }}
+                                        />
+                                        <button
+                                            type="button"
+                                            disabled={Boolean(interveningPairId) || recoverBusy}
+                                            onClick={() => {
+                                                const n = Number(pairInterveneLrInput);
+                                                if (!Number.isFinite(n) || n < 0) {
+                                                    setPairInterveneLrInput(String(pairInterveneLr));
+                                                    setTtavLaunchError('η 必须是 ≥ 0 的数字');
+                                                    return;
+                                                }
+                                                setPairInterveneLr(n);
+                                                setPairInterveneLrInput(String(n));
+                                                setTtavLaunchError(null);
+                                                setTtavLaunchStatus(`Learn/Unlearn η 已设为 ${n}`);
+                                            }}
+                                            style={{
+                                                padding: '2px 10px',
+                                                borderRadius: 6,
+                                                border: '1px solid #94a3b8',
+                                                background: '#f8fafc',
+                                                color: '#334155',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: interveningPairId || recoverBusy ? 'not-allowed' : 'pointer',
+                                            }}
+                                        >
+                                            确认
+                                        </button>
+                                        <span style={{ color: '#94a3b8' }}>
+                                            当前 {pairInterveneLr} · default {DEFAULT_PAIR_INTERVENE_LR}
+                                        </span>
+                                    </div>
+                                )}
                                 {(ttavLaunchError || ttavLaunchStatus) && (
                                     <div style={{
                                         padding: '8px 12px',
@@ -3216,6 +3294,7 @@ export function ReportPanel({
                                                 recoverBusy={recoverBusy}
                                                 activeInterventionPairId={activeInterventionPairId}
                                                 interventionSteps={interventionSteps}
+                                                interveneLr={pairInterveneLr}
                                                 unlearnResults={unlearnResultsByPairId}
                                                 onOpenAnnotationViewer={handleOpenAnnotationViewer}
                                             />
