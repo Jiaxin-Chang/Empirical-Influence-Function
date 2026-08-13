@@ -107,8 +107,19 @@ def build_argv(cfg: dict) -> tuple[list[str], ExpPaths]:
         argv += ["--device_map", str(t["device_map"])]
     if nproc > 1 and t.get("fsdp"):
         argv += ["--fsdp", str(t["fsdp"])]
-        if t.get("fsdp_wrap"):
-            argv += ["--fsdp_transformer_layer_cls_to_wrap", str(t["fsdp_wrap"])]
+        # Newer transformers dropped --fsdp_transformer_layer_cls_to_wrap;
+        # wrap class + activation_checkpointing live in --fsdp_config.
+        fsdp_cfg = dict(t.get("fsdp_config") or {})
+        if t.get("fsdp_wrap") and "transformer_layer_cls_to_wrap" not in fsdp_cfg:
+            wrap = t["fsdp_wrap"]
+            fsdp_cfg["transformer_layer_cls_to_wrap"] = (
+                wrap if isinstance(wrap, list) else [wrap]
+            )
+        if t.get("gradient_checkpointing") and "activation_checkpointing" not in fsdp_cfg:
+            fsdp_cfg["activation_checkpointing"] = True
+        if fsdp_cfg:
+            import json as _json
+            argv += ["--fsdp_config", _json.dumps(fsdp_cfg)]
 
     # Optional seed override (for repeat runs to test seed variance). Default
     # omitted -> HF TrainingArguments default (42).

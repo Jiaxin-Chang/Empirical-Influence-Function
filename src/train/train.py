@@ -27,6 +27,7 @@ from loss import (
     canonical_saliency_agg,
     saliency_loss_display_name,
     saliency_loss_from_outputs,
+    capture_attn_proj_weights,
     build_shortcut_mask,
     build_shortcut_mask_per_target,
     shortcut_invariance_kl,
@@ -192,6 +193,8 @@ class AnnotatedSFTTrainer(Trainer):
                  saliency_agg: str = "last",
                  saliency_exclude_sink_prefix: int = 0,
                  saliency_exclude_special_tokens: bool = False,
+                 saliency_oom_fallback: bool = True,
+                 saliency_fallback_max_seq_len: int = 0,
                  cfmask_rate: float = 0.3,
                  cfmask_max_k: int = 0,
                  cfmask_min_k: int = 0,
@@ -260,6 +263,12 @@ class AnnotatedSFTTrainer(Trainer):
         self.saliency_agg = canonical_saliency_agg(saliency_agg)
         self.saliency_exclude_sink_prefix = int(saliency_exclude_sink_prefix or 0)
         self.saliency_exclude_special_tokens = bool(saliency_exclude_special_tokens)
+        # If saliency/eager-attn OOMs on a long/dense sample, drop saliency for
+        # this step and keep CE so full-corpus training does not die.
+        self.saliency_oom_fallback = bool(saliency_oom_fallback)
+        self.saliency_fallback_max_seq_len = int(saliency_fallback_max_seq_len or 0)
+        self._saliency_oom_fallback_count = 0
+        self._saliency_preempt_fallback_count = 0
         # Counterfactual shortcut-masking augmentation (loss_mode=ce_shortcut_mask)
         self.cfmask_rate = float(cfmask_rate)
         self.cfmask_max_k = int(cfmask_max_k or 0)
@@ -382,6 +391,52 @@ class AnnotatedSFTTrainer(Trainer):
         denom = valid.sum().clamp_min(1)
         return (token_loss * weights * valid).sum() / denom
 
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        if not isinstance(exc, RuntimeError):
+            return False
+        msg = str(exc).lower()
+        return any(
+            k in msg
+            for k in (
+                "out of memory",
+                "oom",
+                "npu out of memory",
+                "cuda out of memory",
+                "hip out of memory",
+            )
+        )
+
+    @staticmethod
+    def _empty_accel_cache() -> None:
+        try:
+            if hasattr(torch, "npu") and hasattr(torch.npu, "is_available") and torch.npu.is_available():
+                torch.npu.empty_cache()
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _ce_only_forward(self, model, inputs):
+        """Memory-cheap forward for NTP/CE (no attentions / hidden states)."""
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            labels=inputs["labels"],
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        return outputs, self._ntp_loss_from_outputs(outputs, inputs["labels"])
+
+    def _should_preempt_saliency(self, inputs) -> bool:
+        cap = int(self.saliency_fallback_max_seq_len or 0)
+        if cap <= 0:
+            return False
+        return int(inputs["input_ids"].size(1)) >= cap
+
     def _build_exclude_source_mask(self, input_ids):
         """[B, T] bool mask: True = drop this source token from the saliency
         NEGATIVE set. Covers the attention-sink prefix (first
@@ -403,12 +458,16 @@ class AnnotatedSFTTrainer(Trainer):
         combined ce_shortcut_mask_saliency objective. Saliency must be measured on
         the CLEAN input: the cfmask masked forward hides the negative context, which
         would trivially satisfy the saliency objective. Returns (saliency_loss, diag)."""
-        clean = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=True,
-            output_hidden_states=True,
-        )
+        all_layers = canonical_saliency_agg(self.saliency_agg) == "rollout"
+        with capture_attn_proj_weights(
+            model, layer_index=self.saliency_layer, all_layers=all_layers,
+        ) as attn_proj_weights:
+            clean = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                output_hidden_states=True,
+            )
         floor_step = self.saliency_floor_step + 1
         exclude_source_mask = self._build_exclude_source_mask(input_ids)
         diag = saliency_loss_from_outputs(
@@ -436,6 +495,7 @@ class AnnotatedSFTTrainer(Trainer):
             neg_weight=self.saliency_neg_weight,
             neg_hard_only=self.saliency_neg_hard_only,
             neg_sample_k=self.saliency_neg_sample_k,
+            attn_proj_weights=attn_proj_weights,
         )
         self.saliency_floor_step = floor_step
         if (
@@ -711,6 +771,39 @@ class AnnotatedSFTTrainer(Trainer):
                 model, inputs, annot_pairs_batch, annot_weights_batch, return_outputs)
 
         needs_saliency = self.loss_mode != "ce_only"
+        preempt_saliency = (
+            needs_saliency
+            and self.saliency_oom_fallback
+            and self._should_preempt_saliency(inputs)
+        )
+        if preempt_saliency:
+            self._saliency_preempt_fallback_count += 1
+            if self.is_world_process_zero() and (
+                self._saliency_preempt_fallback_count <= 5
+                or self._saliency_preempt_fallback_count % 50 == 0
+            ):
+                logger.warning(
+                    "[saliency-fallback] preempt CE-only: seq_len=%d >= "
+                    "saliency_fallback_max_seq_len=%d (count=%d)",
+                    int(inputs["input_ids"].size(1)),
+                    self.saliency_fallback_max_seq_len,
+                    self._saliency_preempt_fallback_count,
+                )
+            outputs, ntp_loss = self._ce_only_forward(model, inputs)
+            total_loss = ntp_loss
+            if not model.training and self.is_world_process_zero():
+                self._eval_ntp_buf.append(float(ntp_loss.detach().cpu()))
+                self._eval_sal_buf.append(0.0)
+                self._eval_total_buf.append(float(total_loss.detach().cpu()))
+            if self.state.global_step % self.args.logging_steps == 0 and self.is_world_process_zero():
+                self.log({
+                    "ntp_loss": float(ntp_loss.detach().cpu()),
+                    "saliency_loss": 0.0,
+                    "total_loss": float(total_loss.detach().cpu()),
+                    "saliency_fallback": 1.0,
+                })
+            return (total_loss, outputs) if return_outputs else total_loss
+
         forward_kwargs = {
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
@@ -721,65 +814,140 @@ class AnnotatedSFTTrainer(Trainer):
         # a weighted NTP from logits so HF's mean CE is not used as-is.
         if self.loss_mode != "saliency_only":
             forward_kwargs["labels"] = inputs["labels"]
-        outputs = model(**forward_kwargs)
 
-        if self.loss_mode == "saliency_only":
-            ntp_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
-        else:
-            ntp_loss = self._ntp_loss_from_outputs(outputs, inputs["labels"])
-
+        attn_proj_weights = None
+        outputs = None
+        ntp_loss = None
         diag = None
-        saliency_loss = torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
-        if self.loss_mode != "ce_only":
-            floor_step = self.saliency_floor_step + 1
-            exclude_source_mask = self._build_exclude_source_mask(inputs["input_ids"])
-            diag = saliency_loss_from_outputs(
-                model,
-                outputs,
-                annot_pairs_batch,
-                saliency_layer=self.saliency_layer,
-                saliency_agg=self.saliency_agg,
-                exclude_source_mask=exclude_source_mask,
-                alpha=self.saliency_alpha,
-                eps=self.saliency_eps,
-                floor_eps=self.saliency_floor_eps,
-                floor_eps_mode=self.saliency_floor_eps_mode,
-                floor_eps_quantile=self.saliency_floor_quantile,
-                floor_eps_ema_beta=self.saliency_floor_ema_beta,
-                prev_floor_eps=self.saliency_floor_eps_ema,
-                floor_eps_min=self.saliency_floor_min_eps,
-                floor_eps_step=floor_step,
-                floor_eps_warmup_steps=self.saliency_floor_warmup_steps,
-                floor_logit_eps=self.saliency_floor_logit_eps,
-                loss_type=self.saliency_loss_type,
-                margin_plus=self.saliency_margin_plus,
-                margin_minus=self.saliency_margin_minus,
-                margin_gamma=self.saliency_margin_gamma,
-                neg_weight=self.saliency_neg_weight,
-                neg_hard_only=self.saliency_neg_hard_only,
-                neg_sample_k=self.saliency_neg_sample_k,
-            )
-            saliency_loss = diag.loss
-            self.saliency_floor_step = floor_step
-            if (
-                self.saliency_loss_type != "softmax"
-                and self.saliency_floor_logit_eps is None
-                and self.saliency_floor_eps_mode == "ema_quantile"
-                and diag.n_queries > 0
-            ):
-                self.saliency_floor_eps_ema = diag.floor_eps
+        saliency_loss = None
+        used_fallback = False
 
-            if diag.n_samples > 0:
-                loss_label = saliency_loss_display_name(diag.loss_type)
-                logger.info(
-                    f"[saliency:{loss_label}] C̄={diag.avg_C:.4f}  N̄={diag.avg_N:.4f}  "
-                    f"ratio={diag.avg_ratio:.3f}  tau={self.saliency_alpha}  "
-                    f"eps_num={self.saliency_eps:.4g}  floor_mode={diag.floor_eps_mode}  "
-                    f"floor_step={diag.floor_eps_step}  warmup={diag.floor_eps_warmup_steps}  "
-                    f"eps_floor_effective={diag.floor_eps:.4g}  eps_floor_batch={diag.batch_floor_eps:.4g}  "
-                    f"eps_floor_logit={diag.floor_logit_eps:.4g}  floor_kind={diag.floor_eps_kind}  "
-                    f"loss={diag.loss.item():.4f}  #queries={diag.n_queries}"
+        def _run_saliency_path():
+            nonlocal attn_proj_weights, outputs, ntp_loss, diag, saliency_loss
+            if needs_saliency:
+                all_layers = canonical_saliency_agg(self.saliency_agg) == "rollout"
+                with capture_attn_proj_weights(
+                    model, layer_index=self.saliency_layer, all_layers=all_layers,
+                ) as attn_proj_weights:
+                    outputs = model(**forward_kwargs)
+            else:
+                outputs = model(**forward_kwargs)
+
+            if self.loss_mode == "saliency_only":
+                ntp_loss = torch.zeros(
+                    (), device=outputs.logits.device, dtype=outputs.logits.dtype
                 )
+            else:
+                ntp_loss = self._ntp_loss_from_outputs(outputs, inputs["labels"])
+
+            saliency_loss = torch.zeros(
+                (), device=outputs.logits.device, dtype=outputs.logits.dtype
+            )
+            if self.loss_mode != "ce_only":
+                floor_step = self.saliency_floor_step + 1
+                exclude_source_mask = self._build_exclude_source_mask(inputs["input_ids"])
+                diag = saliency_loss_from_outputs(
+                    model,
+                    outputs,
+                    annot_pairs_batch,
+                    saliency_layer=self.saliency_layer,
+                    saliency_agg=self.saliency_agg,
+                    exclude_source_mask=exclude_source_mask,
+                    alpha=self.saliency_alpha,
+                    eps=self.saliency_eps,
+                    floor_eps=self.saliency_floor_eps,
+                    floor_eps_mode=self.saliency_floor_eps_mode,
+                    floor_eps_quantile=self.saliency_floor_quantile,
+                    floor_eps_ema_beta=self.saliency_floor_ema_beta,
+                    prev_floor_eps=self.saliency_floor_eps_ema,
+                    floor_eps_min=self.saliency_floor_min_eps,
+                    floor_eps_step=floor_step,
+                    floor_eps_warmup_steps=self.saliency_floor_warmup_steps,
+                    floor_logit_eps=self.saliency_floor_logit_eps,
+                    loss_type=self.saliency_loss_type,
+                    margin_plus=self.saliency_margin_plus,
+                    margin_minus=self.saliency_margin_minus,
+                    margin_gamma=self.saliency_margin_gamma,
+                    neg_weight=self.saliency_neg_weight,
+                    neg_hard_only=self.saliency_neg_hard_only,
+                    neg_sample_k=self.saliency_neg_sample_k,
+                    attn_proj_weights=attn_proj_weights,
+                )
+                saliency_loss = diag.loss
+                self.saliency_floor_step = floor_step
+                if (
+                    self.saliency_loss_type != "softmax"
+                    and self.saliency_floor_logit_eps is None
+                    and self.saliency_floor_eps_mode == "ema_quantile"
+                    and diag.n_queries > 0
+                ):
+                    self.saliency_floor_eps_ema = diag.floor_eps
+
+                if diag.n_samples > 0:
+                    loss_label = saliency_loss_display_name(diag.loss_type)
+                    logger.info(
+                        f"[saliency:{loss_label}] C̄={diag.avg_C:.4f}  N̄={diag.avg_N:.4f}  "
+                        f"ratio={diag.avg_ratio:.3f}  tau={self.saliency_alpha}  "
+                        f"eps_num={self.saliency_eps:.4g}  floor_mode={diag.floor_eps_mode}  "
+                        f"floor_step={diag.floor_eps_step}  warmup={diag.floor_eps_warmup_steps}  "
+                        f"eps_floor_effective={diag.floor_eps:.4g}  eps_floor_batch={diag.batch_floor_eps:.4g}  "
+                        f"eps_floor_logit={diag.floor_logit_eps:.4g}  floor_kind={diag.floor_eps_kind}  "
+                        f"loss={diag.loss.item():.4f}  #queries={diag.n_queries}"
+                    )
+
+        try:
+            _run_saliency_path()
+        except RuntimeError as exc:
+            if not (
+                needs_saliency
+                and self.saliency_oom_fallback
+                and self.loss_mode in ("ce_saliency", "saliency_only")
+                and self._is_oom_error(exc)
+            ):
+                raise
+            used_fallback = True
+            self._saliency_oom_fallback_count += 1
+            # Drop any partial graph from the failed saliency path.
+            outputs = None
+            attn_proj_weights = None
+            diag = None
+            self._empty_accel_cache()
+            if self.is_world_process_zero() and (
+                self._saliency_oom_fallback_count <= 5
+                or self._saliency_oom_fallback_count % 50 == 0
+            ):
+                logger.warning(
+                    "[saliency-fallback] OOM on saliency path → CE-only for this step "
+                    "(seq_len=%d count=%d): %s",
+                    int(inputs["input_ids"].size(1)),
+                    self._saliency_oom_fallback_count,
+                    str(exc).split("\n", 1)[0][:200],
+                )
+            if self.loss_mode == "saliency_only":
+                # No CE term in this mode; skip the step with a zero loss.
+                device = inputs["input_ids"].device
+                total_loss = torch.zeros((), device=device)
+                if return_outputs:
+                    # Prefer any surviving logits; otherwise one cheap CE forward.
+                    if outputs is None or getattr(outputs, "logits", None) is None:
+                        outputs, _ = self._ce_only_forward(model, inputs)
+                    return total_loss, outputs
+                return total_loss
+            # Prefer reusing logits from a completed forward (common: OOM in
+            # build_contribution_rows). A second forward would desync FSDP
+            # collectives vs ranks that did not OOM.
+            if outputs is not None and getattr(outputs, "logits", None) is not None:
+                try:
+                    outputs.attentions = None
+                    outputs.hidden_states = None
+                except Exception:
+                    pass
+                self._empty_accel_cache()
+                ntp_loss = self._ntp_loss_from_outputs(outputs, inputs["labels"])
+            else:
+                self._empty_accel_cache()
+                outputs, ntp_loss = self._ce_only_forward(model, inputs)
+            saliency_loss = torch.zeros((), device=ntp_loss.device, dtype=ntp_loss.dtype)
 
         if self.loss_mode == "ce_saliency":
             total_loss = ntp_loss + self.saliency_lambda * saliency_loss
@@ -792,7 +960,8 @@ class AnnotatedSFTTrainer(Trainer):
 
         detail = None
         should_detail_log = (
-            self.loss_mode != "ce_only"
+            (not used_fallback)
+            and self.loss_mode != "ce_only"
             and self.saliency_detail_log_path
             and self.saliency_detail_log_steps > 0
             and self.state.global_step % self.saliency_detail_log_steps == 0
@@ -862,7 +1031,12 @@ class AnnotatedSFTTrainer(Trainer):
             self._eval_total_buf.append(float(total_loss.detach().cpu()))
             if diag is not None and diag.n_queries > 0:
                 self._eval_ratio_buf.append(float(diag.avg_ratio))
-            if detail is None and self.loss_mode != "ce_only" and self.saliency_detail_top_k > 0:
+            if (
+                (not used_fallback)
+                and detail is None
+                and self.loss_mode != "ce_only"
+                and self.saliency_detail_top_k > 0
+            ):
                 # Compute saliency mAP@k on this eval batch even when we are not
                 # writing the detailed JSONL — keeps validation cheap by reusing
                 # the same outputs we just forwarded.
@@ -892,6 +1066,8 @@ class AnnotatedSFTTrainer(Trainer):
                 "saliency_loss": saliency_loss.item(),
                 "saliency_loss_type_id": 1.0 if self.saliency_loss_type == "softmax" else 0.0,
                 "total_loss": total_loss.item(),
+                "saliency_fallback": 1.0 if used_fallback else 0.0,
+                "saliency_oom_fallback_count": float(self._saliency_oom_fallback_count),
             }
             if self.loss_mode != "ce_only":
                 log_payload.update({
@@ -1180,6 +1356,14 @@ class SFTTrainingArguments(TrainingArguments):
         default="ce_saliency",
         metadata={"help": "Training objective: ce_saliency | saliency_only | ce_only | ce_shortcut_mask | ce_shortcut_mask_saliency | ce_edge_pred | ce_attn_bias."}
     )
+    saliency_oom_fallback: bool = field(
+        default=True,
+        metadata={"help": "If True, catch OOM on the saliency/eager-attn path and fall back to CE-only for that step instead of crashing. Recommended for long full-corpus runs."},
+    )
+    saliency_fallback_max_seq_len: int = field(
+        default=0,
+        metadata={"help": "If >0, skip saliency (CE-only) whenever padded seq_len >= this threshold, without waiting for OOM. 0 disables preemptive skip."},
+    )
     saliency_detail_log_path: str = field(
         default="",
         metadata={"help": "Optional JSONL path for strict-causal query/edge saliency diagnostics."}
@@ -1383,6 +1567,8 @@ def train():
         saliency_agg=training_args.saliency_agg,
         saliency_exclude_sink_prefix=training_args.saliency_exclude_sink_prefix,
         saliency_exclude_special_tokens=training_args.saliency_exclude_special_tokens,
+        saliency_oom_fallback=training_args.saliency_oom_fallback,
+        saliency_fallback_max_seq_len=training_args.saliency_fallback_max_seq_len,
         cfmask_rate=training_args.cfmask_rate,
         cfmask_max_k=training_args.cfmask_max_k,
         cfmask_min_k=training_args.cfmask_min_k,
@@ -1413,7 +1599,8 @@ def train():
         "Training objective: loss_mode=%s saliency_agg=%s saliency_layer=%s "
         "saliency_loss=%s saliency_loss_type=%s "
         "saliency_lambda=%s tau=%s eps_num=%s floor_eps=%s floor_logit_eps=%s floor_mode=%s "
-        "floor_quantile=%s floor_warmup=%s output_dir=%s",
+        "floor_quantile=%s floor_warmup=%s saliency_oom_fallback=%s "
+        "saliency_fallback_max_seq_len=%s output_dir=%s",
         training_args.loss_mode,
         training_args.saliency_agg,
         training_args.saliency_layer,
@@ -1427,6 +1614,8 @@ def train():
         training_args.saliency_floor_eps_mode,
         training_args.saliency_floor_quantile,
         training_args.saliency_floor_warmup_steps,
+        training_args.saliency_oom_fallback,
+        training_args.saliency_fallback_max_seq_len,
         training_args.output_dir,
     )
     trainer.train()

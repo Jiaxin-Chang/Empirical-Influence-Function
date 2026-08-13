@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -17,7 +18,7 @@ def _unwrap_to_decoder_stack(model):
     Walk through HF / PEFT / DDP wrappers and return the module that owns `.layers` (ecoderLayer list).
     """
     m = model
-    # DDP / DeepSpeed wrappers
+    # DDP / DeepSpeed / FSDP wrappers
     if hasattr(m, "module") and not hasattr(m, "layers"):
         m = m.module
     while True:
@@ -30,6 +31,174 @@ def _unwrap_to_decoder_stack(model):
             m = m.base_model
             continue
         raise RuntimeError(f"Cannot locate decoder layer stack on {type(model).__name__}.")
+
+
+def _get_hf_config(model):
+    """Best-effort HF config through DDP / FSDP / Peft wrappers."""
+    m = model
+    if hasattr(m, "module"):
+        m = m.module
+    for _ in range(6):
+        cfg = getattr(m, "config", None)
+        if cfg is not None and hasattr(cfg, "num_attention_heads"):
+            return cfg
+        if hasattr(m, "get_base_model"):
+            try:
+                m = m.get_base_model()
+                continue
+            except Exception:
+                pass
+        if hasattr(m, "base_model"):
+            m = m.base_model
+            continue
+        if hasattr(m, "model"):
+            m = m.model
+            continue
+        break
+    return getattr(model, "config", None)
+
+
+def _attention_gqa_layout(model, self_attn, num_heads: int) -> tuple[int, int, int]:
+    """Return ``(head_dim, num_kv_heads, n_rep)`` for GQA/MQA.
+
+    Prefer HF config / module attrs over ``*.weight.shape``. Under FSDP the
+    local shard shape is not the logical out_features, which previously produced
+    ``num_kv_heads=0`` (ZeroDivision) or nonsense values like 8192.
+    """
+    H = int(num_heads)
+    cfg = _get_hf_config(model)
+
+    head_dim = getattr(self_attn, "head_dim", None)
+    if head_dim is None and cfg is not None:
+        head_dim = getattr(cfg, "head_dim", None)
+    if head_dim is None and cfg is not None and getattr(cfg, "num_attention_heads", None):
+        hs = getattr(cfg, "hidden_size", None)
+        if hs is not None:
+            head_dim = int(hs) // int(cfg.num_attention_heads)
+    if head_dim is None:
+        q_out = getattr(self_attn.q_proj, "out_features", None)
+        if q_out is None:
+            q_out = int(self_attn.q_proj.weight.shape[0])
+        if int(q_out) % H != 0:
+            raise ValueError(f"Cannot infer head_dim: q_out={q_out}, H={H}")
+        head_dim = int(q_out) // H
+    head_dim = int(head_dim)
+    if head_dim <= 0:
+        raise ValueError(f"Invalid head_dim={head_dim}")
+
+    num_kv = getattr(self_attn, "num_key_value_heads", None)
+    if num_kv is None and cfg is not None:
+        num_kv = getattr(cfg, "num_key_value_heads", None)
+    if num_kv is None:
+        v_out = getattr(self_attn.v_proj, "out_features", None)
+        if v_out is None:
+            v_out = int(self_attn.v_proj.weight.shape[0])
+        if int(v_out) % head_dim != 0:
+            raise ValueError(
+                f"Cannot infer num_kv_heads: v_out={v_out}, head_dim={head_dim}"
+            )
+        num_kv = int(v_out) // head_dim
+    num_kv = int(num_kv)
+    if num_kv <= 0 or H % num_kv != 0:
+        raise ValueError(f"H={H} not divisible by num_kv_heads={num_kv}")
+    return head_dim, num_kv, H // num_kv
+
+
+@contextmanager
+def capture_attn_proj_weights(
+    model,
+    layer_index: int = -1,
+    *,
+    all_layers: bool = False,
+):
+    """Clone attention projection weights while FSDP has them unsharded.
+
+    Under FSDP full-shard, reading ``v_proj.weight`` *after* forward sees only a
+    local shard (or OOMs if you ``summon_full_params`` on the whole MoE). During
+    each decoder layer's forward the unit is briefly unsharded — a pre-hook
+    clones the small attention mats (not the MoE experts) for later ALTI math.
+    """
+    decoder = _unwrap_to_decoder_stack(model)
+    n = len(decoder.layers)
+    if all_layers:
+        indices = list(range(n))
+    else:
+        li = int(layer_index)
+        if li < 0:
+            li = n + li
+        li = max(0, min(li, n - 1))
+        indices = [li]
+
+    bag: dict[int, dict] = {}
+    handles = []
+
+    def _make_hook(idx: int, layer_mod):
+        # Hook self_attn so FSDP has already unsharded the parent decoder layer.
+        def _hook(module, _inputs):
+            sa = module
+            ln = layer_mod.input_layernorm
+            bag[idx] = {
+                "v_weight": sa.v_proj.weight.detach().float().clone(),
+                "v_bias": (
+                    None if sa.v_proj.bias is None
+                    else sa.v_proj.bias.detach().float().clone()
+                ),
+                "o_weight": sa.o_proj.weight.detach().float().clone(),
+                "ln_weight": ln.weight.detach().float().clone(),
+                "ln_eps": float(getattr(ln, "variance_epsilon", 1e-6)),
+            }
+        return _hook
+
+    for idx in indices:
+        layer_mod = decoder.layers[idx]
+        # Prefer inner module if this layer is an FSDP wrapper.
+        inner = getattr(layer_mod, "_fsdp_wrapped_module", None) or layer_mod
+        if hasattr(inner, "module") and hasattr(inner.module, "self_attn"):
+            inner = inner.module
+        handles.append(
+            inner.self_attn.register_forward_pre_hook(_make_hook(idx, inner))
+        )
+    try:
+        yield bag
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def _resolve_layer_index(model, layer_index: int) -> int:
+    decoder = _unwrap_to_decoder_stack(model)
+    n = len(decoder.layers)
+    li = int(layer_index)
+    if li < 0:
+        li = n + li
+    return max(0, min(li, n - 1))
+
+
+def _layer_attn_proj_tensors(
+    model,
+    layer,
+    self_attn,
+    layer_index: int,
+    captured: dict[int, dict] | None,
+):
+    """Return ``(ln_weight, v_weight, v_bias, o_weight, ln_eps)`` as float tensors."""
+    li = _resolve_layer_index(model, layer_index)
+    if captured is not None:
+        if li not in captured:
+            raise RuntimeError(
+                f"Missing captured attn proj weights for layer {li} "
+                f"(have {sorted(captured)}); wrap the forward with "
+                f"capture_attn_proj_weights(...)."
+            )
+        w = captured[li]
+        return w["ln_weight"], w["v_weight"], w["v_bias"], w["o_weight"], w["ln_eps"]
+    return (
+        layer.input_layernorm.weight.float(),
+        self_attn.v_proj.weight.float(),
+        None if self_attn.v_proj.bias is None else self_attn.v_proj.bias.float(),
+        self_attn.o_proj.weight.float(),
+        float(getattr(layer.input_layernorm, "variance_epsilon", 1e-6)),
+    )
 
 
 def canonical_saliency_agg(saliency_agg: str | None) -> str:
@@ -100,6 +269,7 @@ def _alti_layer_value_states(
     attn_probs: Tensor,  # [1, H, T, T]
     *,
     layer_index: int,
+    attn_proj_weights: dict[int, dict] | None = None,
 ):
     """Shared ALTI value path for one layer (no full [H,T,D] transform)."""
     if hidden_in.dim() != 3 or hidden_in.size(0) != 1:
@@ -113,16 +283,18 @@ def _alti_layer_value_states(
 
     bsz, T, D = hidden_in.shape
     H = attn_probs.size(1)
-    head_dim = getattr(self_attn, "head_dim", None) or (
-        self_attn.q_proj.weight.shape[0] // H
+    head_dim, num_kv_heads, n_rep = _attention_gqa_layout(model, self_attn, H)
+    gamma, v_w, v_b, o_w, ln_eps = _layer_attn_proj_tensors(
+        model, layer, self_attn, layer_index, attn_proj_weights,
     )
-    v_out = self_attn.v_proj.weight.shape[0]
-    num_kv_heads = v_out // head_dim
-    assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
-    n_rep = H // num_kv_heads
-
-    normed = layer.input_layernorm(hidden_in)
-    v_proj = self_attn.v_proj(normed)
+    device = hidden_in.device
+    # Full RMSNorm (same as layer.input_layernorm) then V — not the gamma⊙x shortcut.
+    x = hidden_in.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(var + ln_eps) * gamma.to(device=device)
+    v_proj = normed @ v_w.to(device=device).t()
+    if v_b is not None:
+        v_proj = v_proj + v_b.to(device=device)
     v_states = v_proj.view(bsz, T, num_kv_heads, head_dim).transpose(1, 2)
     if n_rep > 1:
         v_states = (
@@ -130,9 +302,8 @@ def _alti_layer_value_states(
             .expand(bsz, num_kv_heads, n_rep, T, head_dim)
             .reshape(bsz, H, T, head_dim)
         )
-    # Keep compute dtype = model dtype (bf16/fp16) to cut peak memory vs float32.
     v_states = v_states[0]  # [H, T, hd]
-    o_w_by_head = self_attn.o_proj.weight.view(D, H, head_dim)  # [D, H, hd]
+    o_w_by_head = o_w.to(device=device).view(D, H, head_dim)
     attn_f = attn_probs[0]
     residual = hidden_in[0]
     return v_states, o_w_by_head, attn_f, residual, D
@@ -147,6 +318,7 @@ def build_alti_b_rows_for_queries(
     layer_index: int,
     source_chunk_size: int = 32,
     query_chunk_size: int = 1,
+    attn_proj_weights: dict[int, dict] | None = None,
 ) -> Tensor:
     """Selected rows of paper-§B ALTI C^{(l)} without materializing the full [T,T].
 
@@ -154,6 +326,7 @@ def build_alti_b_rows_for_queries(
     """
     v_states, o_w_by_head, attn_f, residual, D = _alti_layer_value_states(
         model, hidden_in, attn_probs, layer_index=layer_index,
+        attn_proj_weights=attn_proj_weights,
     )
     device = hidden_in.device
     T = hidden_in.size(1)
@@ -206,6 +379,7 @@ def _left_multiply_by_alti_layer(
     layer_index: int,
     mix_row_chunk: int = 4,
     source_chunk_size: int = 32,
+    attn_proj_weights: dict[int, dict] | None = None,
 ) -> Tensor:
     """Compute ``W @ C^{(l)}`` without forming the full C matrix.
 
@@ -226,6 +400,7 @@ def _left_multiply_by_alti_layer(
             layer_index=layer_index,
             source_chunk_size=source_chunk_size,
             query_chunk_size=min(rchunk, 4),
+            attn_proj_weights=attn_proj_weights,
         )
 
     for i0 in range(0, T, rchunk):
@@ -277,6 +452,7 @@ def build_alti_rollout_rows(
     query_chunk_size: int = 1,
     source_chunk_size: int = 32,
     mix_row_chunk: int = 4,
+    attn_proj_weights: dict[int, dict] | None = None,
 ) -> Tensor:
     """Paper §B full ALTI rollout rows for selected queries (memory-efficient).
 
@@ -332,6 +508,7 @@ def build_alti_rollout_rows(
                 layer_index=last_li,
                 source_chunk_size=source_chunk_size,
                 query_chunk_size=query_chunk_size,
+                attn_proj_weights=attn_proj_weights,
             )
 
         # Chunk annotated queries so peak stays O(qchunk * T * D).
@@ -362,6 +539,7 @@ def build_alti_rollout_rows(
                 layer_index=li,
                 mix_row_chunk=mix_row_chunk,
                 source_chunk_size=source_chunk_size,
+                attn_proj_weights=attn_proj_weights,
             )
 
         out[idxs] = W.to(dtype=dtype)
@@ -375,6 +553,7 @@ def build_contribution_matrix(
     attn_probs: Tensor,       # [B, H, T, T] Step 1
     *,
     layer_index: int = -1,
+    attn_proj_weights: dict[int, dict] | None = None,
 ) -> Tensor:
     """
         Strict Kobayashi/ALTI contribution c_{i,j} = ||T_i(x_j)||_2 for the
@@ -389,21 +568,18 @@ def build_contribution_matrix(
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
 
-    head_dim = getattr(self_attn, "head_dim", None) or (
-        self_attn.q_proj.weight.shape[0] // H
-    ) 
-    v_out = self_attn.v_proj.weight.shape[0]
-    num_kv_heads = v_out // head_dim
-    assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
-    n_rep = H // num_kv_heads
+    head_dim, num_kv_heads, n_rep = _attention_gqa_layout(model, self_attn, H)
+    gamma, v_w, v_b, o_w, eps_rms = _layer_attn_proj_tensors(
+        model, layer, self_attn, layer_index, attn_proj_weights,
+    )
+    gamma = gamma.to(device=device)
+    v_w = v_w.to(device=device)
+    o_w = o_w.to(device=device)
 
-    gamma = layer.input_layernorm.weight.to(device).float()           # [D]
     gamma_x = last_hidden_in.float() * gamma                          # [B, T, D]
-    v_w = self_attn.v_proj.weight.to(device).float()                  # [num_kv_heads*head_dim, D]
-    v_b = self_attn.v_proj.bias
     v_proj = gamma_x @ v_w.t()                                        # [B, T, num_kv_heads*head_dim]
     if v_b is not None:
-        v_proj = v_proj + v_b.to(device).float()
+        v_proj = v_proj + v_b.to(device=device)
     v_states = v_proj.view(B, T, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     if n_rep > 1:
         v_states = (
@@ -412,7 +588,6 @@ def build_contribution_matrix(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device).float()    
     o_w_by_head = o_w.view(D, H, head_dim)
     transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 
@@ -427,7 +602,6 @@ def build_contribution_matrix(
     )
 
     # divide by σ_i = RMS(x_i)  (query-side) 
-    eps_rms = getattr(layer.input_layernorm, "variance_epsilon", 1e-6)
     sigma_i = last_hidden_in.float().pow(2).mean(dim=-1).add(eps_rms).sqrt()  # [B, T]
     T_ij = T_ij / sigma_i.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-12)
 
@@ -741,6 +915,7 @@ def build_contribution_rows(
     layer_index: int = -1,
     source_chunk_size: int = 16,
     query_chunk_size: int = 64,
+    attn_proj_weights: dict[int, dict] | None = None,
 ) -> Tensor:
     """Compute only selected query rows C[b, q, :] of the contribution matrix.
 
@@ -764,6 +939,9 @@ def build_contribution_rows(
     (default -1 = last layer). The caller must pass the matching
     ``attn_probs`` (= outputs.attentions[layer_index]) and ``last_hidden_in``
     (= input to that layer = outputs.hidden_states[layer_index]).
+
+    ``attn_proj_weights``: optional dict from ``capture_attn_proj_weights`` —
+    required under FSDP so we do not ``summon_full_params`` (OOM on 30B MoE).
     """
     decoder = _unwrap_to_decoder_stack(model)
     layer = decoder.layers[layer_index]
@@ -774,21 +952,18 @@ def build_contribution_rows(
     device = last_hidden_in.device
     dtype = last_hidden_in.dtype
 
-    head_dim = getattr(self_attn, "head_dim", None) or (
-        self_attn.q_proj.weight.shape[0] // H
+    head_dim, num_kv_heads, n_rep = _attention_gqa_layout(model, self_attn, H)
+    gamma, v_w, v_b, o_w, eps_rms = _layer_attn_proj_tensors(
+        model, layer, self_attn, layer_index, attn_proj_weights,
     )
-    v_out = self_attn.v_proj.weight.shape[0]
-    num_kv_heads = v_out // head_dim
-    assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
-    n_rep = H // num_kv_heads
+    gamma = gamma.to(device=device)
+    v_w = v_w.to(device=device)
+    o_w = o_w.to(device=device)
 
-    gamma = layer.input_layernorm.weight.to(device).float()
     gamma_x = last_hidden_in.float() * gamma
-    v_w = self_attn.v_proj.weight.to(device).float()
-    v_b = self_attn.v_proj.bias
     v_proj = gamma_x @ v_w.t()
     if v_b is not None:
-        v_proj = v_proj + v_b.to(device).float()
+        v_proj = v_proj + v_b.to(device=device)
     v_states = v_proj.view(B, T, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     if n_rep > 1:
         v_states = (
@@ -797,7 +972,6 @@ def build_contribution_rows(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device).float()
     o_w_by_head = o_w.view(D, H, head_dim)
     transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 
@@ -807,7 +981,6 @@ def build_contribution_rows(
     if Q == 0:
         return torch.empty((0, T), device=device, dtype=dtype)
 
-    eps_rms = getattr(layer.input_layernorm, "variance_epsilon", 1e-6)
     query_hidden_all = last_hidden_in.float()[row_batch, row_qry, :]   # [Q, D]
     sigma_q_all = (
         query_hidden_all.pow(2).mean(dim=-1).add(eps_rms).sqrt().clamp_min(1e-12)
@@ -1358,6 +1531,7 @@ def saliency_loss_from_outputs(
         neg_weight: float = 0.5,
         neg_hard_only: bool = False,
         neg_sample_k: int = 0,
+        attn_proj_weights: dict[int, dict] | None = None,
 ) -> SaliencyDiagnostics:
     """
     Takes the model's forward output and produces the saliency diagnostics in one call.
@@ -1369,6 +1543,9 @@ def saliency_loss_from_outputs(
     ``saliency_agg``:
       - ``last`` (default): ||T||_2 rows at ``saliency_layer`` (training surrogate).
       - ``rollout``: paper §B ALTI — L1 min_sum C per layer, full-layer product.
+
+    ``attn_proj_weights``: from ``capture_attn_proj_weights`` during the same
+    forward (needed under FSDP; optional on plain DDP).
     """
     agg = canonical_saliency_agg(saliency_agg)
     n_layers = len(outputs.attentions)
@@ -1394,6 +1571,7 @@ def saliency_loss_from_outputs(
     if agg == "rollout":
         C_rows = build_alti_rollout_rows(
             model, outputs, row_batch, row_qry,
+            attn_proj_weights=attn_proj_weights,
         )
     else:
         li = int(saliency_layer) if int(saliency_layer) >= 0 else n_layers + int(saliency_layer)
@@ -1409,6 +1587,7 @@ def saliency_loss_from_outputs(
             row_batch,
             row_qry,
             layer_index=li,
+            attn_proj_weights=attn_proj_weights,
         )
     exclude_rows = None
     if exclude_source_mask is not None:
