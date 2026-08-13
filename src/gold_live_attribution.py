@@ -488,9 +488,10 @@ def gold_saliency_top_k(
     with torch.no_grad():
         sal_vec = compute_last_layer_saliency_vector(model, batch, target_index)
 
-    # Prefer prompt-only sources for Stage1 (shared with Model panel through prompt_len).
-    prompt_only = (os.environ.get("EIF_GOLD_SALIENCY_PROMPT_ONLY") or "1").strip().lower() not in (
-        "0", "false", "no", "off",
+    # Match predict: rank sources over the full causal prefix (prompt + earlier
+    # gold-answer tokens). Opt into prompt-only via EIF_GOLD_SALIENCY_PROMPT_ONLY=1.
+    prompt_only = (os.environ.get("EIF_GOLD_SALIENCY_PROMPT_ONLY") or "0").strip().lower() in (
+        "1", "true", "yes", "on",
     )
     sal_for_rank = sal_vec[:prompt_len] if prompt_only and prompt_len > 0 else sal_vec
     ranked = top_nontrivial_saliency_sources(

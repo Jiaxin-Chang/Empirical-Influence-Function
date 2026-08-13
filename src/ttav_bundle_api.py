@@ -804,7 +804,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         model_path = str(raw_model_path).strip() if raw_model_path else None
         raw_base_path = req.get("baseModelPath")
         base_model_path = str(raw_base_path).strip() if raw_base_path else None
-        unlearn_lr = float(req.get("unlearnLr", 20.0))
+        unlearn_lr = float(req["unlearnLr"]) if req.get("unlearnLr") is not None else None
         normalize_grad = not bool(req.get("noNormalizeGrad", False))
         recompute_saliency = bool(req.get("recomputeSaliency", True))
         direction = str(req.get("direction", "unlearn") or "unlearn").strip().lower()
@@ -817,7 +817,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
         print(
             f"[{direction}] pair={pair_id or '?'} train={train_sample_id} "
-            f"test={test_source_index}->{test_target_index} lr={unlearn_lr} "
+            f"test={test_source_index}->{test_target_index} "
+            f"lr={unlearn_lr if unlearn_lr is not None else '(default)'} "
             f"persist={persist} mode={completion_mode} "
             f"adapter={model_path or '(env/report)'} base={base_model_path or '(auto/env)'}",
             flush=True,

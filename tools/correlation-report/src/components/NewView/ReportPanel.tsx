@@ -95,10 +95,13 @@ interface UnlearnPairResult {
     before?: { ce?: number; logprob?: number; saliency?: number | null };
     after?: { ce?: number; logprob?: number; saliency?: number | null };
     delta?: { ce?: number; logprob?: number; saliency?: number | null };
-    update?: { paramSpace?: string; lastNLayers?: number; direction?: string };
+    update?: { paramSpace?: string; lastNLayers?: number; direction?: string; steps?: number; unlearnLr?: number };
     testEdge?: { reportedSaliency?: number | null; saliencyMode?: string };
-    intervention?: { active?: boolean; direction?: string; pairId?: string | null };
+    intervention?: { active?: boolean; direction?: string; pairId?: string | null; steps?: number };
 }
+
+/** Normalized LoRA step size for Learn/Unlearn (||Δθ||₂ = η). */
+const PAIR_INTERVENE_LR = 0.05;
 
 interface NextTokenProbRow {
     token: string;
@@ -1410,20 +1413,19 @@ function NextTokenProbPanel({
     error,
     interventionActive,
     interventionDirection,
-    onRecover,
-    recoverBusy,
+    interventionSteps,
 }: {
     result: NextTokenProbResult | null;
     busy?: boolean;
     error?: string | null;
     interventionActive?: boolean;
     interventionDirection?: string | null;
-    onRecover?: () => void;
-    recoverBusy?: boolean;
+    interventionSteps?: number;
 }) {
     const rows = result?.top ?? [];
     const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
     const modeLabel = result?.mode === 'gold' ? 'teacher-forced' : 'model predict';
+    const steps = Math.max(1, interventionSteps ?? 1);
 
     return (
         <div className={styles.probPanel}>
@@ -1439,22 +1441,12 @@ function NextTokenProbPanel({
                         P(actual={JSON.stringify(decodeToken(result.actualToken ?? ''))})={formatProbPct(result.actualProb)}
                     </span>
                 )}
-                {interventionActive && onRecover && (
-                    <button
-                        type="button"
-                        className={styles.probRecoverBtn}
-                        disabled={recoverBusy}
-                        onClick={onRecover}
-                        title="撤销当前 Learn/Unlearn 一步，恢复原权重与概率"
-                    >
-                        {recoverBusy ? 'Recovering…' : 'Recover'}
-                    </button>
-                )}
             </div>
             {interventionActive && (
                 <div className={styles.probInterveneBanner}>
-                    Active {interventionDirection === 'learn' ? 'Learn' : 'Unlearn'} step
-                    — probabilities reflect modified weights. Click Recover to restore.
+                    Active {interventionDirection === 'learn' ? 'Learn' : 'Unlearn'}
+                    {steps > 1 ? ` ×${steps}` : ''}
+                    — probabilities reflect modified weights. Recover from the correlation card on the right.
                 </div>
             )}
             <div className={styles.probPanelBody}>
@@ -1502,6 +1494,7 @@ function PairCard({
     recoverBusy,
     unlearnResult,
     interveneActiveForPair,
+    interventionSteps,
     onOpenAnnotationViewer,
 }: {
     pair: CorrelationPair;
@@ -1517,6 +1510,7 @@ function PairCard({
     recoverBusy?: boolean;
     unlearnResult?: UnlearnPairResult | null;
     interveneActiveForPair?: boolean;
+    interventionSteps?: number;
     /** Open annotation-viewer focused on this train sample + target. */
     onOpenAnnotationViewer?: () => void;
 }) {
@@ -1524,6 +1518,7 @@ function PairCard({
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
     const verdict = unlearnVerdictLabel(unlearnResult?.verdict, unlearnResult?.direction);
     const busy = Boolean(unlearnBusy || learnBusy || recoverBusy);
+    const steps = Math.max(1, interventionSteps ?? 1);
 
     return (
         <div
@@ -1566,7 +1561,7 @@ function PairCard({
                             onUnlearn();
                         }}
                         disabled={busy}
-                        title="对该 train target 做一步 CE ascent（Unlearn），权重保持修改直到 Recover"
+                        title={`对该 train target 做一步 CE ascent（Unlearn，η=${PAIR_INTERVENE_LR} normalized）。可连点累加，Recover 一次回到最初。`}
                         style={{
                             border: '1px solid #fda4af',
                             background: unlearnBusy ? '#ffe4e6' : '#fff1f2',
@@ -1590,7 +1585,7 @@ function PairCard({
                             onLearn();
                         }}
                         disabled={busy}
-                        title="对该 train target 做一步 CE descent（Learn，与 Unlearn 相反），权重保持修改直到 Recover"
+                        title={`对该 train target 做一步 CE descent（Learn，η=${PAIR_INTERVENE_LR} normalized）。可连点累加，Recover 一次回到最初。`}
                         style={{
                             border: '1px solid #86efac',
                             background: learnBusy ? '#dcfce7' : '#f0fdf4',
@@ -1614,7 +1609,7 @@ function PairCard({
                             onRecover();
                         }}
                         disabled={busy}
-                        title="恢复 Learn/Unlearn 之前的权重"
+                        title="恢复到 Learn/Unlearn 之前的原始权重"
                         style={{
                             border: '1px solid #67e8f9',
                             background: recoverBusy ? '#cffafe' : '#ecfeff',
@@ -1626,7 +1621,7 @@ function PairCard({
                             cursor: busy ? 'wait' : 'pointer',
                         }}
                     >
-                        {recoverBusy ? 'Recovering…' : 'Recover'}
+                        {recoverBusy ? 'Recovering…' : (steps > 1 ? `Recover ×${steps}` : 'Recover')}
                     </button>
                 )}
 
@@ -1723,6 +1718,9 @@ function PairCard({
                         {unlearnResult.update?.lastNLayers != null
                             ? ` · last-${unlearnResult.update.lastNLayers}`
                             : ''}
+                        {unlearnResult.update?.steps != null && unlearnResult.update.steps > 1
+                            ? ` · stacked ×${unlearnResult.update.steps}`
+                            : ''}
                         {unlearnResult.testEdge?.saliencyMode
                             ? ` · ${unlearnResult.testEdge.saliencyMode}`
                             : ''}
@@ -1783,6 +1781,7 @@ function TrainSampleGroup({
     interveningDirection,
     recoverBusy,
     activeInterventionPairId,
+    interventionSteps,
     unlearnResults,
     onOpenAnnotationViewer,
 }: {
@@ -1806,6 +1805,7 @@ function TrainSampleGroup({
     interveningDirection?: 'unlearn' | 'learn' | null;
     recoverBusy?: boolean;
     activeInterventionPairId?: string | null;
+    interventionSteps?: number;
     unlearnResults?: Record<string, UnlearnPairResult>;
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
 }) {
@@ -1918,6 +1918,9 @@ function TrainSampleGroup({
                                 recoverBusy={recoverBusy}
                                 unlearnResult={unlearnResults?.[pair.id] ?? null}
                                 interveneActiveForPair={activeInterventionPairId === pair.id}
+                                interventionSteps={
+                                    activeInterventionPairId === pair.id ? interventionSteps : undefined
+                                }
                                 onOpenAnnotationViewer={
                                     onOpenAnnotationViewer
                                         ? () => onOpenAnnotationViewer(pair)
@@ -2012,6 +2015,7 @@ export function ReportPanel({
     const [recoverBusy, setRecoverBusy] = useState(false);
     const [activeInterventionPairId, setActiveInterventionPairId] = useState<string | null>(null);
     const [activeInterventionDirection, setActiveInterventionDirection] = useState<string | null>(null);
+    const [interventionSteps, setInterventionSteps] = useState(0);
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
     const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
@@ -2324,9 +2328,8 @@ export function ReportPanel({
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
     ]);
 
-    // Gold saliency sources → yellow on Model stream ONLY for the shared prompt.
-    // Indices >= promptLen refer to gold-answer tokens; the Model stream at the
-    // same index is predict text — painting those would falsely light model output.
+    // Gold sources in the shared prompt → yellow on Model stream (same indices).
+    // Do not paint Model answer: those indices would be predict text, not gold.
     const goldModelHighlightSourceIndices = useMemo(() => {
         if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
         const abs = goldSelectedCorrIdx !== null
@@ -2337,7 +2340,7 @@ export function ReportPanel({
         );
     }, [attrMode, goldTopCorrelations, goldSelectedCorrIdx, promptLen, modelTokens.length]);
 
-    // Gold answer panel: only answer-local sources (prompt has no tokens there).
+    // Gold answer panel: yellow-highlight answer-local saliency sources (like Model).
     const goldHighlightSourceIndices = useMemo(() => {
         if (attrMode !== 'gold' || goldTopCorrelations.length === 0) return new Set<number>();
         const abs = goldSelectedCorrIdx !== null
@@ -2636,7 +2639,7 @@ export function ReportPanel({
                         trainTargetIndex: pair.train_correlation.target_token_index,
                         modelPath: null,
                         baseModelPath: null,
-                        unlearnLr: 20.0,
+                        unlearnLr: PAIR_INTERVENE_LR,
                         recomputeSaliency: true,
                         direction,
                         persist: true,
@@ -2667,15 +2670,23 @@ export function ReportPanel({
                 if (result.restored === false) {
                     setActiveInterventionPairId(pair.id);
                     setActiveInterventionDirection(direction);
+                    const steps =
+                        result.intervention?.steps
+                        ?? result.update?.steps
+                        ?? 1;
+                    setInterventionSteps(Math.max(1, Number(steps) || 1));
                 } else {
                     setActiveInterventionPairId(null);
                     setActiveInterventionDirection(null);
+                    setInterventionSteps(0);
                 }
                 const dLog = typeof result.delta?.logprob === 'number'
                     ? result.delta.logprob.toFixed(4)
                     : '?';
+                const stepN = result.update?.steps ?? result.intervention?.steps ?? 1;
                 setTtavLaunchStatus(
-                    `${direction === 'learn' ? 'Learn' : 'Unlearn'} ${pair.id} 完成 · ΔlogP=${dLog} · ${result.verdict ?? ''}`,
+                    `${direction === 'learn' ? 'Learn' : 'Unlearn'} ${pair.id} 完成`
+                    + ` · step ${stepN} · ΔlogP=${dLog} · ${result.verdict ?? ''}`,
                 );
                 refreshTokenProbs();
             } catch (error) {
@@ -2725,6 +2736,7 @@ export function ReportPanel({
                 }
                 setActiveInterventionPairId(null);
                 setActiveInterventionDirection(null);
+                setInterventionSteps(0);
                 setTtavLaunchStatus(
                     parsed.recovered ? 'Recovered to original weights.' : 'No active intervention to recover.',
                 );
@@ -3156,8 +3168,7 @@ export function ReportPanel({
                                 error={tokenProbError}
                                 interventionActive={Boolean(activeInterventionPairId)}
                                 interventionDirection={activeInterventionDirection}
-                                onRecover={importedReportActive ? undefined : handleRecoverIntervention}
-                                recoverBusy={recoverBusy}
+                                interventionSteps={interventionSteps}
                             />
 
                         </div>
@@ -3209,6 +3220,7 @@ export function ReportPanel({
                                                 interveningDirection={interveningDirection}
                                                 recoverBusy={recoverBusy}
                                                 activeInterventionPairId={activeInterventionPairId}
+                                                interventionSteps={interventionSteps}
                                                 unlearnResults={unlearnResultsByPairId}
                                                 onOpenAnnotationViewer={handleOpenAnnotationViewer}
                                             />

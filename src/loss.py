@@ -1367,11 +1367,13 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     attn = layer.self_attn
     # device_map=auto may place last layer on cuda:N while hidden_states[-2]
     # was gathered on another GPU — pin everything to the layer device.
-    layer_device = next(layer.parameters()).device
-    layer_dtype = next(layer.parameters()).dtype
-    # Hidden can land in float32 (e.g. after mixed-precision / hook paths) while
-    # Qwen LoRA weights stay bf16 — cast before q/k_proj to avoid
-    # "mat1 float != mat2 BFloat16".
+    # IMPORTANT: under PEFT, ``next(layer.parameters())`` is often a float32 LoRA
+    # matrix; casting hidden to that dtype then calling bf16 ``q_proj`` raises
+    # ``mat1 float != mat2 BFloat16``. Use the base q_proj weight dtype instead.
+    q_mod = attn.q_proj
+    base_q = getattr(q_mod, "base_layer", q_mod)
+    layer_device = base_q.weight.device
+    layer_dtype = base_q.weight.dtype
     hid_in = hid_in.to(device=layer_device, dtype=layer_dtype)
     B, T, _ = hid_in.shape
     device = hid_in.device

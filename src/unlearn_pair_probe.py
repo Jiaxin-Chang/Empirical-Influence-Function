@@ -1,4 +1,4 @@
-"""One-step learn/unlearn probe for a single train↔test saliency correlation pair.
+"""Learn/unlearn probe for a single train↔test saliency correlation pair.
 
 Uses the same model loading path as ``intervention_experiment`` (full checkpoint
 OR base + LoRA adapter). The update uses the **same parameter subspace as pair
@@ -7,9 +7,11 @@ matching** (default: last-1-layer LoRA):
     unlearn: θ ← θ + η · normalize(∇_θ CE_train_target)   # ascent
     learn:   θ ← θ − η · normalize(∇_θ CE_train_target)   # descent
 
-then measures how the *test* target token's CE / log-prob and ALTI saliency
-change. By default weights are restored afterwards (probe). With
-``persist=True`` the step stays applied until ``recover_pair_intervention``.
+Default η≈0.05 (normalized step L2) is a small single-token CE nudge in LoRA
+space — visible on logP / next-token probs without destroying the distribution.
+With ``persist=True``, repeated Learn/Unlearn clicks **accumulate** on the same
+weights; ``recover_pair_intervention`` undoes the full stack back to the
+pre-intervention snapshot.
 
 The train loss is restricted to the pair's train *target* token (other labels
 masked to -100).
@@ -48,8 +50,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Reuse one loaded model across Unlearn/Learn clicks in the same API process.
 _MODEL_CACHE: dict[tuple[str, str], tuple[object, object]] = {}
 
-# Persistent one-step intervention (until recover).
+# Persistent multi-step intervention stack (until recover).
 _INTERVENTION: dict[str, Any] | None = None
+
+# Normalized LoRA step size: ||Δθ||₂ = |η|. ~one mild CE step on the train target.
+DEFAULT_PAIR_INTERVENE_LR = 0.05
+
+
+def _default_pair_intervene_lr() -> float:
+    raw = (os.environ.get("EIF_PAIR_INTERVENE_LR") or "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return float(DEFAULT_PAIR_INTERVENE_LR)
 
 
 def _device_of(model) -> torch.device:
@@ -186,17 +201,31 @@ def intervention_status() -> dict[str, Any]:
         "direction": _INTERVENTION.get("direction"),
         "pairId": _INTERVENTION.get("pair_id"),
         "trainSampleId": _INTERVENTION.get("train_sample_id"),
+        "steps": int(_INTERVENTION.get("steps") or 1),
     }
 
 
+def _accumulate_deltas(
+    old_deltas: list[torch.Tensor],
+    new_deltas: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    if len(old_deltas) != len(new_deltas):
+        raise RuntimeError(
+            f"Cannot accumulate intervention deltas: "
+            f"len {len(old_deltas)} vs {len(new_deltas)}"
+        )
+    return [o + n for o, n in zip(old_deltas, new_deltas)]
+
+
 def recover_pair_intervention() -> dict[str, Any]:
-    """Undo a persisted learn/unlearn step (if any)."""
+    """Undo the full persisted learn/unlearn stack (if any)."""
     global _INTERVENTION
     state = _INTERVENTION
     if state is None:
         return {"status": "success", "recovered": False, "message": "No active intervention."}
     params = state.get("params") or []
     deltas = state.get("deltas") or []
+    steps = int(state.get("steps") or 1)
     if params and deltas:
         _restore_filtered_ascent(params, deltas)
     direction = state.get("direction")
@@ -209,6 +238,7 @@ def recover_pair_intervention() -> dict[str, Any]:
         "recovered": True,
         "direction": direction,
         "pairId": pair_id,
+        "steps": steps,
         "intervention": intervention_status(),
     }
 
@@ -678,7 +708,7 @@ def run_unlearn_pair_probe(
     pair_id: str | None = None,
     model_path: str | None = None,
     base_model_path: str | None = None,
-    unlearn_lr: float = 20.0,
+    unlearn_lr: float | None = None,
     normalize_grad: bool = True,
     recompute_saliency: bool = True,
     sample_id: str | None = None,
@@ -688,7 +718,7 @@ def run_unlearn_pair_probe(
     completion_mode: str = "predict",
     train_sample_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run learn/unlearn step; optionally persist until ``recover_pair_intervention``."""
+    """Run one learn/unlearn step; with persist, stack until ``recover_pair_intervention``."""
     global _INTERVENTION
 
     direction_norm = (direction or "unlearn").strip().lower()
@@ -697,8 +727,9 @@ def run_unlearn_pair_probe(
     completion_norm = (completion_mode or "predict").strip().lower()
     if completion_norm not in {"predict", "gold"}:
         raise ValueError(f"completion_mode must be predict|gold, got {completion_mode!r}")
+    lr_mag = float(unlearn_lr) if unlearn_lr is not None else _default_pair_intervene_lr()
     # Unlearn = ascent (+lr); Learn = descent (-lr).
-    signed_lr = float(unlearn_lr) if direction_norm == "unlearn" else -float(unlearn_lr)
+    signed_lr = lr_mag if direction_norm == "unlearn" else -lr_mag
 
     baseline = report.get("test_sample_baseline") or {}
     if completion_norm == "gold":
@@ -736,8 +767,8 @@ def run_unlearn_pair_probe(
             f"target={train_target_index}, seq_len={len(train_tokens)}."
         )
 
-    # New persist step replaces any previous one.
-    if _INTERVENTION is not None:
+    # Non-persist probes must start from clean weights. Persist stacks accumulate.
+    if _INTERVENTION is not None and not persist:
         recover_pair_intervention()
 
     resolved_model, resolved_base = _resolve_paths(report, model_path, base_model_path)
@@ -921,7 +952,27 @@ def run_unlearn_pair_probe(
                 source_index=test_source_index,
             )
 
+        stacked_steps = 1
         if persist:
+            if _INTERVENTION is not None:
+                prev_params = _INTERVENTION.get("params") or []
+                prev_deltas = _INTERVENTION.get("deltas") or []
+                if (
+                    prev_params
+                    and prev_deltas
+                    and len(prev_params) == len(params)
+                    and all(a is b for a, b in zip(prev_params, params))
+                ):
+                    deltas = _accumulate_deltas(prev_deltas, deltas)
+                    stacked_steps = int(_INTERVENTION.get("steps") or 1) + 1
+                else:
+                    # Param set changed — drop the old stack and keep only this step.
+                    print(
+                        f"[{direction_norm}][WARN] intervention param set changed; "
+                        "starting a fresh persist stack on current weights.",
+                        flush=True,
+                    )
+                    stacked_steps = 1
             _INTERVENTION = {
                 "direction": direction_norm,
                 "pair_id": pair_id,
@@ -929,6 +980,7 @@ def run_unlearn_pair_probe(
                 "params": params,
                 "deltas": deltas,
                 "model": model,
+                "steps": stacked_steps,
             }
             restored = False
             params = None
@@ -978,6 +1030,8 @@ def run_unlearn_pair_probe(
     if not normalize_grad:
         rule = rule.replace("normalized(", "").replace(")", "", 1)
 
+    stacked_steps_out = int((_INTERVENTION or {}).get("steps") or 1) if not restored else 1
+
     result = {
         "status": "success",
         "pairId": pair_id,
@@ -991,10 +1045,10 @@ def run_unlearn_pair_probe(
             "lastNLayers": int(last_n_layers),
             "rule": rule,
             "direction": direction_norm,
-            "unlearnLr": float(unlearn_lr),
+            "unlearnLr": float(lr_mag),
             "signedLr": float(signed_lr),
             "normalizeGrad": bool(normalize_grad),
-            "steps": 1,
+            "steps": int(stacked_steps_out),
             "persist": bool(persist),
             "persistsToDisk": False,
             "trainLossScope": "train_target_token_only",
@@ -1110,29 +1164,86 @@ def compute_next_token_probs(
             f"(need 0 < t < {len(ids)})."
         )
 
+    # Gold/unlearn leave the shared model in train()+GC with input-require-grads.
+    # A plain forward then often hits float32 activations vs bf16 LoRA/base weights.
+    was_training = bool(model.training)
+    model.eval()
+    disabled_input_grads = False
+    if hasattr(model, "disable_input_require_grads"):
+        try:
+            model.disable_input_require_grads()
+            disabled_input_grads = True
+        except Exception:
+            pass
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
     prefix = torch.tensor([ids[:t]], dtype=torch.long, device=device)
     attn = torch.ones_like(prefix)
-    with torch.no_grad():
-        outputs = model(input_ids=prefix, attention_mask=attn, use_cache=False)
-        logits = outputs.logits[0, -1].float()
-        probs = F.softmax(logits, dim=-1)
-        k = max(1, min(int(top_k), int(probs.numel())))
-        values, indices = torch.topk(probs, k=k)
+    outputs = None
+    logits = None
+    probs = None
+    actual_id = int(ids[t])
+    actual_prob = 0.0
+    top_rows: list[dict[str, Any]] = []
+    try:
+        with torch.no_grad():
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(
+                        input_ids=prefix,
+                        attention_mask=attn,
+                        use_cache=False,
+                    )
+            else:
+                outputs = model(
+                    input_ids=prefix,
+                    attention_mask=attn,
+                    use_cache=False,
+                )
+            logits = outputs.logits[0, -1].float()
+            probs = F.softmax(logits, dim=-1)
+            k = max(1, min(int(top_k), int(probs.numel())))
+            values, indices = torch.topk(probs, k=k)
 
-        actual_id = int(ids[t])
-        actual_prob = float(probs[actual_id].item())
-        top_rows = []
-        for p, tid in zip(values.tolist(), indices.tolist()):
-            tid_i = int(tid)
-            top_rows.append({
-                "token": tokenizer.decode([tid_i]),
-                "tokenId": tid_i,
-                "prob": float(p),
-                "isActual": tid_i == actual_id,
-            })
-
-    del outputs, logits, probs, prefix, attn
-    _release_cuda_memory(model, reason="next_token_probs")
+            actual_prob = float(probs[actual_id].item())
+            top_rows = []
+            for p, tid in zip(values.tolist(), indices.tolist()):
+                tid_i = int(tid)
+                top_rows.append({
+                    "token": tokenizer.decode([tid_i]),
+                    "tokenId": tid_i,
+                    "prob": float(p),
+                    "isActual": tid_i == actual_id,
+                })
+    finally:
+        del outputs, logits, probs, prefix, attn
+        if disabled_input_grads and hasattr(model, "enable_input_require_grads"):
+            try:
+                model.enable_input_require_grads()
+            except Exception:
+                pass
+        if was_training:
+            # Restore gold/unlearn last-layer setup (GC + frozen dropout).
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                try:
+                    model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            model.train()
+            for m in model.modules():
+                if isinstance(m, torch.nn.Dropout):
+                    m.eval()
+        _release_cuda_memory(model, reason="next_token_probs")
 
     return {
         "status": "success",
