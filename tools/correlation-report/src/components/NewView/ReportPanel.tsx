@@ -1401,11 +1401,11 @@ function unlearnVerdictLabel(verdict: string | undefined, direction?: string): {
 
 function formatProbPct(p: number): string {
     if (!Number.isFinite(p)) return '—';
-    const pct = p * 100;
-    if (pct >= 10) return `${pct.toFixed(1)}%`;
-    if (pct >= 1) return `${pct.toFixed(2)}%`;
-    return `${pct.toFixed(2)}%`;
+    return `${(p * 100).toFixed(3)}%`;
 }
+
+/** Hide next-token rows below 0.001% absolute probability. */
+const NEXT_TOKEN_PROB_MIN = 1e-5; // 0.001%
 
 function NextTokenProbPanel({
     result,
@@ -1422,7 +1422,7 @@ function NextTokenProbPanel({
     interventionDirection?: string | null;
     interventionSteps?: number;
 }) {
-    const rows = result?.top ?? [];
+    const rows = (result?.top ?? []).filter(r => r.prob >= NEXT_TOKEN_PROB_MIN);
     const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
     const modeLabel = result?.mode === 'gold' ? 'teacher-forced' : 'model predict';
     const steps = Math.max(1, interventionSteps ?? 1);
@@ -1454,11 +1454,13 @@ function NextTokenProbPanel({
                 {!busy && error && <div className={styles.probEmpty} style={{ color: '#f38ba8' }}>{error}</div>}
                 {!busy && !error && rows.length === 0 && (
                     <div className={styles.probEmpty}>
-                        Click a Model or Gold answer token to show the next-token distribution.
+                        {(result?.top?.length ?? 0) > 0
+                            ? `No tokens ≥ 0.001% in top-k.`
+                            : 'Click a Model or Gold answer token to show the next-token distribution.'}
                     </div>
                 )}
                 {!busy && rows.map((row, i) => {
-                    const width = `${Math.max(2, (row.prob / maxP) * 100)}%`;
+                    const width = `${Math.max(0.5, (row.prob / maxP) * 100)}%`;
                     const display = decodeToken(row.token).replace(/\n/g, '\\n');
                     return (
                         <div key={`${row.tokenId}-${i}`} className={styles.probRow}>
