@@ -1381,8 +1381,8 @@ function unlearnVerdictLabel(verdict: string | undefined, direction?: string): {
         case 'saliency_only':
             return {
                 text: isLearn
-                    ? 'saliency 上升但 CE 几乎不动'
-                    : 'saliency 下降但 CE 几乎不动（test 已近满分）',
+                    ? 'saliency 上升，但 CE 几乎不动'
+                    : 'saliency 下降，但 CE 几乎不动',
                 color: '#a16207',
             };
         case 'no_effect':
@@ -1684,17 +1684,9 @@ function PairCard({
                 }}>
                     <div style={{ fontWeight: 700, color: verdict.color }}>{verdict.text}</div>
                     <div>
-                        ΔlogP(test target) = <strong>{formatSigned(unlearnResult.delta?.logprob)}</strong>
+                        ΔCE = <strong>{formatSigned(unlearnResult.delta?.ce)}</strong>
                         {' · '}
                         Δsaliency = <strong>{formatSigned(unlearnResult.delta?.saliency, 6)}</strong>
-                        {' · '}
-                        ΔCE = <strong>{formatSigned(unlearnResult.delta?.ce)}</strong>
-                    </div>
-                    <div style={{ color: '#78716c' }}>
-                        before logP {formatSigned(unlearnResult.before?.logprob)} → after {formatSigned(unlearnResult.after?.logprob)}
-                        {unlearnResult.before?.saliency != null && (
-                            <> · sal {formatSigned(unlearnResult.before.saliency, 6)} → {formatSigned(unlearnResult.after?.saliency, 6)}</>
-                        )}
                     </div>
                     {unlearnResult.testEdge?.reportedSaliency != null && (
                         <div style={{ color: '#a8a29e' }}>
@@ -2680,13 +2672,16 @@ export function ReportPanel({
                     setActiveInterventionDirection(null);
                     setInterventionSteps(0);
                 }
-                const dLog = typeof result.delta?.logprob === 'number'
-                    ? result.delta.logprob.toFixed(4)
+                const dCe = typeof result.delta?.ce === 'number'
+                    ? result.delta.ce.toFixed(4)
+                    : '?';
+                const dSal = typeof result.delta?.saliency === 'number'
+                    ? result.delta.saliency.toFixed(4)
                     : '?';
                 const stepN = result.update?.steps ?? result.intervention?.steps ?? 1;
                 setTtavLaunchStatus(
                     `${direction === 'learn' ? 'Learn' : 'Unlearn'} ${pair.id} 完成`
-                    + ` · step ${stepN} · ΔlogP=${dLog} · ${result.verdict ?? ''}`,
+                    + ` · step ${stepN} · ΔCE=${dCe} · Δsal=${dSal} · ${result.verdict ?? ''}`,
                 );
                 refreshTokenProbs();
             } catch (error) {
