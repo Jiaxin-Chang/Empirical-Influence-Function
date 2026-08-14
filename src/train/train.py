@@ -194,7 +194,7 @@ class AnnotatedSFTTrainer(Trainer):
                  saliency_exclude_sink_prefix: int = 0,
                  saliency_exclude_special_tokens: bool = False,
                  saliency_oom_fallback: bool = True,
-                 saliency_fallback_max_seq_len: int = 0,
+                 saliency_fallback_max_seq_len: int = 1280,
                  cfmask_rate: float = 0.3,
                  cfmask_max_k: int = 0,
                  cfmask_min_k: int = 0,
@@ -430,6 +430,18 @@ class AnnotatedSFTTrainer(Trainer):
             output_hidden_states=False,
         )
         return outputs, self._ntp_loss_from_outputs(outputs, inputs["labels"])
+
+    @staticmethod
+    def _strip_heavy_outputs(outputs) -> None:
+        """Drop attention / hidden-state tensors that dominate peak memory."""
+        if outputs is None:
+            return
+        for attr in ("attentions", "hidden_states", "past_key_values"):
+            try:
+                if getattr(outputs, attr, None) is not None:
+                    setattr(outputs, attr, None)
+            except Exception:
+                pass
 
     def _should_preempt_saliency(self, inputs) -> bool:
         cap = int(self.saliency_fallback_max_seq_len or 0)
@@ -907,10 +919,19 @@ class AnnotatedSFTTrainer(Trainer):
                 raise
             used_fallback = True
             self._saliency_oom_fallback_count += 1
-            # Drop any partial graph from the failed saliency path.
-            outputs = None
+            # Keep completed-forward logits when possible (typical: OOM inside
+            # build_contribution_rows). Only drop heavy saliency tensors.
             attn_proj_weights = None
             diag = None
+            saliency_loss = None
+            has_logits = (
+                outputs is not None
+                and getattr(outputs, "logits", None) is not None
+            )
+            if has_logits:
+                self._strip_heavy_outputs(outputs)
+            else:
+                outputs = None
             self._empty_accel_cache()
             if self.is_world_process_zero() and (
                 self._saliency_oom_fallback_count <= 5
@@ -918,8 +939,9 @@ class AnnotatedSFTTrainer(Trainer):
             ):
                 logger.warning(
                     "[saliency-fallback] OOM on saliency path → CE-only for this step "
-                    "(seq_len=%d count=%d): %s",
+                    "(seq_len=%d reuse_logits=%s count=%d): %s",
                     int(inputs["input_ids"].size(1)),
+                    has_logits,
                     self._saliency_oom_fallback_count,
                     str(exc).split("\n", 1)[0][:200],
                 )
@@ -928,25 +950,37 @@ class AnnotatedSFTTrainer(Trainer):
                 device = inputs["input_ids"].device
                 total_loss = torch.zeros((), device=device)
                 if return_outputs:
-                    # Prefer any surviving logits; otherwise one cheap CE forward.
-                    if outputs is None or getattr(outputs, "logits", None) is None:
-                        outputs, _ = self._ce_only_forward(model, inputs)
+                    if not has_logits:
+                        try:
+                            outputs, _ = self._ce_only_forward(model, inputs)
+                        except RuntimeError as ce_exc:
+                            if not self._is_oom_error(ce_exc):
+                                raise
+                            self._empty_accel_cache()
+                            outputs = None
                     return total_loss, outputs
                 return total_loss
-            # Prefer reusing logits from a completed forward (common: OOM in
-            # build_contribution_rows). A second forward would desync FSDP
-            # collectives vs ranks that did not OOM.
-            if outputs is not None and getattr(outputs, "logits", None) is not None:
-                try:
-                    outputs.attentions = None
-                    outputs.hidden_states = None
-                except Exception:
-                    pass
-                self._empty_accel_cache()
+            # Prefer reusing logits from a completed forward. A second forward
+            # would often OOM again and can desync FSDP vs ranks that did not OOM.
+            if has_logits:
                 ntp_loss = self._ntp_loss_from_outputs(outputs, inputs["labels"])
             else:
-                self._empty_accel_cache()
-                outputs, ntp_loss = self._ce_only_forward(model, inputs)
+                try:
+                    outputs, ntp_loss = self._ce_only_forward(model, inputs)
+                except RuntimeError as ce_exc:
+                    if not self._is_oom_error(ce_exc):
+                        raise
+                    # Last resort: skip microbatch rather than kill the run.
+                    self._empty_accel_cache()
+                    device = inputs["input_ids"].device
+                    ntp_loss = torch.zeros((), device=device)
+                    outputs = None
+                    if self.is_world_process_zero():
+                        logger.warning(
+                            "[saliency-fallback] CE-only forward also OOM "
+                            "(seq_len=%d) → skip step with zero loss",
+                            int(inputs["input_ids"].size(1)),
+                        )
             saliency_loss = torch.zeros((), device=ntp_loss.device, dtype=ntp_loss.dtype)
 
         if self.loss_mode == "ce_saliency":
@@ -1361,8 +1395,14 @@ class SFTTrainingArguments(TrainingArguments):
         metadata={"help": "If True, catch OOM on the saliency/eager-attn path and fall back to CE-only for that step instead of crashing. Recommended for long full-corpus runs."},
     )
     saliency_fallback_max_seq_len: int = field(
-        default=0,
-        metadata={"help": "If >0, skip saliency (CE-only) whenever padded seq_len >= this threshold, without waiting for OOM. 0 disables preemptive skip."},
+        default=1280,
+        metadata={
+            "help": (
+                "If >0, skip saliency (CE-only) whenever padded seq_len >= this "
+                "threshold, without waiting for OOM. Default 1280 avoids eager "
+                "T^2 peaks on long samples; set 0 to disable preemptive skip."
+            )
+        },
     )
     saliency_detail_log_path: str = field(
         default="",
