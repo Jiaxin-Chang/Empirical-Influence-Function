@@ -1401,11 +1401,10 @@ function unlearnVerdictLabel(verdict: string | undefined, direction?: string): {
 
 function formatProbPct(p: number): string {
     if (!Number.isFinite(p)) return '—';
-    return `${(p * 100).toFixed(3)}%`;
+    const pct = p * 100;
+    if (pct < 0.001 && pct > 0) return `${pct.toExponential(2)}%`;
+    return `${pct.toFixed(3)}%`;
 }
-
-/** Hide next-token rows below 0.001% absolute probability. */
-const NEXT_TOKEN_PROB_MIN = 1e-5; // 0.001%
 
 function NextTokenProbPanel({
     result,
@@ -1422,7 +1421,7 @@ function NextTokenProbPanel({
     interventionDirection?: string | null;
     interventionSteps?: number;
 }) {
-    const rows = (result?.top ?? []).filter(r => r.prob >= NEXT_TOKEN_PROB_MIN);
+    const rows = result?.top ?? [];
     const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
     const modeLabel = result?.mode === 'gold' ? 'teacher-forced' : 'model predict';
     const steps = Math.max(1, interventionSteps ?? 1);
@@ -1454,9 +1453,7 @@ function NextTokenProbPanel({
                 {!busy && error && <div className={styles.probEmpty} style={{ color: '#f38ba8' }}>{error}</div>}
                 {!busy && !error && rows.length === 0 && (
                     <div className={styles.probEmpty}>
-                        {(result?.top?.length ?? 0) > 0
-                            ? `No tokens ≥ 0.001% in top-k.`
-                            : 'Click a Model or Gold answer token to show the next-token distribution.'}
+                        Click a Model or Gold answer token to show the next-token distribution.
                     </div>
                 )}
                 {!busy && rows.map((row, i) => {
@@ -2026,6 +2023,11 @@ export function ReportPanel({
     const [interventionSteps, setInterventionSteps] = useState(0);
     const [pairInterveneLr, setPairInterveneLr] = useState(DEFAULT_PAIR_INTERVENE_LR);
     const [pairInterveneLrInput, setPairInterveneLrInput] = useState(String(DEFAULT_PAIR_INTERVENE_LR));
+    const [continueStepsInput, setContinueStepsInput] = useState('50');
+    const [continueLrInput, setContinueLrInput] = useState('2e-5');
+    const [continueBusy, setContinueBusy] = useState(false);
+    const [continueJobId, setContinueJobId] = useState<string | null>(null);
+    const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
     const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
@@ -2764,6 +2766,101 @@ export function ReportPanel({
         })();
     }, [eifApiUrl, refreshTokenProbs]);
 
+    const handleContinueTrainEval = useCallback(() => {
+        if (importedReportActive) return;
+        const maxSteps = Math.max(1, Math.floor(Number(continueStepsInput)) || 50);
+        const learningRate = Number(continueLrInput);
+        if (!Number.isFinite(learningRate) || learningRate <= 0) {
+            setTtavLaunchError('续训 lr 必须是 > 0 的数字（如 2e-5）');
+            return;
+        }
+        // Train only on ANNOTATION_CONTINUE_TRAIN_DATA (small annotated subset).
+        // Do NOT pass related-train ids / full EIF_TRAIN_DATA — that is not continue-train.
+        setContinueBusy(true);
+        setContinueResultSummary(null);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('续训：小集 ANNOTATION_CONTINUE_TRAIN_DATA → 评测 line_hit_pre/rec…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        maxSteps,
+                        learningRate,
+                        lossMode: 'ce_saliency',
+                        evalBefore: true,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Continue-train API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Continue-train failed (HTTP ${resp.status})`,
+                    );
+                }
+                const jobId = String(parsed.jobId || '');
+                if (!jobId) throw new Error('Continue-train response missing jobId');
+                setContinueJobId(jobId);
+                setTtavLaunchStatus(`Continue-train job ${jobId} running…`);
+
+                for (;;) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    const stResp = await fetch(
+                        `${buildEifApiUrl(eifApiUrl, '/api/continue-train-eval-status')}?jobId=${encodeURIComponent(jobId)}`,
+                    );
+                    const stRaw = await stResp.text();
+                    let st: Record<string, unknown> = {};
+                    if (stRaw.trim()) {
+                        try {
+                            st = JSON.parse(stRaw) as Record<string, unknown>;
+                        } catch {
+                            continue;
+                        }
+                    }
+                    const stage = String(st.stage || '');
+                    const message = typeof st.message === 'string' ? st.message : stage;
+                    setTtavLaunchStatus(`[${jobId}] ${message}`);
+                    if (stage === 'completed') {
+                        const result = (st.result || {}) as Record<string, unknown>;
+                        const before = (result.before || {}) as Record<string, number | null>;
+                        const after = (result.after || {}) as Record<string, number | null>;
+                        const delta = (result.delta || {}) as Record<string, number | null>;
+                        const fmt = (v: number | null | undefined) =>
+                            typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                        const summary =
+                            `line_hit_pre ${fmt(before.line_hit_pre)} → ${fmt(after.line_hit_pre)}`
+                            + ` (Δ ${fmt(delta.line_hit_pre)})`
+                            + ` · line_hit_rec ${fmt(before.line_hit_rec)} → ${fmt(after.line_hit_rec)}`
+                            + ` (Δ ${fmt(delta.line_hit_rec)})`
+                            + ` · out ${String(result.outputDir || '')}`;
+                        setContinueResultSummary(summary);
+                        setTtavLaunchStatus(`Continue-train done · ${summary}`);
+                        break;
+                    }
+                    if (stage === 'error' || st.error === true) {
+                        throw new Error(message || 'Continue-train failed');
+                    }
+                }
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Continue-train failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl]);
+
     const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
         if (!report || !selectedMeta) return;
 
@@ -3249,6 +3346,82 @@ export function ReportPanel({
                                         <span style={{ color: '#94a3b8' }}>
                                             当前 {pairInterveneLr} · default {DEFAULT_PAIR_INTERVENE_LR}
                                         </span>
+                                    </div>
+                                )}
+                                {!importedReportActive && (
+                                    <div style={{
+                                        padding: '6px 12px',
+                                        fontSize: 11,
+                                        color: '#475569',
+                                        borderBottom: '1px solid #e5e7eb',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 8,
+                                        flexWrap: 'wrap',
+                                    }}>
+                                        <span style={{ fontWeight: 700 }}>Continue train</span>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            steps
+                                            <input
+                                                type="number"
+                                                min={1}
+                                                value={continueStepsInput}
+                                                disabled={continueBusy}
+                                                onChange={(e) => setContinueStepsInput(e.target.value)}
+                                                style={{
+                                                    width: 56,
+                                                    padding: '2px 6px',
+                                                    borderRadius: 6,
+                                                    border: '1px solid #cbd5e1',
+                                                    fontSize: 11,
+                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                }}
+                                            />
+                                        </label>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            lr
+                                            <input
+                                                type="text"
+                                                value={continueLrInput}
+                                                disabled={continueBusy}
+                                                onChange={(e) => setContinueLrInput(e.target.value)}
+                                                title="AdamW lr on LoRA (e.g. 2e-5). Not the Learn/Unlearn η."
+                                                style={{
+                                                    width: 64,
+                                                    padding: '2px 6px',
+                                                    borderRadius: 6,
+                                                    border: '1px solid #cbd5e1',
+                                                    fontSize: 11,
+                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                }}
+                                            />
+                                        </label>
+                                        <button
+                                            type="button"
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy}
+                                            onClick={handleContinueTrainEval}
+                                            title="只在 ANNOTATION_CONTINUE_TRAIN_DATA（新标注小集）上从当前 saliency adapter 续训 CE+saliency；评测只看 line_hit_pre / line_hit_rec（EIF_TEST_DATA）"
+                                            style={{
+                                                padding: '2px 10px',
+                                                borderRadius: 6,
+                                                border: '1px solid #86efac',
+                                                background: continueBusy ? '#dcfce7' : '#f0fdf4',
+                                                color: '#15803d',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: continueBusy ? 'wait' : 'pointer',
+                                            }}
+                                        >
+                                            {continueBusy ? 'Training…' : '续训(小集) + line_hit'}
+                                        </button>
+                                        {continueJobId && (
+                                            <span style={{ color: '#94a3b8' }}>job {continueJobId}</span>
+                                        )}
+                                        {continueResultSummary && (
+                                            <span style={{ color: '#166534', width: '100%' }}>
+                                                {continueResultSummary}
+                                            </span>
+                                        )}
                                     </div>
                                 )}
                                 {(ttavLaunchError || ttavLaunchStatus) && (

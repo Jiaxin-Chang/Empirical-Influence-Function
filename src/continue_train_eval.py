@@ -1,0 +1,784 @@
+"""Continue LoRA training on a **small annotated subset**, then eval with AI4Go line_hit.
+
+Interactive loop intent:
+  1) put newly annotated samples into ANNOTATION_CONTINUE_TRAIN_DATA
+     (NOT the full original train set)
+  2) continue-train a few AdamW steps from the current saliency adapter
+  3) re-score EIF_TEST_DATA with line_hit_pre / line_hit_rec (same math as
+     AI4Go ``hw_test_data/eval_gold_strip_three_models.py``)
+
+Train data resolution (strict — never silently use the full bank train file):
+  - ``ANNOTATION_CONTINUE_TRAIN_DATA`` / request ``trainData``
+    (compact: input_ids + label + attention_edges; no ChatML re-encode)
+  - OR request ``trainSampleIds`` sliced from ``EIF_TRAIN_DATA`` into a temp JSONL
+    (source must also be compact)
+
+Eval data:
+  - ``EIF_TEST_DATA`` — JSONL with ``prompt``+``label|response`` (or chat ``input``+``output``)
+
+CLI:
+  python -m src.continue_train_eval \\
+    --adapter-path $EIF_ADAPTER_PATH_SALIENCY \\
+    --continue-train-data path/to/small_annotated.jsonl \\
+    --test-data path/to/test.jsonl \\
+    --max-steps 50 --lr 2e-5
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from src.intervention_experiment import load_model_and_tokenizer, load_train_samples
+from src.bank_loss import BankLossConfig, compute_bank_loss, load_bank_loss_config
+from src.eif_adapter_env import base_model_path_from_env
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CHAT_STOP = "<|im_end|>"
+
+
+@dataclass
+class ContinueTrainConfig:
+    adapter_path: str
+    base_model_path: str | None
+    train_data: str  # small annotated subset only
+    test_data: str
+    output_dir: str
+    max_steps: int = 50
+    learning_rate: float = 2e-5
+    loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
+    eval_before: bool = True
+    max_new_tokens: int = 1024
+    seed: int = 42
+    train_sample_ids: list[int] = field(default_factory=list)
+    # Optional full train JSONL used only when slicing by train_sample_ids.
+    source_train_data: str | None = None
+    also_truncate_score: bool = True
+
+
+def _resolve_path(raw: str | None) -> str | None:
+    if not raw or not str(raw).strip():
+        return None
+    expanded = os.path.expanduser(str(raw).strip())
+    p = Path(expanded)
+    if not p.is_absolute():
+        for root in (Path.cwd(), REPO_ROOT):
+            cand = (root / p).resolve()
+            if cand.exists():
+                return str(cand)
+        return str((REPO_ROOT / p).resolve())
+    return str(p.resolve())
+
+
+def default_paths_from_env() -> dict[str, str | None]:
+    from src.eif_adapter_env import adapter_path_for_family
+
+    # Small subset only — do NOT fall back to full EIF_TRAIN_DATA.
+    continue_train = (os.environ.get("ANNOTATION_CONTINUE_TRAIN_DATA") or "").strip()
+    source_train = (
+        (os.environ.get("EIF_TRAIN_DATA") or "").strip()
+        or (os.environ.get("ANNOTATION_TRAIN_DATA") or "").strip()
+    )
+    test = (os.environ.get("EIF_TEST_DATA") or "").strip()
+    out = (os.environ.get("EIF_CONTINUE_OUTPUT_DIR") or "").strip() or str(
+        REPO_ROOT / "outputs" / "continue_trial"
+    )
+    adapter = (
+        (os.environ.get("EIF_ADAPTER_PATH_SALIENCY") or "").strip()
+        or adapter_path_for_family("saliency")
+        or (os.environ.get("EIF_ADAPTER_PATH") or "").strip()
+    )
+    base = base_model_path_from_env() or (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip() or None
+    return {
+        "adapter_path": _resolve_path(adapter),
+        "base_model_path": _resolve_path(base) if base else None,
+        "continue_train_data": _resolve_path(continue_train),
+        "source_train_data": _resolve_path(source_train),
+        "test_data": _resolve_path(test),
+        "output_dir": _resolve_path(out) or str(REPO_ROOT / "outputs" / "continue_trial"),
+    }
+
+
+def _release_cuda():
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _evict_cached_models():
+    try:
+        from src.gold_live_attribution import clear_gold_session
+
+        clear_gold_session()
+    except Exception as exc:
+        print(f"[continue-train] gold session clear skipped: {exc}", flush=True)
+    try:
+        from src.unlearn_pair_probe import _MODEL_CACHE, recover_pair_intervention
+
+        recover_pair_intervention()
+        _MODEL_CACHE.clear()
+    except Exception as exc:
+        print(f"[continue-train] unlearn cache clear skipped: {exc}", flush=True)
+    _release_cuda()
+
+
+def _device_of(model) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ── AI4Go line_hit (from eval_gold_strip_three_models.py) ─────────────────────
+
+def del_spaces(txt: str) -> str:
+    return re.sub(r"\s", "", txt or "")
+
+
+def to_lines(text: str) -> list[str]:
+    rows: list[str] = []
+    for raw in text.split("\n"):
+        item = del_spaces(raw)
+        if item and item not in "{}":
+            rows.append(item)
+    return rows
+
+
+def cal_intersection(expects: list[str], actuals: list[str]) -> int:
+    pool = list(actuals)
+    cnt = 0
+    for item in expects:
+        if item in pool:
+            cnt += 1
+            pool.remove(item)
+    return cnt
+
+
+def line_hit(expect: str, actual: str, method: str) -> float:
+    expects = to_lines(expect)
+    actuals = to_lines(actual)
+    denominator = len(expects) if method == "recall" else len(actuals)
+    if denominator == 0:
+        return 0.0
+    return min(1.0, cal_intersection(expects, actuals) / denominator) * 100.0
+
+
+def truncate_predict_to_label_lines(label: str, predict: str) -> str:
+    n = len(label.splitlines())
+    return "\n".join(predict.splitlines()[:n])
+
+
+def remove_leading_thinking(text: str) -> tuple[str, bool]:
+    """Best-effort strip of leading <think>…</think> blocks (AI4Go-compatible)."""
+    if not text:
+        return "", False
+    pattern = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+    new, n = pattern.subn("", text, count=1)
+    if n:
+        return new, True
+    # Unclosed thinking at start
+    m = re.match(r"^\s*<think>(.*)$", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return "", True
+    return text, False
+
+
+def _render_eval_prompt(tokenizer, prompt: str) -> str:
+    """ChatML eval prompt (thinking off), aligned with AI4Go generate path."""
+    from src.intervention_experiment import _render_qwen_eval_prompt
+
+    return _render_qwen_eval_prompt(tokenizer, prompt, system="")
+
+
+# ── Train data: small subset only ─────────────────────────────────────────────
+
+def slice_train_jsonl_by_ids(
+    source_path: str,
+    ids: list[int],
+    dest_path: Path,
+) -> str:
+    """Copy selected 0-based line indices into a small continue-train JSONL."""
+    wanted = sorted({int(i) for i in ids if int(i) >= 0})
+    if not wanted:
+        raise ValueError("trainSampleIds is empty")
+    want_set = set(wanted)
+    max_id = max(wanted)
+    kept = 0
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(source_path, encoding="utf-8") as src, dest_path.open("w", encoding="utf-8") as out:
+        for i, line in enumerate(src):
+            if not line.strip():
+                continue
+            if i in want_set:
+                out.write(line if line.endswith("\n") else line + "\n")
+                kept += 1
+            if i >= max_id and kept == len(want_set):
+                break
+    if kept == 0:
+        raise ValueError(
+            f"No rows extracted for ids={wanted} from {source_path}"
+        )
+    if kept < len(want_set):
+        print(
+            f"[continue-train][WARN] requested {len(want_set)} ids, got {kept}",
+            flush=True,
+        )
+    print(
+        f"[continue-train] sliced {kept} samples → {dest_path}",
+        flush=True,
+    )
+    return str(dest_path.resolve())
+
+
+def resolve_continue_train_jsonl(cfg: ContinueTrainConfig) -> str:
+    """Return path to the small continue-train JSONL (never the full bank by accident)."""
+    src = (cfg.source_train_data or "").strip()
+    train_path = (cfg.train_data or "").strip()
+
+    # Explicit trainSampleIds always win: slice a small subset from source (or from
+    # train_data if it is the only available JSONL).
+    if cfg.train_sample_ids:
+        slice_src = src or train_path
+        if not slice_src or not Path(slice_src).is_file():
+            raise ValueError(
+                "trainSampleIds given but source train JSONL missing "
+                "(set EIF_TRAIN_DATA / request sourceTrainData)."
+            )
+        dest = Path(cfg.output_dir) / "continue_train_subset.jsonl"
+        return slice_train_jsonl_by_ids(slice_src, cfg.train_sample_ids, dest)
+
+    if train_path and Path(train_path).is_file():
+        # Guard: refuse silently training on the full bank train file.
+        if (
+            src
+            and Path(src).is_file()
+            and Path(train_path).resolve() == Path(src).resolve()
+        ):
+            raise ValueError(
+                "continue-train refuses to use the full EIF_TRAIN_DATA as the "
+                "training set. Set ANNOTATION_CONTINUE_TRAIN_DATA to a small annotated "
+                "JSONL, or pass trainSampleIds to slice a subset."
+            )
+        return train_path
+
+    raise ValueError(
+        "No small continue-train set. Provide ANNOTATION_CONTINUE_TRAIN_DATA "
+        "(annotated subset JSONL) or trainSampleIds."
+    )
+
+
+def _compact_batch(sample: dict, device: torch.device) -> dict[str, torch.Tensor]:
+    ids = sample.get("input_ids")
+    labels = sample.get("labels", sample.get("label"))
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("continue-train sample missing compact input_ids")
+    if not isinstance(labels, list) or len(labels) != len(ids):
+        raise ValueError("continue-train sample need label/labels list aligned with input_ids")
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    label_t = torch.tensor([labels], dtype=torch.long, device=device)
+    attn = torch.ones_like(input_ids)
+    return {"input_ids": input_ids, "labels": label_t, "attention_mask": attn}
+
+
+def _sample_batch(sample: dict, tokenizer, device: torch.device) -> tuple[dict[str, torch.Tensor], list | None]:
+    del tokenizer  # compact path does not re-encode
+    edges = sample.get("attention_edges") or sample.get("edges")
+    return _compact_batch(sample, device), edges if isinstance(edges, list) else None
+
+
+def _trainable_lora_params(model):
+    params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
+    if not params:
+        params = [p for p in model.parameters() if p.requires_grad]
+    return params
+
+
+def run_continue_training(
+    model,
+    tokenizer,
+    train_samples: list[dict],
+    *,
+    cfg: ContinueTrainConfig,
+    bank_cfg: BankLossConfig,
+    progress_cb=None,
+) -> dict[str, Any]:
+    device = _device_of(model)
+    model.train()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.eval()
+
+    params = _trainable_lora_params(model)
+    if not params:
+        raise RuntimeError("No trainable LoRA parameters found for continue-train.")
+    opt = torch.optim.AdamW(params, lr=float(cfg.learning_rate))
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    n_train = len(train_samples)
+    if n_train == 0:
+        raise ValueError("No train samples to continue-train on.")
+
+    losses: list[float] = []
+    t0 = time.time()
+    step = 0
+    while step < int(cfg.max_steps):
+        sample = train_samples[step % n_train]
+        batch, edges = _sample_batch(sample, tokenizer, device)
+        opt.zero_grad(set_to_none=True)
+        loss, mode_used = compute_bank_loss(
+            model,
+            batch,
+            device=device,
+            cfg=bank_cfg,
+            edges=edges,
+            special_ids=special_ids,
+        )
+        if loss is None:
+            step += 1
+            continue
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        loss_v = float(loss.detach().float().cpu())
+        losses.append(loss_v)
+        step += 1
+        if progress_cb is not None:
+            progress_cb(step, int(cfg.max_steps), loss_v, mode_used)
+        if step == 1 or step % 10 == 0 or step == int(cfg.max_steps):
+            print(
+                f"[continue-train] step {step}/{cfg.max_steps} "
+                f"loss={loss_v:.4f} mode={mode_used} n_subset={n_train}",
+                flush=True,
+            )
+        del batch, loss
+        if step % 20 == 0:
+            _release_cuda()
+
+    model.eval()
+    return {
+        "steps": step,
+        "meanLoss": float(sum(losses) / max(1, len(losses))),
+        "lastLoss": float(losses[-1]) if losses else None,
+        "elapsedSec": round(time.time() - t0, 2),
+        "lossModeUsed": bank_cfg.loss_mode,
+        "nTrainSamples": n_train,
+    }
+
+
+# ── Eval dataset + generation (AI4Go-aligned) ─────────────────────────────────
+
+def load_eval_samples(jsonl_path: str) -> list[dict]:
+    """Load eval rows: prefer prompt+label/response; else chat input/output."""
+    rows: list[dict] = []
+    with open(jsonl_path, encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            prompt = obj.get("prompt")
+            label = obj.get("response", obj.get("label"))
+            if isinstance(prompt, str) and isinstance(label, str):
+                rows.append({
+                    "task_id": obj.get("task_id", f"row_{line_no}"),
+                    "prompt": prompt,
+                    "label": label,
+                    "source_line": line_no,
+                })
+                continue
+            # Chat fallback used by EIF load_samples-style files.
+            user = obj.get("input") or ""
+            if isinstance(obj.get("messages"), list):
+                for m in obj["messages"]:
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        user = m.get("content") or user
+                    if isinstance(m, dict) and m.get("role") == "assistant":
+                        label = m.get("content") or label
+            gold = label if isinstance(label, str) else (obj.get("output") or "")
+            if isinstance(user, str) and user and isinstance(gold, str) and gold:
+                rows.append({
+                    "task_id": obj.get("task_id", f"row_{line_no}"),
+                    "prompt": user,
+                    "label": gold,
+                    "source_line": line_no,
+                })
+    if not rows:
+        raise ValueError(f"No eval samples in {jsonl_path}")
+    return rows
+
+
+@torch.no_grad()
+def generate_one(tokenizer, model, prompt: str, max_new_tokens: int) -> dict[str, Any]:
+    text = _render_eval_prompt(tokenizer, prompt)
+    encoded = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    device = _device_of(model)
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+    prompt_tokens = int(encoded["input_ids"].shape[1])
+
+    eos_ids = [tokenizer.eos_token_id]
+    im_end_id = tokenizer.convert_tokens_to_ids(CHAT_STOP)
+    if isinstance(im_end_id, int) and im_end_id >= 0 and im_end_id not in eos_ids:
+        eos_ids.append(im_end_id)
+
+    out = model.generate(
+        **encoded,
+        max_new_tokens=int(max_new_tokens),
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=eos_ids,
+    )
+    gen = out[0, prompt_tokens:]
+    generated_list = gen.tolist()
+    text_out = tokenizer.decode(gen, skip_special_tokens=True)
+    predict, removed = remove_leading_thinking(text_out)
+    finish_reason = "stop" if generated_list and generated_list[-1] in eos_ids else "length"
+    row = {
+        "predict": predict,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens": len(generated_list),
+    }
+    if removed:
+        row["predict_raw"] = text_out
+        row["thinking_removed"] = True
+    return row
+
+
+def evaluate_line_hit(
+    model,
+    tokenizer,
+    samples: list[dict],
+    *,
+    max_new_tokens: int = 1024,
+    also_truncate_score: bool = True,
+    progress_cb=None,
+) -> dict[str, Any]:
+    """Return mean line_hit_pre / line_hit_rec (and optional trunc variants)."""
+    model.eval()
+    pres: list[float] = []
+    recs: list[float] = []
+    trunc_pres: list[float] = []
+    trunc_recs: list[float] = []
+    per_sample: list[dict[str, Any]] = []
+    truncated_cases = 0
+
+    for i, sample in enumerate(samples):
+        gen = generate_one(tokenizer, model, sample["prompt"], max_new_tokens)
+        pre = line_hit(sample["label"], gen["predict"], "precision")
+        rec = line_hit(sample["label"], gen["predict"], "recall")
+        pres.append(pre)
+        recs.append(rec)
+        row: dict[str, Any] = {
+            "index": i,
+            "task_id": sample.get("task_id"),
+            "line_hit_pre": round(pre, 4),
+            "line_hit_rec": round(rec, 4),
+            "finish_reason": gen.get("finish_reason"),
+            "generated_tokens": gen.get("generated_tokens"),
+        }
+        if also_truncate_score:
+            predict_trunc = truncate_predict_to_label_lines(sample["label"], gen["predict"])
+            if predict_trunc != gen["predict"]:
+                truncated_cases += 1
+            t_pre = line_hit(sample["label"], predict_trunc, "precision")
+            t_rec = line_hit(sample["label"], predict_trunc, "recall")
+            trunc_pres.append(t_pre)
+            trunc_recs.append(t_rec)
+            row["line_hit_pre_trunc"] = round(t_pre, 4)
+            row["line_hit_rec_trunc"] = round(t_rec, 4)
+        per_sample.append(row)
+        if progress_cb is not None:
+            progress_cb(i + 1, len(samples), row)
+        if (i + 1) % 10 == 0 or (i + 1) == len(samples):
+            msg = (
+                f"[continue-eval] {i + 1}/{len(samples)} "
+                f"pre={sum(pres)/len(pres):.2f} rec={sum(recs)/len(recs):.2f}"
+            )
+            if trunc_pres:
+                msg += (
+                    f" trunc_pre={sum(trunc_pres)/len(trunc_pres):.2f} "
+                    f"trunc_rec={sum(trunc_recs)/len(trunc_recs):.2f}"
+                )
+            print(msg, flush=True)
+
+    summary: dict[str, Any] = {
+        "n": len(samples),
+        "line_hit_pre": round(sum(pres) / max(1, len(pres)), 4),
+        "line_hit_rec": round(sum(recs) / max(1, len(recs)), 4),
+        "perSample": per_sample,
+    }
+    if also_truncate_score and trunc_pres:
+        summary["line_hit_pre_trunc"] = round(sum(trunc_pres) / len(trunc_pres), 4)
+        summary["line_hit_rec_trunc"] = round(sum(trunc_recs) / len(trunc_recs), 4)
+        summary["truncated_cases"] = truncated_cases
+    return summary
+
+
+def save_adapter(model, tokenizer, output_dir: str, meta: dict[str, Any]) -> str:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if hasattr(model, "save_pretrained"):
+        model.save_pretrained(str(out))
+    else:
+        raise RuntimeError("Model has no save_pretrained; expected PeftModel.")
+    try:
+        tokenizer.save_pretrained(str(out))
+    except Exception:
+        pass
+    (out / "continue_train_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return str(out.resolve())
+
+
+def _metric_delta(before: dict | None, after: dict) -> dict[str, float | None]:
+    if before is None:
+        return {
+            "line_hit_pre": None,
+            "line_hit_rec": None,
+            "line_hit_pre_trunc": None,
+            "line_hit_rec_trunc": None,
+        }
+    def d(key: str):
+        a, b = after.get(key), before.get(key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return float(a) - float(b)
+        return None
+    return {
+        "line_hit_pre": d("line_hit_pre"),
+        "line_hit_rec": d("line_hit_rec"),
+        "line_hit_pre_trunc": d("line_hit_pre_trunc"),
+        "line_hit_rec_trunc": d("line_hit_rec_trunc"),
+    }
+
+
+def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> dict[str, Any]:
+    if not cfg.adapter_path or not Path(cfg.adapter_path).is_dir():
+        raise FileNotFoundError(f"adapter_path not found: {cfg.adapter_path!r}")
+    if not cfg.test_data or not Path(cfg.test_data).is_file():
+        raise FileNotFoundError(f"test_data not found: {cfg.test_data!r}")
+
+    train_jsonl = resolve_continue_train_jsonl(cfg)
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+
+    _evict_cached_models()
+    torch.manual_seed(int(cfg.seed))
+
+    print(f"[continue-train] loading adapter={cfg.adapter_path}", flush=True)
+    print(f"[continue-train] subset={train_jsonl}", flush=True)
+    print(f"[continue-eval] test={cfg.test_data}", flush=True)
+
+    model, tokenizer = load_model_and_tokenizer(
+        model_path=cfg.adapter_path,
+        base_model_path=cfg.base_model_path,
+        attn_implementation="eager",
+    )
+    for n, p in model.named_parameters():
+        if "lora_" in n:
+            p.requires_grad_(True)
+
+    train_samples = load_train_samples(train_jsonl)
+    eval_samples = load_eval_samples(cfg.test_data)
+    if not train_samples:
+        raise ValueError(f"No train samples in {train_jsonl}")
+
+    n_edges = sum(1 for s in train_samples if s.get("attention_edges") or s.get("edges"))
+    print(
+        f"[continue-train] subset_size={len(train_samples)} "
+        f"(with_edges={n_edges}/{len(train_samples)}) "
+        f"eval_n={len(eval_samples)} steps={cfg.max_steps} lr={cfg.learning_rate}",
+        flush=True,
+    )
+    if n_edges == 0 and cfg.loss_mode == "ce_saliency":
+        print(
+            "[continue-train][WARN] no attention_edges in subset; "
+            "ce_saliency will fall back to CE-only per sample.",
+            flush=True,
+        )
+
+    bank_cfg = load_bank_loss_config(
+        cfg.adapter_path,
+        Path(cfg.adapter_path).name,
+        loss_mode_override=cfg.loss_mode,
+    )
+    bank_cfg.loss_mode = cfg.loss_mode if cfg.loss_mode in ("ce_only", "ce_saliency") else bank_cfg.loss_mode
+
+    def _prog(stage: str, message: str, **extra):
+        if progress_cb is not None:
+            progress_cb(stage, message, extra)
+
+    before = None
+    if cfg.eval_before:
+        _prog("eval_before", "Evaluating baseline adapter (line_hit)…")
+        before = evaluate_line_hit(
+            model, tokenizer, eval_samples,
+            max_new_tokens=cfg.max_new_tokens,
+            also_truncate_score=cfg.also_truncate_score,
+            progress_cb=lambda i, n, _r: _prog(
+                "eval_before", f"Eval before {i}/{n}", done=i, total=n,
+            ),
+        )
+        print(
+            f"[continue-eval] BEFORE line_hit_pre={before['line_hit_pre']} "
+            f"line_hit_rec={before['line_hit_rec']}",
+            flush=True,
+        )
+
+    _prog("training", f"Continue-training {cfg.max_steps} steps on {len(train_samples)} samples…")
+    train_stats = run_continue_training(
+        model, tokenizer, train_samples, cfg=cfg, bank_cfg=bank_cfg,
+        progress_cb=lambda s, m, loss, mode: _prog(
+            "training", f"step {s}/{m} loss={loss:.4f}", step=s, total=m, loss=loss,
+        ),
+    )
+
+    _prog("eval_after", "Evaluating continued adapter (line_hit)…")
+    after = evaluate_line_hit(
+        model, tokenizer, eval_samples,
+        max_new_tokens=cfg.max_new_tokens,
+        also_truncate_score=cfg.also_truncate_score,
+        progress_cb=lambda i, n, _r: _prog(
+            "eval_after", f"Eval after {i}/{n}", done=i, total=n,
+        ),
+    )
+    print(
+        f"[continue-eval] AFTER line_hit_pre={after['line_hit_pre']} "
+        f"line_hit_rec={after['line_hit_rec']}",
+        flush=True,
+    )
+
+    delta = _metric_delta(before, after)
+    meta = {
+        "config": asdict(cfg),
+        "continueTrainJsonl": train_jsonl,
+        "trainStats": train_stats,
+        "before": None if before is None else {k: v for k, v in before.items() if k != "perSample"},
+        "after": {k: v for k, v in after.items() if k != "perSample"},
+        "delta": delta,
+        "nTrainWithEdges": n_edges,
+    }
+    detail = {"before": before, "after": after}
+    out_dir = save_adapter(model, tokenizer, cfg.output_dir, meta)
+    detail_path = Path(out_dir) / "continue_eval_detail.json"
+    detail_path.write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta["outputDir"] = out_dir
+    meta["detailPath"] = str(detail_path)
+
+    _prog("completed", "Continue-train + line_hit eval finished.", result=meta)
+    del model
+    _evict_cached_models()
+    return {"status": "success", **meta}
+
+
+def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrainConfig:
+    req = req or {}
+    defaults = default_paths_from_env()
+    adapter = _resolve_path(req.get("adapterPath") or defaults["adapter_path"])
+    base = _resolve_path(req.get("baseModelPath") or defaults["base_model_path"])
+    # Prefer explicit small subset path; do not default to full EIF_TRAIN_DATA.
+    train = _resolve_path(req.get("trainData") or defaults["continue_train_data"])
+    source_train = _resolve_path(req.get("sourceTrainData") or defaults["source_train_data"])
+    test = _resolve_path(req.get("testData") or defaults["test_data"])
+    out = _resolve_path(req.get("outputDir") or defaults["output_dir"])
+
+    raw_ids = req.get("trainSampleIds") or []
+    train_ids: list[int] = []
+    if isinstance(raw_ids, list):
+        for x in raw_ids:
+            try:
+                train_ids.append(int(x))
+            except (TypeError, ValueError):
+                pass
+
+    if not adapter:
+        raise ValueError("adapterPath / EIF_ADAPTER_PATH_SALIENCY is required")
+    if not test:
+        raise ValueError("testData / EIF_TEST_DATA is required")
+    if not train and not train_ids:
+        raise ValueError(
+            "Need a small continue-train set: set ANNOTATION_CONTINUE_TRAIN_DATA "
+            "or pass trainSampleIds (will slice from EIF_TRAIN_DATA)."
+        )
+
+    return ContinueTrainConfig(
+        adapter_path=adapter,
+        base_model_path=base,
+        train_data=train or "",
+        test_data=test,
+        output_dir=out or str(REPO_ROOT / "outputs" / "continue_trial"),
+        max_steps=max(1, int(req.get("maxSteps", 50))),
+        learning_rate=float(req.get("learningRate", 2e-5)),
+        loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
+        eval_before=bool(req.get("evalBefore", True)),
+        max_new_tokens=max(16, int(req.get("maxNewTokens", 1024))),
+        seed=int(req.get("seed", 42)),
+        train_sample_ids=train_ids,
+        source_train_data=source_train,
+        also_truncate_score=bool(req.get("alsoTruncateScore", True)),
+    )
+
+
+def main():
+    defaults = default_paths_from_env()
+    p = argparse.ArgumentParser(description="Continue LoRA on small annotated set + line_hit eval")
+    p.add_argument("--adapter-path", default=defaults["adapter_path"])
+    p.add_argument("--base-model-path", default=defaults["base_model_path"])
+    p.add_argument("--continue-train-data", default=defaults["continue_train_data"],
+                   help="Small annotated JSONL (NOT the full original train set)")
+    p.add_argument("--source-train-data", default=defaults["source_train_data"],
+                   help="Full train JSONL; only used with --train-sample-ids")
+    p.add_argument("--train-sample-ids", default="",
+                   help="Comma-separated 0-based indices to slice from source train")
+    p.add_argument("--test-data", default=defaults["test_data"])
+    p.add_argument("--output-dir", default=defaults["output_dir"])
+    p.add_argument("--max-steps", type=int, default=50)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--loss-mode", default="ce_saliency", choices=["ce_only", "ce_saliency"])
+    p.add_argument("--no-eval-before", action="store_true")
+    p.add_argument("--max-new-tokens", type=int, default=1024)
+    args = p.parse_args()
+
+    ids: list[int] = []
+    if args.train_sample_ids.strip():
+        ids = [int(x) for x in args.train_sample_ids.split(",") if x.strip() != ""]
+
+    cfg = ContinueTrainConfig(
+        adapter_path=str(args.adapter_path or ""),
+        base_model_path=args.base_model_path,
+        train_data=str(args.continue_train_data or ""),
+        test_data=str(args.test_data or ""),
+        output_dir=str(args.output_dir or ""),
+        max_steps=args.max_steps,
+        learning_rate=args.lr,
+        loss_mode=args.loss_mode,
+        eval_before=not args.no_eval_before,
+        max_new_tokens=args.max_new_tokens,
+        train_sample_ids=ids,
+        source_train_data=args.source_train_data,
+    )
+    result = run_continue_train_and_eval(cfg)
+    before = result.get("before") or {}
+    after = result.get("after") or {}
+    delta = result.get("delta") or {}
+    print(json.dumps({
+        "outputDir": result.get("outputDir"),
+        "continueTrainJsonl": result.get("continueTrainJsonl"),
+        "before": {"line_hit_pre": before.get("line_hit_pre"), "line_hit_rec": before.get("line_hit_rec")},
+        "after": {"line_hit_pre": after.get("line_hit_pre"), "line_hit_rec": after.get("line_hit_rec")},
+        "delta": {"line_hit_pre": delta.get("line_hit_pre"), "line_hit_rec": delta.get("line_hit_rec")},
+    }, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

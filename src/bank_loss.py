@@ -1,11 +1,22 @@
-"""Train-bank loss helpers aligned with viz/data_attribution.py.
+"""Train-bank loss helpers aligned with ``src/train`` ce_saliency training.
+
+Default hypers match the common training CLI::
+
+    --loss_mode ce_saliency
+    --saliency_loss_type contrastive
+    --saliency_lambda 1.5
+    --saliency_alpha 1.0
+    --saliency_margin_plus 2.0
+    --saliency_layer -1
+    --saliency_neg_sample_k 64
 
 ce_only     -> CE
-ce_saliency -> CE + λ * contrastive saliency loss (needs attention_edges)
+ce_saliency -> CE + λ * contrastive saliency (negatives subsampled with k=64)
 """
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,16 +24,25 @@ import torch
 import torch.nn.functional as F
 
 
+# Defaults aligned with train.py CLI used for ce_saliency + contrastive runs.
+_DEFAULT_SALIENCY_LOSS_TYPE = "contrastive"
+_DEFAULT_SALIENCY_LAMBDA = 1.5
+_DEFAULT_SALIENCY_ALPHA = 1.0
+_DEFAULT_MARGIN_PLUS = 2.0
+_DEFAULT_SALIENCY_LAYER = -1
+_DEFAULT_NEG_SAMPLE_K = 64
+
+
 @dataclass
 class BankLossConfig:
     loss_mode: str = "ce_only"  # ce_only | ce_saliency
-    saliency_loss_type: str = "contrastive"
-    saliency_lambda: float = 1.5
-    alpha: float = 1.0
+    saliency_loss_type: str = _DEFAULT_SALIENCY_LOSS_TYPE
+    saliency_lambda: float = _DEFAULT_SALIENCY_LAMBDA
+    alpha: float = _DEFAULT_SALIENCY_ALPHA
     eps: float = 1e-8
-    margin_plus: float = 2.0
-    neg_sample_k: int = 0
-    saliency_layer: int = -1
+    margin_plus: float = _DEFAULT_MARGIN_PLUS
+    neg_sample_k: int = _DEFAULT_NEG_SAMPLE_K
+    saliency_layer: int = _DEFAULT_SALIENCY_LAYER
     exclude_sink_prefix: int = 0
     exclude_special_tokens: bool = False
 
@@ -37,7 +57,11 @@ class BankLossConfig:
 
 
 def infer_bank_loss_mode(model_path: str | None, model_tag: str) -> str:
-    """Prefer adapter/model-local saliency_training_config.json; else infer from tag."""
+    """Prefer adapter-local saliency_training_config.json; else infer from tag.
+
+    ``saliency`` / ``contrastive`` in the path wins over a coincidental
+    ``ce_only`` substring (e.g. ``.../ce_saliency``).
+    """
     if model_path:
         cfg_path = Path(model_path) / "saliency_training_config.json"
         if cfg_path.is_file():
@@ -49,11 +73,32 @@ def infer_bank_loss_mode(model_path: str | None, model_tag: str) -> str:
             except Exception:
                 pass
     tag = (model_tag or "").lower()
+    # Prefer saliency markers first so paths like ".../ce_saliency" are correct.
+    if "saliency" in tag or "contrastive" in tag or "cesal" in tag:
+        return "ce_saliency"
     if "ce_only" in tag or tag.endswith("_ce") or tag == "ce":
         return "ce_only"
-    if "saliency" in tag or "contrastive" in tag:
-        return "ce_saliency"
     return "ce_only"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def load_bank_loss_config(
@@ -62,6 +107,14 @@ def load_bank_loss_config(
     *,
     loss_mode_override: str | None = None,
 ) -> BankLossConfig:
+    """Load bank objective; defaults match train contrastive + k=64.
+
+    Override sources (later wins only within each field via json/env):
+      - ``BankLossConfig`` train-aligned defaults (incl. neg_sample_k=64)
+      - adapter ``saliency_training_config.json`` when present
+      - env: ``EIF_BANK_LOSS_MODE``, ``EIF_BANK_SALIENCY_LAMBDA``,
+        ``EIF_BANK_SALIENCY_NEG_SAMPLE_K``, …
+    """
     raw: dict = {}
     if model_path:
         cfg_path = Path(model_path) / "saliency_training_config.json"
@@ -70,31 +123,74 @@ def load_bank_loss_config(
                 raw = json.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception:
                 raw = {}
+
     override = (loss_mode_override or "").strip().lower()
+    if not override:
+        override = (os.environ.get("EIF_BANK_LOSS_MODE") or "").strip().lower()
     if override in ("", "auto", "none"):
         mode = infer_bank_loss_mode(model_path, model_tag)
     elif override in ("ce_only", "ce_saliency"):
         mode = override
     elif override == "saliency_only":
-        # Bank sketches currently share the ce_saliency objective path.
         mode = "ce_saliency"
     else:
         raise ValueError(
             f"Unknown bank loss_mode_override={loss_mode_override!r}; "
             "use auto|ce_only|ce_saliency"
         )
-    return BankLossConfig(
+
+    loss_type = str(
+        raw.get("saliency_loss_type")
+        or (os.environ.get("EIF_BANK_SALIENCY_LOSS_TYPE") or "").strip()
+        or _DEFAULT_SALIENCY_LOSS_TYPE
+    )
+    lam = float(
+        raw["saliency_lambda"]
+        if "saliency_lambda" in raw
+        else _env_float("EIF_BANK_SALIENCY_LAMBDA", _DEFAULT_SALIENCY_LAMBDA)
+    )
+    if "saliency_temperature_tau" in raw:
+        alpha = float(raw["saliency_temperature_tau"])
+    elif "saliency_alpha" in raw:
+        alpha = float(raw["saliency_alpha"])
+    else:
+        alpha = _env_float("EIF_BANK_SALIENCY_ALPHA", _DEFAULT_SALIENCY_ALPHA)
+    margin_plus = float(
+        raw["saliency_margin_plus"]
+        if "saliency_margin_plus" in raw
+        else _env_float("EIF_BANK_SALIENCY_MARGIN_PLUS", _DEFAULT_MARGIN_PLUS)
+    )
+    if "saliency_neg_sample_k" in raw:
+        neg_k = int(raw.get("saliency_neg_sample_k") or 0)
+    elif (os.environ.get("EIF_BANK_SALIENCY_NEG_SAMPLE_K") or "").strip() != "":
+        neg_k = _env_int("EIF_BANK_SALIENCY_NEG_SAMPLE_K", _DEFAULT_NEG_SAMPLE_K)
+    else:
+        neg_k = _DEFAULT_NEG_SAMPLE_K
+    layer = int(
+        raw["saliency_layer"]
+        if "saliency_layer" in raw
+        else _env_int("EIF_BANK_SALIENCY_LAYER", _DEFAULT_SALIENCY_LAYER)
+    )
+
+    cfg = BankLossConfig(
         loss_mode=mode,
-        saliency_loss_type=str(raw.get("saliency_loss_type") or "contrastive"),
-        saliency_lambda=float(raw.get("saliency_lambda", 1.5)),
-        alpha=float(raw.get("saliency_temperature_tau", raw.get("saliency_alpha", 1.0))),
+        saliency_loss_type=loss_type,
+        saliency_lambda=lam,
+        alpha=alpha,
         eps=float(raw.get("saliency_eps_num", 1e-8)),
-        margin_plus=float(raw.get("saliency_margin_plus", 2.0)),
-        neg_sample_k=int(raw.get("saliency_neg_sample_k", 0) or 0),
-        saliency_layer=int(raw.get("saliency_layer", -1)),
+        margin_plus=margin_plus,
+        neg_sample_k=neg_k,
+        saliency_layer=layer,
         exclude_sink_prefix=int(raw.get("saliency_exclude_sink_prefix", 0) or 0),
         exclude_special_tokens=bool(raw.get("saliency_exclude_special_tokens", False)),
     )
+    print(
+        f"[bank-loss] mode={cfg.loss_mode} type={cfg.saliency_loss_type} "
+        f"λ={cfg.saliency_lambda} α={cfg.alpha} margin+={cfg.margin_plus} "
+        f"neg_k={cfg.neg_sample_k} layer={cfg.saliency_layer} tag={cfg.cache_tag}",
+        flush=True,
+    )
+    return cfg
 
 
 def _import_saliency_loss_from_outputs():

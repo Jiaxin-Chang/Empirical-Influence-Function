@@ -148,45 +148,109 @@ def load_samples_from_formal_jsonl(jsonl_path: str):
     return sample_list
 
 
-def build_train_dataset(train_samples, convert_fn):
-    train_ds = Dataset.from_dict(dataset_list_to_dict(train_samples))
-    train_ds = train_ds.map(lambda x, i: {"sample_index": i}, with_indices=True)
-    print(f"[DEBUG] Tokenizing {len(train_ds)} train samples...", flush=True)
-    try:
-        train_ds = train_ds.map(
-            convert_fn,
-            batched=True,
-            batch_size=1000,
-            num_proc=4,
-            remove_columns=["input", "output", "system"],
-            desc="Tokenizing train",
-        )
-    except Exception as e:
-        print(f"[DEBUG] Multiprocess map failed ({e}), falling back to single process...", flush=True)
-        train_ds = train_ds.map(
-            convert_fn,
-            batched=True,
-            remove_columns=["input", "output", "system"],
-            desc="Tokenizing train",
-        )
-    train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
+def build_compact_train_dataset(train_samples):
+    """Build a HF Dataset from pretokenized compact rows (no ChatML re-encode).
 
+    Each sample must provide ``input_ids`` and ``labels`` (or ``label``) as equal-length
+    int lists. ``attention_edges`` stay on the Python ``train_samples`` list and are
+    looked up by ``sample_index`` — they are not stored in the HF Dataset.
+    """
+    input_ids_col: list[list[int]] = []
+    labels_col: list[list[int]] = []
+    sample_index_col: list[int] = []
+    skipped = 0
+    for i, s in enumerate(train_samples):
+        ids = s.get("input_ids")
+        labs = s.get("labels", s.get("label"))
+        if not isinstance(ids, list) or not ids:
+            skipped += 1
+            continue
+        if not isinstance(labs, list) or len(labs) != len(ids):
+            skipped += 1
+            continue
+        input_ids_col.append([int(x) for x in ids])
+        labels_col.append([int(x) for x in labs])
+        sample_index_col.append(int(s.get("sample_index", i)))
+    if not input_ids_col:
+        raise ValueError(
+            "No compact train samples (need input_ids + label/labels lists). "
+            "ChatML / prompt+response rows are no longer accepted for train data."
+        )
+    if skipped:
+        print(
+            f"[DEBUG] build_compact_train_dataset: skipped {skipped} non-compact rows",
+            flush=True,
+        )
+    print(
+        f"[DEBUG] Building compact train dataset: {len(input_ids_col)} samples "
+        f"(no re-encode)",
+        flush=True,
+    )
+    train_ds = Dataset.from_dict(
+        {
+            "input_ids": input_ids_col,
+            "labels": labels_col,
+            "sample_index": sample_index_col,
+        }
+    )
+    train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
     return train_ds
 
 
-def build_single_sample_dataset(sample, convert_fn):
-    # Build single-sample Dataset
+def build_train_dataset(train_samples, convert_fn=None):
+    """Train dataset from compact ``input_ids``/``labels`` only.
+
+    ``convert_fn`` (ChatML tokenize) is ignored and deprecated — re-encoding
+    misaligns ``attention_edges``.
+    """
+    if convert_fn is not None:
+        print(
+            "[WARN] build_train_dataset: convert_fn ignored; "
+            "train data must already be compact (input_ids + labels).",
+            flush=True,
+        )
+    return build_compact_train_dataset(train_samples)
+
+
+def build_single_compact_sample_dataset(sample):
+    """Single-row Dataset from compact sample (no ChatML re-encode)."""
+    ids = sample.get("input_ids")
+    labs = sample.get("labels", sample.get("label"))
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("compact sample missing input_ids")
+    if not isinstance(labs, list) or len(labs) != len(ids):
+        raise ValueError("compact sample need label/labels list same length as input_ids")
+    return Dataset.from_dict(
+        {
+            "input_ids": [[int(x) for x in ids]],
+            "labels": [[int(x) for x in labs]],
+        }
+    )
+
+
+def build_single_sample_dataset(sample, convert_fn=None):
+    """Prefer compact ``input_ids``/``labels``; ChatML convert only for test fallback."""
+    ids = sample.get("input_ids")
+    labs = sample.get("labels", sample.get("label"))
+    if isinstance(ids, list) and ids and isinstance(labs, list) and len(labs) == len(ids):
+        return build_single_compact_sample_dataset(sample)
+
+    if convert_fn is None:
+        raise ValueError(
+            "Sample has no compact input_ids+labels, and no convert_fn was provided. "
+            "Train rows must be compact; test rows may still use ChatML convert_fn."
+        )
+    # Test-only legacy path: tokenize system/input/output via ChatML.
     temp_ds = Dataset.from_dict({
         "input":  [sample["input"]],
         "output": [sample["output"]],
-        "system": [sample["system"]],
+        "system": [sample.get("system") or ""],
     })
     temp_ds = temp_ds.map(
-        convert_fn, 
-        batched=True, 
-        remove_columns=["input", "output", "system"]
+        convert_fn,
+        batched=True,
+        remove_columns=["input", "output", "system"],
     )
-
     return temp_ds
 
 

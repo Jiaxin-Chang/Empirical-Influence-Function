@@ -2,6 +2,8 @@ import argparse
 import hashlib
 import json
 import os
+import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
@@ -30,6 +32,11 @@ from src.gold_live_attribution import (
     _hydrate_eif_env,
     gold_retrieve_and_stage3,
     gold_saliency_top_k,
+)
+from src.continue_train_eval import (
+    build_config_from_request,
+    default_paths_from_env,
+    run_continue_train_and_eval,
 )
 
 
@@ -61,6 +68,75 @@ PREPARE_STATUS: dict[str, dict] = {}
 # shared in-process model cache.
 UNLEARN_PROBE_LOCK = Lock()
 GOLD_LIVE_LOCK = Lock()
+CONTINUE_TRAIN_LOCK = Lock()
+CONTINUE_TRAIN_JOBS: dict[str, dict] = {}
+CONTINUE_TRAIN_JOBS_LOCK = Lock()
+
+def _set_continue_job(job_id: str, **fields):
+    with CONTINUE_TRAIN_JOBS_LOCK:
+        cur = dict(CONTINUE_TRAIN_JOBS.get(job_id) or {"jobId": job_id})
+        cur.update(fields)
+        cur["updatedAt"] = int(time() * 1000)
+        CONTINUE_TRAIN_JOBS[job_id] = cur
+    print(
+        f"[continue-train][{job_id}] {fields.get('stage', '?')}: {fields.get('message', '')}",
+        flush=True,
+    )
+
+
+def _get_continue_job(job_id: str) -> dict:
+    with CONTINUE_TRAIN_JOBS_LOCK:
+        payload = CONTINUE_TRAIN_JOBS.get(job_id)
+    if payload is None:
+        return {
+            "jobId": job_id,
+            "stage": "unknown",
+            "message": "Unknown jobId",
+            "active": False,
+            "error": True,
+            "updatedAt": int(time() * 1000),
+        }
+    return dict(payload)
+
+
+def _run_continue_train_job(job_id: str, req: dict):
+    try:
+        cfg = build_config_from_request(req)
+
+        def progress(stage: str, message: str, extra: dict | None = None):
+            payload = {
+                "stage": stage,
+                "message": message,
+                "active": stage not in {"completed", "error"},
+                "error": False,
+            }
+            if isinstance(extra, dict):
+                # Don't put huge result blobs into status repeatedly.
+                slim = {k: v for k, v in extra.items() if k != "result"}
+                payload["progress"] = slim
+                if "result" in extra:
+                    payload["result"] = extra["result"]
+            _set_continue_job(job_id, **payload)
+
+        with CONTINUE_TRAIN_LOCK:
+            result = run_continue_train_and_eval(cfg, progress_cb=progress)
+        _set_continue_job(
+            job_id,
+            stage="completed",
+            message="Continue-train + eval finished.",
+            active=False,
+            error=False,
+            result=result,
+        )
+    except Exception as exc:
+        _set_continue_job(
+            job_id,
+            stage="error",
+            message=str(exc),
+            active=False,
+            error=True,
+        )
+
 
 # Server-side kill switch for live model loading. Independent of (and stronger
 # than) the per-request `requireCached` flag: that one is client-supplied and
@@ -446,6 +522,19 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/continue-train-eval-status":
+            job_id = parse_qs(parsed.query).get("jobId", [""])[0].strip()
+            if not job_id:
+                self._send_json(400, {"status": "error", "message": "jobId is required"})
+                return
+            self._send_json(200, {"status": "success", **_get_continue_job(job_id)})
+            return
+        if parsed.path == "/api/continue-train-eval-defaults":
+            self._send_json(200, {
+                "status": "success",
+                "defaults": default_paths_from_env(),
+            })
+            return
         if parsed.path != "/api/prepare-ttav-bundle-status":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -460,6 +549,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/continue-train-eval":
+            self._handle_continue_train_eval()
+            return
         if parsed.path == "/api/prepare-ttav-train-probe":
             self._handle_prepare_train_probe()
             return
@@ -632,6 +724,90 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         }
         self._send_json(200, response)
 
+    def _handle_continue_train_eval(self):
+        """Start async continue-train on small annotated subset + line_hit eval."""
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "EIF_CACHE_ONLY=1 — continue-train disabled on this server.",
+            })
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        try:
+            cfg = build_config_from_request(req)
+        except Exception as exc:
+            self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+
+        # Reject if another continue-train is already active.
+        with CONTINUE_TRAIN_JOBS_LOCK:
+            active = [
+                j for j in CONTINUE_TRAIN_JOBS.values()
+                if j.get("active")
+            ]
+        if active:
+            self._send_json(409, {
+                "status": "error",
+                "message": f"Another continue-train job is active: {active[0].get('jobId')}",
+                "jobId": active[0].get("jobId"),
+            })
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        _set_continue_job(
+            job_id,
+            stage="queued",
+            message="Continue-train job queued…",
+            active=True,
+            error=False,
+            config={
+                "adapterPath": cfg.adapter_path,
+                "trainData": cfg.train_data,
+                "trainSampleIds": cfg.train_sample_ids,
+                "sourceTrainData": cfg.source_train_data,
+                "testData": cfg.test_data,
+                "outputDir": cfg.output_dir,
+                "maxSteps": cfg.max_steps,
+                "learningRate": cfg.learning_rate,
+                "lossMode": cfg.loss_mode,
+                "evalBefore": cfg.eval_before,
+                "metrics": ["line_hit_pre", "line_hit_rec"],
+            },
+        )
+        thread = threading.Thread(
+            target=_run_continue_train_job,
+            args=(job_id, req),
+            name=f"continue-train-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._send_json(200, {
+            "status": "success",
+            "jobId": job_id,
+            "message": "Continue-train job started (small subset + line_hit)",
+            "config": {
+                "adapterPath": cfg.adapter_path,
+                "trainData": cfg.train_data,
+                "trainSampleIds": cfg.train_sample_ids,
+                "testData": cfg.test_data,
+                "outputDir": cfg.output_dir,
+                "maxSteps": cfg.max_steps,
+                "learningRate": cfg.learning_rate,
+                "lossMode": cfg.loss_mode,
+                "metrics": ["line_hit_pre", "line_hit_rec"],
+            },
+        })
+
     def _load_report_from_req(self, req: dict) -> tuple[dict | None, str | None]:
         from src.eif_adapter_env import resolve_report_json_path, stamp_report_family
 
@@ -754,7 +930,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, result)
 
     def _handle_unlearn_pair_probe(self):
-        """One-step lm_head unlearning probe for a single correlation pair."""
+        """One-step LoRA learn/unlearn on CE + single-edge contrastive."""
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
         try:

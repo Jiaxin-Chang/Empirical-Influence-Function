@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import gc
 import os
-from functools import partial
 from heapq import nlargest
 from pathlib import Path
 from typing import Any
@@ -47,7 +46,7 @@ from src.intervention_experiment import (
     get_context_window,
     is_trivial_token,
     load_model_and_tokenizer,
-    load_samples,
+    load_train_samples,
     make_attention_projection_filter,
     make_lora_param_filter,
     top_nontrivial_saliency_sources,
@@ -58,7 +57,6 @@ from src.loss import (
     compute_last_layer_saliency_vector,
     prepare_last_layer_grad_checkpointing,
 )
-from src.process_data import process_func_chatml
 from src.unlearn_pair_probe import _release_cuda_memory
 
 
@@ -119,10 +117,6 @@ def _hydrate_eif_env(*, force_file: bool = True) -> Path | None:
         if path.is_file():
             _apply(path)
             return path
-    viewer_env = REPO_ROOT / "tools" / "annotation-viewer" / ".env"
-    if viewer_env.is_file():
-        _apply(viewer_env)
-        return viewer_env
     return None
 
 
@@ -236,7 +230,7 @@ def _resolve_train_data() -> Path:
     if not raw:
         raise ValueError(
             "No train data. Set EIF_TRAIN_DATA in eif_api.env "
-            "(chat JSONL used by intervention_experiment)."
+            "(compact JSONL: input_ids + label + attention_edges)."
         )
     p = Path(raw).expanduser()
     candidates = [p] if p.is_absolute() else [Path.cwd() / p, REPO_ROOT / p]
@@ -372,13 +366,12 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         loss_mode_override=bank_override,
     )
 
-    print(f"[gold-live] loading train data {train_path}", flush=True)
-    train_samples = load_samples(str(train_path))
+    print(f"[gold-live] loading compact train data {train_path}", flush=True)
+    train_samples = load_train_samples(str(train_path))
     if not train_samples:
         raise ValueError(f"No train samples loaded from {train_path}")
 
-    convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
-    train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    train_ds = build_train_dataset(train_samples)
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer, padding=True, return_tensors="pt",
     )
@@ -447,7 +440,6 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         "bank": bank,
         "bank_cfg": bank_cfg,
         "train_samples": train_samples,
-        "convert_to_chatml": convert_to_chatml,
         "collator": base_collator,
         "marker_ids": marker,
         "model_path": model_path,
@@ -562,7 +554,6 @@ def _stage3_one_train(
     tokenizer = session["tokenizer"]
     device = session["device"]
     train_samples = session["train_samples"]
-    convert_to_chatml = session["convert_to_chatml"]
     collator = session["collator"]
     marker_ids = session["marker_ids"]
     cache: dict = session["train_detail_cache"]
@@ -572,7 +563,7 @@ def _stage3_one_train(
 
     cached = cache.get(str(train_idx))
     if cached is None:
-        tr_ds = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
+        tr_ds = build_single_sample_dataset(train_samples[train_idx])
         tr_batch = collator([tr_ds[0]])
         tr_batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in tr_batch.items()}
         if tr_batch["input_ids"].size(1) > SEQUENCE_LENGTH_LIMIT:

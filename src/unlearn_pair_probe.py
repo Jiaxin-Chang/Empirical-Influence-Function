@@ -2,19 +2,26 @@
 
 Uses the same model loading path as ``intervention_experiment`` (full checkpoint
 OR base + LoRA adapter). The update uses the **same parameter subspace as pair
-matching** (default: last-1-layer LoRA):
+matching** (default: last-1-layer LoRA).
 
-    unlearn: θ ← θ + η · normalize(∇_θ CE_train_target)   # ascent
-    learn:   θ ← θ − η · normalize(∇_θ CE_train_target)   # descent
+Train objective (aligned with ce_saliency training, but **one selected edge**)::
 
-Default η≈0.05 (normalized step L2) is a small single-token CE nudge in LoRA
-space — visible on logP / next-token probs without destroying the distribution.
-With ``persist=True``, repeated Learn/Unlearn clicks **accumulate** on the same
-weights; ``recover_pair_intervention`` undoes the full stack back to the
-pre-intervention snapshot.
+    L = CE(train_target) + λ · L_contrastive(pos = selected src→tgt)
 
-The train loss is restricted to the pair's train *target* token (other labels
-masked to -100).
+Same scalar L for both directions ("整段 L 同号"):
+
+    unlearn: θ ← θ + η · normalize(∇_θ L)   # ascent on L
+    learn:   θ ← θ − η · normalize(∇_θ L)   # descent on L
+
+i.e. we do **not** flip only the saliency term or only CE — Learn and Unlearn
+are opposite steps on the identical combined objective.
+
+Default η≈0.05 (normalized step L2). With ``persist=True``, clicks accumulate;
+``recover_pair_intervention`` undoes the stack.
+
+CE labels: only the pair's train *target* token (others -100).
+Saliency: that edge is the sole positive; other causal sources at the target
+are negatives (contrastive + neg_sample_k, same hypers as bank/train).
 """
 
 from __future__ import annotations
@@ -29,6 +36,12 @@ import torch
 import torch.nn.functional as F
 
 from src.attribution_evaluation import _target_token_losses
+from src.bank_loss import (
+    BankLossConfig,
+    _annot_pairs_from_edges,
+    _import_saliency_loss_from_outputs,
+    load_bank_loss_config,
+)
 from src.export_real_ttav_bundle import (
     convert_report_tokens_to_ids,
     validate_roundtrip_tokens,
@@ -244,20 +257,10 @@ def recover_pair_intervention() -> dict[str, Any]:
 
 
 def _hydrate_annotation_viewer_env() -> None:
-    """Pull ANNOTATION_TRAIN_DATA from tools/annotation-viewer/.env if unset."""
-    env_path = REPO_ROOT / "tools" / "annotation-viewer" / ".env"
-    if not env_path.is_file():
-        return
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+    """Ensure repo-root eif_api.env is loaded (shared with ttav / annotation-viewer)."""
+    from src.gold_live_attribution import _hydrate_eif_env
 
+    _hydrate_eif_env()
 
 def _resolve_existing_path(raw: str) -> Path | None:
     p = Path(raw).expanduser()
@@ -593,13 +596,34 @@ def _batch_to_device(batch: dict[str, torch.Tensor], device) -> dict[str, torch.
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-def _compute_filtered_ce_grads(
+def _intervene_loss_config(model_path: str | None) -> BankLossConfig:
+    """CE + single-edge contrastive hypers (force ce_saliency; reuse bank/train knobs)."""
+    base = load_bank_loss_config(model_path, model_tag="")
+    return BankLossConfig(
+        loss_mode="ce_saliency",
+        saliency_loss_type="contrastive",
+        saliency_lambda=float(base.saliency_lambda),
+        alpha=float(base.alpha),
+        eps=float(base.eps),
+        margin_plus=float(base.margin_plus),
+        neg_sample_k=int(base.neg_sample_k),
+        saliency_layer=int(base.saliency_layer),
+        exclude_sink_prefix=int(base.exclude_sink_prefix),
+        exclude_special_tokens=bool(base.exclude_special_tokens),
+    )
+
+
+def _compute_filtered_train_grads(
     model,
     batch: dict[str, torch.Tensor],
     param_filter: Callable[[str, Any], bool],
     device,
-) -> tuple[list[torch.nn.Parameter], list[torch.Tensor]]:
-    """∇_θ CE on filtered params for the labeled tokens in ``batch``."""
+    *,
+    train_source_index: int,
+    train_target_index: int,
+    loss_cfg: BankLossConfig,
+) -> tuple[list[torch.nn.Parameter], list[torch.Tensor], dict[str, float]]:
+    """∇_θ L on filtered params, L = CE(tgt) + λ · contrastive(selected edge)."""
     if _model_has_inference_params(model):
         raise RuntimeError(
             "Model parameters are InferenceMode-tainted (often from loading under "
@@ -637,12 +661,56 @@ def _compute_filtered_ce_grads(
                     input_ids=local["input_ids"],
                     attention_mask=local.get("attention_mask"),
                     labels=local["labels"],
+                    output_attentions=True,
+                    output_hidden_states=True,
                     use_cache=False,
                     return_dict=True,
                 )
-                loss = outputs.loss
-                if loss is None or not torch.isfinite(loss):
-                    raise RuntimeError(f"Train CE loss invalid: {loss}")
+                ce = outputs.loss
+                if ce is None or not torch.isfinite(ce):
+                    raise RuntimeError(f"Train CE loss invalid: {ce}")
+                if ce.dim() > 0:
+                    ce = ce.mean()
+
+                saliency_loss_from_outputs = _import_saliency_loss_from_outputs()
+                n_tokens = int(local["input_ids"].size(1))
+                edges = [{"src": int(train_source_index), "dst": int(train_target_index)}]
+                annot_pairs = _annot_pairs_from_edges(edges, n_tokens, device)
+                exclude = None
+                if loss_cfg.exclude_sink_prefix > 0:
+                    em = torch.zeros_like(local["input_ids"], dtype=torch.bool)
+                    em[:, : loss_cfg.exclude_sink_prefix] = True
+                    exclude = em
+
+                diag = saliency_loss_from_outputs(
+                    model,
+                    outputs,
+                    annot_pairs,
+                    saliency_layer=loss_cfg.saliency_layer,
+                    exclude_source_mask=exclude,
+                    alpha=loss_cfg.alpha,
+                    eps=loss_cfg.eps,
+                    floor_eps=0.0,
+                    floor_eps_mode="fixed",
+                    floor_eps_step=0,
+                    floor_eps_warmup_steps=0,
+                    floor_logit_eps=None,
+                    loss_type=loss_cfg.saliency_loss_type,
+                    margin_plus=loss_cfg.margin_plus,
+                    neg_sample_k=loss_cfg.neg_sample_k,
+                )
+                sal = diag.loss
+                if sal is None or not torch.isfinite(sal):
+                    raise RuntimeError(f"Train saliency loss invalid: {sal}")
+                loss = ce + float(loss_cfg.saliency_lambda) * sal
+                print(
+                    f"[unlearn] train L=CE+λ·con: ce={float(ce.detach()):.6g} "
+                    f"sal={float(sal.detach()):.6g} λ={loss_cfg.saliency_lambda:g} "
+                    f"L={float(loss.detach()):.6g} "
+                    f"edge={train_source_index}->{train_target_index} "
+                    f"k={loss_cfg.neg_sample_k} m={loss_cfg.margin_plus:g}",
+                    flush=True,
+                )
                 grads = torch.autograd.grad(
                     loss,
                     params,
@@ -656,7 +724,13 @@ def _compute_filtered_ce_grads(
                     out_grads.append(torch.zeros_like(p, dtype=torch.float32))
                 else:
                     out_grads.append(g.detach().to(dtype=torch.float32))
-            return params, out_grads
+            stats = {
+                "ce": float(ce.detach().cpu()),
+                "saliency": float(sal.detach().cpu()),
+                "total": float(loss.detach().cpu()),
+                "saliencyLambda": float(loss_cfg.saliency_lambda),
+            }
+            return params, out_grads, stats
         finally:
             for p, flag in original_flags:
                 p.requires_grad_(flag)
@@ -902,18 +976,33 @@ def run_unlearn_pair_probe(
             )
 
     param_filter, param_space_tag, last_n_layers = _resolve_match_param_filter(model, report)
+    loss_cfg = _intervene_loss_config(resolved_model)
     print(
         f"[{direction_norm}] param_space={param_space_tag} (aligned with pair matching; "
         f"model_grad_space={grad_space})",
+        flush=True,
+    )
+    print(
+        f"[{direction_norm}] train_obj=CE+λ·contrastive(single_edge) "
+        f"λ={loss_cfg.saliency_lambda:g} α={loss_cfg.alpha:g} "
+        f"m={loss_cfg.margin_plus:g} k={loss_cfg.neg_sample_k} "
+        f"layer={loss_cfg.saliency_layer}",
         flush=True,
     )
 
     params = None
     deltas = None
     restored = True
+    train_loss_stats: dict[str, float] | None = None
     try:
-        params, grads = _compute_filtered_ce_grads(
-            model, train_batch, param_filter, device
+        params, grads, train_loss_stats = _compute_filtered_train_grads(
+            model,
+            train_batch,
+            param_filter,
+            device,
+            train_source_index=train_source_index,
+            train_target_index=train_target_index,
+            loss_cfg=loss_cfg,
         )
         grad_norm = float(torch.cat([g.reshape(-1) for g in grads]).float().norm().item())
         deltas = _apply_filtered_ascent(
@@ -1023,9 +1112,9 @@ def run_unlearn_pair_probe(
             verdict = "opposite_effect"
 
     rule = (
-        "theta <- theta + eta * normalized(grad_train_ce)"
+        "theta <- theta + eta * normalized(grad_train_L)"
         if direction_norm == "unlearn"
-        else "theta <- theta - eta * normalized(grad_train_ce)"
+        else "theta <- theta - eta * normalized(grad_train_L)"
     )
     if not normalize_grad:
         rule = rule.replace("normalized(", "").replace(")", "", 1)
@@ -1051,9 +1140,18 @@ def run_unlearn_pair_probe(
             "steps": int(stacked_steps_out),
             "persist": bool(persist),
             "persistsToDisk": False,
-            "trainLossScope": "train_target_token_only",
+            "trainLossScope": "ce_plus_single_edge_contrastive",
+            "trainObjective": "CE(train_target) + lambda * contrastive(selected_edge)",
+            "sameSignObjective": True,
             "trainTargetIndex": int(train_target_index),
             "trainSourceIndex": int(train_source_index),
+            "saliencyLossType": loss_cfg.saliency_loss_type,
+            "saliencyLambda": float(loss_cfg.saliency_lambda),
+            "saliencyAlpha": float(loss_cfg.alpha),
+            "saliencyMarginPlus": float(loss_cfg.margin_plus),
+            "saliencyNegSampleK": int(loss_cfg.neg_sample_k),
+            "saliencyLayer": int(loss_cfg.saliency_layer),
+            "trainLoss": train_loss_stats,
         },
         "testEdge": {
             "sourceIndex": int(test_source_index),

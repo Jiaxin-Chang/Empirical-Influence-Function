@@ -51,6 +51,7 @@ from src.intervention_experiment import (
     lm_head_filter,
     load_model_and_tokenizer,
     load_samples,
+    load_train_samples,
 )
 from src.loss import compute_lm_head_ce_gradient_no_backward
 from src.process_data import process_func_chatml
@@ -744,7 +745,7 @@ def main() -> None:
         max_gpu_memory=args.max_gpu_memory,
     )
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
-    train_samples = load_samples(args.train_data)
+    train_samples = load_train_samples(args.train_data)
     test_samples = load_samples(args.test_data)
     if args.train_limit is not None:
         train_samples = train_samples[: int(args.train_limit)]
@@ -759,8 +760,8 @@ def main() -> None:
     )
     collator = CustomCollator(base_collator)
 
-    print("[batched-data] building train dataset...", flush=True)
-    train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    print("[batched-data] building train dataset (compact)...", flush=True)
+    train_ds = build_train_dataset(train_samples)
     idx_to_row = {int(train_ds[i]["sample_index"]): i for i in range(len(train_ds))}
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(train_ds),

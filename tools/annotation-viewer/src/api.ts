@@ -29,6 +29,7 @@ export type SampleSummary = {
   raw_id: string
   length: number
   n_edges: number
+  in_continue?: boolean
 }
 
 export type SampleDetail = {
@@ -42,6 +43,9 @@ export type SampleDetail = {
   attention_edges: Edge[]
   annotation_meta: Record<string, unknown>
   subtypes: string[]
+  in_continue?: boolean
+  sample_key?: string
+  continue_path?: string | null
 }
 
 export type SaliencyHit = { src: number; score: number }
@@ -73,6 +77,9 @@ export const api = {
       ok: boolean
       data_path: string | null
       n_samples: number
+      continue_path: string | null
+      n_continue: number
+      write_mode: string
       subtypes: string[]
       saliency_available: boolean
     }>('/api/health'),
@@ -99,13 +106,25 @@ export const api = {
     }>(`/api/sample/${idx}/saliency/${target}?top_k=${topK}`),
 
   deleteEdge: (idx: number, edge: Edge) =>
-    jsonFetch<{ ok: boolean; n_edges: number }>(`/api/sample/${idx}/edges/delete`, {
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/sample/${idx}/edges/delete`, {
       method: 'POST',
       body: JSON.stringify(edge),
     }),
 
   addEdge: (idx: number, edge: Edge & { source?: string }) =>
-    jsonFetch<{ ok: boolean; n_edges: number }>(`/api/sample/${idx}/edges/add`, {
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/sample/${idx}/edges/add`, {
       method: 'POST',
       body: JSON.stringify(edge),
     }),

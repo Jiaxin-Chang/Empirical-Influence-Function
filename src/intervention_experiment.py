@@ -44,34 +44,120 @@ from src.bank_loss import load_bank_loss_config, compute_bank_loss
 
 # ====== DATA LOADING (auto-detects format) ======
 
-def load_samples(jsonl_path: str) -> list[dict]:
-    """Load samples from a JSONL file, auto-detecting the format.
+def load_train_samples(jsonl_path: str) -> list[dict]:
+    """Load **compact** train rows only (no ChatML re-encode later).
 
-    Supported formats:
+    Required per line:
+      - ``input_ids``: list[int]  (ChatML already tokenized)
+      - ``label`` or ``labels``: list[int], same length (prompt positions = -100)
 
-    **Format A – messages array (original):**
-    ``{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."},
-                    {"role": "assistant", "content": "..."}]}``
-
-    **Format B – flat fields (new):**
-    ``{"prompt": "...", "response": "...", "task_id": "...", "system": "..."}``
-    ``system`` is optional; ``task_id`` is preserved for output file naming.
-
-    **Format C – eval predictions:**
-    ``{"prompt": "...", "label": "...", "predict": "...", "task_id": "..."}``
-    Gold is ``label`` (or ``response``); optional ``predict`` is kept for
-    teacher-forced attribution via ``--completion-source predict|auto``.
-
-    Normalised to ``{system, input, output, task_id[, predict]}``.
+    Optional:
+      - ``attention_edges`` / ``edges``
+      - ``uid`` / ``task_id`` / ``raw_id``
     """
+    samples: list[dict] = []
+    skipped = 0
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            ids = obj.get("input_ids")
+            labs = obj.get("label", obj.get("labels"))
+            # Reject string gold "label" — that is eval text, not compact masks.
+            if not isinstance(ids, list) or not ids:
+                skipped += 1
+                continue
+            if not isinstance(labs, list) or len(labs) != len(ids):
+                skipped += 1
+                continue
+            sample: dict = {
+                "input_ids": [int(x) for x in ids],
+                "labels": [int(x) for x in labs],
+                "sample_index": len(samples),
+                "task_id": str(obj.get("task_id", "") or obj.get("uid", "") or f"row_{line_no}"),
+                "uid": str(obj.get("uid") or ""),
+                "raw_id": str(obj.get("raw_id") or ""),
+            }
+            edges = obj.get("attention_edges")
+            if edges is None:
+                edges = obj.get("edges")
+            if edges is not None:
+                sample["attention_edges"] = edges
+            samples.append(sample)
+    if not samples:
+        raise ValueError(
+            f"No compact train samples in {jsonl_path!r}. "
+            "Need JSONL rows with input_ids + label/labels (int lists). "
+            "ChatML messages / prompt+response are not accepted for train data "
+            "(re-encoding would misalign attention_edges)."
+        )
+    if skipped:
+        print(
+            f"[DEBUG] load_train_samples: kept {len(samples)}, skipped {skipped} "
+            f"non-compact rows in {jsonl_path}",
+            flush=True,
+        )
+    return samples
+
+
+def load_samples(jsonl_path: str, *, compact_only: bool = False) -> list[dict]:
+    """Load samples from a JSONL file.
+
+    **Train data:** use ``load_train_samples`` or ``compact_only=True`` —
+    compact ``input_ids`` + ``label``/``labels`` lists only.
+
+    **Test / eval data** (``compact_only=False``) may also be text formats for
+    generation:
+
+    **Format A – messages array:**
+    ``{"messages": [{"role": "system"|"user"|"assistant", ...}, ...]}``
+
+    **Format B/C – flat fields:**
+    ``{"prompt": "...", "response"|"label"|"predict": "..."}``
+
+    **Format D – compact** (preferred when present):
+    ``{"input_ids": [...], "label"|"labels": [...], "attention_edges": [...]}``
+    """
+    if compact_only:
+        return load_train_samples(jsonl_path)
+
     samples: list[dict] = []
     seen_inputs: set[str] = set()
 
     with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
             obj = json.loads(line)
+
+            # ── Format D: compact (prefer; no re-encode) ──────────────────
+            ids = obj.get("input_ids")
+            labs = obj.get("label", obj.get("labels"))
+            if isinstance(ids, list) and ids and isinstance(labs, list) and len(labs) == len(ids):
+                sample = {
+                    "input_ids": [int(x) for x in ids],
+                    "labels": [int(x) for x in labs],
+                    "sample_index": len(samples),
+                    "task_id": str(obj.get("task_id", "") or obj.get("uid", "") or f"row_{line_no}"),
+                    "uid": str(obj.get("uid") or ""),
+                    "system": obj.get("system") or "",
+                    "input": obj.get("input") or obj.get("prompt") or "",
+                    "output": (
+                        obj.get("output")
+                        if isinstance(obj.get("output"), str)
+                        else (obj.get("response") if isinstance(obj.get("response"), str) else "")
+                    ),
+                }
+                edges = obj.get("attention_edges")
+                if edges is None:
+                    edges = obj.get("edges")
+                if edges is not None:
+                    sample["attention_edges"] = edges
+                if isinstance(obj.get("predict"), str) and obj["predict"]:
+                    sample["predict"] = obj["predict"]
+                samples.append(sample)
+                continue
 
             # ── Format A: messages array ──────────────────────────────────
             if "messages" in obj:
@@ -79,7 +165,7 @@ def load_samples(jsonl_path: str) -> list[dict]:
                 if len(msgs) < 3 or not msgs[2]["content"]:
                     continue
                 system = msgs[0]["content"]
-                inp    = msgs[1]["content"]
+                inp = msgs[1]["content"]
                 output = msgs[2]["content"]
                 task_id = obj.get("task_id", "") or obj.get("uid", "")
                 predict = obj.get("predict")
@@ -88,15 +174,15 @@ def load_samples(jsonl_path: str) -> list[dict]:
             elif "prompt" in obj and (
                 "response" in obj or "label" in obj or "predict" in obj
             ):
-                system  = obj.get("system", "")
-                inp     = obj["prompt"]
-                # Gold for UI / correct_full_tokens; prefer explicit response/label.
-                output  = obj.get("response")
+                system = obj.get("system", "")
+                inp = obj["prompt"]
+                output = obj.get("response")
                 if output is None or output == "":
-                    output = obj.get("label", "")
+                    # String label only (not list — list already handled as compact).
+                    lab = obj.get("label", "")
+                    output = lab if isinstance(lab, str) else ""
                 task_id = str(obj.get("task_id", "") or obj.get("uid", ""))
                 predict = obj.get("predict")
-                # Allow predict-only rows when gold is missing (rare).
                 if not output and not predict:
                     continue
 
@@ -108,26 +194,18 @@ def load_samples(jsonl_path: str) -> list[dict]:
             seen_inputs.add(inp)
 
             sample = {
-                "system":  system,
-                "input":   inp,
-                "output":  output or "",
+                "system": system,
+                "input": inp,
+                "output": output or "",
                 "task_id": task_id,
             }
             if isinstance(predict, str) and predict:
                 sample["predict"] = predict
-            # Optional annotation edges for CE+saliency train-bank (viz-aligned).
             edges = obj.get("attention_edges")
             if edges is None:
                 edges = obj.get("edges")
             if edges is not None:
                 sample["attention_edges"] = edges
-            # Preserve compact token ids when present (viz free-run uses these verbatim).
-            if isinstance(obj.get("input_ids"), list) and obj["input_ids"]:
-                sample["input_ids"] = list(obj["input_ids"])
-                labs = obj.get("label", obj.get("labels"))
-                # Compact rows use list labels; string "label" is eval gold text.
-                if isinstance(labs, list) and len(labs) == len(sample["input_ids"]):
-                    sample["labels"] = list(labs)
             samples.append(sample)
 
     return samples
@@ -1616,7 +1694,7 @@ def _load_or_build_saliency_train_bank(
         if n_edges == 0:
             print(
                 "[WARN] ce_saliency bank requested but no attention_edges found in train JSONL. "
-                "Re-run tools/compact_to_chat_jsonl.py (now preserves edges), or the bank "
+                "Use compact data that includes attention_edges, or the bank "
                 "will effectively be CE-only.",
                 flush=True,
             )
@@ -1920,26 +1998,16 @@ def run_causal_intervention_experiment(
     convert_to_chatml = partial(process_func_chatml, tokenizer=tokenizer)
 
     print("[DEBUG] Loading train/test samples...", flush=True)
-    train_samples = load_samples(train_data)
-    test_samples  = load_samples(test_data)
+    train_samples = load_train_samples(train_data)
+    test_samples = load_samples(test_data)
     if train_limit is not None and train_limit < len(train_samples):
         print(f"[DEBUG] Limiting train samples: {len(train_samples)} -> {train_limit}", flush=True)
         train_samples = train_samples[:train_limit]
     print(f"[DEBUG] Loaded {len(train_samples)} train, {len(test_samples)} test samples.", flush=True)
-    if not train_samples:
-        raise ValueError(
-            f"No train samples loaded from {train_data!r}. "
-            "Compact graphsignal JSONL (input_ids/label only) is not accepted directly — "
-            "convert first, e.g.\n"
-            "  python tools/compact_to_chat_jsonl.py \\\n"
-            "    --tokenizer <Qwen3-8B> \\\n"
-            "    --input smoke_train_data.jsonl \\\n"
-            "    --output smoke_train_data_chat.jsonl"
-        )
     if not test_samples:
         raise ValueError(
             f"No test samples loaded from {test_data!r}. "
-            "Need messages[], or prompt+label/response/predict fields."
+            "Need compact input_ids+labels, or messages[] / prompt+label|response|predict."
         )
 
     base_collator = DataCollatorForSeq2Seq(
@@ -1948,8 +2016,8 @@ def run_causal_intervention_experiment(
     )
     collator = CustomCollator(base_collator)
 
-    print("[DEBUG] Building train dataset...", flush=True)
-    train_ds = build_train_dataset(train_samples, convert_to_chatml)
+    print("[DEBUG] Building train dataset (compact, no re-encode)...", flush=True)
+    train_ds = build_train_dataset(train_samples)
     print(f"[DEBUG] Train dataset built: {len(train_ds)} samples.", flush=True)
     prescreen_length_sweep_stats = _prescreen_length_sweep_report(
         train_ds,
@@ -2418,7 +2486,7 @@ def run_causal_intervention_experiment(
         nonlocal model, tokenizer, base_collator, accelerator, fine_param_filter
 
         if cached_detail is None:
-            tr_ds   = build_single_sample_dataset(train_samples[train_idx], convert_to_chatml)
+            tr_ds   = build_single_sample_dataset(train_samples[train_idx])
             tr_batch = base_collator([tr_ds[0]])
             tr_batch = {k: v.to(accelerator.device) for k, v in tr_batch.items()}
 

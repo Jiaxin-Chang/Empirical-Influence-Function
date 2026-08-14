@@ -1,13 +1,15 @@
 """
 Train-annotation viewer API.
 
-Serves / edits a compact graphsignal JSONL (input_ids + attention_edges + annotations).
-Default data file: go_single_train_v2_graphsignal_10k_compact.json.bak at repo root.
+Browse a compact graphsignal JSONL (input_ids + attention_edges + annotations).
+Edits (add/delete edges) never rewrite the source file — they upsert into a
+separate continue-train JSONL (ANNOTATION_CONTINUE_TRAIN_DATA).
 
 Run:
   cd tools/annotation-viewer
   pip install -r server/requirements.txt
-  python -m server.main --data ../../go_single_train_v2_graphsignal_10k_compact.json.bak
+  python -m server.main --data ../../smoke_train_data.jsonl \\
+    --continue-data ../../continue_annotated_subset.jsonl
 
 Optional ALTI saliency (needs GPU + model weights):
   python -m server.main --data ... --model ../../../code-corr-annotation/models/Qwen2.5-Coder-7B-Instruct
@@ -32,8 +34,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VIEWER_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_dotenv(path: Path) -> None:
-    """Minimal .env loader (KEY=VALUE); does not override existing env vars."""
+def _load_dotenv(path: Path, *, override: bool = False) -> None:
+    """Minimal .env loader (KEY=VALUE)."""
     if not path.is_file():
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -43,27 +45,55 @@ def _load_dotenv(path: Path) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if not key:
+            continue
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = value
 
 
-_load_dotenv(VIEWER_ROOT / ".env")
+# Prefer repo-root eif_api.env (shared with ttav_bundle_api); local .env is deprecated.
+_load_dotenv(REPO_ROOT / "eif_api.env", override=True)
+_load_dotenv(REPO_ROOT / ".env", override=False)
+_load_dotenv(VIEWER_ROOT / ".env", override=False)
+
+
+def _resolve_env_path(raw: str) -> Path:
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    for root in (REPO_ROOT, VIEWER_ROOT, Path.cwd()):
+        cand = (root / p).resolve()
+        if cand.exists():
+            return cand
+    return (REPO_ROOT / p).resolve()
 
 
 def _default_data_path() -> Path:
     raw = (os.environ.get("ANNOTATION_TRAIN_DATA") or "").strip()
     if not raw:
+        # Fall back to bank train if compact path not set.
+        raw = (os.environ.get("EIF_TRAIN_DATA") or "").strip()
+    if not raw:
         raise SystemExit(
             "ANNOTATION_TRAIN_DATA is not set. "
-            "Put it in tools/annotation-viewer/.env or pass --data."
+            "Put it in repo-root eif_api.env (or pass --data)."
         )
-    p = Path(raw).expanduser()
-    return p.resolve() if p.is_absolute() else (VIEWER_ROOT / p).resolve()
+    return _resolve_env_path(raw)
+
+
+def _default_continue_path() -> Path | None:
+    """Writable small annotated subset used by continue-train (never the full bank)."""
+    raw = (os.environ.get("ANNOTATION_CONTINUE_TRAIN_DATA") or "").strip()
+    if not raw:
+        return None
+    return _resolve_env_path(raw)
 
 
 DEFAULT_DATA = _default_data_path()
-# Decode-only tokenizer. Empty means "must pass --tokenizer" unless env is set.
-_TOKENIZER_RAW = (os.environ.get("ANNOTATION_TOKENIZER") or "").strip()
+DEFAULT_CONTINUE = _default_continue_path()
+# Tokenizer/decode: use base model path (no separate ANNOTATION_TOKENIZER).
+_TOKENIZER_RAW = (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
 DEFAULT_TOKENIZER = Path(_TOKENIZER_RAW).expanduser() if _TOKENIZER_RAW else Path()
 
 SUBTYPES = [
@@ -89,6 +119,10 @@ app.add_middleware(
 _state_lock = threading.RLock()
 _data_path: Path | None = None
 _offsets: list[int] = []  # byte offset of each non-empty line; last sentinel = file size
+# Writable continue-train subset (add/delete upsert here; source stays read-only).
+_continue_path: Path | None = None
+_continue_offsets: list[int] = []
+_continue_key_to_idx: dict[str, int] = {}
 _tokenizer = None
 _tokenizer_path: str | None = None
 _model = None
@@ -142,6 +176,7 @@ def _build_offsets(path: Path) -> list[int]:
 
 
 def _read_sample(idx: int) -> dict[str, Any]:
+    """Read raw row from the source (read-only) JSONL by 0-based index."""
     assert _data_path is not None
     if idx < 0 or idx >= len(_offsets) - 1:
         raise HTTPException(404, f"sample index {idx} out of range")
@@ -151,19 +186,67 @@ def _read_sample(idx: int) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
-def _rewrite_sample(idx: int, obj: dict[str, Any]) -> None:
-    """Replace one JSONL line via temp file, then rebuild offsets."""
-    global _offsets
-    assert _data_path is not None
-    if idx < 0 or idx >= len(_offsets) - 1:
+def _sample_key(obj: dict[str, Any], source_idx: int | None = None) -> str:
+    """Stable identity for upsert into the continue subset."""
+    uid = obj.get("uid")
+    if isinstance(uid, str) and uid.strip():
+        return f"uid:{uid.strip()}"
+    raw_id = obj.get("raw_id")
+    if isinstance(raw_id, str) and raw_id.strip():
+        return f"raw_id:{raw_id.strip()}"
+    stamped = obj.get("source_train_index")
+    if isinstance(stamped, int) and stamped >= 0:
+        return f"source_idx:{stamped}"
+    if source_idx is not None and source_idx >= 0:
+        return f"source_idx:{source_idx}"
+    # Last resort: content fingerprint (stable enough for interactive edits).
+    ids = obj.get("input_ids") or []
+    return f"ids:{len(ids)}:{hash(tuple(int(x) for x in ids[:64]))}"
+
+
+def _rebuild_continue_index() -> None:
+    global _continue_offsets, _continue_key_to_idx
+    _continue_key_to_idx = {}
+    if _continue_path is None or not _continue_path.is_file():
+        _continue_offsets = []
+        return
+    _continue_offsets = _build_offsets(_continue_path)
+    n = max(0, len(_continue_offsets) - 1)
+    with _continue_path.open("rb") as f:
+        for i in range(n):
+            f.seek(_continue_offsets[i])
+            raw = f.readline()
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            key = _sample_key(obj)
+            _continue_key_to_idx[key] = i
+
+
+def _read_continue_by_idx(idx: int) -> dict[str, Any]:
+    assert _continue_path is not None
+    if idx < 0 or idx >= len(_continue_offsets) - 1:
+        raise HTTPException(404, f"continue sample index {idx} out of range")
+    with _continue_path.open("rb") as f:
+        f.seek(_continue_offsets[idx])
+        raw = f.readline()
+    return json.loads(raw.decode("utf-8"))
+
+
+def _rewrite_jsonl_line(path: Path, offsets: list[int], idx: int, obj: dict[str, Any]) -> list[int]:
+    """Replace one JSONL line via temp file; return rebuilt offsets."""
+    if idx < 0 or idx >= len(offsets) - 1:
         raise HTTPException(404, f"sample index {idx} out of range")
 
-    start = _offsets[idx]
-    end = _offsets[idx + 1]
+    start = offsets[idx]
+    end = offsets[idx + 1]
     new_line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-    tmp = _data_path.with_name(_data_path.name + f".{os.getpid()}.tmp")
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
 
-    with _data_path.open("rb") as src, tmp.open("wb") as dst:
+    with path.open("rb") as src, tmp.open("wb") as dst:
         if start:
             dst.write(src.read(start))
         src.seek(end)
@@ -171,22 +254,89 @@ def _rewrite_sample(idx: int, obj: dict[str, Any]) -> None:
         dst.write(src.read())
 
     try:
-        os.replace(tmp, _data_path)
+        os.replace(tmp, path)
     except PermissionError:
-        # Windows: destination may be briefly locked (IDE preview etc.).
-        # Fall back to truncating overwrite (still durable enough for interactive edits).
         import shutil
 
-        with tmp.open("rb") as src, _data_path.open("wb") as dst:
+        with tmp.open("rb") as src, path.open("wb") as dst:
             shutil.copyfileobj(src, dst)
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
 
-    _offsets = _build_offsets(_data_path)
-    _saliency_cache.clear()
+    return _build_offsets(path)
 
+
+def _append_jsonl_line(path: Path, obj: dict[str, Any]) -> list[int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    with path.open("ab") as f:
+        f.write(line)
+    return _build_offsets(path)
+
+
+def _ensure_continue_path() -> Path:
+    if _continue_path is None:
+        raise HTTPException(
+            400,
+            "No continue-train dataset configured. Set ANNOTATION_CONTINUE_TRAIN_DATA "
+            "in repo-root eif_api.env (or pass --continue-data). "
+            "Edits no longer write back to the source train JSONL.",
+        )
+    return _continue_path
+
+
+def _lookup_continue(source_idx: int, source_obj: dict[str, Any]) -> tuple[str, int | None]:
+    key = _sample_key(source_obj, source_idx)
+    return key, _continue_key_to_idx.get(key)
+
+
+def _effective_sample(idx: int) -> tuple[dict[str, Any], bool, str]:
+    """Source row overlaid with continue-train edit if present.
+
+    Returns (obj, from_continue, sample_key).
+    """
+    source = _read_sample(idx)
+    key, cont_idx = _lookup_continue(idx, source)
+    if cont_idx is None:
+        return source, False, key
+    overlay = _read_continue_by_idx(cont_idx)
+    # Prefer continue annotations; keep source fields if continue omitted them.
+    merged = dict(source)
+    merged.update(overlay)
+    return merged, True, key
+
+
+def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
+    """Write edited sample into the continue subset (insert or replace by key)."""
+    global _continue_offsets
+    path = _ensure_continue_path()
+    obj = dict(obj)
+    obj["source_train_index"] = int(source_idx)
+    if _data_path is not None:
+        obj["source_train_path"] = str(_data_path)
+    key = _sample_key(obj, source_idx)
+    existing = _continue_key_to_idx.get(key)
+
+    if existing is None:
+        _continue_offsets = _append_jsonl_line(path, obj)
+        _continue_key_to_idx[key] = max(0, len(_continue_offsets) - 2)
+        action = "inserted"
+    else:
+        _continue_offsets = _rewrite_jsonl_line(path, _continue_offsets, existing, obj)
+        # Offsets changed; rebuild key map (line order preserved).
+        _rebuild_continue_index()
+        action = "updated"
+
+    _saliency_cache.clear()
+    return {
+        "ok": True,
+        "action": action,
+        "key": key,
+        "continue_path": str(path),
+        "n_continue": max(0, len(_continue_offsets) - 1),
+    }
 
 def _resolve_tokenizer_path() -> str:
     if _tokenizer_path:
@@ -208,8 +358,8 @@ def _get_tokenizer():
     if not path or not Path(path).exists():
         raise HTTPException(
             500,
-            "Tokenizer path not found. Set ANNOTATION_TOKENIZER in "
-            "tools/annotation-viewer/.env or pass --tokenizer <path>.",
+            "Tokenizer path not found. Set EIF_BASE_MODEL_PATH in "
+            "repo-root eif_api.env or pass --tokenizer <path>.",
         )
     _tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     return _tokenizer
@@ -314,6 +464,9 @@ def health():
         "ok": True,
         "data_path": str(_data_path) if _data_path else None,
         "n_samples": max(0, len(_offsets) - 1) if _offsets else 0,
+        "continue_path": str(_continue_path) if _continue_path else None,
+        "n_continue": max(0, len(_continue_offsets) - 1) if _continue_offsets else 0,
+        "write_mode": "continue_upsert",
         "subtypes": SUBTYPES,
         "tokenizer_path": tok_path,
         "tokenizer_ready": _tokenizer is not None,
@@ -371,6 +524,14 @@ def list_samples(q: str = "", offset: int = 0, limit: int = 50):
                 matched_before_offset += 1
                 continue
             n_edges = len(obj.get("attention_edges") or [])
+            key = _sample_key(obj, i)
+            in_continue = key in _continue_key_to_idx
+            if in_continue:
+                try:
+                    cont = _read_continue_by_idx(_continue_key_to_idx[key])
+                    n_edges = len(cont.get("attention_edges") or [])
+                except HTTPException:
+                    pass
             items.append(
                 {
                     "index": i,
@@ -379,6 +540,7 @@ def list_samples(q: str = "", offset: int = 0, limit: int = 50):
                     "raw_id": raw_id,
                     "length": int(obj.get("length") or len(obj.get("input_ids") or [])),
                     "n_edges": n_edges,
+                    "in_continue": in_continue,
                 }
             )
             scanned += 1
@@ -392,7 +554,7 @@ def get_sample(idx: int):
     if _data_path is None:
         raise HTTPException(400, "No data file open.")
     with _state_lock:
-        obj = _read_sample(idx)
+        obj, from_continue, key = _effective_sample(idx)
     input_ids = [int(x) for x in (obj.get("input_ids") or [])]
     labels = [int(x) for x in (obj.get("label") or [])]
     tokens = _surface_tokens_from_obj(obj, input_ids)
@@ -420,6 +582,9 @@ def get_sample(idx: int):
         "attention_edges": edges,
         "annotation_meta": obj.get("annotation_meta") or {},
         "subtypes": SUBTYPES,
+        "in_continue": from_continue,
+        "sample_key": key,
+        "continue_path": str(_continue_path) if _continue_path else None,
     }
 
 
@@ -509,7 +674,7 @@ def delete_edge(idx: int, body: DeleteEdgeBody):
         raise HTTPException(400, "No data file open.")
 
     with _state_lock:
-        obj = _read_sample(idx)
+        obj, _, _ = _effective_sample(idx)
         edges = list(obj.get("attention_edges") or [])
         before = len(edges)
         edges = [
@@ -539,9 +704,9 @@ def delete_edge(idx: int, body: DeleteEdgeBody):
             )
         ]
         _sync_meta(obj)
-        _rewrite_sample(idx, obj)
+        persist = _upsert_continue(idx, obj)
 
-    return {"ok": True, "n_edges": len(edges)}
+    return {"ok": True, "n_edges": len(edges), **persist}
 
 
 @app.post("/api/sample/{idx}/edges/add")
@@ -554,7 +719,7 @@ def add_edge(idx: int, body: AddEdgeBody):
         raise HTTPException(400, "No data file open.")
 
     with _state_lock:
-        obj = _read_sample(idx)
+        obj, _, _ = _effective_sample(idx)
         n = len(obj.get("input_ids") or [])
         if not (0 <= body.src < n and 0 <= body.dst < n):
             raise HTTPException(400, f"src/dst out of range 0..{n-1}")
@@ -583,10 +748,9 @@ def add_edge(idx: int, body: AddEdgeBody):
         )
         obj["annotations"] = anns
         _sync_meta(obj)
-        _rewrite_sample(idx, obj)
+        persist = _upsert_continue(idx, obj)
 
-    return {"ok": True, "n_edges": len(edges), "edge": body.model_dump()}
-
+    return {"ok": True, "n_edges": len(edges), "edge": body.model_dump(), **persist}
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train annotation viewer server")
@@ -594,7 +758,16 @@ def main(argv: list[str] | None = None) -> None:
         "--data",
         type=str,
         default=str(DEFAULT_DATA),
-        help="Path to annotated train JSONL (.bak ok)",
+        help="Source train JSONL (read-only browse). Default: ANNOTATION_TRAIN_DATA",
+    )
+    parser.add_argument(
+        "--continue-data",
+        type=str,
+        default=str(DEFAULT_CONTINUE) if DEFAULT_CONTINUE else "",
+        help=(
+            "Writable continue-train subset JSONL for add/delete upserts. "
+            "Default: ANNOTATION_CONTINUE_TRAIN_DATA from eif_api.env"
+        ),
     )
     parser.add_argument(
         "--tokenizer",
@@ -602,7 +775,7 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help=(
             "Tokenizer-only path for decoding input_ids (no GPU / no live saliency). "
-            "Default: ANNOTATION_TOKENIZER from .env"
+            "Default: EIF_BASE_MODEL_PATH from eif_api.env"
         ),
     )
     parser.add_argument(
@@ -622,16 +795,47 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
 
-    global _data_path, _offsets, _model_path, _tokenizer_path, _saliency_cache_dir
-    print(f"Data from .env/CLI: {args.data}", flush=True)
+    global _data_path, _offsets, _continue_path, _continue_offsets, _continue_key_to_idx
+    global _model_path, _tokenizer_path, _saliency_cache_dir
+    print(f"Source data (.env/CLI): {args.data}", flush=True)
     data = Path(args.data).expanduser().resolve()
     if not data.exists():
         print(f"[WARN] data file not found yet: {data}", flush=True)
     else:
         _data_path = data
-        print(f"Indexing {data} ...", flush=True)
+        print(f"Indexing source {data} ...", flush=True)
         _offsets = _build_offsets(data)
-        print(f"  {len(_offsets) - 1} samples", flush=True)
+        print(f"  {len(_offsets) - 1} samples (read-only)", flush=True)
+
+    cont_raw = (args.continue_data or "").strip()
+    if cont_raw:
+        _continue_path = Path(cont_raw).expanduser().resolve()
+        if _data_path is not None and _continue_path.resolve() == _data_path.resolve():
+            raise SystemExit(
+                "continue-data must differ from source --data. "
+                "Edits must go to a separate small JSONL."
+            )
+        if _continue_path.is_file():
+            print(f"Indexing continue-train {_continue_path} ...", flush=True)
+            _rebuild_continue_index()
+            print(
+                f"  {max(0, len(_continue_offsets) - 1)} samples "
+                f"({len(_continue_key_to_idx)} keys)",
+                flush=True,
+            )
+        else:
+            print(
+                f"Continue-train file will be created on first edit: {_continue_path}",
+                flush=True,
+            )
+            _continue_offsets = []
+            _continue_key_to_idx.clear()
+    else:
+        print(
+            "[WARN] No --continue-data / ANNOTATION_CONTINUE_TRAIN_DATA. "
+            "Browse works; add/delete will refuse until configured.",
+            flush=True,
+        )
 
     if args.saliency_cache:
         _saliency_cache_dir = Path(args.saliency_cache).expanduser().resolve()
@@ -648,14 +852,14 @@ def main(argv: list[str] | None = None) -> None:
     elif not args.tokenizer:
         if _TOKENIZER_RAW and DEFAULT_TOKENIZER.expanduser().exists():
             print(
-                f"Tokenizer from .env: {DEFAULT_TOKENIZER.expanduser().resolve()} "
+                f"Tokenizer from EIF_BASE_MODEL_PATH: {DEFAULT_TOKENIZER.expanduser().resolve()} "
                 f"(live saliency {'disk_cache' if _saliency_cache_dir else 'off'})",
                 flush=True,
             )
         else:
             print(
                 "[WARN] No tokenizer configured. "
-                "Set ANNOTATION_TOKENIZER in .env or pass --tokenizer <path>.",
+                "Set EIF_BASE_MODEL_PATH in eif_api.env or pass --tokenizer <path>.",
                 flush=True,
             )
 

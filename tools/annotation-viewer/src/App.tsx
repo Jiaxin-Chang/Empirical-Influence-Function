@@ -22,6 +22,8 @@ function displayToken(tok: string): string {
 
 export default function App() {
   const [dataPath, setDataPath] = useState(DEFAULT_DATA)
+  const [continuePath, setContinuePath] = useState<string | null>(null)
+  const [nContinue, setNContinue] = useState(0)
   const [nSamples, setNSamples] = useState(0)
   const [query, setQuery] = useState('')
   const [list, setList] = useState<SampleSummary[]>([])
@@ -60,6 +62,8 @@ export default function App() {
       await refreshList(query, 0, false)
       const h = await api.health()
       setSaliencyAvailable(h.saliency_available)
+      setContinuePath(h.continue_path)
+      setNContinue(h.n_continue ?? 0)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -91,7 +95,10 @@ export default function App() {
               ? '（该 target 无标注边，请点其它 token，例如有边的 Type 等）'
               : '')
           : ` · ${detail.attention_edges.length} edges`
-      setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}`)
+      const contNote = detail.in_continue
+        ? ' · 已在续训小集（展示覆盖后的标注）'
+        : ' · 源集只读（编辑会写入续训小集）'
+      setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}${contNote}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -104,11 +111,16 @@ export default function App() {
       try {
         const h = await api.health()
         setSaliencyAvailable(h.saliency_available)
+        setContinuePath(h.continue_path)
+        setNContinue(h.n_continue ?? 0)
         if (h.data_path) {
           setDataPath(h.data_path)
           setNSamples(h.n_samples)
           setStatus(
-            `服务已加载 ${h.data_path}（${h.n_samples} 条）` +
+            `源集 ${h.data_path}（${h.n_samples} 条，只读）` +
+              (h.continue_path
+                ? ` · 续训小集 ${h.continue_path}（${h.n_continue} 条）`
+                : ' · 未配置续训小集（无法保存编辑）') +
               (h.saliency_available
                 ? ' · saliency 已启用'
                 : ' · 仅展示 annotation（未开 saliency）'),
@@ -174,9 +186,16 @@ export default function App() {
       try {
         await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
         setAddSrc(null)
+        const h = await api.health()
+        setNContinue(h.n_continue ?? 0)
+        setContinuePath(h.continue_path)
         await loadSample(selectedIdx)
+        await refreshList(query, 0, false)
         setTarget(i)
-        setStatus(`已添加 ${addSubtype}: ${addSrc} → ${i}`)
+        setStatus(
+          `已添加 ${addSubtype}: ${addSrc} → ${i} → 续训小集` +
+            (h.continue_path ? `（${h.n_continue} 条）` : ''),
+        )
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
       } finally {
@@ -219,9 +238,16 @@ export default function App() {
     try {
       await api.deleteEdge(selectedIdx, edge)
       setPendingEdge(null)
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
       await loadSample(selectedIdx)
+      await refreshList(query, 0, false)
       setTarget(edge.dst)
-      setStatus(`已删除 ${edge.subtype}: ${edge.src} → ${edge.dst}`)
+      setStatus(
+        `已删除 ${edge.subtype}: ${edge.src} → ${edge.dst} → 续训小集` +
+          (h.continue_path ? `（${h.n_continue} 条）` : ''),
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -246,8 +272,8 @@ export default function App() {
       <header className="header">
         <h1>Train Annotation Viewer</h1>
         <p>
-          加载带标注的 train JSONL，点 target token 看 top-6 saliency（蓝底）与相关 annotation（彩色下划线）。
-          可删除 / 新增标注并写回原文件。
+          浏览源 train JSONL（只读）。新增 / 删除标注会 upsert 到续训小集
+          （ANNOTATION_CONTINUE_TRAIN_DATA），不写回原文件。
         </p>
       </header>
 
@@ -263,6 +289,11 @@ export default function App() {
         <button type="button" onClick={openData} disabled={busy}>
           打开 / 刷新
         </button>
+        {continuePath && (
+          <span className="hint" title={continuePath} style={{ maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            续训小集 · {nContinue} 条
+          </span>
+        )}
         <label>
           搜索 uid
           <input
@@ -331,7 +362,10 @@ export default function App() {
                 className={`sampleItem ${selectedIdx === item.index ? 'active' : ''}`}
                 onClick={() => void loadSample(item.index)}
               >
-                <div className="uid">#{item.index} {item.uid}</div>
+                <div className="uid">
+                  #{item.index} {item.uid}
+                  {item.in_continue ? ' · 续训' : ''}
+                </div>
                 <div className="meta">
                   {item.language} · len={item.length} · edges={item.n_edges}
                 </div>

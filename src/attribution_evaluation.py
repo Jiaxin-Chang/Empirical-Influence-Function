@@ -34,6 +34,7 @@ from src.intervention_experiment import (
     lm_head_filter,
     load_model_and_tokenizer,
     load_samples,
+    load_train_samples,
     _gather_scores,
     _is_cuda_alloc_error,
     _load_or_build_prescreen_sketch_cache,
@@ -2233,7 +2234,7 @@ def main(argv: list[str] | None = None) -> None:
 
     train_samples = []
     if not args.skip_data:
-        train_samples = load_samples(args.train_data)
+        train_samples = load_train_samples(args.train_data)
     test_samples = load_samples(args.test_data)
     if args.train_limit is not None and train_samples:
         train_samples = train_samples[: int(args.train_limit)]
@@ -2396,7 +2397,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.skip_data:
         print("[eval] building train dataset...", flush=True)
-        train_ds = build_train_dataset(train_samples, convert_to_chatml)
+        train_ds = build_train_dataset(train_samples)
         train_loader = torch.utils.data.DataLoader(
             DatasetWrapper(train_ds),
             batch_size=max(1, int(args.prescreen_batch_size)),
