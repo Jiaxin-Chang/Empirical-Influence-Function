@@ -815,21 +815,20 @@ def main(argv: list[str] | None = None) -> None:
                 "continue-data must differ from source --data. "
                 "Edits must go to a separate small JSONL."
             )
-        if _continue_path.is_file():
-            print(f"Indexing continue-train {_continue_path} ...", flush=True)
-            _rebuild_continue_index()
+        if not _continue_path.is_file():
+            _continue_path.parent.mkdir(parents=True, exist_ok=True)
+            _continue_path.write_text("", encoding="utf-8")
             print(
-                f"  {max(0, len(_continue_offsets) - 1)} samples "
-                f"({len(_continue_key_to_idx)} keys)",
+                f"Created empty continue-train JSONL: {_continue_path}",
                 flush=True,
             )
-        else:
-            print(
-                f"Continue-train file will be created on first edit: {_continue_path}",
-                flush=True,
-            )
-            _continue_offsets = []
-            _continue_key_to_idx.clear()
+        print(f"Indexing continue-train {_continue_path} ...", flush=True)
+        _rebuild_continue_index()
+        print(
+            f"  {max(0, len(_continue_offsets) - 1)} samples "
+            f"({len(_continue_key_to_idx)} keys)",
+            flush=True,
+        )
     else:
         print(
             "[WARN] No --continue-data / ANNOTATION_CONTINUE_TRAIN_DATA. "

@@ -11,6 +11,7 @@ EIF_BASE_MODEL_PATH=/path/to/Qwen3-8B
 ```
 
 - 源集只读浏览；增删标注 upsert 到 `ANNOTATION_CONTINUE_TRAIN_DATA`
+- 启动后端时若 `ANNOTATION_CONTINUE_TRAIN_DATA` 路径尚无文件，会自动新建空 `.jsonl`
 - Tokenizer 用 `EIF_BASE_MODEL_PATH`（无需 `ANNOTATION_TOKENIZER`）
 - 续训小集与 `python -m src.continue_train_eval` / 报告页「续训(小集)」共用同一路径
 
