@@ -1783,17 +1783,19 @@ function PairCard({
 
             {expanded && (
                 <div className={styles.pairCardBody}>
-                    <div className={styles.contextRow}>
-                        <div>
-                            <div className={styles.contextRowLabel}>Source Context</div>
-                            <ContextChip tokens={pair.train_context.source_context} />
+                    {pair.retrieval !== 'structural_ast' && (
+                        <div className={styles.contextRow}>
+                            <div>
+                                <div className={styles.contextRowLabel}>Source Context</div>
+                                <ContextChip tokens={pair.train_context.source_context} />
+                            </div>
+                            <div className={styles.contextDivider} />
+                            <div>
+                                <div className={styles.contextRowLabel}>Target Context</div>
+                                <ContextChip tokens={pair.train_context.target_context} />
+                            </div>
                         </div>
-                        <div className={styles.contextDivider} />
-                        <div>
-                            <div className={styles.contextRowLabel}>Target Context</div>
-                            <ContextChip tokens={pair.train_context.target_context} />
-                        </div>
-                    </div>
+                    )}
                     {detail && (
                         <TrainSampleViewer
                             detail={detail}
