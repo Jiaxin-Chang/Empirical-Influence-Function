@@ -53,17 +53,18 @@ def build_contribution_matrix(
     dtype = last_hidden_in.dtype
 
     head_dim = getattr(self_attn, "head_dim", None) or (
-        self_attn.q_proj.weight.shape[0] // H
+        getattr(self_attn.q_proj, "base_layer", self_attn.q_proj).weight.shape[0] // H
     ) 
-    v_out = self_attn.v_proj.weight.shape[0]
+    v_base = getattr(self_attn.v_proj, "base_layer", self_attn.v_proj)
+    v_out = v_base.weight.shape[0]
     num_kv_heads = v_out // head_dim
     assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
     n_rep = H // num_kv_heads
 
     gamma = layer.input_layernorm.weight.to(device).float()           # [D]
     gamma_x = last_hidden_in.float() * gamma                          # [B, T, D]
-    v_w = self_attn.v_proj.weight.to(device).float()                  # [num_kv_heads*head_dim, D]
-    v_b = self_attn.v_proj.bias
+    v_w = v_base.weight.to(device).float()                  # [num_kv_heads*head_dim, D]
+    v_b = getattr(v_base, "bias", None)
     v_proj = gamma_x @ v_w.t()                                        # [B, T, num_kv_heads*head_dim]
     if v_b is not None:
         v_proj = v_proj + v_b.to(device).float()
@@ -75,7 +76,8 @@ def build_contribution_matrix(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device).float()    
+    o_base = getattr(self_attn.o_proj, "base_layer", self_attn.o_proj)
+    o_w = o_base.weight.to(device).float()    
     o_w_by_head = o_w.view(D, H, head_dim)
     transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 
@@ -438,17 +440,18 @@ def build_contribution_rows(
     dtype = last_hidden_in.dtype
 
     head_dim = getattr(self_attn, "head_dim", None) or (
-        self_attn.q_proj.weight.shape[0] // H
+        getattr(self_attn.q_proj, "base_layer", self_attn.q_proj).weight.shape[0] // H
     )
-    v_out = self_attn.v_proj.weight.shape[0]
+    v_base = getattr(self_attn.v_proj, "base_layer", self_attn.v_proj)
+    v_out = v_base.weight.shape[0]
     num_kv_heads = v_out // head_dim
     assert H % num_kv_heads == 0, f"H={H} not divisible by num_kv_heads={num_kv_heads}"
     n_rep = H // num_kv_heads
 
     gamma = layer.input_layernorm.weight.to(device).float()
     gamma_x = last_hidden_in.float() * gamma
-    v_w = self_attn.v_proj.weight.to(device).float()
-    v_b = self_attn.v_proj.bias
+    v_w = v_base.weight.to(device).float()
+    v_b = getattr(v_base, "bias", None)
     v_proj = gamma_x @ v_w.t()
     if v_b is not None:
         v_proj = v_proj + v_b.to(device).float()
@@ -460,7 +463,8 @@ def build_contribution_rows(
             .reshape(B, H, T, head_dim)
         )
 
-    o_w = self_attn.o_proj.weight.to(device).float()
+    o_base = getattr(self_attn.o_proj, "base_layer", self_attn.o_proj)
+    o_w = o_base.weight.to(device).float()
     o_w_by_head = o_w.view(D, H, head_dim)
     transformed = torch.einsum("bhsd,ohd->bhso", v_states, o_w_by_head)
 

@@ -1344,6 +1344,27 @@ def prepare_last_layer_grad_checkpointing(model) -> None:
             m.eval()
 
 
+def _peft_linear_forward(linear, x: Tensor) -> Tensor:
+    """Call a (possibly PEFT) Linear without bf16/float32 matmul mismatch.
+
+    PEFT adapters often stay float32 while base Qwen weights are bf16. Casting
+    the activation to the adapter dtype (or base dtype when no adapter) avoids
+    ``mat1 BFloat16 != float``.
+    """
+    base = getattr(linear, "base_layer", linear)
+    lora_A = getattr(linear, "lora_A", None)
+    if lora_A is not None:
+        # lora_A may be ModuleDict (per-adapter) or a single Linear.
+        try:
+            first = next(lora_A.parameters())
+            x_in = x.to(dtype=first.dtype)
+            out = linear(x_in)
+            return out.to(dtype=x.dtype)
+        except StopIteration:
+            pass
+    return linear(x.to(dtype=base.weight.dtype))
+
+
 def _recompute_layer_attn_probs(model, hid_in: Tensor, layer_index: int = -1) -> Tensor:
     """Recompute one decoder layer's attention probs from that layer's input.
 
@@ -1384,8 +1405,10 @@ def _recompute_layer_attn_probs(model, hid_in: Tensor, layer_index: int = -1) ->
     normed = layer.input_layernorm(hid_in)
     head_dim = attn.head_dim
     hidden_shape = (B, T, -1, head_dim)
-    query_states = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
-    key_states = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
+    q_out = _peft_linear_forward(attn.q_proj, normed)
+    k_out = _peft_linear_forward(attn.k_proj, normed)
+    query_states = attn.q_norm(q_out.view(hidden_shape)).transpose(1, 2)
+    key_states = attn.k_norm(k_out.view(hidden_shape)).transpose(1, 2)
 
     position_ids = torch.arange(T, device=device, dtype=torch.long).unsqueeze(0)
     if hasattr(decoder, "rotary_emb"):

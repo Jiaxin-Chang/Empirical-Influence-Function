@@ -399,6 +399,23 @@ def _patch_model_with_attn_hook(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _cast_lora_params_to_dtype(model, dtype: torch.dtype) -> int:
+    """Cast PEFT LoRA tensors to match base (adapters often load as float32).
+
+    Calling bf16 activations into float32 ``lora_A`` raises
+    ``mat1 BFloat16 != float`` during last-layer ALTI recompute / Stage3.
+    """
+    n = 0
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        if not p.is_floating_point() or p.dtype == dtype:
+            continue
+        p.data = p.data.to(dtype)
+        n += 1
+    return n
+
+
 def load_model_and_tokenizer(
     model_path: str | None = None,
     attn_implementation: str = "eager",
@@ -458,6 +475,9 @@ def load_model_and_tokenizer(
             os.path.abspath(model_path),
             local_files_only=True,
         )
+        n_cast = _cast_lora_params_to_dtype(model, torch.bfloat16)
+        if n_cast:
+            print(f"  Aligned {n_cast} LoRA tensors to bfloat16", flush=True)
         # Only LoRA params participate in attribution grads (matches viz).
         for n, p in model.named_parameters():
             p.requires_grad = ("lora_" in n)
