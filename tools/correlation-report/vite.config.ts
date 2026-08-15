@@ -1,6 +1,6 @@
 import react from '@vitejs/plugin-react-swc'
 import { defineConfig, type Plugin } from 'vite'
-import { readdirSync, existsSync, readFileSync } from 'fs'
+import { readdirSync, existsSync, readFileSync, statSync } from 'fs'
 import { resolve, join } from 'path'
 import type { IncomingMessage, ServerResponse } from 'http'
 
@@ -9,11 +9,38 @@ const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
-// Prefer explicit env, then the smoke file that lives in this repo, then the
-// older oversample name used on some machines.
+
+/** Lightweight parse of repo-root eif_api.env (no dependency on dotenv). */
+function readEifApiEnv(): Record<string, string> {
+  const envPath = resolve(DATA_ROOT, 'eif_api.env')
+  if (!existsSync(envPath)) return {}
+  const out: Record<string, string> = {}
+  for (const raw of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || !line.includes('=')) continue
+    const i = line.indexOf('=')
+    const key = line.slice(0, i).trim()
+    const value = line.slice(i + 1).trim().replace(/^['"]|['"]$/g, '')
+    if (key) out[key] = value
+  }
+  return out
+}
+
+const EIF_ENV = readEifApiEnv()
+
+// Prefer continue-train subset (annotation-viewer writes here), then source train.
+// Env: TRAIN_GT_JSONL / VITE_TRAIN_GT_JSONL, or ANNOTATION_* from eif_api.env.
 const TRAIN_GT_EDGES_JSONL = (() => {
-  const fromEnv = process.env.TRAIN_GT_JSONL || process.env.VITE_TRAIN_GT_JSONL
-  if (fromEnv) return resolve(DATA_ROOT, fromEnv)
+  const fromEnv =
+    process.env.TRAIN_GT_JSONL ||
+    process.env.VITE_TRAIN_GT_JSONL ||
+    process.env.ANNOTATION_TRAIN_DATA ||
+    EIF_ENV.ANNOTATION_TRAIN_DATA ||
+    EIF_ENV.EIF_TRAIN_DATA
+  if (fromEnv) {
+    if (fromEnv.startsWith('/') || /^[A-Za-z]:[\\/]/.test(fromEnv)) return fromEnv
+    return resolve(DATA_ROOT, fromEnv)
+  }
   const candidates = [
     resolve(DATA_ROOT, 'smoke_train_data.jsonl'),
     resolve(DATA_ROOT, 'smoke_train_data_oversample_llm.jsonl'),
@@ -21,18 +48,62 @@ const TRAIN_GT_EDGES_JSONL = (() => {
   return candidates.find(existsSync) ?? candidates[0]
 })()
 
+const CONTINUE_GT_EDGES_JSONL = (() => {
+  const fromEnv =
+    process.env.ANNOTATION_CONTINUE_TRAIN_DATA ||
+    process.env.VITE_CONTINUE_GT_JSONL ||
+    process.env.CONTINUE_GT_JSONL ||
+    EIF_ENV.ANNOTATION_CONTINUE_TRAIN_DATA
+  if (fromEnv) {
+    if (fromEnv.startsWith('/') || /^[A-Za-z]:[\\/]/.test(fromEnv)) return fromEnv
+    return resolve(DATA_ROOT, fromEnv)
+  }
+  return resolve(DATA_ROOT, 'continue_annotated_subset.jsonl')
+})()
+
 /** targetIdx -> sourceIdx[] for each train sample id (line index in the jsonl). */
 type TrainGtEdges = Record<string, Record<string, number[]>>
 
-let trainGtEdgesCache: string | null | undefined
+let trainGtEdgesCache: { sig: string; payload: string | null } | undefined
+
+function _edgesFromRow(row: {
+  attention_edges?: { src?: unknown; dst?: unknown }[]
+  qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
+}): Record<string, number[]> {
+  const byTarget: Record<string, number[]> = {}
+  const edges = Array.isArray(row.attention_edges) && row.attention_edges.length > 0
+    ? row.attention_edges.map(e => ({ src: e.src, dst: e.dst }))
+    : (row.qwen_annotations ?? []).map(e => ({ src: e.token_i_idx, dst: e.token_j_idx }))
+  for (const edge of edges) {
+    const src = typeof edge.src === 'number' ? edge.src : null
+    const dst = typeof edge.dst === 'number' ? edge.dst : null
+    if (src === null || dst === null) continue
+    const key = String(dst)
+    if (!byTarget[key]) byTarget[key] = []
+    byTarget[key].push(src)
+  }
+  for (const key of Object.keys(byTarget)) {
+    byTarget[key] = [...new Set(byTarget[key])]
+  }
+  return byTarget
+}
 
 function buildTrainGtEdgesPayload(): string | null {
-  if (trainGtEdgesCache !== undefined) return trainGtEdgesCache
   if (!existsSync(TRAIN_GT_EDGES_JSONL)) {
     console.warn(`[train-gt-edges] missing ${TRAIN_GT_EDGES_JSONL} — red annotation underlines disabled`)
-    trainGtEdgesCache = null
     return null
   }
+  let sig = TRAIN_GT_EDGES_JSONL
+  try {
+    sig += `:${statSync(TRAIN_GT_EDGES_JSONL).mtimeMs}`
+    if (existsSync(CONTINUE_GT_EDGES_JSONL)) {
+      sig += `|${CONTINUE_GT_EDGES_JSONL}:${statSync(CONTINUE_GT_EDGES_JSONL).mtimeMs}`
+    }
+  } catch {
+    /* ignore */
+  }
+  if (trainGtEdgesCache?.sig === sig) return trainGtEdgesCache.payload
+
   try {
     const lines = readFileSync(TRAIN_GT_EDGES_JSONL, 'utf-8').split(/\r?\n/).filter(Boolean)
     const out: TrainGtEdges = {}
@@ -42,30 +113,42 @@ function buildTrainGtEdgesPayload(): string | null {
         attention_edges?: { src?: unknown; dst?: unknown }[]
         qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
       }
-      const byTarget: Record<string, number[]> = {}
-      const edges = Array.isArray(row.attention_edges) && row.attention_edges.length > 0
-        ? row.attention_edges.map(e => ({ src: e.src, dst: e.dst }))
-        : (row.qwen_annotations ?? []).map(e => ({ src: e.token_i_idx, dst: e.token_j_idx }))
-      for (const edge of edges) {
-        const src = typeof edge.src === 'number' ? edge.src : null
-        const dst = typeof edge.dst === 'number' ? edge.dst : null
-        if (src === null || dst === null) continue
-        const key = String(dst)
-        if (!byTarget[key]) byTarget[key] = []
-        byTarget[key].push(src)
-      }
-      // Dedup while preserving order
-      for (const key of Object.keys(byTarget)) {
-        byTarget[key] = [...new Set(byTarget[key])]
-      }
-      out[String(i)] = byTarget
+      out[String(i)] = _edgesFromRow(row)
     }
-    console.info(`[train-gt-edges] loaded ${Object.keys(out).length} samples from ${TRAIN_GT_EDGES_JSONL}`)
-    trainGtEdgesCache = JSON.stringify(out)
-    return trainGtEdgesCache
+
+    // Overlay annotation-viewer continue subset (edits never rewrite source JSONL).
+    if (existsSync(CONTINUE_GT_EDGES_JSONL)) {
+      const contLines = readFileSync(CONTINUE_GT_EDGES_JSONL, 'utf-8').split(/\r?\n/).filter(Boolean)
+      let overlaid = 0
+      for (const line of contLines) {
+        try {
+          const row = JSON.parse(line) as {
+            source_train_index?: unknown
+            attention_edges?: { src?: unknown; dst?: unknown }[]
+            qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
+          }
+          const idx = typeof row.source_train_index === 'number' ? row.source_train_index : null
+          if (idx === null || idx < 0 || idx > 4) continue
+          out[String(idx)] = _edgesFromRow(row)
+          overlaid += 1
+        } catch {
+          /* skip bad line */
+        }
+      }
+      console.info(
+        `[train-gt-edges] loaded ${Object.keys(out).length} samples from ${TRAIN_GT_EDGES_JSONL}` +
+          ` + overlay ${overlaid} from ${CONTINUE_GT_EDGES_JSONL}`,
+      )
+    } else {
+      console.info(`[train-gt-edges] loaded ${Object.keys(out).length} samples from ${TRAIN_GT_EDGES_JSONL}`)
+    }
+
+    const payload = JSON.stringify(out)
+    trainGtEdgesCache = { sig, payload }
+    return payload
   } catch (err) {
     console.warn('[train-gt-edges] failed to parse GT jsonl', err)
-    trainGtEdgesCache = null
+    trainGtEdgesCache = { sig, payload: null }
     return null
   }
 }

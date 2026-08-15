@@ -166,21 +166,27 @@ export default function App() {
     })()
   }, [refreshList, loadSample])
 
+  // Side panel: filter by selected target when set; otherwise list ALL edges
+  // (reopening used to look "empty" until you clicked the right target).
   const relatedEdges = useMemo(() => {
-    if (!sample || target == null) return [] as Edge[]
+    if (!sample) return [] as Edge[]
+    if (target == null) return sample.attention_edges
     return sample.attention_edges.filter(e => e.dst === target)
   }, [sample, target])
 
   const underlineMap = useMemo(() => {
-    // src -> subtypes that annotate the current target
+    // Always underline every saved annotation source (not only current target).
+    // Filtering by target made it look like edges "disappeared" after reopen /
+    // when the selected target was not the one just annotated.
     const map = new Map<number, string[]>()
-    for (const e of relatedEdges) {
+    if (!sample) return map
+    for (const e of sample.attention_edges) {
       const arr = map.get(e.src) || []
       if (!arr.includes(e.subtype)) arr.push(e.subtype)
       map.set(e.src, arr)
     }
     return map
-  }, [relatedEdges])
+  }, [sample])
 
   const saliencySet = useMemo(() => new Set(saliency.map(s => s.src)), [saliency])
 
@@ -201,17 +207,19 @@ export default function App() {
       setBusy(true)
       setError('')
       try {
-        await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
+        const added = await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
         setAddSrc(null)
         const h = await api.health()
         setNContinue(h.n_continue ?? 0)
         setContinuePath(h.continue_path)
-        await loadSample(selectedIdx)
+        // Reload with the new target selected so its underlines/list show immediately.
+        await loadSample(selectedIdx, i)
         await refreshList(query, 0, false)
-        setTarget(i)
+        const nEdges = typeof added?.n_edges === 'number' ? added.n_edges : undefined
         setStatus(
           `已添加 ${addSubtype}: ${addSrc} → ${i} → 续训小集` +
-            (h.continue_path ? `（${h.n_continue} 条）` : ''),
+            (h.continue_path ? `（${h.n_continue} 条样本）` : '') +
+            (nEdges != null ? ` · 该样本现有 ${nEdges} 条边` : ''),
         )
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -239,12 +247,15 @@ export default function App() {
   }
 
   const onUnderlinedClick = (e: MouseEvent, srcIdx: number) => {
-    if (mode !== 'inspect' || target == null) return
+    if (mode !== 'inspect' || !sample) return
     e.stopPropagation()
-    const edges = relatedEdges.filter(x => x.src === srcIdx)
-    if (edges.length >= 1) {
-      setPendingEdge(edges[0])
-    }
+    const all = sample.attention_edges.filter(x => x.src === srcIdx)
+    if (!all.length) return
+    // Prefer an edge into the current target when set; else first edge from this source.
+    const preferred =
+      target != null ? all.find(x => x.dst === target) ?? all[0] : all[0]
+    setPendingEdge(preferred)
+    if (target == null) setTarget(preferred.dst)
   }
 
   const deletePending = async () => {
@@ -467,7 +478,11 @@ export default function App() {
 
               <p className="hint">
                 {mode === 'inspect'
-                  ? `点击 token 设为 target。当前 target: ${target ?? '无'}（指向它的标注边: ${relatedEdges.length}）。${
+                  ? `点击 token 设为 target。${
+                      target == null
+                        ? `未选 target：显示全部 ${sample.attention_edges.length} 条标注边的 source 下划线。`
+                        : `当前 target @${target}：指向它的边 ${relatedEdges.length} 条（样本共 ${sample.attention_edges.length} 条）。`
+                    }${
                       saliencyAvailable ? '' : '（未启用模型 saliency，不影响看标注下划线）'
                     } ${saliencyMsg}`
                   : `添加模式：先点 source${addSrc != null ? `（已选 @${addSrc}）` : ''}，再点 target，类型=${addSubtype}`}
@@ -507,8 +522,8 @@ export default function App() {
                           style={underlineStyle(subs)}
                           title={titleParts.join(' · ')}
                           onClick={ev => {
-                            // 点击已下划线的 source：弹出删除，不切换 target
-                            if (subs.length && mode === 'inspect' && target != null && i !== target) {
+                            // 点击已下划线的 source：弹出删除（可先不选 target）
+                            if (subs.length && mode === 'inspect' && i !== target) {
                               onUnderlinedClick(ev, i)
                               return
                             }
@@ -524,10 +539,14 @@ export default function App() {
               </div>
 
               <div className="sideActions">
-                {target != null && (
+                {target != null ? (
                   <div className="card">
                     <h3>
-                      Target @{target} 的标注边（{relatedEdges.length}）
+                      Target @{target} 的标注边（{relatedEdges.length}
+                      {sample.attention_edges.length !== relatedEdges.length
+                        ? ` / 样本共 ${sample.attention_edges.length}`
+                        : ''}
+                      ）
                     </h3>
                     {!relatedEdges.length && <p className="hint">该 target 没有 annotation edge</p>}
                     {relatedEdges.map(e => (
@@ -545,6 +564,34 @@ export default function App() {
                           <code>{JSON.stringify(sample.tokens[e.src] ?? '')}</code>
                           {' → '}
                           dst @{e.dst}
+                        </span>
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() => setPendingEdge(e)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="card">
+                    <h3>全部标注边（{sample.attention_edges.length}）</h3>
+                    <p className="hint">点一个 token 作为 target 可筛选；下划线当前显示全部 source。</p>
+                    {sample.attention_edges.map(e => (
+                      <div className="edgeRow" key={`${e.src}-${e.dst}-${e.subtype}`}>
+                        <span
+                          style={{
+                            color: SUBTYPE_COLORS[e.subtype] || '#333',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {e.subtype}
+                        </span>
+                        <span>
+                          src @{e.src} → dst @{e.dst}{' '}
+                          <code>{JSON.stringify(sample.tokens[e.dst] ?? '')}</code>
                         </span>
                         <button
                           type="button"

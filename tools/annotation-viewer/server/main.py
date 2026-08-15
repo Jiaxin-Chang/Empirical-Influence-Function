@@ -188,20 +188,35 @@ def _read_sample(idx: int) -> dict[str, Any]:
 
 def _sample_key(obj: dict[str, Any], source_idx: int | None = None) -> str:
     """Stable identity for upsert into the continue subset."""
+    keys = _sample_keys(obj, source_idx)
+    return keys[0]
+
+
+def _sample_keys(obj: dict[str, Any], source_idx: int | None = None) -> list[str]:
+    """All plausible identity keys for a sample (uid preferred, then fallbacks).
+
+    Older continue rows may have been keyed only by ``source_idx`` while the
+    source row also has ``uid`` — trying every key avoids silent overlay miss
+    (looks like newly added edges vanished after reopen).
+    """
+    keys: list[str] = []
     uid = obj.get("uid")
     if isinstance(uid, str) and uid.strip():
-        return f"uid:{uid.strip()}"
+        keys.append(f"uid:{uid.strip()}")
     raw_id = obj.get("raw_id")
     if isinstance(raw_id, str) and raw_id.strip():
-        return f"raw_id:{raw_id.strip()}"
+        keys.append(f"raw_id:{raw_id.strip()}")
     stamped = obj.get("source_train_index")
     if isinstance(stamped, int) and stamped >= 0:
-        return f"source_idx:{stamped}"
+        keys.append(f"source_idx:{stamped}")
     if source_idx is not None and source_idx >= 0:
-        return f"source_idx:{source_idx}"
-    # Last resort: content fingerprint (stable enough for interactive edits).
-    ids = obj.get("input_ids") or []
-    return f"ids:{len(ids)}:{hash(tuple(int(x) for x in ids[:64]))}"
+        k = f"source_idx:{source_idx}"
+        if k not in keys:
+            keys.append(k)
+    if not keys:
+        ids = obj.get("input_ids") or []
+        keys.append(f"ids:{len(ids)}:{hash(tuple(int(x) for x in ids[:64]))}")
+    return keys
 
 
 def _rebuild_continue_index() -> None:
@@ -222,8 +237,8 @@ def _rebuild_continue_index() -> None:
                 continue
             if not isinstance(obj, dict):
                 continue
-            key = _sample_key(obj)
-            _continue_key_to_idx[key] = i
+            for key in _sample_keys(obj):
+                _continue_key_to_idx[key] = i
 
 
 def _read_continue_by_idx(idx: int) -> dict[str, Any]:
@@ -288,8 +303,12 @@ def _ensure_continue_path() -> Path:
 
 
 def _lookup_continue(source_idx: int, source_obj: dict[str, Any]) -> tuple[str, int | None]:
-    key = _sample_key(source_obj, source_idx)
-    return key, _continue_key_to_idx.get(key)
+    keys = _sample_keys(source_obj, source_idx)
+    for key in keys:
+        cont_idx = _continue_key_to_idx.get(key)
+        if cont_idx is not None:
+            return key, cont_idx
+    return keys[0], None
 
 
 def _effective_sample(idx: int) -> tuple[dict[str, Any], bool, str]:
@@ -316,24 +335,33 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
     obj["source_train_index"] = int(source_idx)
     if _data_path is not None:
         obj["source_train_path"] = str(_data_path)
-    key = _sample_key(obj, source_idx)
-    existing = _continue_key_to_idx.get(key)
+    keys = _sample_keys(obj, source_idx)
+    existing: int | None = None
+    for k in keys:
+        if k in _continue_key_to_idx:
+            existing = _continue_key_to_idx[k]
+            break
 
     if existing is None:
         _continue_offsets = _append_jsonl_line(path, obj)
-        _continue_key_to_idx[key] = max(0, len(_continue_offsets) - 2)
+        cont_idx = max(0, len(_continue_offsets) - 2)
         action = "inserted"
     else:
         _continue_offsets = _rewrite_jsonl_line(path, _continue_offsets, existing, obj)
         # Offsets changed; rebuild key map (line order preserved).
         _rebuild_continue_index()
+        cont_idx = _continue_key_to_idx.get(keys[0], existing)
         action = "updated"
+
+    # Register every alias key so uid / source_idx lookups both hit.
+    for k in keys:
+        _continue_key_to_idx[k] = cont_idx
 
     _saliency_cache.clear()
     return {
         "ok": True,
         "action": action,
-        "key": key,
+        "key": keys[0],
         "continue_path": str(path),
         "n_continue": max(0, len(_continue_offsets) - 1),
     }
@@ -524,11 +552,11 @@ def list_samples(q: str = "", offset: int = 0, limit: int = 50):
                 matched_before_offset += 1
                 continue
             n_edges = len(obj.get("attention_edges") or [])
-            key = _sample_key(obj, i)
-            in_continue = key in _continue_key_to_idx
-            if in_continue:
+            key, cont_idx = _lookup_continue(i, obj)
+            in_continue = cont_idx is not None
+            if in_continue and cont_idx is not None:
                 try:
-                    cont = _read_continue_by_idx(_continue_key_to_idx[key])
+                    cont = _read_continue_by_idx(cont_idx)
                     n_edges = len(cont.get("attention_edges") or [])
                 except HTTPException:
                     pass
@@ -541,6 +569,7 @@ def list_samples(q: str = "", offset: int = 0, limit: int = 50):
                     "length": int(obj.get("length") or len(obj.get("input_ids") or [])),
                     "n_edges": n_edges,
                     "in_continue": in_continue,
+                    "sample_key": key,
                 }
             )
             scanned += 1
