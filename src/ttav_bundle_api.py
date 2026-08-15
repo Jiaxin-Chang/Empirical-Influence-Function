@@ -38,6 +38,10 @@ from src.continue_train_eval import (
     default_paths_from_env,
     run_continue_train_and_eval,
 )
+from src.eif_adapter_env import (
+    get_active_adapter_status,
+    set_active_adapter_override,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -529,6 +533,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"status": "success", **_get_continue_job(job_id)})
             return
+        if parsed.path == "/api/continue-adapter-status":
+            self._send_json(200, {"status": "success", **get_active_adapter_status()})
+            return
         if parsed.path == "/api/continue-train-eval-defaults":
             self._send_json(200, {
                 "status": "success",
@@ -551,6 +558,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/continue-train-eval":
             self._handle_continue_train_eval()
+            return
+        if parsed.path == "/api/continue-adapter-recover":
+            self._handle_continue_adapter_recover()
             return
         if parsed.path == "/api/prepare-ttav-train-probe":
             self._handle_prepare_train_probe()
@@ -806,6 +816,44 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 "lossMode": cfg.loss_mode,
                 "metrics": ["line_hit_pre", "line_hit_rec"],
             },
+        })
+
+    def _handle_continue_adapter_recover(self):
+        """Clear continue-train live adapter override; reload from eif_api.env paths."""
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "EIF_CACHE_ONLY=1 — adapter recover disabled.",
+            })
+            return
+        before = get_active_adapter_status()
+        # Also undo any in-memory Learn/Unlearn stack so we truly match env weights.
+        try:
+            recover_pair_intervention()
+        except Exception as exc:
+            print(f"[continue-recover] pair intervene recover skipped: {exc}", flush=True)
+        status = set_active_adapter_override(None)
+        try:
+            from src.continue_train_eval import _evict_cached_models
+            _evict_cached_models()
+        except Exception as exc:
+            print(f"[continue-recover] cache eviction failed: {exc}", flush=True)
+        env_path = status.get("envAdapterPath")
+        print(
+            f"[continue-recover] cleared override "
+            f"(was {before.get('overridePath')}); env adapter={env_path}",
+            flush=True,
+        )
+        self._send_json(200, {
+            "status": "success",
+            "recovered": bool(before.get("overrideActive")),
+            "before": before,
+            "activeAdapter": status,
+            "message": (
+                "Restored live probes to EIF_ADAPTER_PATH_* from env."
+                if before.get("overrideActive")
+                else "No continue-adapter override was active."
+            ),
         })
 
     def _load_report_from_req(self, req: dict) -> tuple[dict | None, str | None]:

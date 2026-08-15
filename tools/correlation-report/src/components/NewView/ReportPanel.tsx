@@ -2028,6 +2028,8 @@ export function ReportPanel({
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
+    const [continueAdapterActive, setContinueAdapterActive] = useState(false);
+    const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
     const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
@@ -2835,16 +2837,32 @@ export function ReportPanel({
                         const before = (result.before || {}) as Record<string, number | null>;
                         const after = (result.after || {}) as Record<string, number | null>;
                         const delta = (result.delta || {}) as Record<string, number | null>;
+                        const per = (result.perSampleDeltas || {}) as Record<string, unknown>;
+                        const preBlock = (per.line_hit_pre || {}) as Record<string, unknown>;
+                        const recBlock = (per.line_hit_rec || {}) as Record<string, unknown>;
                         const fmt = (v: number | null | undefined) =>
                             typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                        const fmtIdx = (v: unknown, n: unknown) => {
+                            const arr = Array.isArray(v) ? v.map(String) : [];
+                            const count = typeof n === 'number' ? n : arr.length;
+                            const head = arr.slice(0, 12).join(',');
+                            return `${count}[${head}${arr.length > 12 ? '…' : ''}]`;
+                        };
                         const summary =
                             `line_hit_pre ${fmt(before.line_hit_pre)} → ${fmt(after.line_hit_pre)}`
                             + ` (Δ ${fmt(delta.line_hit_pre)})`
                             + ` · line_hit_rec ${fmt(before.line_hit_rec)} → ${fmt(after.line_hit_rec)}`
                             + ` (Δ ${fmt(delta.line_hit_rec)})`
+                            + ` · test↑pre ${fmtIdx(preBlock.increased, preBlock.nIncreased)}`
+                            + ` ↓pre ${fmtIdx(preBlock.decreased, preBlock.nDecreased)}`
+                            + ` · test↑rec ${fmtIdx(recBlock.increased, recBlock.nIncreased)}`
+                            + ` ↓rec ${fmtIdx(recBlock.decreased, recBlock.nDecreased)}`
                             + ` · out ${String(result.outputDir || '')}`;
                         setContinueResultSummary(summary);
+                        setContinueAdapterActive(true);
                         setTtavLaunchStatus(`Continue-train done · ${summary}`);
+                        // Live probes now use continued adapter — refresh left token probs.
+                        refreshTokenProbs();
                         break;
                     }
                     if (stage === 'error' || st.error === true) {
@@ -2859,7 +2877,55 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl]);
+    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl, refreshTokenProbs]);
+
+    const handleContinueAdapterRecover = useCallback(() => {
+        if (importedReportActive) return;
+        setContinueRecoverBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('Recovering live adapter to eif_api.env…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-adapter-recover'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}',
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Recover API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Continue-adapter recover failed (HTTP ${resp.status})`,
+                    );
+                }
+                setContinueAdapterActive(false);
+                setActiveInterventionPairId(null);
+                setActiveInterventionDirection(null);
+                setInterventionSteps(0);
+                setTtavLaunchStatus(
+                    typeof parsed.message === 'string'
+                        ? parsed.message
+                        : 'Restored env adapter.',
+                );
+                refreshTokenProbs();
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Continue-adapter recover failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueRecoverBusy(false);
+            }
+        })();
+    }, [importedReportActive, eifApiUrl, refreshTokenProbs]);
 
     const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
         if (!report || !selectedMeta) return;
@@ -3398,7 +3464,7 @@ export function ReportPanel({
                                         </label>
                                         <button
                                             type="button"
-                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy}
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
                                             onClick={handleContinueTrainEval}
                                             title="只在 ANNOTATION_CONTINUE_TRAIN_DATA（新标注小集）上从当前 saliency adapter 续训 CE+saliency；评测只看 line_hit_pre / line_hit_rec（EIF_TEST_DATA）"
                                             style={{
@@ -3414,6 +3480,39 @@ export function ReportPanel({
                                         >
                                             {continueBusy ? 'Training…' : '续训(小集) + line_hit'}
                                         </button>
+                                        <button
+                                            type="button"
+                                            disabled={
+                                                continueBusy
+                                                || continueRecoverBusy
+                                                || Boolean(interveningPairId)
+                                                || recoverBusy
+                                                || !continueAdapterActive
+                                            }
+                                            onClick={handleContinueAdapterRecover}
+                                            title="清除续训后的 live adapter 覆盖，恢复为 eif_api.env 中的 EIF_ADAPTER_PATH_*，并刷新 token 概率"
+                                            style={{
+                                                padding: '2px 10px',
+                                                borderRadius: 6,
+                                                border: '1px solid #a5f3fc',
+                                                background: continueRecoverBusy ? '#cffafe' : '#ecfeff',
+                                                color: '#0e7490',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor:
+                                                    continueBusy || continueRecoverBusy || !continueAdapterActive
+                                                        ? 'not-allowed'
+                                                        : 'pointer',
+                                                opacity: continueAdapterActive ? 1 : 0.45,
+                                            }}
+                                        >
+                                            {continueRecoverBusy ? 'Recovering…' : 'Recover 原 adapter'}
+                                        </button>
+                                        {continueAdapterActive && (
+                                            <span style={{ color: '#0e7490', fontSize: 11 }}>
+                                                live=续训 adapter
+                                            </span>
+                                        )}
                                         {continueJobId && (
                                             <span style={{ color: '#94a3b8' }}>job {continueJobId}</span>
                                         )}

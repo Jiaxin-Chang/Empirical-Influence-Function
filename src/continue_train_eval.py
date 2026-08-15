@@ -563,6 +563,108 @@ def _metric_delta(before: dict | None, after: dict) -> dict[str, float | None]:
     }
 
 
+def summarize_per_sample_line_hit_deltas(
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+    *,
+    eps: float = 1e-9,
+) -> dict[str, Any]:
+    """Compare per-sample line_hit on EIF_TEST_DATA (eval set), not the continue subset.
+
+    Returns index lists that rose / fell / stayed flat for pre and rec.
+    """
+    empty = {
+        "nCompared": 0,
+        "line_hit_pre": {"increased": [], "decreased": [], "unchanged": []},
+        "line_hit_rec": {"increased": [], "decreased": [], "unchanged": []},
+        "rows": [],
+    }
+    if before is None:
+        return empty
+    b_rows = {int(r["index"]): r for r in (before.get("perSample") or []) if isinstance(r, dict)}
+    a_rows = {int(r["index"]): r for r in (after.get("perSample") or []) if isinstance(r, dict)}
+    common = sorted(set(b_rows) & set(a_rows))
+    if not common:
+        return empty
+
+    out_pre = {"increased": [], "decreased": [], "unchanged": []}
+    out_rec = {"increased": [], "decreased": [], "unchanged": []}
+    rows: list[dict[str, Any]] = []
+
+    def _bucket(metric: str, buckets: dict[str, list], idx: int, b_v: float, a_v: float):
+        dv = float(a_v) - float(b_v)
+        entry = {
+            "index": idx,
+            "task_id": a_rows[idx].get("task_id") or b_rows[idx].get("task_id"),
+            "before": round(float(b_v), 4),
+            "after": round(float(a_v), 4),
+            "delta": round(dv, 4),
+        }
+        if dv > eps:
+            buckets["increased"].append(entry)
+        elif dv < -eps:
+            buckets["decreased"].append(entry)
+        else:
+            buckets["unchanged"].append(entry)
+        return entry
+
+    for idx in common:
+        b, a = b_rows[idx], a_rows[idx]
+        pre_e = _bucket(
+            "line_hit_pre", out_pre, idx,
+            float(b.get("line_hit_pre") or 0.0),
+            float(a.get("line_hit_pre") or 0.0),
+        )
+        rec_e = _bucket(
+            "line_hit_rec", out_rec, idx,
+            float(b.get("line_hit_rec") or 0.0),
+            float(a.get("line_hit_rec") or 0.0),
+        )
+        rows.append({
+            "index": idx,
+            "task_id": a.get("task_id") or b.get("task_id"),
+            "line_hit_pre": pre_e,
+            "line_hit_rec": rec_e,
+        })
+
+    return {
+        "nCompared": len(common),
+        "line_hit_pre": out_pre,
+        "line_hit_rec": out_rec,
+        "rows": rows,
+    }
+
+
+def _print_per_sample_delta_report(report: dict[str, Any]) -> None:
+    n = int(report.get("nCompared") or 0)
+    print(f"[continue-eval] per-sample line_hit deltas on EIF_TEST_DATA (n={n}):", flush=True)
+    for metric in ("line_hit_pre", "line_hit_rec"):
+        block = report.get(metric) or {}
+        up = block.get("increased") or []
+        down = block.get("decreased") or []
+        flat = block.get("unchanged") or []
+        up_idx = [e["index"] for e in up]
+        down_idx = [e["index"] for e in down]
+        print(
+            f"  {metric}: ↑{len(up)} {up_idx[:40]}{'…' if len(up_idx) > 40 else ''} "
+            f"↓{len(down)} {down_idx[:40]}{'…' if len(down_idx) > 40 else ''} "
+            f"→{len(flat)} unchanged",
+            flush=True,
+        )
+        for e in up[:10]:
+            print(
+                f"    ↑ idx={e['index']} {e.get('task_id') or ''} "
+                f"{e['before']}→{e['after']} (Δ{e['delta']:+})",
+                flush=True,
+            )
+        for e in down[:10]:
+            print(
+                f"    ↓ idx={e['index']} {e.get('task_id') or ''} "
+                f"{e['before']}→{e['after']} (Δ{e['delta']:+})",
+                flush=True,
+            )
+
+
 def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> dict[str, Any]:
     if not cfg.adapter_path or not Path(cfg.adapter_path).is_dir():
         raise FileNotFoundError(f"adapter_path not found: {cfg.adapter_path!r}")
@@ -634,6 +736,10 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             f"line_hit_rec={before['line_hit_rec']}",
             flush=True,
         )
+        # Free generate KV / allocator fragmentation before saliency train step.
+        model.zero_grad(set_to_none=True)
+        _release_cuda()
+        print("[continue-train] empty_cache after eval_before", flush=True)
 
     _prog("training", f"Continue-training {cfg.max_steps} steps on {len(train_samples)} samples…")
     train_stats = run_continue_training(
@@ -659,6 +765,9 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
     )
 
     delta = _metric_delta(before, after)
+    per_sample_deltas = summarize_per_sample_line_hit_deltas(before, after)
+    _print_per_sample_delta_report(per_sample_deltas)
+
     meta = {
         "config": asdict(cfg),
         "continueTrainJsonl": train_jsonl,
@@ -666,14 +775,50 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         "before": None if before is None else {k: v for k, v in before.items() if k != "perSample"},
         "after": {k: v for k, v in after.items() if k != "perSample"},
         "delta": delta,
+        "perSampleDeltas": {
+            "nCompared": per_sample_deltas["nCompared"],
+            "line_hit_pre": {
+                "increased": [e["index"] for e in per_sample_deltas["line_hit_pre"]["increased"]],
+                "decreased": [e["index"] for e in per_sample_deltas["line_hit_pre"]["decreased"]],
+                "nIncreased": len(per_sample_deltas["line_hit_pre"]["increased"]),
+                "nDecreased": len(per_sample_deltas["line_hit_pre"]["decreased"]),
+                "nUnchanged": len(per_sample_deltas["line_hit_pre"]["unchanged"]),
+                "increasedDetail": per_sample_deltas["line_hit_pre"]["increased"][:50],
+                "decreasedDetail": per_sample_deltas["line_hit_pre"]["decreased"][:50],
+            },
+            "line_hit_rec": {
+                "increased": [e["index"] for e in per_sample_deltas["line_hit_rec"]["increased"]],
+                "decreased": [e["index"] for e in per_sample_deltas["line_hit_rec"]["decreased"]],
+                "nIncreased": len(per_sample_deltas["line_hit_rec"]["increased"]),
+                "nDecreased": len(per_sample_deltas["line_hit_rec"]["decreased"]),
+                "nUnchanged": len(per_sample_deltas["line_hit_rec"]["unchanged"]),
+                "increasedDetail": per_sample_deltas["line_hit_rec"]["increased"][:50],
+                "decreasedDetail": per_sample_deltas["line_hit_rec"]["decreased"][:50],
+            },
+        },
         "nTrainWithEdges": n_edges,
     }
-    detail = {"before": before, "after": after}
+    detail = {
+        "before": before,
+        "after": after,
+        "perSampleDeltas": per_sample_deltas,
+    }
     out_dir = save_adapter(model, tokenizer, cfg.output_dir, meta)
     detail_path = Path(out_dir) / "continue_eval_detail.json"
     detail_path.write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
     meta["outputDir"] = out_dir
     meta["detailPath"] = str(detail_path)
+
+    # Make live probes (token probs / learn) use the continued adapter until recover.
+    from src.eif_adapter_env import set_active_adapter_override
+
+    adapter_status = set_active_adapter_override(out_dir, source="continue")
+    meta["activeAdapter"] = adapter_status
+    print(
+        f"[continue-train] activated live adapter override → {out_dir} "
+        f"(recover restores env adapter)",
+        flush=True,
+    )
 
     _prog("completed", "Continue-train + line_hit eval finished.", result=meta)
     del model

@@ -95,8 +95,51 @@ def _env_path(*keys: str) -> str:
     return ""
 
 
+# After continue-train, live probes (token probs / learn) can use the new
+# adapter without rewriting eif_api.env. Recover clears this override.
+_ACTIVE_ADAPTER_OVERRIDE: str | None = None
+_ACTIVE_ADAPTER_SOURCE: str | None = None  # e.g. "continue"
+
+
+def get_active_adapter_override() -> str | None:
+    return _ACTIVE_ADAPTER_OVERRIDE
+
+
+def get_active_adapter_status() -> dict[str, Any]:
+    env_saliency = _env_path("EIF_ADAPTER_PATH_SALIENCY", "EIF_ADAPTER_PATH", "EIF_MODEL_PATH")
+    return {
+        "overrideActive": bool(_ACTIVE_ADAPTER_OVERRIDE),
+        "overridePath": _ACTIVE_ADAPTER_OVERRIDE,
+        "source": _ACTIVE_ADAPTER_SOURCE,
+        "envAdapterPath": env_saliency or None,
+    }
+
+
+def set_active_adapter_override(
+    path: str | None,
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Set/clear process-wide live adapter override (does not edit eif_api.env)."""
+    global _ACTIVE_ADAPTER_OVERRIDE, _ACTIVE_ADAPTER_SOURCE
+    if path is None or not str(path).strip():
+        _ACTIVE_ADAPTER_OVERRIDE = None
+        _ACTIVE_ADAPTER_SOURCE = None
+    else:
+        resolved = str(Path(path).expanduser().resolve())
+        _ACTIVE_ADAPTER_OVERRIDE = resolved
+        _ACTIVE_ADAPTER_SOURCE = source or "override"
+    return get_active_adapter_status()
+
+
 def adapter_path_for_family(family: ReportFamily) -> str:
-    """Pick adapter directory for a report family."""
+    """Pick adapter directory for a report family.
+
+    If a continue-train (or other) override is active, prefer that path so
+    token-probs / learn / gold share the continued weights until recover.
+    """
+    if _ACTIVE_ADAPTER_OVERRIDE:
+        return _ACTIVE_ADAPTER_OVERRIDE
     if family == "ce":
         return _env_path("EIF_ADAPTER_PATH_CE", "EIF_ADAPTER_PATH", "EIF_MODEL_PATH")
     if family == "saliency":
