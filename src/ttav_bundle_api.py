@@ -562,6 +562,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/continue-adapter-recover":
             self._handle_continue_adapter_recover()
             return
+        if parsed.path == "/api/structural-pair-retrieve":
+            self._handle_structural_pair_retrieve()
+            return
         if parsed.path == "/api/prepare-ttav-train-probe":
             self._handle_prepare_train_probe()
             return
@@ -855,6 +858,94 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 else "No continue-adapter override was active."
             ),
         })
+
+    def _handle_structural_pair_retrieve(self):
+        """Rank train pairs by structure+text similarity (flat pair list)."""
+        _hydrate_eif_env()
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        src_tok = str(req.get("sourceToken") or "").strip()
+        dst_tok = str(req.get("targetToken") or "").strip()
+        if not src_tok or not dst_tok:
+            self._send_json(400, {
+                "status": "error",
+                "message": "sourceToken and targetToken are required",
+            })
+            return
+
+        subtype = req.get("subtype")
+        subtype_s = str(subtype).strip() if subtype is not None else None
+        try:
+            top_k = int(req.get("topK", 40) or 40)
+        except (TypeError, ValueError):
+            top_k = 40
+        try:
+            sw = float(req.get("structWeight", 0.8))
+            tw = float(req.get("textWeight", 0.2))
+        except (TypeError, ValueError):
+            sw, tw = 0.8, 0.2
+
+        src_idx = req.get("sourceIndex")
+        dst_idx = req.get("targetIndex")
+        try:
+            src_i = int(src_idx) if src_idx is not None else None
+            dst_i = int(dst_idx) if dst_idx is not None else None
+        except (TypeError, ValueError):
+            src_i, dst_i = None, None
+        if src_i is None or dst_i is None:
+            self._send_json(400, {
+                "status": "error",
+                "message": "sourceIndex and targetIndex are required for AST pair scoring",
+            })
+            return
+
+        raw_tokens = req.get("tokens")
+        query_tokens: list[str] | None = None
+        if isinstance(raw_tokens, list) and raw_tokens:
+            query_tokens = [str(t) for t in raw_tokens]
+        try:
+            prompt_len = int(req["promptLen"]) if req.get("promptLen") is not None else None
+        except (TypeError, ValueError):
+            prompt_len = None
+        try:
+            max_train = int(req["maxTrainSamples"]) if req.get("maxTrainSamples") is not None else None
+        except (TypeError, ValueError):
+            max_train = None
+
+        print(
+            f"[structural-ast] retrieve {src_tok!r}@{src_i} → {dst_tok!r}@{dst_i} "
+            f"tokens={len(query_tokens) if query_tokens else 0} topK={top_k}",
+            flush=True,
+        )
+        try:
+            from src.structural_pair_retrieval import retrieve_structural_pairs
+
+            result = retrieve_structural_pairs(
+                query_src_token=src_tok,
+                query_dst_token=dst_tok,
+                query_src_index=src_i,
+                query_dst_index=dst_i,
+                query_tokens=query_tokens,
+                query_prompt_len=prompt_len,
+                top_k=top_k,
+                struct_weight=sw,
+                text_weight=tw,
+                max_train_samples=max_train,
+            )
+        except Exception as exc:
+            print(f"[structural-ast] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
 
     def _load_report_from_req(self, req: dict) -> tuple[dict | None, str | None]:
         from src.eif_adapter_env import resolve_report_json_path, stamp_report_family

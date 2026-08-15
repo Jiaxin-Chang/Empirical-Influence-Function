@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import styles from './NewView.module.css';
 import { InlineVisualizer } from './InlineVisualizer';
 import {
@@ -57,6 +57,11 @@ interface CorrelationPair {
     id: string;
     cos_sim: number;
     coarse_cos_sim: number;
+    score?: number;
+    struct_score?: number;
+    text_score?: number;
+    subtype?: string;
+    retrieval?: string;
     train_sample_id: number;
     test_correlation: TestCorrelation;
     train_correlation: TrainCorrelation;
@@ -1086,6 +1091,8 @@ function CodeTokenStream({
     selectedTargetIndex,
     analyzedIndices,
     onTokenClick,
+    /** Default: only analyzed response tokens. `prompt` = context/prefix only. */
+    clickScope = 'analyzed',
     linkedTokenIndex,
     onTokenHover,
     compact = false,
@@ -1097,6 +1104,7 @@ function CodeTokenStream({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
+    clickScope?: 'analyzed' | 'prompt' | 'all';
     linkedTokenIndex?: number | null;
     onTokenHover?: (idx: number | null) => void;
     compact?: boolean;
@@ -1120,9 +1128,11 @@ function CodeTokenStream({
                     }
                     else if (isResponse) state = responseState;
 
-                    // Clickable iff this index has per_token_results. Do NOT gate on
-                    // isTrivialToken: intervention now attributes punctuation (}, ), …).
-                    const clickable = Boolean(onTokenClick && isAnalyzed);
+                    const clickable = Boolean(onTokenClick) && (
+                        clickScope === 'all'
+                        || (clickScope === 'prompt' && !isResponse)
+                        || (clickScope === 'analyzed' && isAnalyzed)
+                    );
                     return (
                         <TokenSpan
                             key={i}
@@ -1151,14 +1161,17 @@ function OutputComparePanel({
     selectedTargetIndex,
     analyzedIndices,
     onTokenClick,
+    modelClickScope = 'analyzed',
     goldSelectedLocalIndex,
     goldHighlightSourceIndices,
     onGoldTokenClick,
+    goldHint,
     linkedTokenIndex,
     onTokenHover,
     saliencySelected,
     saliencySelectEnabled,
     onToggleSaliencySelect,
+    headerExtra,
 }: {
     modelTokens: string[];
     /** Gold answer tokens only — no prompt prefix. */
@@ -1168,15 +1181,18 @@ function OutputComparePanel({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
+    modelClickScope?: 'analyzed' | 'prompt' | 'all';
     goldSelectedLocalIndex?: number | null;
     goldHighlightSourceIndices?: Set<number>;
     onGoldTokenClick?: (localIdx: number) => void;
+    goldHint?: string;
     linkedTokenIndex?: number | null;
     onTokenHover?: (idx: number | null) => void;
     /** Whether the current test saliency edge is ticked for probe filtering. */
     saliencySelected?: boolean;
     saliencySelectEnabled?: boolean;
     onToggleSaliencySelect?: () => void;
+    headerExtra?: ReactNode;
 }) {
     const hasGold = goldResponseTokens.length > 0;
     const goldAnalyzed = useMemo(
@@ -1190,6 +1206,8 @@ function OutputComparePanel({
                 <span className={styles.codePanelLabel}>
                     {hasGold ? 'Model Output vs Gold' : 'Model Output'}
                 </span>
+                <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+                {headerExtra}
                 {onToggleSaliencySelect && (
                     <button
                         type="button"
@@ -1204,7 +1222,6 @@ function OutputComparePanel({
                         }
                         onClick={onToggleSaliencySelect}
                         style={{
-                            marginLeft: 'auto',
                             border: saliencySelected ? '1px solid #7c3aed' : '1px solid #cbd5e1',
                             background: saliencySelected ? '#f5f3ff' : '#ffffff',
                             color: !saliencySelectEnabled
@@ -1221,6 +1238,7 @@ function OutputComparePanel({
                         {saliencySelected ? '已选' : '选择'}
                     </button>
                 )}
+                </div>
             </div>
             <div className={styles.outputCompareBody}>
                 <div className={styles.outputSection}>
@@ -1228,6 +1246,11 @@ function OutputComparePanel({
                         <span className={`${styles.outputSectionTitle} ${styles.outputSectionTitleModel}`}>
                             Model
                         </span>
+                        {modelClickScope === 'prompt' && (
+                            <span style={{ marginLeft: 8, fontSize: 11, color: '#7c3aed' }}>
+                                点击灰色上下文 token → 选 source
+                            </span>
+                        )}
                     </div>
                     <CodeTokenStream
                         tokens={modelTokens}
@@ -1237,6 +1260,7 @@ function OutputComparePanel({
                         selectedTargetIndex={selectedTargetIndex}
                         analyzedIndices={analyzedIndices}
                         onTokenClick={onTokenClick}
+                        clickScope={modelClickScope}
                         linkedTokenIndex={linkedTokenIndex}
                         onTokenHover={onTokenHover}
                         compact={hasGold}
@@ -1249,7 +1273,7 @@ function OutputComparePanel({
                                 Gold
                             </span>
                             <span style={{ marginLeft: 8, fontSize: 11, color: '#64748b' }}>
-                                点击 → 现场 teacher-force 归因
+                                {goldHint ?? '点击 → 现场 teacher-force 归因'}
                             </span>
                         </div>
                         <CodeTokenStream
@@ -1980,8 +2004,8 @@ export function ReportPanel({
     };
     // Selected test correlation (source_token_index)
     const [selectedTestCorrIdx, setSelectedTestCorrIdx] = useState<number | null>(null);
-    // Gold live attribution (teacher-force API)
-    type AttrMode = 'predict' | 'gold';
+    // Gold live attribution (teacher-force API) | manual = user-picked source→gold-target
+    type AttrMode = 'predict' | 'gold' | 'manual';
     const [attrMode, setAttrMode] = useState<AttrMode>('predict');
     const [goldLocalIdx, setGoldLocalIdx] = useState<number | null>(null);
     const [goldTopCorrelations, setGoldTopCorrelations] = useState<TestCorrelation[]>([]);
@@ -1989,6 +2013,9 @@ export function ReportPanel({
     const [goldPairs, setGoldPairs] = useState<CorrelationPair[]>([]);
     const [goldTrainDetails, setGoldTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
     const [goldBusy, setGoldBusy] = useState(false);
+    /** Manual pair pick: source = context (prompt), target = gold completion (absolute idx). */
+    const [manualSourceIdx, setManualSourceIdx] = useState<number | null>(null);
+    const [manualTargetAbsIdx, setManualTargetAbsIdx] = useState<number | null>(null);
     const clearGoldLive = useCallback(() => {
         setGoldLocalIdx(null);
         setGoldTopCorrelations([]);
@@ -1996,6 +2023,10 @@ export function ReportPanel({
         setGoldPairs([]);
         setGoldTrainDetails({});
         setGoldBusy(false);
+    }, []);
+    const clearManualPair = useCallback(() => {
+        setManualSourceIdx(null);
+        setManualTargetAbsIdx(null);
     }, []);
     // cos_sim filter defaults (UI controls removed with the old header)
     const threshold = 0.0;
@@ -2030,6 +2061,27 @@ export function ReportPanel({
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
+    const [structuralAttributionEnabled, setStructuralAttributionEnabled] = useState(false);
+    const [structuralPairs, setStructuralPairs] = useState<CorrelationPair[]>([]);
+    const [structuralBusy, setStructuralBusy] = useState(false);
+    const [structuralError, setStructuralError] = useState<string | null>(null);
+    const [structuralMeta, setStructuralMeta] = useState<string | null>(null);
+    const enterManualPairMode = useCallback(() => {
+        setAttrMode('manual');
+        setSelectedTokIdx(null);
+        setSelectedTestCorrIdx(null);
+        clearGoldLive();
+        clearManualPair();
+        setStructuralAttributionEnabled(true);
+        setModelSaliencySelected(false);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('指定 pair：先点 Model 上下文选 source，再点 Gold 选 target');
+    }, [clearGoldLive, clearManualPair, setSelectedTokIdx]);
+    const exitManualPairMode = useCallback(() => {
+        clearManualPair();
+        setAttrMode('predict');
+        setTtavLaunchStatus(null);
+    }, [clearManualPair]);
     const [unlearnResultsByPairId, setUnlearnResultsByPairId] = useState<Record<string, UnlearnPairResult>>({});
     const [tokenProbResult, setTokenProbResult] = useState<NextTokenProbResult | null>(null);
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
@@ -2239,7 +2291,8 @@ export function ReportPanel({
         setHoverTarget(null);
         setAttrMode('predict');
         clearGoldLive();
-    }, [selectedSampleId, clearGoldLive]);
+        clearManualPair();
+    }, [selectedSampleId, clearGoldLive, clearManualPair]);
 
     // Map from token index → PerTokenResult for quick lookup
     const perTokenMap = useMemo(() => {
@@ -2271,6 +2324,9 @@ export function ReportPanel({
     const allDisplayPairs = useMemo(() => {
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
+
+        // Manual pair mode: gradient list stays empty; structural pane owns retrieval.
+        if (attrMode === 'manual') return [];
 
         if (attrMode === 'gold') {
             if (goldSelectedCorrIdx === null) return [];
@@ -2312,6 +2368,18 @@ export function ReportPanel({
     }, [allDisplayPairs]);
 
     const trainPanelEmptyHint = useMemo(() => {
+        if (attrMode === 'manual') {
+            if (manualSourceIdx === null && manualTargetAbsIdx === null) {
+                return '指定 pair：点 Model 灰色上下文选 source，再点 Gold 选 target；下方结构归因会检索 train pairs，可用 Learn 提升该 gold token 概率。';
+            }
+            if (manualSourceIdx === null) {
+                return '已选 target — 请再点 Model 上下文 token 作为 source。';
+            }
+            if (manualTargetAbsIdx === null) {
+                return '已选 source — 请再点 Gold complete token 作为 target。';
+            }
+            return '指定 pair 已就绪。上方不做梯度 saliency；请看下方结构归因结果，对 pair 点 Learn。';
+        }
         if (attrMode === 'gold') {
             if (goldLocalIdx === null) {
                 return '点击右侧 Gold 答案中的任意 token，现场计算 teacher-force saliency。';
@@ -2338,7 +2406,8 @@ export function ReportPanel({
         }
         return 'No matching pairs for this source→target edge. Try lowering the cos_sim threshold.';
     }, [
-        attrMode, goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
+        attrMode, manualSourceIdx, manualTargetAbsIdx,
+        goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
     ]);
 
@@ -2373,9 +2442,21 @@ export function ReportPanel({
             return;
         }
         const absIdx = promptLen + localIdx;
+
+        // Manual pair pick: gold click only sets target (no saliency API).
+        if (attrMode === 'manual') {
+            setManualTargetAbsIdx(prev => (prev === absIdx ? null : absIdx));
+            setTtavLaunchError(null);
+            setTtavLaunchStatus(
+                `指定 pair target = "${decodeToken(goldResponseTokens[localIdx] ?? '').trim() || '·'}" @ ${absIdx}`,
+            );
+            return;
+        }
+
         setAttrMode('gold');
         setSelectedTokIdx(null);
         setSelectedTestCorrIdx(null);
+        clearManualPair();
         setGoldLocalIdx(localIdx);
         setGoldSelectedCorrIdx(null);
         setGoldPairs([]);
@@ -2427,8 +2508,19 @@ export function ReportPanel({
         })();
     }, [
         importedReportActive, promptLen, eifApiUrl, selectedMeta.fileName,
-        clearGoldLive, setSelectedTokIdx,
+        clearGoldLive, clearManualPair, setSelectedTokIdx, attrMode, goldResponseTokens,
     ]);
+
+    const handleManualSourceClick = useCallback((idx: number) => {
+        if (idx < 0 || idx >= promptLen) {
+            setTtavLaunchError('指定 pair 的 source 必须是上下文（prompt）token，不能点 model 输出。');
+            return;
+        }
+        setManualSourceIdx(prev => (prev === idx ? null : idx));
+        setTtavLaunchError(null);
+        const surf = decodeToken(modelTokens[idx] ?? correctTokens[idx] ?? '').trim() || '·';
+        setTtavLaunchStatus(`指定 pair source = "${surf}" @ ${idx}`);
+    }, [promptLen, modelTokens, correctTokens]);
 
     const handleGoldCorrClick = useCallback((sourceAbsIdx: number) => {
         if (goldLocalIdx === null) return;
@@ -2618,9 +2710,156 @@ export function ReportPanel({
         }
     }, [attrMode, goldLocalIdx, promptLen, importedReportActive, fetchTokenProbs]);
 
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode === 'manual' && manualTargetAbsIdx != null && manualTargetAbsIdx > 0) {
+            fetchTokenProbs('gold', manualTargetAbsIdx);
+        }
+    }, [attrMode, manualTargetAbsIdx, importedReportActive, fetchTokenProbs]);
+
     const refreshTokenProbs = useCallback(() => {
         if (tokenProbFocus) fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index);
     }, [tokenProbFocus, fetchTokenProbs]);
+
+    const activeQueryEdge = useMemo(() => {
+        if (attrMode === 'manual') {
+            if (manualSourceIdx === null || manualTargetAbsIdx === null) return null;
+            if (
+                manualSourceIdx < 0
+                || manualSourceIdx >= promptLen
+                || manualTargetAbsIdx < promptLen
+                || manualTargetAbsIdx >= correctTokens.length
+            ) {
+                return null;
+            }
+            return {
+                sourceIndex: manualSourceIdx,
+                targetIndex: manualTargetAbsIdx,
+                sourceToken: decodeToken(correctTokens[manualSourceIdx] ?? modelTokens[manualSourceIdx] ?? ''),
+                targetToken: decodeToken(correctTokens[manualTargetAbsIdx] ?? ''),
+                tokens: correctTokens,
+                promptLen,
+            };
+        }
+        if (attrMode === 'gold') {
+            if (goldLocalIdx === null || goldSelectedCorrIdx === null) return null;
+            const absTgt = promptLen + goldLocalIdx;
+            const corr = goldTopCorrelations.find(c => c.source_token_index === goldSelectedCorrIdx);
+            const srcTok = corr?.source_token
+                ?? correctTokens[goldSelectedCorrIdx]
+                ?? '';
+            const dstTok = corr?.target_token
+                ?? correctTokens[absTgt]
+                ?? goldResponseTokens[goldLocalIdx]
+                ?? '';
+            return {
+                sourceIndex: goldSelectedCorrIdx,
+                targetIndex: absTgt,
+                sourceToken: decodeToken(srcTok),
+                targetToken: decodeToken(dstTok),
+                tokens: correctTokens,
+                promptLen,
+            };
+        }
+        if (!selectedResult || selectedTestCorrIdx === null) return null;
+        const corr = selectedResult.top_correlations.find(
+            c => c.source_token_index === selectedTestCorrIdx,
+        );
+        return {
+            sourceIndex: selectedTestCorrIdx,
+            targetIndex: selectedResult.target_token_index,
+            sourceToken: decodeToken(corr?.source_token ?? modelTokens[selectedTestCorrIdx] ?? ''),
+            targetToken: decodeToken(corr?.target_token ?? selectedResult.target_token),
+            tokens: modelTokens,
+            promptLen,
+        };
+    }, [
+        attrMode, manualSourceIdx, manualTargetAbsIdx,
+        goldLocalIdx, goldSelectedCorrIdx, goldTopCorrelations,
+        promptLen, correctTokens, goldResponseTokens, modelTokens,
+        selectedResult, selectedTestCorrIdx,
+    ]);
+
+    const fetchStructuralPairs = useCallback((edge: {
+        sourceIndex: number;
+        targetIndex: number;
+        sourceToken: string;
+        targetToken: string;
+        tokens: string[];
+        promptLen: number;
+    }) => {
+        if (importedReportActive) return;
+        setStructuralBusy(true);
+        setStructuralError(null);
+        setStructuralMeta(null);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/structural-pair-retrieve'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sourceToken: edge.sourceToken,
+                        targetToken: edge.targetToken,
+                        sourceIndex: edge.sourceIndex,
+                        targetIndex: edge.targetIndex,
+                        tokens: edge.tokens,
+                        promptLen: edge.promptLen,
+                        topK: 40,
+                        structWeight: 0.8,
+                        textWeight: 0.2,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Structural API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Structural retrieve failed (HTTP ${resp.status})`,
+                    );
+                }
+                const pairs = Array.isArray(parsed.pairs)
+                    ? parsed.pairs as CorrelationPair[]
+                    : [];
+                setStructuralPairs(pairs);
+                const q = (parsed.query || {}) as Record<string, unknown>;
+                const ast = (q.ast || {}) as Record<string, unknown>;
+                setStructuralMeta(
+                    `AST全量枚举 · ${pairs.length} top`
+                    + (typeof parsed.nScoredPairs === 'number' ? ` / scored=${parsed.nScoredPairs}` : '')
+                    + (ast.lca ? ` · query lca=${String(ast.lca)}/${String(ast.relation || '')}` : '')
+                    + ` · w=0.8/0.2`,
+                );
+            } catch (error) {
+                setStructuralPairs([]);
+                setStructuralError(error instanceof Error ? error.message : 'Structural retrieve failed');
+            } finally {
+                setStructuralBusy(false);
+            }
+        })();
+    }, [importedReportActive, eifApiUrl]);
+
+    useEffect(() => {
+        if (!structuralAttributionEnabled) {
+            setStructuralPairs([]);
+            setStructuralError(null);
+            setStructuralMeta(null);
+            return;
+        }
+        if (!activeQueryEdge) {
+            setStructuralPairs([]);
+            setStructuralMeta(null);
+            return;
+        }
+        fetchStructuralPairs(activeQueryEdge);
+    }, [structuralAttributionEnabled, activeQueryEdge, fetchStructuralPairs]);
 
     const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {
         if (!report || !selectedMeta || importedReportActive) return;
@@ -2657,7 +2896,7 @@ export function ReportPanel({
                         recomputeSaliency: true,
                         direction,
                         persist: true,
-                        completionMode: attrMode === 'gold' ? 'gold' : 'predict',
+                        completionMode: attrMode === 'predict' ? 'predict' : 'gold',
                         trainSampleDetail: trainDetail ?? null,
                     }),
                 });
@@ -3240,28 +3479,154 @@ export function ReportPanel({
                                 goldResponseTokens={goldResponseTokens}
                                 promptLen={promptLen}
                                 highlightSourceIndices={
-                                    attrMode === 'predict'
-                                        ? sourceHighlightIndices
-                                        : attrMode === 'gold'
-                                            ? goldModelHighlightSourceIndices
-                                            : undefined
+                                    attrMode === 'manual'
+                                        ? (manualSourceIdx != null ? new Set([manualSourceIdx]) : undefined)
+                                        : attrMode === 'predict'
+                                            ? sourceHighlightIndices
+                                            : attrMode === 'gold'
+                                                ? goldModelHighlightSourceIndices
+                                                : undefined
                                 }
                                 selectedTargetIndex={attrMode === 'predict' ? (selectedTokIdx ?? undefined) : undefined}
                                 analyzedIndices={analyzedIndices}
+                                modelClickScope={attrMode === 'manual' ? 'prompt' : 'analyzed'}
                                 onTokenClick={idx => {
+                                    if (attrMode === 'manual') {
+                                        handleManualSourceClick(idx);
+                                        return;
+                                    }
                                     setAttrMode('predict');
                                     clearGoldLive();
+                                    clearManualPair();
                                     setSelectedTokIdx(prev => prev === idx ? null : idx);
                                 }}
-                                goldSelectedLocalIndex={attrMode === 'gold' ? goldLocalIdx : null}
-                                goldHighlightSourceIndices={goldHighlightSourceIndices}
+                                goldSelectedLocalIndex={
+                                    attrMode === 'manual'
+                                        ? (manualTargetAbsIdx != null && manualTargetAbsIdx >= promptLen
+                                            ? manualTargetAbsIdx - promptLen
+                                            : null)
+                                        : attrMode === 'gold' ? goldLocalIdx : null
+                                }
+                                goldHighlightSourceIndices={
+                                    attrMode === 'manual' ? undefined : goldHighlightSourceIndices
+                                }
                                 onGoldTokenClick={handleGoldTokenClick}
+                                goldHint={
+                                    attrMode === 'manual'
+                                        ? '点击 → 选指定 pair 的 target（仅 Gold complete）'
+                                        : undefined
+                                }
                                 linkedTokenIndex={linkedTestTokenIndex}
                                 onTokenHover={inlineBundle ? handleTestTokenHover : undefined}
                                 saliencySelected={modelSaliencySelected}
-                                saliencySelectEnabled={selectedTokIdx !== null && selectedTestCorrIdx !== null}
+                                saliencySelectEnabled={
+                                    attrMode !== 'manual'
+                                    && selectedTokIdx !== null
+                                    && selectedTestCorrIdx !== null
+                                }
                                 onToggleSaliencySelect={() => setModelSaliencySelected(v => !v)}
+                                headerExtra={(
+                                    <button
+                                        type="button"
+                                        aria-pressed={attrMode === 'manual'}
+                                        disabled={importedReportActive || goldResponseTokens.length === 0}
+                                        title={
+                                            importedReportActive
+                                                ? '上传报告不支持指定 pair'
+                                                : goldResponseTokens.length === 0
+                                                    ? '需要 Gold complete tokens'
+                                                    : (attrMode === 'manual'
+                                                        ? '退出指定 pair 模式'
+                                                        : '手动选上下文 source + Gold target，结构归因检索后 Learn 提升该 token 概率')
+                                        }
+                                        onClick={() => {
+                                            if (attrMode === 'manual') exitManualPairMode();
+                                            else enterManualPairMode();
+                                        }}
+                                        style={{
+                                            border: attrMode === 'manual' ? '1px solid #7c3aed' : '1px solid #cbd5e1',
+                                            background: attrMode === 'manual' ? '#f5f3ff' : '#ffffff',
+                                            color: attrMode === 'manual' ? '#6d28d9' : '#64748b',
+                                            borderRadius: 999,
+                                            padding: '2px 10px',
+                                            fontSize: 11,
+                                            fontWeight: 700,
+                                            cursor: importedReportActive || goldResponseTokens.length === 0
+                                                ? 'not-allowed'
+                                                : 'pointer',
+                                            opacity: importedReportActive || goldResponseTokens.length === 0 ? 0.55 : 1,
+                                        }}
+                                    >
+                                        {attrMode === 'manual' ? '指定 pair · 开' : '指定 pair'}
+                                    </button>
+                                )}
                             />
+
+                            {attrMode === 'manual' && (
+                                <div
+                                    className={styles.correlationList}
+                                    style={{
+                                        borderColor: '#c4b5fd',
+                                        background: '#faf5ff',
+                                    }}
+                                >
+                                    <div className={styles.correlationListTitle}>
+                                        指定 pair · 结构归因 query
+                                    </div>
+                                    <div style={{
+                                        padding: '8px 12px',
+                                        fontSize: 12,
+                                        color: '#4c1d95',
+                                        display: 'flex',
+                                        flexWrap: 'wrap',
+                                        gap: 8,
+                                        alignItems: 'center',
+                                    }}>
+                                        <span>
+                                            source:{' '}
+                                            <strong>
+                                                {manualSourceIdx == null
+                                                    ? '（点 Model 上下文）'
+                                                    : `"${decodeToken(modelTokens[manualSourceIdx] ?? correctTokens[manualSourceIdx] ?? '').trim() || '·'}" @ ${manualSourceIdx}`}
+                                            </strong>
+                                        </span>
+                                        <span style={{ color: '#a78bfa' }}>→</span>
+                                        <span>
+                                            target:{' '}
+                                            <strong>
+                                                {manualTargetAbsIdx == null
+                                                    ? '（点 Gold）'
+                                                    : `"${decodeToken(correctTokens[manualTargetAbsIdx] ?? '').trim() || '·'}" @ ${manualTargetAbsIdx}`}
+                                            </strong>
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={clearManualPair}
+                                            style={{
+                                                marginLeft: 'auto',
+                                                border: '1px solid #c4b5fd',
+                                                background: '#fff',
+                                                borderRadius: 6,
+                                                padding: '2px 8px',
+                                                fontSize: 11,
+                                                cursor: 'pointer',
+                                                color: '#6d28d9',
+                                            }}
+                                        >
+                                            清除选中
+                                        </button>
+                                    </div>
+                                    <div style={{ padding: '0 12px 8px', fontSize: 11, color: '#6b7280' }}>
+                                        {manualSourceIdx != null && manualTargetAbsIdx != null
+                                            ? (structuralAttributionEnabled
+                                                ? (structuralBusy
+                                                    ? '正在结构检索 train pairs…'
+                                                    : '两侧选齐后自动检索；对下方结构 pair 点 Learn 可抬高该 Gold token 概率。')
+                                                : '请勾选右侧「结构归因」以检索。')
+                                            : '先选 source（上下文），再选 target（Gold complete）。'}
+                                    </div>
+                                </div>
+                            )}
 
                             {attrMode === 'gold' && goldLocalIdx !== null && (
                                 <div className={styles.correlationList}>
@@ -3352,6 +3717,42 @@ export function ReportPanel({
                         {/* ── Right Column: Training pairs ── */}
                         <div className={styles.bottomRight}>
                             <div className={styles.bottomPanel}>
+                                {!importedReportActive && (
+                                    <div style={{
+                                        padding: '6px 12px',
+                                        fontSize: 11,
+                                        color: '#475569',
+                                        borderBottom: '1px solid #e5e7eb',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 8,
+                                        flexWrap: 'wrap',
+                                    }}>
+                                        <label
+                                            style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: 6,
+                                                fontWeight: 700,
+                                                color: structuralAttributionEnabled ? '#6d28d9' : '#475569',
+                                                cursor: 'pointer',
+                                            }}
+                                            title="勾选后右侧分上下栏：上=梯度归因；下=对 train 全量枚举 context×completion，用 tree-sitter AST pair 相似 + 文本相似（不依赖 attention_edges 标签）"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={structuralAttributionEnabled}
+                                                onChange={(e) => setStructuralAttributionEnabled(e.target.checked)}
+                                            />
+                                            结构归因
+                                        </label>
+                                        {structuralAttributionEnabled && (
+                                            <span style={{ color: '#7c3aed', fontSize: 10 }}>
+                                                AST全量枚举 + 磁盘缓存 · 结构:文本=8:2
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
                                 {!importedReportActive && (
                                     <div style={{
                                         padding: '6px 12px',
@@ -3534,7 +3935,199 @@ export function ReportPanel({
                                     </div>
                                 )}
 
-                                {trainGroups.length === 0 ? (
+                                {structuralAttributionEnabled ? (
+                                    <div style={{
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        height: '100%',
+                                        minHeight: 360,
+                                        overflow: 'hidden',
+                                    }}>
+                                        <div style={{
+                                            flex: '1 1 50%',
+                                            minHeight: 160,
+                                            overflow: 'auto',
+                                            borderBottom: '1px solid #e5e7eb',
+                                        }}>
+                                            <div style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 1,
+                                                padding: '6px 12px',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                background: '#f8fafc',
+                                                borderBottom: '1px solid #e5e7eb',
+                                                color: '#1d4ed8',
+                                            }}>
+                                                上 · {attrMode === 'manual' ? '梯度归因（指定 pair 模式跳过）' : '梯度归因'}
+                                            </div>
+                                            {trainGroups.length === 0 ? (
+                                                <div className={styles.emptyState} style={{ padding: '24px 0' }}>
+                                                    {trainPanelEmptyHint}
+                                                </div>
+                                            ) : (
+                                                <div className={styles.trainGroupList}>
+                                                    {trainGroups.map(({ id, pairs }) => (
+                                                        <TrainSampleGroup
+                                                            key={`grad-${id}`}
+                                                            trainIdx={id}
+                                                            pairs={pairs}
+                                                            detail={
+                                                                attrMode === 'gold'
+                                                                    ? (goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)])
+                                                                    : report.train_sample_details[String(id)]
+                                                            }
+                                                            onProbeEmbeddings={importedReportActive ? undefined : handleOpenTrainProbe}
+                                                            probeBusy={probingTrainSampleId === id}
+                                                            selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
+                                                            onTogglePairSelection={toggleTrainPairSelection}
+                                                            comparisonSummary={trainProbeComparisons[id]}
+                                                            linkedTokenIndex={linkedTrainSampleId === id ? linkedTrainTokenIndex : null}
+                                                            onTokenHover={inlineBundle?.trainSampleId === id
+                                                                ? makeTrainTokenHoverHandler(id, report.train_sample_details[String(id)]?.full_tokens ?? [])
+                                                                : undefined}
+                                                            gtEdgesByTarget={trainGtEdges?.[String(id)]}
+                                                            onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}
+                                                            onLearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'learn')}
+                                                            onRecoverIntervention={importedReportActive ? undefined : handleRecoverIntervention}
+                                                            interveningPairId={interveningPairId}
+                                                            interveningDirection={interveningDirection}
+                                                            recoverBusy={recoverBusy}
+                                                            activeInterventionPairId={activeInterventionPairId}
+                                                            interventionSteps={interventionSteps}
+                                                            interveneLr={pairInterveneLr}
+                                                            unlearnResults={unlearnResultsByPairId}
+                                                            onOpenAnnotationViewer={handleOpenAnnotationViewer}
+                                                        />
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div style={{
+                                            flex: '1 1 50%',
+                                            minHeight: 160,
+                                            overflow: 'auto',
+                                            background: '#faf5ff',
+                                        }}>
+                                            <div style={{
+                                                position: 'sticky',
+                                                top: 0,
+                                                zIndex: 1,
+                                                padding: '6px 12px',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                background: '#f3e8ff',
+                                                borderBottom: '1px solid #e9d5ff',
+                                                color: '#6d28d9',
+                                            }}>
+                                                下 · 结构归因（AST · PRE∪SUF×MID
+                                                {attrMode === 'manual' ? ' · 指定 pair' : ''}）
+                                                {structuralBusy ? ' …首次会建缓存，可能较慢' : ''}
+                                                {structuralMeta ? ` · ${structuralMeta}` : ''}
+                                            </div>
+                                            {structuralError && (
+                                                <div style={{ padding: 12, color: '#b91c1c', fontSize: 11 }}>
+                                                    {structuralError}
+                                                </div>
+                                            )}
+                                            {!structuralError && !structuralBusy && structuralPairs.length === 0 && (
+                                                <div className={styles.emptyState} style={{ padding: '24px 0' }}>
+                                                    {activeQueryEdge
+                                                        ? 'No AST/text pairs above threshold (check tree-sitter / language).'
+                                                        : (attrMode === 'manual'
+                                                            ? '指定 pair：选齐上下文 source 与 Gold target 后自动检索。'
+                                                            : '先选中一条 source→target 边。')}
+                                                </div>
+                                            )}
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 10px 16px' }}>
+                                                {structuralPairs.map((pair) => {
+                                                    const st = pair as CorrelationPair & {
+                                                        struct_score?: number;
+                                                        text_score?: number;
+                                                        ast?: Record<string, string>;
+                                                    };
+                                                    const ast = st.ast || {};
+                                                    return (
+                                                        <div
+                                                            key={pair.id}
+                                                            style={{
+                                                                border: '1px solid #e9d5ff',
+                                                                borderRadius: 8,
+                                                                background: '#fff',
+                                                                padding: '8px 10px',
+                                                                fontSize: 11,
+                                                                color: '#334155',
+                                                                display: 'grid',
+                                                                gap: 4,
+                                                            }}
+                                                        >
+                                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                                                                <span style={{
+                                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                                    fontWeight: 700,
+                                                                    color: '#6d28d9',
+                                                                }}>
+                                                                    {(pair.score ?? pair.cos_sim).toFixed(4)}
+                                                                </span>
+                                                                {ast.train_lca && (
+                                                                    <span style={{
+                                                                        padding: '1px 6px',
+                                                                        borderRadius: 999,
+                                                                        background: '#ede9fe',
+                                                                        color: '#5b21b6',
+                                                                        fontSize: 10,
+                                                                        fontWeight: 700,
+                                                                    }}>
+                                                                        lca={ast.train_lca}/{ast.train_relation || '?'}
+                                                                    </span>
+                                                                )}
+                                                                <span style={{ color: '#64748b', fontSize: 10 }}>
+                                                                    struct {(st.struct_score ?? 0).toFixed(3)}
+                                                                    {' · '}text {(st.text_score ?? 0).toFixed(3)}
+                                                                </span>
+                                                                <button
+                                                                    type="button"
+                                                                    title="在 annotation-viewer 打开该 train"
+                                                                    onClick={() => handleOpenAnnotationViewer(pair)}
+                                                                    style={{
+                                                                        marginLeft: 'auto',
+                                                                        border: '1px solid #ddd6fe',
+                                                                        background: '#f5f3ff',
+                                                                        color: '#6d28d9',
+                                                                        borderRadius: 6,
+                                                                        padding: '1px 8px',
+                                                                        fontSize: 10,
+                                                                        fontWeight: 700,
+                                                                        cursor: 'pointer',
+                                                                    }}
+                                                                >
+                                                                    TRAIN #{pair.train_sample_id}
+                                                                </button>
+                                                            </div>
+                                                            <div>
+                                                                <span style={{ color: '#92400e' }}>train </span>
+                                                                <strong>{pair.train_correlation.source_token.trim() || '·'}</strong>
+                                                                <span> → </span>
+                                                                <strong>{pair.train_correlation.target_token.trim() || '·'}</strong>
+                                                                <span style={{ color: '#94a3b8' }}>
+                                                                    {' '}@{pair.train_correlation.source_token_index}
+                                                                    →{pair.train_correlation.target_token_index}
+                                                                </span>
+                                                            </div>
+                                                            <div style={{ color: '#64748b', fontSize: 10 }}>
+                                                                AST {ast.train_src_type || '?'} → {ast.train_dst_type || '?'}
+                                                                {' · '}query {pair.test_correlation.source_token.trim() || '·'}
+                                                                {' → '}
+                                                                {pair.test_correlation.target_token.trim() || '·'}
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : trainGroups.length === 0 ? (
                                     <div className={styles.emptyState} style={{ padding: '32px 0' }}>
                                         {trainPanelEmptyHint}
                                     </div>
