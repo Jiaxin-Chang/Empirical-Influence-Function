@@ -1344,11 +1344,11 @@ def prepare_last_layer_grad_checkpointing(model) -> None:
             m.eval()
 
 
-def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
-    """Recompute last-layer attention probs from layer input hidden states.
+def _recompute_layer_attn_probs(model, hid_in: Tensor, layer_index: int = -1) -> Tensor:
+    """Recompute one decoder layer's attention probs from that layer's input.
 
     Avoids ``output_attentions=True`` (which materializes HxTxT for *every*
-    layer and is what OOM'd at seq≈3.5k). Returns ``[B, H, T, T]``.
+    layer and OOMs at long ChatML seq). Returns ``[B, H, T, T]``.
     """
     from src.saliency_loss import _unwrap_to_decoder_stack
     try:
@@ -1363,10 +1363,12 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
         )
 
     decoder = _unwrap_to_decoder_stack(model)
-    layer = decoder.layers[-1]
+    n_layers = len(decoder.layers)
+    li = int(layer_index) if int(layer_index) >= 0 else n_layers + int(layer_index)
+    li = max(0, min(li, n_layers - 1))
+    layer = decoder.layers[li]
     attn = layer.self_attn
-    # device_map=auto may place last layer on cuda:N while hidden_states[-2]
-    # was gathered on another GPU — pin everything to the layer device.
+    # device_map=auto may place layers on different GPUs — pin to this layer.
     # IMPORTANT: under PEFT, ``next(layer.parameters())`` is often a float32 LoRA
     # matrix; casting hidden to that dtype then calling bf16 ``q_proj`` raises
     # ``mat1 float != mat2 BFloat16``. Use the base q_proj weight dtype instead.
@@ -1389,10 +1391,9 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     if hasattr(decoder, "rotary_emb"):
         cos, sin = decoder.rotary_emb(normed, position_ids)
     else:
-        # Fallback: some wrappers keep rotary on the outer CausalLM.model
         rotary = getattr(getattr(model, "model", model), "rotary_emb", None)
         if rotary is None:
-            raise RuntimeError("Cannot locate rotary_emb to recompute last-layer attention.")
+            raise RuntimeError("Cannot locate rotary_emb to recompute layer attention.")
         cos, sin = rotary(normed, position_ids)
     cos = cos.to(device=device, dtype=dtype)
     sin = sin.to(device=device, dtype=dtype)
@@ -1400,7 +1401,6 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
 
     key_states = repeat_kv(key_states, attn.num_key_value_groups)
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn.scaling
-    # Causal mask (additive) — must live on attn_weights' device under multi-GPU.
     causal = torch.triu(
         torch.full(
             (T, T),
@@ -1414,6 +1414,11 @@ def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
     attn_probs = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
     del query_states, key_states, attn_weights, normed, cos, sin, causal
     return attn_probs
+
+
+def _recompute_last_layer_attn_probs(model, hid_in: Tensor) -> Tensor:
+    """Recompute last-layer attention probs from layer input hidden states."""
+    return _recompute_layer_attn_probs(model, hid_in, layer_index=-1)
 
 
 def _last_layer_contribution_row(

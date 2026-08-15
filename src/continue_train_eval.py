@@ -134,10 +134,31 @@ def _evict_cached_models():
         from src.unlearn_pair_probe import _MODEL_CACHE, recover_pair_intervention
 
         recover_pair_intervention()
+        # Move cached models off GPU before dropping refs (empty_cache alone is not enough).
+        for key in list(_MODEL_CACHE.keys()):
+            try:
+                model, _tok = _MODEL_CACHE.pop(key)
+            except KeyError:
+                continue
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            del model
         _MODEL_CACHE.clear()
     except Exception as exc:
         print(f"[continue-train] unlearn cache clear skipped: {exc}", flush=True)
     _release_cuda()
+    if torch.cuda.is_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            print(
+                f"[continue-train] after evict: "
+                f"free={free_b / 1e9:.2f}G / total={total_b / 1e9:.2f}G",
+                flush=True,
+            )
+        except Exception:
+            pass
 
 
 def _device_of(model) -> torch.device:
@@ -897,6 +918,27 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         )
 
     _prog("training", f"Continue-training {cfg.max_steps} steps on {len(train_samples)} samples…")
+    if train_samples:
+        try:
+            seq_lens = [len(s.get("input_ids") or []) for s in train_samples]
+            print(
+                f"[continue-train] subset seq_len min/max/mean="
+                f"{min(seq_lens)}/{max(seq_lens)}/{sum(seq_lens)/len(seq_lens):.0f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            print(
+                f"[continue-train] before train step: "
+                f"free={free_b / 1e9:.2f}G / total={total_b / 1e9:.2f}G "
+                f"(ce_saliency uses single-layer attn recompute, not all-layer output_attentions)",
+                flush=True,
+            )
+        except Exception:
+            pass
     train_stats = run_continue_training(
         model, tokenizer, train_samples, cfg=cfg, bank_cfg=bank_cfg,
         progress_cb=lambda s, m, loss, mode: _prog(

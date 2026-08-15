@@ -801,8 +801,23 @@ def infer_sample_id_from_report(report: dict[str, Any]) -> str | None:
 
 
 def clear_gold_session() -> None:
+    """Drop the cached gold model so continue-train can reclaim VRAM."""
     global _SESSION
-    if _SESSION is not None:
-        _release_cuda_memory(_SESSION.get("model"), reason="gold_session_clear")
+    session = _SESSION
     _SESSION = None
+    if session is not None:
+        model = session.pop("model", None)
+        session.clear()
+        if model is not None:
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            try:
+                del model
+            except Exception:
+                pass
+        _release_cuda_memory(None, reason="gold_session_clear")
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

@@ -278,9 +278,13 @@ def compute_bank_loss(
             )
         return loss, "ce_only"
 
+    # CRITICAL: do NOT set output_attentions=True — that materializes HxTxT for
+    # every layer. At FIM ChatML seq≈4k–8k this alone fills an 80–96GB GPU.
+    # Match the last-layer probe path: hidden_states only, then recompute the
+    # single saliency layer's attention probs.
     outputs = model(
         **inputs,
-        output_attentions=True,
+        output_attentions=False,
         output_hidden_states=True,
         use_cache=False,
         return_dict=True,
@@ -298,8 +302,29 @@ def compute_bank_loss(
     if ce.dim() > 0:
         ce = ce.mean()
 
+    from types import SimpleNamespace
+    from src.loss import _recompute_layer_attn_probs
+
     saliency_loss_from_outputs = _import_saliency_loss_from_outputs()
     n_tokens = int(input_ids.size(1))
+    # hidden_states: [emb, layer0_out, ..., layer_{L-1}_out] → L decoder layers
+    n_layers = max(0, len(outputs.hidden_states) - 1)
+    li = int(cfg.saliency_layer)
+    if li < 0:
+        li = n_layers + li
+    li = max(0, min(li, max(0, n_layers - 1)))
+    hid_in = outputs.hidden_states[li]
+    attn_sel = _recompute_layer_attn_probs(model, hid_in, layer_index=li)
+    # Fake HF attentions tuple so saliency_loss_from_outputs can index [li].
+    fake_attns = [None] * n_layers
+    fake_attns[li] = attn_sel
+    sal_outputs = SimpleNamespace(
+        attentions=tuple(fake_attns),
+        hidden_states=outputs.hidden_states,
+        loss=outputs.loss,
+        logits=getattr(outputs, "logits", None),
+    )
+
     annot_pairs = _annot_pairs_from_edges(edges, n_tokens, device)
     exclude = None
     if cfg.exclude_sink_prefix > 0 or (cfg.exclude_special_tokens and special_ids):
@@ -313,9 +338,9 @@ def compute_bank_loss(
 
     diag = saliency_loss_from_outputs(
         model,
-        outputs,
+        sal_outputs,
         annot_pairs,
-        saliency_layer=cfg.saliency_layer,
+        saliency_layer=li,
         exclude_source_mask=exclude,
         alpha=cfg.alpha,
         eps=cfg.eps,
