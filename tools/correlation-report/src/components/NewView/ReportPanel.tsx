@@ -1520,6 +1520,7 @@ function PairCard({
     interventionSteps,
     interveneLr,
     onOpenAnnotationViewer,
+    defaultExpanded = false,
 }: {
     pair: CorrelationPair;
     detail?: TrainSampleDetail;
@@ -1536,10 +1537,11 @@ function PairCard({
     interveneActiveForPair?: boolean;
     interventionSteps?: number;
     interveneLr?: number;
-    /** Open annotation-viewer focused on this train sample + target. */
+    /** Open annotation-viewer focused on this train sample + source/target. */
     onOpenAnnotationViewer?: () => void;
+    defaultExpanded?: boolean;
 }) {
-    const [expanded, setExpanded] = useState(false);
+    const [expanded, setExpanded] = useState(defaultExpanded);
     const { bg, fg } = cosSimilarityColor(pair.cos_sim);
     const verdict = unlearnVerdictLabel(unlearnResult?.verdict, unlearnResult?.direction);
     const busy = Boolean(unlearnBusy || learnBusy || recoverBusy);
@@ -1678,7 +1680,7 @@ function PairCard({
                     className={styles.trainBadge}
                     role="link"
                     tabIndex={0}
-                    title="在 annotation-viewer 中打开该 train 样本并选中本 pair 的 target"
+                    title="在 annotation-viewer 中打开该 train，黄=source / 橙=target（仅可视化）"
                     onClick={(event) => {
                         event.stopPropagation();
                         onOpenAnnotationViewer?.();
@@ -1811,6 +1813,7 @@ function TrainSampleGroup({
     interveneLr,
     unlearnResults,
     onOpenAnnotationViewer,
+    pairDefaultExpanded = false,
 }: {
     trainIdx: number;
     pairs: CorrelationPair[];
@@ -1836,6 +1839,7 @@ function TrainSampleGroup({
     interveneLr?: number;
     unlearnResults?: Record<string, UnlearnPairResult>;
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
+    pairDefaultExpanded?: boolean;
 }) {
     const [collapsed, setCollapsed] = useState(false);
     const annotatedSourceIndices = useMemo(
@@ -1955,6 +1959,7 @@ function TrainSampleGroup({
                                         ? () => onOpenAnnotationViewer(pair)
                                         : undefined
                                 }
+                                defaultExpanded={pairDefaultExpanded}
                             />
                         ))}
                     </div>
@@ -2016,6 +2021,10 @@ export function ReportPanel({
     /** Manual pair pick: source = context (prompt), target = gold completion (absolute idx). */
     const [manualSourceIdx, setManualSourceIdx] = useState<number | null>(null);
     const [manualTargetAbsIdx, setManualTargetAbsIdx] = useState<number | null>(null);
+    /** Gradient Stage3 pairs for 指定 pair (same API as gold edge retrieve). */
+    const [manualGradPairs, setManualGradPairs] = useState<CorrelationPair[]>([]);
+    const [manualTrainDetails, setManualTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
+    const [manualGradBusy, setManualGradBusy] = useState(false);
     const clearGoldLive = useCallback(() => {
         setGoldLocalIdx(null);
         setGoldTopCorrelations([]);
@@ -2027,6 +2036,9 @@ export function ReportPanel({
     const clearManualPair = useCallback(() => {
         setManualSourceIdx(null);
         setManualTargetAbsIdx(null);
+        setManualGradPairs([]);
+        setManualTrainDetails({});
+        setManualGradBusy(false);
     }, []);
     // cos_sim filter defaults (UI controls removed with the old header)
     const threshold = 0.0;
@@ -2325,8 +2337,12 @@ export function ReportPanel({
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
 
-        // Manual pair mode: gradient list stays empty; structural pane owns retrieval.
-        if (attrMode === 'manual') return [];
+        // Manual pair: gradient Stage3 on the user-picked gold edge.
+        if (attrMode === 'manual') {
+            return manualGradPairs
+                .filter(keep)
+                .sort((a, b) => b.cos_sim - a.cos_sim);
+        }
 
         if (attrMode === 'gold') {
             if (goldSelectedCorrIdx === null) return [];
@@ -2347,7 +2363,7 @@ export function ReportPanel({
             .sort((a, b) => b.cos_sim - a.cos_sim);
     }, [
         attrMode, selectedResult, selectedTestCorrIdx, threshold, hideZero,
-        goldPairs, goldSelectedCorrIdx,
+        goldPairs, goldSelectedCorrIdx, manualGradPairs,
     ]);
 
     // Group pairs by train_sample_id; keep Top-10 trains by best pair cos for this edge.
@@ -2367,10 +2383,38 @@ export function ReportPanel({
             .slice(0, 10);
     }, [allDisplayPairs]);
 
+    const structuralTrainGroups = useMemo(() => {
+        const map = new Map<number, CorrelationPair[]>();
+        structuralPairs.forEach(p => {
+            if (!map.has(p.train_sample_id)) map.set(p.train_sample_id, []);
+            map.get(p.train_sample_id)!.push(p);
+        });
+        return Array.from(map.entries())
+            .map(([id, pairs]) => ({
+                id,
+                pairs: [...pairs].sort(
+                    (a, b) => (b.score ?? b.cos_sim) - (a.score ?? a.cos_sim),
+                ),
+                bestSim: Math.max(...pairs.map(p => p.score ?? p.cos_sim)),
+            }))
+            .sort((a, b) => b.bestSim - a.bestSim)
+            .slice(0, 10);
+    }, [structuralPairs]);
+
+    const resolveTrainDetail = useCallback((id: number): TrainSampleDetail | undefined => {
+        if (attrMode === 'manual') {
+            return manualTrainDetails[String(id)] ?? report.train_sample_details[String(id)];
+        }
+        if (attrMode === 'gold') {
+            return goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)];
+        }
+        return report.train_sample_details[String(id)];
+    }, [attrMode, manualTrainDetails, goldTrainDetails, report.train_sample_details]);
+
     const trainPanelEmptyHint = useMemo(() => {
         if (attrMode === 'manual') {
             if (manualSourceIdx === null && manualTargetAbsIdx === null) {
-                return '指定 pair：点 Model 灰色上下文选 source，再点 Gold 选 target；下方结构归因会检索 train pairs，可用 Learn 提升该 gold token 概率。';
+                return '指定 pair：点 Model 灰色上下文选 source，再点 Gold 选 target；上下栏分别跑梯度 Stage3 与结构检索。';
             }
             if (manualSourceIdx === null) {
                 return '已选 target — 请再点 Model 上下文 token 作为 source。';
@@ -2378,7 +2422,13 @@ export function ReportPanel({
             if (manualTargetAbsIdx === null) {
                 return '已选 source — 请再点 Gold complete token 作为 target。';
             }
-            return '指定 pair 已就绪。上方不做梯度 saliency；请看下方结构归因结果，对 pair 点 Learn。';
+            if (manualGradBusy) {
+                return '指定 pair：正在梯度检索 train + Stage3…';
+            }
+            if (manualGradPairs.length === 0) {
+                return '指定 pair 梯度检索无结果。可换一条边，或看下方结构归因。';
+            }
+            return '指定 pair 梯度归因结果（对该 gold edge 做 bank 匹配）。';
         }
         if (attrMode === 'gold') {
             if (goldLocalIdx === null) {
@@ -2406,7 +2456,7 @@ export function ReportPanel({
         }
         return 'No matching pairs for this source→target edge. Try lowering the cos_sim threshold.';
     }, [
-        attrMode, manualSourceIdx, manualTargetAbsIdx,
+        attrMode, manualSourceIdx, manualTargetAbsIdx, manualGradBusy, manualGradPairs.length,
         goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
     ]);
@@ -2583,6 +2633,79 @@ export function ReportPanel({
         })();
     }, [goldLocalIdx, goldSelectedCorrIdx, promptLen, eifApiUrl, selectedMeta.fileName]);
 
+    // 指定 pair: once source+target are set, run the same gold Stage3 gradient retrieve.
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode !== 'manual') return;
+        if (manualSourceIdx === null || manualTargetAbsIdx === null) {
+            setManualGradPairs([]);
+            setManualTrainDetails({});
+            setManualGradBusy(false);
+            return;
+        }
+        let cancelled = false;
+        setManualGradBusy(true);
+        setManualGradPairs([]);
+        setManualTrainDetails({});
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(
+            `指定 pair 梯度 Stage3 · src ${manualSourceIdx} → tgt ${manualTargetAbsIdx}…`,
+        );
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/gold-retrieve-stage3'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        sourceIndex: manualSourceIdx,
+                        targetIndex: manualTargetAbsIdx,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                try {
+                    parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+                } catch {
+                    throw new Error(`指定 pair Stage3 non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `指定 pair Stage3 failed (HTTP ${resp.status})`,
+                    );
+                }
+                if (cancelled) return;
+                const pairs = Array.isArray(parsed.correlationPairs)
+                    ? parsed.correlationPairs as CorrelationPair[]
+                    : [];
+                const details = (
+                    typeof parsed.trainSampleDetails === 'object'
+                    && parsed.trainSampleDetails !== null
+                ) ? parsed.trainSampleDetails as Record<string, TrainSampleDetail> : {};
+                setManualGradPairs(pairs);
+                setManualTrainDetails(details);
+                setTtavLaunchStatus(
+                    `指定 pair 梯度 ready · ${pairs.length} pairs · ${Object.keys(details).length} trains`,
+                );
+            } catch (error) {
+                if (cancelled) return;
+                const msg = error instanceof Error ? error.message : '指定 pair Stage3 failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+                setManualGradPairs([]);
+                setManualTrainDetails({});
+            } finally {
+                if (!cancelled) setManualGradBusy(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [
+        attrMode, manualSourceIdx, manualTargetAbsIdx,
+        importedReportActive, eifApiUrl, selectedMeta.fileName,
+    ]);
+
     // Load a prepared bundle into the in-page plot. All three entry points route
     // here when the mode is 'inline'; the window path below is left untouched.
     //
@@ -2638,6 +2761,7 @@ export function ReportPanel({
         const url = new URL(base);
         url.searchParams.set('sample', String(pair.train_sample_id));
         url.searchParams.set('target', String(pair.train_correlation.target_token_index));
+        url.searchParams.set('source', String(pair.train_correlation.source_token_index));
         window.open(url.toString(), '_blank', 'noopener,noreferrer');
     };
 
@@ -2871,10 +2995,13 @@ export function ReportPanel({
         setTtavLaunchStatus(`${verb} pair ${pair.id}…`);
 
         const trainDetail =
-            attrMode === 'gold'
-                ? (goldTrainDetails[String(pair.train_sample_id)]
+            attrMode === 'manual'
+                ? (manualTrainDetails[String(pair.train_sample_id)]
                     ?? report.train_sample_details[String(pair.train_sample_id)])
-                : report.train_sample_details[String(pair.train_sample_id)];
+                : attrMode === 'gold'
+                    ? (goldTrainDetails[String(pair.train_sample_id)]
+                        ?? report.train_sample_details[String(pair.train_sample_id)])
+                    : report.train_sample_details[String(pair.train_sample_id)];
 
         void (async () => {
             try {
@@ -2960,7 +3087,7 @@ export function ReportPanel({
         })();
     }, [
         report, selectedMeta, importedReportActive, eifApiUrl, selectedSampleId,
-        attrMode, goldTrainDetails, refreshTokenProbs, pairInterveneLr,
+        attrMode, goldTrainDetails, manualTrainDetails, refreshTokenProbs, pairInterveneLr,
     ]);
 
     const handleRecoverIntervention = useCallback(() => {
@@ -3619,10 +3746,8 @@ export function ReportPanel({
                                     <div style={{ padding: '0 12px 8px', fontSize: 11, color: '#6b7280' }}>
                                         {manualSourceIdx != null && manualTargetAbsIdx != null
                                             ? (structuralAttributionEnabled
-                                                ? (structuralBusy
-                                                    ? '正在结构检索 train pairs…'
-                                                    : '两侧选齐后自动检索；对下方结构 pair 点 Learn 可抬高该 Gold token 概率。')
-                                                : '请勾选右侧「结构归因」以检索。')
+                                                ? '选齐后：上栏梯度 Stage3 + 下栏结构检索会并行跑；Learn 用 gold completion。'
+                                                : '已触发梯度 Stage3。勾选「结构归因」可同时看 AST pair。')
                                             : '先选 source（上下文），再选 target（Gold complete）。'}
                                     </div>
                                 </div>
@@ -3960,7 +4085,8 @@ export function ReportPanel({
                                                 borderBottom: '1px solid #e5e7eb',
                                                 color: '#1d4ed8',
                                             }}>
-                                                上 · {attrMode === 'manual' ? '梯度归因（指定 pair 模式跳过）' : '梯度归因'}
+                                                上 · 梯度归因
+                                                {attrMode === 'manual' ? ' · 指定 pair' : ''}
                                             </div>
                                             {trainGroups.length === 0 ? (
                                                 <div className={styles.emptyState} style={{ padding: '24px 0' }}>
@@ -3973,11 +4099,7 @@ export function ReportPanel({
                                                             key={`grad-${id}`}
                                                             trainIdx={id}
                                                             pairs={pairs}
-                                                            detail={
-                                                                attrMode === 'gold'
-                                                                    ? (goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)])
-                                                                    : report.train_sample_details[String(id)]
-                                                            }
+                                                            detail={resolveTrainDetail(id)}
                                                             onProbeEmbeddings={importedReportActive ? undefined : handleOpenTrainProbe}
                                                             probeBusy={probingTrainSampleId === id}
                                                             selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
@@ -3985,7 +4107,7 @@ export function ReportPanel({
                                                             comparisonSummary={trainProbeComparisons[id]}
                                                             linkedTokenIndex={linkedTrainSampleId === id ? linkedTrainTokenIndex : null}
                                                             onTokenHover={inlineBundle?.trainSampleId === id
-                                                                ? makeTrainTokenHoverHandler(id, report.train_sample_details[String(id)]?.full_tokens ?? [])
+                                                                ? makeTrainTokenHoverHandler(id, resolveTrainDetail(id)?.full_tokens ?? [])
                                                                 : undefined}
                                                             gtEdgesByTarget={trainGtEdges?.[String(id)]}
                                                             onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}
@@ -4040,90 +4162,37 @@ export function ReportPanel({
                                                             : '先选中一条 source→target 边。')}
                                                 </div>
                                             )}
-                                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 10px 16px' }}>
-                                                {structuralPairs.map((pair) => {
-                                                    const st = pair as CorrelationPair & {
-                                                        struct_score?: number;
-                                                        text_score?: number;
-                                                        ast?: Record<string, string>;
-                                                    };
-                                                    const ast = st.ast || {};
-                                                    return (
-                                                        <div
-                                                            key={pair.id}
-                                                            style={{
-                                                                border: '1px solid #e9d5ff',
-                                                                borderRadius: 8,
-                                                                background: '#fff',
-                                                                padding: '8px 10px',
-                                                                fontSize: 11,
-                                                                color: '#334155',
-                                                                display: 'grid',
-                                                                gap: 4,
-                                                            }}
-                                                        >
-                                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-                                                                <span style={{
-                                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                                                                    fontWeight: 700,
-                                                                    color: '#6d28d9',
-                                                                }}>
-                                                                    {(pair.score ?? pair.cos_sim).toFixed(4)}
-                                                                </span>
-                                                                {ast.train_lca && (
-                                                                    <span style={{
-                                                                        padding: '1px 6px',
-                                                                        borderRadius: 999,
-                                                                        background: '#ede9fe',
-                                                                        color: '#5b21b6',
-                                                                        fontSize: 10,
-                                                                        fontWeight: 700,
-                                                                    }}>
-                                                                        lca={ast.train_lca}/{ast.train_relation || '?'}
-                                                                    </span>
-                                                                )}
-                                                                <span style={{ color: '#64748b', fontSize: 10 }}>
-                                                                    struct {(st.struct_score ?? 0).toFixed(3)}
-                                                                    {' · '}text {(st.text_score ?? 0).toFixed(3)}
-                                                                </span>
-                                                                <button
-                                                                    type="button"
-                                                                    title="在 annotation-viewer 打开该 train"
-                                                                    onClick={() => handleOpenAnnotationViewer(pair)}
-                                                                    style={{
-                                                                        marginLeft: 'auto',
-                                                                        border: '1px solid #ddd6fe',
-                                                                        background: '#f5f3ff',
-                                                                        color: '#6d28d9',
-                                                                        borderRadius: 6,
-                                                                        padding: '1px 8px',
-                                                                        fontSize: 10,
-                                                                        fontWeight: 700,
-                                                                        cursor: 'pointer',
-                                                                    }}
-                                                                >
-                                                                    TRAIN #{pair.train_sample_id}
-                                                                </button>
-                                                            </div>
-                                                            <div>
-                                                                <span style={{ color: '#92400e' }}>train </span>
-                                                                <strong>{pair.train_correlation.source_token.trim() || '·'}</strong>
-                                                                <span> → </span>
-                                                                <strong>{pair.train_correlation.target_token.trim() || '·'}</strong>
-                                                                <span style={{ color: '#94a3b8' }}>
-                                                                    {' '}@{pair.train_correlation.source_token_index}
-                                                                    →{pair.train_correlation.target_token_index}
-                                                                </span>
-                                                            </div>
-                                                            <div style={{ color: '#64748b', fontSize: 10 }}>
-                                                                AST {ast.train_src_type || '?'} → {ast.train_dst_type || '?'}
-                                                                {' · '}query {pair.test_correlation.source_token.trim() || '·'}
-                                                                {' → '}
-                                                                {pair.test_correlation.target_token.trim() || '·'}
-                                                            </div>
-                                                        </div>
-                                                    );
-                                                })}
+                                            <div style={{
+                                                padding: '6px 12px',
+                                                fontSize: 10,
+                                                color: '#6b7280',
+                                                borderBottom: '1px solid #e9d5ff',
+                                            }}>
+                                                分数=0.8·结构+0.2·文本；lca/relation=两端 AST 最低公共祖先与树关系；
+                                                黄=source / 橙=target。点 TRAIN 打开标注页也会黄/橙高亮（仅可视化）。
+                                            </div>
+                                            <div className={styles.trainGroupList} style={{ padding: '8px 0 16px' }}>
+                                                {structuralTrainGroups.map(({ id, pairs }) => (
+                                                    <TrainSampleGroup
+                                                        key={`ast-${id}`}
+                                                        trainIdx={id}
+                                                        pairs={pairs}
+                                                        detail={resolveTrainDetail(id)}
+                                                        gtEdgesByTarget={trainGtEdges?.[String(id)]}
+                                                        onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}
+                                                        onLearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'learn')}
+                                                        onRecoverIntervention={importedReportActive ? undefined : handleRecoverIntervention}
+                                                        interveningPairId={interveningPairId}
+                                                        interveningDirection={interveningDirection}
+                                                        recoverBusy={recoverBusy}
+                                                        activeInterventionPairId={activeInterventionPairId}
+                                                        interventionSteps={interventionSteps}
+                                                        interveneLr={pairInterveneLr}
+                                                        unlearnResults={unlearnResultsByPairId}
+                                                        onOpenAnnotationViewer={handleOpenAnnotationViewer}
+                                                        pairDefaultExpanded
+                                                    />
+                                                ))}
                                             </div>
                                         </div>
                                     </div>
@@ -4138,11 +4207,7 @@ export function ReportPanel({
                                                 key={id}
                                                 trainIdx={id}
                                                 pairs={pairs}
-                                                detail={
-                                                    attrMode === 'gold'
-                                                        ? (goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)])
-                                                        : report.train_sample_details[String(id)]
-                                                }
+                                                detail={resolveTrainDetail(id)}
                                                 onProbeEmbeddings={importedReportActive ? undefined : handleOpenTrainProbe}
                                                 probeBusy={probingTrainSampleId === id}
                                                 selectedPairIds={selectedTrainPairIdsByGroup[id] ?? []}
@@ -4150,7 +4215,7 @@ export function ReportPanel({
                                                 comparisonSummary={trainProbeComparisons[id]}
                                                 linkedTokenIndex={linkedTrainSampleId === id ? linkedTrainTokenIndex : null}
                                                 onTokenHover={inlineBundle?.trainSampleId === id
-                                                    ? makeTrainTokenHoverHandler(id, report.train_sample_details[String(id)]?.full_tokens ?? [])
+                                                    ? makeTrainTokenHoverHandler(id, resolveTrainDetail(id)?.full_tokens ?? [])
                                                     : undefined}
                                                 gtEdgesByTarget={trainGtEdges?.[String(id)]}
                                                 onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}

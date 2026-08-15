@@ -230,6 +230,12 @@ button, input, select {
   font-weight: 700;
 }
 
+.tok.focusSource {
+  background: #fde68a;
+  color: #1a1f24;
+  font-weight: 700;
+}
+
 .tok.saliency {
   background: rgba(59, 130, 246, 0.55);
   color: #fff;

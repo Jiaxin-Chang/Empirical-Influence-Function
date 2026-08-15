@@ -30,6 +30,8 @@ export default function App() {
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
   const [sample, setSample] = useState<SampleDetail | null>(null)
   const [target, setTarget] = useState<number | null>(null)
+  /** Deep-link / viz-only focus source (yellow). Not an annotation edit. */
+  const [focusSource, setFocusSource] = useState<number | null>(null)
   const [saliency, setSaliency] = useState<SaliencyHit[]>([])
   const [saliencyMsg, setSaliencyMsg] = useState<string>('')
   const [mode, setMode] = useState<Mode>('inspect')
@@ -71,7 +73,11 @@ export default function App() {
     }
   }, [dataPath, query, refreshList])
 
-  const loadSample = useCallback(async (idx: number, initialTarget?: number | null) => {
+  const loadSample = useCallback(async (
+    idx: number,
+    initialTarget?: number | null,
+    initialSource?: number | null,
+  ) => {
     setBusy(true)
     setError('')
     try {
@@ -79,6 +85,9 @@ export default function App() {
       setSelectedIdx(idx)
       setSample(detail)
       setTarget(initialTarget ?? null)
+      setFocusSource(
+        initialSource != null && Number.isInteger(initialSource) ? initialSource : null,
+      )
       setSaliency([])
       setSaliencyMsg('')
       setPendingEdge(null)
@@ -95,10 +104,14 @@ export default function App() {
               ? '（该 target 无标注边，请点其它 token，例如有边的 Type 等）'
               : '')
           : ` · ${detail.attention_edges.length} edges`
+      const srcNote =
+        initialSource != null && Number.isInteger(initialSource)
+          ? ` · source @${initialSource}（黄底可视化）`
+          : ''
       const contNote = detail.in_continue
         ? ' · 已在续训小集（展示覆盖后的标注）'
         : ' · 源集只读（编辑会写入续训小集）'
-      setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}${contNote}`)
+      setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}${srcNote}${contNote}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -127,18 +140,22 @@ export default function App() {
           )
           await refreshList('', 0, false)
 
-          // Deep link from correlation-report: ?sample=0&target=123
+          // Deep link from correlation-report: ?sample=0&target=123&source=45
           const params = new URLSearchParams(window.location.search)
           const sampleRaw = params.get('sample')
           const targetRaw = params.get('target')
+          const sourceRaw = params.get('source')
           if (sampleRaw != null && sampleRaw !== '') {
             const sampleIdx = Number(sampleRaw)
             const targetIdx =
               targetRaw != null && targetRaw !== '' ? Number(targetRaw) : null
+            const sourceIdx =
+              sourceRaw != null && sourceRaw !== '' ? Number(sourceRaw) : null
             if (Number.isInteger(sampleIdx) && sampleIdx >= 0) {
               await loadSample(
                 sampleIdx,
                 targetIdx != null && Number.isInteger(targetIdx) ? targetIdx : null,
+                sourceIdx != null && Number.isInteger(sourceIdx) ? sourceIdx : null,
               )
             }
           }
@@ -462,12 +479,14 @@ export default function App() {
                     {sample.tokens.map((tok, i) => {
                       const subs = underlineMap.get(i) || []
                       const isTarget = target === i
-                      const isSal = saliencySet.has(i) && !isTarget
+                      const isFocusSrc = focusSource === i && !isTarget
+                      const isSal = saliencySet.has(i) && !isTarget && !isFocusSrc
                       const isAddSrc = mode === 'add' && addSrc === i
                       const classes = [
                         'tok',
                         i >= sample.answer_start ? 'responseZone' : 'promptZone',
                         isTarget || isAddSrc ? 'target' : '',
+                        isFocusSrc ? 'focusSource' : '',
                         isSal ? 'saliency' : '',
                       ]
                         .filter(Boolean)
@@ -476,6 +495,7 @@ export default function App() {
                         `@${i}`,
                         JSON.stringify(tok),
                         subs.length ? `ann: ${subs.join(',')}` : '',
+                        isFocusSrc ? 'focus source (viz)' : '',
                         isSal
                           ? `saliency=${saliency.find(s => s.src === i)?.score.toFixed(4)}`
                           : '',

@@ -34,7 +34,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / ".cache" / "structural_ast_index"
 # Bump when parse geometry changes so stale pkls are ignored.
-AST_INDEX_VERSION = "fim_recon_v1"
+AST_INDEX_VERSION = "fim_recon_v2"
 
 DEFAULT_STRUCT_WEIGHT = 0.8
 DEFAULT_TEXT_WEIGHT = 0.2
@@ -82,9 +82,25 @@ def _train_jsonl_path() -> Path | None:
 
 
 def normalize_surface(tok: str | None) -> str:
-    s = (tok or "").replace("Ġ", " ").replace("▁", " ").strip()
+    s = token_surface(tok)
+    s = s.replace("Ġ", " ").replace("▁", " ").strip()
     s = re.sub(r"\s+", "", s)
     return s.casefold()
+
+
+def token_surface(tok: Any) -> str:
+    """Normalize train/report token cells to a display/decode surface string."""
+    if tok is None:
+        return ""
+    if isinstance(tok, str):
+        return tok
+    if isinstance(tok, dict):
+        for key in ("surface", "token", "text", "value"):
+            v = tok.get(key)
+            if isinstance(v, str):
+                return v
+        return ""
+    return str(tok)
 
 
 def text_similarity(a: str | None, b: str | None) -> float:
@@ -465,7 +481,7 @@ def tokens_and_char_spans(
     spans: list[tuple[int, int]] = []
     pos = 0
     for t in tokens:
-        s = t if isinstance(t, str) else str(t)
+        s = token_surface(t)
         # Keep tokenizer spaces (Ġ) as space so offsets stay aligned with decode.
         s = s.replace("Ġ", " ").replace("▁", " ")
         start = pos
@@ -716,7 +732,7 @@ def index_one_sample(
 def _tokens_from_train_obj(obj: dict[str, Any], tokenizer) -> list[str]:
     qt = obj.get("qwen_tokens")
     if isinstance(qt, list) and qt:
-        return [str(x) for x in qt]
+        return [token_surface(x) for x in qt]
     ids = obj.get("input_ids")
     if not isinstance(ids, list) or not ids:
         return []
