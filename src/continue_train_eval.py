@@ -57,6 +57,8 @@ class ContinueTrainConfig:
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
     eval_before: bool = True
+    # Precomputed baseline line_hit JSONL (skip GPU eval_before when set + file exists).
+    eval_before_cache: str | None = None
     max_new_tokens: int = 1024
     seed: int = 42
     train_sample_ids: list[int] = field(default_factory=list)
@@ -89,6 +91,10 @@ def default_paths_from_env() -> dict[str, str | None]:
         or (os.environ.get("ANNOTATION_TRAIN_DATA") or "").strip()
     )
     test = (os.environ.get("EIF_TEST_DATA") or "").strip()
+    eval_before_cache = (
+        (os.environ.get("EIF_CONTINUE_EVAL_BEFORE_CACHE") or "").strip()
+        or (os.environ.get("EIF_EVAL_BEFORE_RESULTS") or "").strip()
+    )
     out = (os.environ.get("EIF_CONTINUE_OUTPUT_DIR") or "").strip() or str(
         REPO_ROOT / "outputs" / "continue_trial"
     )
@@ -104,6 +110,7 @@ def default_paths_from_env() -> dict[str, str | None]:
         "continue_train_data": _resolve_path(continue_train),
         "source_train_data": _resolve_path(source_train),
         "test_data": _resolve_path(test),
+        "eval_before_cache": _resolve_path(eval_before_cache),
         "output_dir": _resolve_path(out) or str(REPO_ROOT / "outputs" / "continue_trial"),
     }
 
@@ -417,6 +424,127 @@ def load_eval_samples(jsonl_path: str) -> list[dict]:
     return rows
 
 
+def load_eval_before_cache(
+    cache_path: str,
+    eval_samples: list[dict],
+    *,
+    also_truncate_score: bool = True,
+) -> dict[str, Any]:
+    """Build the same summary shape as ``evaluate_line_hit`` from a precomputed JSONL.
+
+    Each cache line should include ``line_hit_pre`` / ``line_hit_rec`` (and optionally
+    trunc variants). Rows are matched to ``eval_samples`` by ``task_id`` first, then
+    by positional index.
+    """
+    path = Path(cache_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"eval_before cache not found: {cache_path}")
+
+    cache_rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                continue
+            obj.setdefault("_cache_line", line_no)
+            cache_rows.append(obj)
+    if not cache_rows:
+        raise ValueError(f"eval_before cache is empty: {cache_path}")
+
+    by_tid: dict[str, dict[str, Any]] = {}
+    for row in cache_rows:
+        tid = row.get("task_id")
+        if tid is None:
+            continue
+        key = str(tid).strip()
+        if key and key not in by_tid:
+            by_tid[key] = row
+
+    pres: list[float] = []
+    recs: list[float] = []
+    trunc_pres: list[float] = []
+    trunc_recs: list[float] = []
+    per_sample: list[dict[str, Any]] = []
+    missing: list[str] = []
+    matched_by = {"task_id": 0, "index": 0}
+
+    for i, sample in enumerate(eval_samples):
+        tid = str(sample.get("task_id") or "").strip()
+        row = by_tid.get(tid) if tid else None
+        how = "task_id"
+        if row is None and i < len(cache_rows):
+            row = cache_rows[i]
+            how = "index"
+        if row is None:
+            missing.append(tid or f"index:{i}")
+            continue
+        matched_by[how] = matched_by.get(how, 0) + 1
+
+        if "line_hit_pre" not in row or "line_hit_rec" not in row:
+            raise ValueError(
+                f"Cache row for task_id={tid or i} missing line_hit_pre/line_hit_rec "
+                f"(file={cache_path})"
+            )
+        pre = float(row["line_hit_pre"])
+        rec = float(row["line_hit_rec"])
+        pres.append(pre)
+        recs.append(rec)
+        entry: dict[str, Any] = {
+            "index": i,
+            "task_id": sample.get("task_id") or row.get("task_id"),
+            "line_hit_pre": round(pre, 4),
+            "line_hit_rec": round(rec, 4),
+            "finish_reason": row.get("finish_reason"),
+            "generated_tokens": row.get("generated_tokens"),
+            "cache_match": how,
+        }
+        if also_truncate_score:
+            if "line_hit_pre_trunc" in row and "line_hit_rec_trunc" in row:
+                t_pre = float(row["line_hit_pre_trunc"])
+                t_rec = float(row["line_hit_rec_trunc"])
+            else:
+                # Fall back to full scores when cache has no trunc fields.
+                t_pre, t_rec = pre, rec
+            trunc_pres.append(t_pre)
+            trunc_recs.append(t_rec)
+            entry["line_hit_pre_trunc"] = round(t_pre, 4)
+            entry["line_hit_rec_trunc"] = round(t_rec, 4)
+        per_sample.append(entry)
+
+    if missing:
+        raise ValueError(
+            f"eval_before cache missing {len(missing)}/{len(eval_samples)} eval rows "
+            f"(examples={missing[:5]}). Cache={cache_path}"
+        )
+    if len(per_sample) != len(eval_samples):
+        raise ValueError(
+            f"eval_before cache matched {len(per_sample)} rows but eval has "
+            f"{len(eval_samples)} (cache={cache_path})"
+        )
+
+    summary: dict[str, Any] = {
+        "n": len(per_sample),
+        "line_hit_pre": round(sum(pres) / max(1, len(pres)), 4),
+        "line_hit_rec": round(sum(recs) / max(1, len(recs)), 4),
+        "perSample": per_sample,
+        "source": "cache",
+        "cachePath": str(path.resolve()),
+        "matchedBy": matched_by,
+    }
+    if also_truncate_score and trunc_pres:
+        summary["line_hit_pre_trunc"] = round(sum(trunc_pres) / len(trunc_pres), 4)
+        summary["line_hit_rec_trunc"] = round(sum(trunc_recs) / len(trunc_recs), 4)
+    print(
+        f"[continue-eval] loaded eval_before cache n={summary['n']} "
+        f"pre={summary['line_hit_pre']} rec={summary['line_hit_rec']} "
+        f"match={matched_by} path={path}",
+        flush=True,
+    )
+    return summary
+
+
 @torch.no_grad()
 def generate_one(tokenizer, model, prompt: str, max_new_tokens: int) -> dict[str, Any]:
     text = _render_eval_prompt(tokenizer, prompt)
@@ -721,7 +849,27 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             progress_cb(stage, message, extra)
 
     before = None
-    if cfg.eval_before:
+    eval_before_source = None
+    cache_path = (cfg.eval_before_cache or "").strip()
+    cache_ok = bool(cache_path and Path(cache_path).is_file())
+
+    if cache_ok:
+        _prog("eval_before", f"Loading baseline line_hit from cache (skip GPU)…")
+        before = load_eval_before_cache(
+            cache_path,
+            eval_samples,
+            also_truncate_score=cfg.also_truncate_score,
+        )
+        eval_before_source = "cache"
+        print(
+            f"[continue-eval] BEFORE (cache) line_hit_pre={before['line_hit_pre']} "
+            f"line_hit_rec={before['line_hit_rec']}",
+            flush=True,
+        )
+        # Model was just loaded for training; still clear allocator before saliency.
+        model.zero_grad(set_to_none=True)
+        _release_cuda()
+    elif cfg.eval_before:
         _prog("eval_before", "Evaluating baseline adapter (line_hit)…")
         before = evaluate_line_hit(
             model, tokenizer, eval_samples,
@@ -731,6 +879,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
                 "eval_before", f"Eval before {i}/{n}", done=i, total=n,
             ),
         )
+        eval_before_source = "live"
         print(
             f"[continue-eval] BEFORE line_hit_pre={before['line_hit_pre']} "
             f"line_hit_rec={before['line_hit_rec']}",
@@ -740,6 +889,12 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         model.zero_grad(set_to_none=True)
         _release_cuda()
         print("[continue-train] empty_cache after eval_before", flush=True)
+    elif cache_path:
+        print(
+            f"[continue-train][WARN] eval_before cache set but file missing: {cache_path}; "
+            "skipping baseline eval",
+            flush=True,
+        )
 
     _prog("training", f"Continue-training {cfg.max_steps} steps on {len(train_samples)} samples…")
     train_stats = run_continue_training(
@@ -772,6 +927,8 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         "config": asdict(cfg),
         "continueTrainJsonl": train_jsonl,
         "trainStats": train_stats,
+        "evalBeforeSource": eval_before_source,
+        "evalBeforeCache": cache_path if eval_before_source == "cache" else None,
         "before": None if before is None else {k: v for k, v in before.items() if k != "perSample"},
         "after": {k: v for k, v in after.items() if k != "perSample"},
         "delta": delta,
@@ -836,6 +993,9 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
     source_train = _resolve_path(req.get("sourceTrainData") or defaults["source_train_data"])
     test = _resolve_path(req.get("testData") or defaults["test_data"])
     out = _resolve_path(req.get("outputDir") or defaults["output_dir"])
+    eval_before_cache = _resolve_path(
+        req.get("evalBeforeCache") or defaults.get("eval_before_cache")
+    )
 
     raw_ids = req.get("trainSampleIds") or []
     train_ids: list[int] = []
@@ -866,6 +1026,7 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         learning_rate=float(req.get("learningRate", 2e-5)),
         loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
         eval_before=bool(req.get("evalBefore", True)),
+        eval_before_cache=eval_before_cache,
         max_new_tokens=max(16, int(req.get("maxNewTokens", 1024))),
         seed=int(req.get("seed", 42)),
         train_sample_ids=train_ids,
@@ -886,6 +1047,11 @@ def main():
     p.add_argument("--train-sample-ids", default="",
                    help="Comma-separated 0-based indices to slice from source train")
     p.add_argument("--test-data", default=defaults["test_data"])
+    p.add_argument(
+        "--eval-before-cache",
+        default=defaults.get("eval_before_cache") or "",
+        help="Precomputed baseline line_hit JSONL (EIF_CONTINUE_EVAL_BEFORE_CACHE); skips GPU eval_before",
+    )
     p.add_argument("--output-dir", default=defaults["output_dir"])
     p.add_argument("--max-steps", type=int, default=50)
     p.add_argument("--lr", type=float, default=2e-5)
@@ -908,6 +1074,7 @@ def main():
         learning_rate=args.lr,
         loss_mode=args.loss_mode,
         eval_before=not args.no_eval_before,
+        eval_before_cache=str(args.eval_before_cache or "").strip() or None,
         max_new_tokens=args.max_new_tokens,
         train_sample_ids=ids,
         source_train_data=args.source_train_data,

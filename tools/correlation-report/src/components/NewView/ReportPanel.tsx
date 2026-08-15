@@ -2781,7 +2781,7 @@ export function ReportPanel({
         setContinueBusy(true);
         setContinueResultSummary(null);
         setTtavLaunchError(null);
-        setTtavLaunchStatus('续训：小集 ANNOTATION_CONTINUE_TRAIN_DATA → 评测 line_hit_pre/rec…');
+        setTtavLaunchStatus('续训：小集 → 评测 line_hit（eval_before 优先读 EIF_CONTINUE_EVAL_BEFORE_CACHE）…');
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
