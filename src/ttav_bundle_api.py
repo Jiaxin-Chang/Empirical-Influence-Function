@@ -1004,16 +1004,24 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "message": "targetIndex is required"})
             return
         top_k = req.get("topK")
-        print(f"[gold] saliency targetIndex={target_index}", flush=True)
+        mode = str(req.get("mode", "gold") or "gold").strip().lower()
+        source_index = req.get("sourceIndex")
+        print(
+            f"[live-saliency] mode={mode} targetIndex={target_index}"
+            + (f" sourceIndex={source_index}" if source_index is not None else ""),
+            flush=True,
+        )
         try:
             with GOLD_LIVE_LOCK:
                 result = gold_saliency_top_k(
                     report,
                     target_index=target_index,
                     top_k=int(top_k) if top_k is not None else None,
+                    mode=mode,
+                    source_index=int(source_index) if source_index is not None else None,
                 )
         except Exception as exc:
-            print(f"[gold] saliency failed: {exc}", flush=True)
+            print(f"[live-saliency] failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
         self._send_json(200, result)

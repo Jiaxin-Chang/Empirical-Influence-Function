@@ -460,13 +460,60 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     return _SESSION
 
 
+def _completion_tokens_and_ids(
+    report: dict[str, Any],
+    tokenizer,
+    *,
+    mode: str = "gold",
+) -> tuple[list[str], list[int], int]:
+    """Token surfaces + ids for live saliency.
+
+    ``mode=gold`` → teacher-forced correct_full_tokens.
+    ``mode=predict`` → model completion full_tokens.
+    """
+    mode_norm = (mode or "gold").strip().lower()
+    if mode_norm not in ("gold", "predict"):
+        raise ValueError(f"mode must be 'gold' or 'predict', got {mode!r}")
+    if mode_norm == "gold":
+        return _gold_tokens_and_ids(report, tokenizer)
+
+    baseline = report.get("test_sample_baseline") or {}
+    tokens = list(baseline.get("full_tokens") or [])
+    if not tokens:
+        raise ValueError("Report missing test_sample_baseline.full_tokens for predict saliency.")
+    prompt_len = int(baseline.get("prompt_len") or 0)
+    if not (0 <= prompt_len < len(tokens)):
+        raise ValueError(f"Invalid prompt_len={prompt_len} for predict len={len(tokens)}.")
+
+    stored = baseline.get("full_token_ids")
+    if isinstance(stored, list) and len(stored) == len(tokens):
+        return tokens, [int(x) for x in stored], prompt_len
+
+    ids = convert_report_tokens_to_ids(tokenizer, tokens)
+    if len(ids) != len(tokens):
+        raise ValueError(
+            f"Could not align predict token ids ({len(ids)}) to surfaces ({len(tokens)})."
+        )
+    return tokens, ids, prompt_len
+
+
 def gold_saliency_top_k(
     report: dict[str, Any],
     *,
     target_index: int,
     top_k: int | None = None,
+    mode: str = "gold",
+    source_index: int | None = None,
 ) -> dict[str, Any]:
-    """Stage 1: top-k saliency sources for a gold target index (absolute in correct_full_tokens)."""
+    """Stage 1: top-k saliency sources for one target (gold or predict completion).
+
+    Optional ``source_index`` adds ``edgeSaliency`` for that specific edge
+    (used by 指定 pair panel).
+    """
+    mode_norm = (mode or "gold").strip().lower()
+    if mode_norm not in ("gold", "predict"):
+        raise ValueError(f"mode must be 'gold' or 'predict', got {mode!r}")
+
     session = _ensure_session(report)
     model = session["model"]
     tokenizer = session["tokenizer"]
@@ -474,10 +521,10 @@ def gold_saliency_top_k(
     ensure_peft_lora_dtype(model, torch.bfloat16)
     k = max(1, int(top_k if top_k is not None else _env_int("EIF_GOLD_TOP_SALIENCY", 4)))
 
-    tokens, ids, prompt_len = _gold_tokens_and_ids(report, tokenizer)
+    tokens, ids, prompt_len = _completion_tokens_and_ids(report, tokenizer, mode=mode_norm)
     if not (prompt_len <= target_index < len(ids)):
         raise ValueError(
-            f"gold target_index={target_index} out of range "
+            f"{mode_norm} target_index={target_index} out of range "
             f"[prompt_len={prompt_len}, len={len(ids)})."
         )
 
@@ -486,8 +533,6 @@ def gold_saliency_top_k(
     with torch.no_grad():
         sal_vec = compute_last_layer_saliency_vector(model, batch, target_index)
 
-    # Match predict: rank sources over the full causal prefix (prompt + earlier
-    # gold-answer tokens). Opt into prompt-only via EIF_GOLD_SALIENCY_PROMPT_ONLY=1.
     prompt_only = (os.environ.get("EIF_GOLD_SALIENCY_PROMPT_ONLY") or "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
@@ -511,16 +556,33 @@ def gold_saliency_top_k(
             "saliency_rank": rank_i,
         })
 
-    _release_cuda_memory(model, reason="gold_saliency")
-    return {
+    edge_sal = None
+    edge_src_tok = None
+    if source_index is not None:
+        si = int(source_index)
+        if not (0 <= si < target_index):
+            raise ValueError(
+                f"source_index={si} must be in [0, {target_index}) for edge saliency"
+            )
+        edge_sal = float(sal_vec[si]) if si < len(sal_vec) else None
+        edge_src_tok = tokens[si] if si < len(tokens) else tokenizer.decode([ids[si]])
+
+    _release_cuda_memory(model, reason=f"{mode_norm}_saliency")
+    out: dict[str, Any] = {
         "status": "success",
-        "mode": "gold",
+        "mode": mode_norm,
         "promptLen": prompt_len,
         "targetTokenIndex": int(target_index),
         "targetToken": target_tok,
         "topCorrelations": top,
         "filterTag": session["filter_tag"],
+        "adapterPath": session.get("model_path"),
     }
+    if source_index is not None:
+        out["sourceTokenIndex"] = int(source_index)
+        out["sourceToken"] = edge_src_tok
+        out["edgeSaliency"] = edge_sal
+    return out
 
 
 def _compute_edge_features(

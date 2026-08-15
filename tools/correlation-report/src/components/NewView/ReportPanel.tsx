@@ -2060,6 +2060,8 @@ export function ReportPanel({
         setManualGradPairs([]);
         setManualTrainDetails({});
         setManualGradBusy(false);
+        setManualEdgeSaliency(null);
+        setManualEdgeSaliencyErr(null);
     }, []);
     // cos_sim filter defaults (UI controls removed with the old header)
     const threshold = 0.0;
@@ -2094,6 +2096,13 @@ export function ReportPanel({
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
+    /** After continue-train: live predict top-k overlay (null = use report JSON). */
+    const [predictLiveTop, setPredictLiveTop] = useState<TestCorrelation[] | null>(null);
+    const [predictLiveBusy, setPredictLiveBusy] = useState(false);
+    /** 指定 pair: live saliency of the selected source→target edge. */
+    const [manualEdgeSaliency, setManualEdgeSaliency] = useState<number | null>(null);
+    const [manualEdgeSaliencyBusy, setManualEdgeSaliencyBusy] = useState(false);
+    const [manualEdgeSaliencyErr, setManualEdgeSaliencyErr] = useState<string | null>(null);
     const [structuralAttributionEnabled, setStructuralAttributionEnabled] = useState(false);
     const [structuralPairs, setStructuralPairs] = useState<CorrelationPair[]>([]);
     const [structuralTrainDetails, setStructuralTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
@@ -2342,10 +2351,16 @@ export function ReportPanel({
 
     // Source token highlights for the selected token
     const sourceHighlightIndices = useMemo(() => {
+        if (attrMode === 'predict') {
+            const top = predictLiveTop ?? selectedResult?.top_correlations;
+            if (!top || top.length === 0) return new Set<number>();
+            if (selectedTestCorrIdx !== null) return new Set([selectedTestCorrIdx]);
+            return new Set(top.map(c => c.source_token_index));
+        }
         if (!selectedResult) return new Set<number>();
         if (selectedTestCorrIdx !== null) return new Set([selectedTestCorrIdx]);
         return new Set(selectedResult.top_correlations.map(c => c.source_token_index));
-    }, [selectedResult, selectedTestCorrIdx]);
+    }, [attrMode, predictLiveTop, selectedResult, selectedTestCorrIdx]);
 
     const ttavSelectedIndices = useMemo(() => {
         const selected = new Set<number>();
@@ -2853,6 +2868,222 @@ export function ReportPanel({
         if (tokenProbFocus) fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index);
     }, [tokenProbFocus, fetchTokenProbs]);
 
+    const saliencyFocusRef = useRef({
+        attrMode,
+        selectedTokIdx,
+        goldLocalIdx,
+        manualSourceIdx,
+        manualTargetAbsIdx,
+        continueAdapterActive,
+        promptLen,
+    });
+    saliencyFocusRef.current = {
+        attrMode,
+        selectedTokIdx,
+        goldLocalIdx,
+        manualSourceIdx,
+        manualTargetAbsIdx,
+        continueAdapterActive,
+        promptLen,
+    };
+
+    const fetchLiveSaliency = useCallback(async (opts: {
+        mode: 'predict' | 'gold';
+        targetIndex: number;
+        sourceIndex?: number | null;
+        topK?: number;
+    }): Promise<Record<string, unknown>> => {
+        if (!selectedMeta) throw new Error('No report selected');
+        const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/gold-saliency'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                reportFileName: selectedMeta.fileName,
+                mode: opts.mode,
+                targetIndex: opts.targetIndex,
+                topK: opts.topK ?? 4,
+                ...(opts.sourceIndex != null ? { sourceIndex: opts.sourceIndex } : {}),
+            }),
+        });
+        const raw = await resp.text();
+        let parsed: Record<string, unknown> = {};
+        try {
+            parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+        } catch {
+            throw new Error(`Live saliency non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+        }
+        if (!resp.ok || parsed.status !== 'success') {
+            throw new Error(
+                typeof parsed.message === 'string'
+                    ? parsed.message
+                    : `Live saliency failed (HTTP ${resp.status})`,
+            );
+        }
+        return parsed;
+    }, [eifApiUrl, selectedMeta]);
+
+    /** Refresh predict/gold top-k and 指定-pair edge saliency after continue / recover. */
+    const refreshSaliencyPanels = useCallback(async (opts?: {
+        /** After recover: drop live predict overlay and show report JSON again. */
+        restorePredictReport?: boolean;
+    }) => {
+        if (importedReportActive || !selectedMeta) return;
+        const focus = saliencyFocusRef.current;
+        const restorePredict = Boolean(opts?.restorePredictReport);
+
+        if (restorePredict) {
+            setPredictLiveTop(null);
+            setPredictLiveBusy(false);
+        }
+
+        // Predict top-k: live only while continued adapter is active (or refreshing into it).
+        if (focus.attrMode === 'predict' && focus.selectedTokIdx != null && focus.selectedTokIdx > 0) {
+            if (restorePredict) {
+                // already cleared
+            } else {
+                setPredictLiveBusy(true);
+                try {
+                    const parsed = await fetchLiveSaliency({
+                        mode: 'predict',
+                        targetIndex: focus.selectedTokIdx,
+                        topK: 4,
+                    });
+                    const top = Array.isArray(parsed.topCorrelations)
+                        ? parsed.topCorrelations as TestCorrelation[]
+                        : [];
+                    setPredictLiveTop(top);
+                } catch (error) {
+                    const msg = error instanceof Error ? error.message : 'Predict live saliency failed';
+                    setTtavLaunchError(msg);
+                } finally {
+                    setPredictLiveBusy(false);
+                }
+            }
+        }
+
+        // Gold top-k: always re-fetch live (env or continued adapter after cache evict).
+        if (focus.attrMode === 'gold' && focus.goldLocalIdx != null) {
+            const abs = focus.promptLen + focus.goldLocalIdx;
+            setGoldBusy(true);
+            try {
+                const parsed = await fetchLiveSaliency({
+                    mode: 'gold',
+                    targetIndex: abs,
+                    topK: 4,
+                });
+                const top = Array.isArray(parsed.topCorrelations)
+                    ? parsed.topCorrelations as TestCorrelation[]
+                    : [];
+                setGoldTopCorrelations(top);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Gold live saliency failed';
+                setTtavLaunchError(msg);
+            } finally {
+                setGoldBusy(false);
+            }
+        }
+
+        // 指定 pair edge saliency
+        if (
+            focus.attrMode === 'manual'
+            && focus.manualSourceIdx != null
+            && focus.manualTargetAbsIdx != null
+        ) {
+            setManualEdgeSaliencyBusy(true);
+            setManualEdgeSaliencyErr(null);
+            try {
+                const parsed = await fetchLiveSaliency({
+                    mode: 'gold',
+                    targetIndex: focus.manualTargetAbsIdx,
+                    sourceIndex: focus.manualSourceIdx,
+                    topK: 4,
+                });
+                const score = typeof parsed.edgeSaliency === 'number' ? parsed.edgeSaliency : null;
+                setManualEdgeSaliency(score);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Pair edge saliency failed';
+                setManualEdgeSaliencyErr(msg);
+                setManualEdgeSaliency(null);
+            } finally {
+                setManualEdgeSaliencyBusy(false);
+            }
+        }
+    }, [importedReportActive, selectedMeta, fetchLiveSaliency]);
+
+    // While continued adapter is active, keep predict panel on live scores when target changes.
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode !== 'predict' || selectedTokIdx == null || selectedTokIdx <= 0) return;
+        if (!continueAdapterActive) {
+            setPredictLiveTop(null);
+            return;
+        }
+        let cancelled = false;
+        setPredictLiveBusy(true);
+        void (async () => {
+            try {
+                const parsed = await fetchLiveSaliency({
+                    mode: 'predict',
+                    targetIndex: selectedTokIdx,
+                    topK: 4,
+                });
+                if (cancelled) return;
+                const top = Array.isArray(parsed.topCorrelations)
+                    ? parsed.topCorrelations as TestCorrelation[]
+                    : [];
+                setPredictLiveTop(top);
+            } catch (error) {
+                if (cancelled) return;
+                const msg = error instanceof Error ? error.message : 'Predict live saliency failed';
+                setTtavLaunchError(msg);
+            } finally {
+                if (!cancelled) setPredictLiveBusy(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [
+        attrMode, selectedTokIdx, continueAdapterActive,
+        importedReportActive, fetchLiveSaliency,
+    ]);
+
+    // 指定 pair: fetch edge saliency whenever source+target are set.
+    useEffect(() => {
+        if (importedReportActive) return;
+        if (attrMode !== 'manual') return;
+        if (manualSourceIdx == null || manualTargetAbsIdx == null) {
+            setManualEdgeSaliency(null);
+            setManualEdgeSaliencyErr(null);
+            return;
+        }
+        let cancelled = false;
+        setManualEdgeSaliencyBusy(true);
+        setManualEdgeSaliencyErr(null);
+        void (async () => {
+            try {
+                const parsed = await fetchLiveSaliency({
+                    mode: 'gold',
+                    targetIndex: manualTargetAbsIdx,
+                    sourceIndex: manualSourceIdx,
+                    topK: 4,
+                });
+                if (cancelled) return;
+                const score = typeof parsed.edgeSaliency === 'number' ? parsed.edgeSaliency : null;
+                setManualEdgeSaliency(score);
+            } catch (error) {
+                if (cancelled) return;
+                const msg = error instanceof Error ? error.message : 'Pair edge saliency failed';
+                setManualEdgeSaliencyErr(msg);
+                setManualEdgeSaliency(null);
+            } finally {
+                if (!cancelled) setManualEdgeSaliencyBusy(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [
+        attrMode, manualSourceIdx, manualTargetAbsIdx,
+        importedReportActive, fetchLiveSaliency, continueAdapterActive,
+    ]);
+
     const activeQueryEdge = useMemo(() => {
         if (attrMode === 'manual') {
             if (manualSourceIdx === null || manualTargetAbsIdx === null) return null;
@@ -3243,8 +3474,9 @@ export function ReportPanel({
                         setContinueResultSummary(summary);
                         setContinueAdapterActive(true);
                         setTtavLaunchStatus(`Continue-train done · ${summary}`);
-                        // Live probes now use continued adapter — refresh left token probs.
+                        // Live probes now use continued adapter — refresh probs + saliency panels.
                         refreshTokenProbs();
+                        void refreshSaliencyPanels();
                         break;
                     }
                     if (stage === 'error' || st.error === true) {
@@ -3259,7 +3491,7 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl, refreshTokenProbs]);
+    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl, refreshTokenProbs, refreshSaliencyPanels]);
 
     const handleContinueAdapterRecover = useCallback(() => {
         if (importedReportActive) return;
@@ -3298,7 +3530,9 @@ export function ReportPanel({
                         ? parsed.message
                         : 'Restored env adapter.',
                 );
+                // Probs + saliency: reload with env adapter; predict panel returns to report JSON.
                 refreshTokenProbs();
+                void refreshSaliencyPanels({ restorePredictReport: true });
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Continue-adapter recover failed';
                 setTtavLaunchError(msg);
@@ -3307,7 +3541,7 @@ export function ReportPanel({
                 setContinueRecoverBusy(false);
             }
         })();
-    }, [importedReportActive, eifApiUrl, refreshTokenProbs]);
+    }, [importedReportActive, eifApiUrl, refreshTokenProbs, refreshSaliencyPanels]);
 
     const handleOpenTrainProbe = (trainIdx: number, pairs: CorrelationPair[]) => {
         if (!report || !selectedMeta) return;
@@ -3766,6 +4000,40 @@ export function ReportPanel({
                                                 : '已触发梯度 Stage3。勾选「结构归因」可同时看 AST pair。')
                                             : '先选 source（上下文），再选 target（Gold complete）。'}
                                     </div>
+                                    {manualSourceIdx != null && manualTargetAbsIdx != null && (
+                                        <div style={{
+                                            margin: '0 12px 10px',
+                                            padding: '8px 10px',
+                                            borderRadius: 8,
+                                            border: '1px solid #ddd6fe',
+                                            background: '#ffffff',
+                                            fontSize: 12,
+                                            color: '#4c1d95',
+                                            display: 'flex',
+                                            flexWrap: 'wrap',
+                                            gap: 8,
+                                            alignItems: 'center',
+                                        }}>
+                                            <span style={{ fontWeight: 700 }}>edge saliency</span>
+                                            {manualEdgeSaliencyBusy ? (
+                                                <span style={{ color: '#7c3aed' }}>计算中…</span>
+                                            ) : manualEdgeSaliencyErr ? (
+                                                <span style={{ color: '#b91c1c' }}>{manualEdgeSaliencyErr}</span>
+                                            ) : manualEdgeSaliency != null ? (
+                                                <span className={styles.sourceChipSal}>
+                                                    {manualEdgeSaliency.toFixed(4)}
+                                                </span>
+                                            ) : (
+                                                <span style={{ color: '#9ca3af' }}>—</span>
+                                            )}
+                                            <span style={{ color: '#9ca3af', fontSize: 11 }}>
+                                                {continueAdapterActive
+                                                    ? '· live（续训 adapter）'
+                                                    : '· live（env adapter）'}
+                                                {' · recover 后会重算回到原 adapter'}
+                                            </span>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -3776,9 +4044,11 @@ export function ReportPanel({
                                         {decodeToken(goldResponseTokens[goldLocalIdx] ?? '').trim()}"
                                         {' '}@ idx {promptLen + goldLocalIdx}
                                         {goldBusy ? ' …' : ''}
+                                        {continueAdapterActive ? ' · 续训 adapter' : ''}
                                     </div>
                                     <div className={styles.correlationListHint}>
                                         Teacher-force gold path. Click one edge to run bank Top-10 + Stage3.
+                                        {' '}续训结束后会自动重算；Recover 后回到 env adapter。
                                     </div>
                                     <div className={styles.correlationListItems}>
                                         {goldTopCorrelations.map(c => (
@@ -3811,16 +4081,21 @@ export function ReportPanel({
                                 <div className={styles.correlationList}>
                                     <div className={styles.correlationListTitle}>
                                         Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
+                                        {predictLiveBusy ? ' …' : ''}
+                                        {predictLiveTop
+                                            ? (continueAdapterActive ? ' · live(续训)' : ' · live')
+                                            : ' · report'}
                                     </div>
                                     <div className={styles.correlationListHint}>
                                         Click one source→target edge to load its Top-10 training matches on the right.
+                                        {' '}续训后切到 live 分数；Recover 后回到报告原版。
                                     </div>
                                     <div className={styles.correlationListItems}>
-                                        {selectedResult.top_correlations.slice(0, 4).map(c => (
+                                        {(predictLiveTop ?? selectedResult.top_correlations).slice(0, 4).map(c => (
                                             <button
                                                 key={c.source_token_index}
                                                 type="button"
-                                                title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(selectedResult.target_token).trim()} for train retrieval`}
+                                                title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(c.target_token || selectedResult.target_token).trim()} for train retrieval`}
                                                 className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
                                                 onClick={() => setSelectedTestCorrIdx(
                                                     prev => prev === c.source_token_index ? null : c.source_token_index
@@ -3831,7 +4106,7 @@ export function ReportPanel({
                                                     <span className={styles.corrSourceTok}>
                                                         {(decodeToken(c.source_token).trim() || '·')}
                                                         <span className={styles.corrArrow}>→</span>
-                                                        {decodeToken(selectedResult.target_token).trim() || '·'}
+                                                        {decodeToken(c.target_token || selectedResult.target_token).trim() || '·'}
                                                     </span>
                                                 </div>
                                                 <div className={styles.corrBtnRight}>
