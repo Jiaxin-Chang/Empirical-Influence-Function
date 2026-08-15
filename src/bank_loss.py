@@ -15,6 +15,7 @@ ce_saliency -> CE + λ * contrastive saliency (negatives subsampled with k=64)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -247,6 +248,41 @@ def _annot_pairs_from_edges(edges, n_tokens: int, device) -> list[torch.Tensor]:
     return [torch.tensor(pairs, dtype=torch.long, device=device)]
 
 
+def _sdpa_context():
+    """Prefer flash / mem-efficient SDPA; avoid MATH which materializes HxTxT per layer.
+
+    With ``enable_input_require_grads`` + long ChatML, MATH SDPA saves ~H·T² per
+    decoder layer for backward and OOMs around seq≈2k on 80–96GB GPUs.
+    """
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel([
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+        ])
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def _capture_layer_input_hidden(model, layer_index: int):
+    """Forward-pre-hook to keep only the saliency layer's input (not all hidden_states)."""
+    from src.saliency_loss import _unwrap_to_decoder_stack
+
+    decoder = _unwrap_to_decoder_stack(model)
+    n_layers = len(decoder.layers)
+    li = int(layer_index) if int(layer_index) >= 0 else n_layers + int(layer_index)
+    li = max(0, min(li, n_layers - 1))
+    holder: dict[str, torch.Tensor | None] = {"hid": None, "li": li, "n_layers": n_layers}
+
+    def _pre_hook(_module, args):
+        # Decoder layer forward(hidden_states, ...)
+        if args and torch.is_tensor(args[0]):
+            holder["hid"] = args[0]
+
+    handle = decoder.layers[li].register_forward_pre_hook(_pre_hook)
+    return holder, handle
+
+
 def compute_bank_loss(
     model,
     batch,
@@ -265,7 +301,8 @@ def compute_bank_loss(
 
     need_saliency = cfg.loss_mode == "ce_saliency" and bool(edges)
     if not need_saliency:
-        outputs = model(**inputs, use_cache=False, return_dict=True)
+        with _sdpa_context():
+            outputs = model(**inputs, use_cache=False, return_dict=True)
         loss = outputs.loss
         if loss is None:
             logits = outputs.logits
@@ -278,22 +315,30 @@ def compute_bank_loss(
             )
         return loss, "ce_only"
 
-    # CRITICAL: do NOT set output_attentions=True — that materializes HxTxT for
-    # every layer. At FIM ChatML seq≈2k+ with eager attn this fills an 80–96GB GPU.
-    # Prefer sdpa/flash for the main forward; recompute only the saliency layer.
+    # CRITICAL: do NOT set output_attentions=True — materializes HxTxT for every layer.
+    # Also avoid output_hidden_states=True (keeps all layer states); hook one layer instead.
+    # Prefer flash/mem-efficient SDPA so training does not fall back to MATH TxT.
     attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
     print(
         f"[bank-loss] ce_saliency forward attn_impl={attn_impl!r} "
-        f"seq={int(input_ids.size(1))} (single-layer attn recompute)",
+        f"seq={int(input_ids.size(1))} (single-layer attn recompute; no all-hidden)",
         flush=True,
     )
-    outputs = model(
-        **inputs,
-        output_attentions=False,
-        output_hidden_states=True,
-        use_cache=False,
-        return_dict=True,
-    )
+
+    li_req = int(cfg.saliency_layer)
+    holder, hook = _capture_layer_input_hidden(model, li_req)
+    try:
+        with _sdpa_context():
+            outputs = model(
+                **inputs,
+                output_attentions=False,
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+    finally:
+        hook.remove()
+
     ce = outputs.loss
     if ce is None:
         logits = outputs.logits
@@ -306,30 +351,34 @@ def compute_bank_loss(
         )
     if ce.dim() > 0:
         ce = ce.mean()
+    # Drop the big vocab tensor from the live namespace (graph may still retain it for CE).
+    try:
+        outputs.logits = None
+    except Exception:
+        pass
+
+    hid_in = holder.get("hid")
+    if hid_in is None:
+        raise RuntimeError(
+            "Failed to capture saliency-layer input hidden state via forward hook."
+        )
+    li = int(holder["li"])
+    n_layers = int(holder["n_layers"])
 
     from types import SimpleNamespace
     from src.loss import _recompute_layer_attn_probs
 
     saliency_loss_from_outputs = _import_saliency_loss_from_outputs()
     n_tokens = int(input_ids.size(1))
-    # hidden_states: [emb, layer0_out, ..., layer_{L-1}_out] → L decoder layers
-    n_layers = max(0, len(outputs.hidden_states) - 1)
-    li = int(cfg.saliency_layer)
-    if li < 0:
-        li = n_layers + li
-    li = max(0, min(li, max(0, n_layers - 1)))
-    hid_in = outputs.hidden_states[li]
-    # Drop references to other layer states we don't need for the saliency branch
-    # indexing (the CE graph still retains what it needs via outputs.loss).
-    slim_hidden = [None] * len(outputs.hidden_states)
-    slim_hidden[li] = hid_in
     attn_sel = _recompute_layer_attn_probs(model, hid_in, layer_index=li)
+    slim_hidden = [None] * (n_layers + 1)
+    slim_hidden[li] = hid_in
     fake_attns = [None] * n_layers
     fake_attns[li] = attn_sel
     sal_outputs = SimpleNamespace(
         attentions=tuple(fake_attns),
         hidden_states=tuple(slim_hidden),
-        loss=outputs.loss,
+        loss=ce,
         logits=None,
     )
 

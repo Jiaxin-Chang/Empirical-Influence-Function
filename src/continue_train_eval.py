@@ -37,13 +37,20 @@ from typing import Any
 
 import torch
 
-from src.intervention_experiment import load_model_and_tokenizer, load_train_samples
+from src.intervention_experiment import (
+    _left_truncate_train_row_for_bank,
+    load_model_and_tokenizer,
+    load_train_samples,
+)
 from src.bank_loss import BankLossConfig, compute_bank_loss, load_bank_loss_config
 from src.eif_adapter_env import base_model_path_from_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHAT_STOP = "<|im_end|>"
+# Without flash-attn, sdpa MATH fallback stores HxTxT per layer under training.
+# Cap seq so continue-train fits on ~96GB; override with EIF_CONTINUE_MAX_SEQ_LEN.
+_DEFAULT_CONTINUE_MAX_SEQ_LEN = 1536
 
 
 @dataclass
@@ -65,6 +72,8 @@ class ContinueTrainConfig:
     # Optional full train JSONL used only when slicing by train_sample_ids.
     source_train_data: str | None = None
     also_truncate_score: bool = True
+    # Left-truncate ChatML for CE+saliency continue-train (VRAM). 0 = no cap.
+    max_seq_len: int = _DEFAULT_CONTINUE_MAX_SEQ_LEN
 
 
 def _resolve_path(raw: str | None) -> str | None:
@@ -319,10 +328,41 @@ def _compact_batch(sample: dict, device: torch.device) -> dict[str, torch.Tensor
     return {"input_ids": input_ids, "labels": label_t, "attention_mask": attn}
 
 
-def _sample_batch(sample: dict, tokenizer, device: torch.device) -> tuple[dict[str, torch.Tensor], list | None]:
+def _continue_max_seq_len(cfg: ContinueTrainConfig) -> int | None:
+    raw = (os.environ.get("EIF_CONTINUE_MAX_SEQ_LEN") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+        except ValueError:
+            v = int(cfg.max_seq_len)
+    else:
+        v = int(cfg.max_seq_len)
+    return None if v <= 0 else v
+
+
+def _sample_batch(
+    sample: dict,
+    tokenizer,
+    device: torch.device,
+    *,
+    max_seq_len: int | None = None,
+) -> tuple[dict[str, torch.Tensor], list | None]:
     del tokenizer  # compact path does not re-encode
     edges = sample.get("attention_edges") or sample.get("edges")
-    return _compact_batch(sample, device), edges if isinstance(edges, list) else None
+    edges_list = edges if isinstance(edges, list) else None
+    batch = _compact_batch(sample, device)
+    if max_seq_len is not None and int(batch["input_ids"].size(1)) > int(max_seq_len):
+        batch, edges_list, dropped = _left_truncate_train_row_for_bank(
+            batch, edges_list, int(max_seq_len),
+        )
+        if dropped:
+            print(
+                f"[continue-train] left-truncated {dropped} prompt tokens → "
+                f"seq={int(batch['input_ids'].size(1))} "
+                f"(edges kept={0 if not edges_list else len(edges_list)})",
+                flush=True,
+            )
+    return batch, edges_list
 
 
 def _trainable_lora_params(model):
@@ -367,12 +407,22 @@ def run_continue_training(
     if n_train == 0:
         raise ValueError("No train samples to continue-train on.")
 
+    max_seq = _continue_max_seq_len(cfg)
+    if max_seq is not None:
+        print(
+            f"[continue-train] max_seq_len={max_seq} "
+            f"(left-truncate; set EIF_CONTINUE_MAX_SEQ_LEN=0 to disable)",
+            flush=True,
+        )
+
     losses: list[float] = []
     t0 = time.time()
     step = 0
     while step < int(cfg.max_steps):
         sample = train_samples[step % n_train]
-        batch, edges = _sample_batch(sample, tokenizer, device)
+        batch, edges = _sample_batch(
+            sample, tokenizer, device, max_seq_len=max_seq,
+        )
         seq_len = int(batch["input_ids"].size(1))
         opt.zero_grad(set_to_none=True)
         if step == 0 and torch.cuda.is_available():
@@ -426,8 +476,8 @@ def run_continue_training(
         "elapsedSec": round(time.time() - t0, 2),
         "lossModeUsed": bank_cfg.loss_mode,
         "nTrainSamples": n_train,
+        "maxSeqLen": max_seq,
     }
-
 
 # ── Eval dataset + generation (AI4Go-aligned) ─────────────────────────────────
 
@@ -1148,6 +1198,11 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         train_sample_ids=train_ids,
         source_train_data=source_train,
         also_truncate_score=bool(req.get("alsoTruncateScore", True)),
+        max_seq_len=int(
+            req.get("maxSeqLen")
+            if req.get("maxSeqLen") is not None
+            else _DEFAULT_CONTINUE_MAX_SEQ_LEN
+        ),
     )
 
 
@@ -1174,6 +1229,13 @@ def main():
     p.add_argument("--loss-mode", default="ce_saliency", choices=["ce_only", "ce_saliency"])
     p.add_argument("--no-eval-before", action="store_true")
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=_DEFAULT_CONTINUE_MAX_SEQ_LEN,
+        help="Left-truncate ChatML to this length for continue-train (0=disable). "
+             "Also EIF_CONTINUE_MAX_SEQ_LEN.",
+    )
     args = p.parse_args()
 
     ids: list[int] = []
@@ -1194,6 +1256,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         train_sample_ids=ids,
         source_train_data=args.source_train_data,
+        max_seq_len=int(args.max_seq_len),
     )
     result = run_continue_train_and_eval(cfg)
     before = result.get("before") or {}
