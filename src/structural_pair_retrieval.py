@@ -12,7 +12,8 @@ Pipeline
    *only that* code — ignore long “snippets before” / ChatML wrappers.
 3. Attach AST features to tokens that fall in PRE / MID / SUF regions (via
    reconstruct↔original char mapping).
-4. **Full enumerate** every (context_i ∈ PRE∪SUF, completion_j ∈ MID).
+4. **Enumerate** for each target ``j ∈ MID``: sources from ``PRE∪SUF`` **and**
+   earlier MID tokens ``i ∈ MID`` with ``i < j`` (same-completion causal pairs).
 5. Score vs query pair: 0.8 · AST-pair similarity + 0.2 · endpoint text similarity.
 6. Disk-cache per-sample token AST feats so restarts / repeated clicks are cheap.
 """
@@ -795,14 +796,16 @@ def build_or_load_train_ast_index(
                 )
 
     n_fim = sum(1 for s in samples if s.parse_mode == "fim")
-    n_pairs = sum(
-        max(0, len(s.context_indices)) * max(0, len(s.completion_indices))
-        for s in samples
-    )
+    # (PRE∪SUF)×MID + causal MID×MID (i<j): |C|·|M| + |M|·(|M|-1)/2
+    n_pairs = 0
+    for s in samples:
+        c = max(0, len(s.context_indices))
+        m = max(0, len(s.completion_indices))
+        n_pairs += c * m + (m * (m - 1)) // 2
     print(
         f"[structural-ast] ready samples={len(samples)} fim={n_fim} "
-        f"enumerable_pairs≈{n_pairs} (PRE∪SUF)×MID cache={CACHE_DIR} "
-        f"elapsed={time.time() - t0:.1f}s",
+        f"enumerable_pairs≈{n_pairs} (PRE∪SUF)×MID + MID_i<j×MID "
+        f"cache={CACHE_DIR} elapsed={time.time() - t0:.1f}s",
         flush=True,
     )
     _INDEX_MEM = {"path": key, "mtime": mtime, "samples": samples}
@@ -841,7 +844,7 @@ def retrieve_structural_pairs(
     min_score: float = 0.02,
     max_train_samples: int | None = None,
 ) -> dict[str, Any]:
-    """Full-enumerate context×completion pairs; rank by AST+text vs query edge."""
+    """Full-enumerate (PRE∪SUF ∪ earlier-MID) → MID pairs; rank by AST+text vs query."""
     _ = query_subtype  # explicitly unused
     sw = float(struct_weight)
     tw = float(text_weight)
@@ -879,12 +882,13 @@ def retrieve_structural_pairs(
         cmp_idxs = sample.completion_indices or list(
             range(ans, len(sample.tokens))
         )
-        if not ctx_idxs or not cmp_idxs:
+        if not cmp_idxs:
             continue
-        # Full enumeration over FIM regions only: (PRE∪SUF) × MID.
+        # Target always in MID. Sources: PRE∪SUF, plus MID tokens before target.
         for j in cmp_idxs:
             t_dst = sample.tokens[j]
-            for i in ctx_idxs:
+            src_idxs = list(ctx_idxs) + [i for i in cmp_idxs if i < j]
+            for i in src_idxs:
                 t_src = sample.tokens[i]
                 if not normalize_surface(t_src) and not normalize_surface(t_dst):
                     n_skipped_empty += 1

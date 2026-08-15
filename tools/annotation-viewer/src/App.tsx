@@ -274,6 +274,35 @@ export default function App() {
     }
   }
 
+  const bumpEdgeWeight = async (edge: Edge, delta: number) => {
+    if (selectedIdx == null) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await api.bumpWeight(selectedIdx, {
+        src: edge.src,
+        dst: edge.dst,
+        subtype: edge.subtype,
+        delta,
+      })
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
+      await loadSample(selectedIdx, edge.dst)
+      await refreshList(query, 0, false)
+      const nw = res.new_weight ?? res.edge?.weight
+      setStatus(
+        `权重 ${edge.subtype} ${edge.src}→${edge.dst}: ${res.old_weight ?? '?'} → ${nw ?? '?'}` +
+          ` → 续训小集` +
+          (h.continue_path ? `（${h.n_continue} 条）` : ''),
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const underlineStyle = (subtypes: string[]): CSSProperties | undefined => {
     if (!subtypes.length) return undefined
     // CSS can only show one underline color; prefer first, tooltip lists all.
@@ -555,6 +584,29 @@ export default function App() {
                           <code>{JSON.stringify(sample.tokens[e.src] ?? '')}</code>
                           {' → '}
                           dst @{e.dst}
+                        </span>
+                        <span className="edgeWeight" title="续训 saliency 正样本权重（默认 1，可 +/−）">
+                          w={e.weight ?? 1}
+                        </span>
+                        <span className="weightBtns">
+                          <button
+                            type="button"
+                            className="weightBtn"
+                            disabled={busy}
+                            title="权重 −1（最低 1；仍写入续训小集）"
+                            onClick={() => void bumpEdgeWeight(e, -1)}
+                          >
+                            −
+                          </button>
+                          <button
+                            type="button"
+                            className="weightBtn"
+                            disabled={busy}
+                            title="权重 +1 → 续训小集；loss 对该正样本加权"
+                            onClick={() => void bumpEdgeWeight(e, 1)}
+                          >
+                            +
+                          </button>
                         </span>
                         <button
                           type="button"

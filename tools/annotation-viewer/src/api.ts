@@ -20,7 +20,7 @@ export const SUBTYPE_LABELS: Record<string, string> = {
   api: '库用法配对',
 }
 
-export type Edge = { src: number; dst: number; subtype: string }
+export type Edge = { src: number; dst: number; subtype: string; weight?: number }
 
 export type SampleSummary = {
   index: number
@@ -117,14 +117,33 @@ export const api = {
       body: JSON.stringify(edge),
     }),
 
-  addEdge: (idx: number, edge: Edge & { source?: string }) =>
+  addEdge: (idx: number, edge: Edge & { source?: string; weight?: number }) =>
     jsonFetch<{
       ok: boolean
       n_edges: number
       action?: string
       continue_path?: string
       n_continue?: number
+      edge?: Edge
     }>(`/api/sample/${idx}/edges/add`, {
+      method: 'POST',
+      body: JSON.stringify(edge),
+    }),
+
+  bumpWeight: (
+    idx: number,
+    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & { delta?: number },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+      edge?: Edge
+      old_weight?: number
+      new_weight?: number
+    }>(`/api/sample/${idx}/edges/bump-weight`, {
       method: 'POST',
       body: JSON.stringify(edge),
     }),

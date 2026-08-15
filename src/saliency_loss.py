@@ -531,11 +531,14 @@ def _annotation_rows_from_pairs(
     B: int,
     T: int,
     device,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    annot_weights: list[Tensor] | Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return row_batch, row_qry, src_all, inv, w_all (edge weights, default 1)."""
     flat = flatten_annot_pairs(annot_pairs, device=device)
     if flat.numel() == 0:
         empty = torch.empty((0,), device=device, dtype=torch.long)
-        return empty, empty, empty, empty
+        empty_w = torch.empty((0,), device=device, dtype=torch.float32)
+        return empty, empty, empty, empty, empty_w
 
     batch_ids = flat[:, 0]
     p0 = flat[:, 1]
@@ -552,13 +555,53 @@ def _annotation_rows_from_pairs(
     qry_all = qry_all[keep]
     if batch_ids.numel() == 0:
         empty = torch.empty((0,), device=device, dtype=torch.long)
-        return empty, empty, empty, empty
+        empty_w = torch.empty((0,), device=device, dtype=torch.float32)
+        return empty, empty, empty, empty, empty_w
+
+    w_all = _flatten_annot_weights(annot_weights, annot_pairs, device=device, n_flat=flat.size(0))
+    if w_all.numel() == flat.size(0):
+        w_all = w_all[keep]
+    else:
+        # Misaligned / missing → unit weight on kept edges
+        w_all = torch.ones(batch_ids.size(0), device=device, dtype=torch.float32)
 
     keys = batch_ids * T + qry_all
     unique_keys, inv = torch.unique(keys, return_inverse=True)
     row_batch = unique_keys // T
     row_qry = unique_keys % T
-    return row_batch, row_qry, src_all, inv
+    return row_batch, row_qry, src_all, inv, w_all
+
+
+def _flatten_annot_weights(
+    annot_weights: list[Tensor] | Tensor | None,
+    annot_pairs: list[Tensor] | Tensor,
+    *,
+    device,
+    n_flat: int,
+) -> Tensor:
+    """Align per-edge weights with flatten_annot_pairs order; default all 1s."""
+    if annot_weights is None:
+        return torch.ones(n_flat, device=device, dtype=torch.float32)
+    if isinstance(annot_weights, torch.Tensor):
+        w = annot_weights.to(device=device, dtype=torch.float32).reshape(-1)
+        if w.numel() == n_flat:
+            return w.clamp_min(1.0)
+        return torch.ones(n_flat, device=device, dtype=torch.float32)
+    chunks = []
+    if isinstance(annot_pairs, torch.Tensor):
+        # Flat tensor form: weights should already be a 1-D tensor of length n_flat
+        return torch.ones(n_flat, device=device, dtype=torch.float32)
+    for b, pairs in enumerate(annot_pairs):
+        if pairs is None or pairs.numel() == 0:
+            continue
+        n = int(pairs.size(0))
+        if b < len(annot_weights) and annot_weights[b] is not None and annot_weights[b].numel() == n:
+            chunks.append(annot_weights[b].to(device=device, dtype=torch.float32).reshape(-1).clamp_min(1.0))
+        else:
+            chunks.append(torch.ones(n, device=device, dtype=torch.float32))
+    if not chunks:
+        return torch.ones(n_flat, device=device, dtype=torch.float32)
+    return torch.cat(chunks, dim=0)
 
 
 
@@ -658,6 +701,7 @@ def compute_saliency_loss_from_rows(
     src_all: Tensor,         # [E]
     inv: Tensor,             # [E], edge -> row index
     *,
+    src_weights: Tensor | None = None,  # [E] positive edge weights (>=1); None → 1
     alpha: float,
     eps: float,
     floor_eps: float = 0.0,
@@ -678,7 +722,12 @@ def compute_saliency_loss_from_rows(
     neg_sample_k: int = 0,        # if >0, randomly subsample this many negatives per query for softmax/softmax_margin (MoCo-style)
     exclude_source_rows: Tensor | None = None,  # [Q, T] bool/float, 1 = drop this source from the NEGATIVE set (sink / special tokens)
 ) -> SaliencyDiagnostics:
-    """Saliency objective with C already row-gathered."""
+    """Saliency objective with C already row-gathered.
+
+    Positive annotation weights (``src_weights`` / edge ``weight`` field) accumulate
+    into ``A_adj``. Binary membership uses ``A_adj > 0``; positive loss terms scale
+    by the float weight so bumping an edge emphasizes that pair in continue-train.
+    """
     Q, T = C_rows.shape
     device = C_rows.device
     dtype = C_rows.dtype
@@ -692,10 +741,17 @@ def compute_saliency_loss_from_rows(
             n_samples=0,
         )
 
+    if src_weights is None:
+        put_vals = torch.ones_like(src_all, device=device, dtype=dtype)
+    else:
+        put_vals = src_weights.to(device=device, dtype=dtype).reshape(-1).clamp_min(1.0)
+        if put_vals.numel() != src_all.numel():
+            put_vals = torch.ones_like(src_all, device=device, dtype=dtype)
+
     A_adj = torch.zeros(Q, T, device=device, dtype=dtype)
     A_adj.index_put_(
         (inv.to(device=device, dtype=torch.long), src_all.to(device=device, dtype=torch.long)),
-        torch.ones_like(src_all, device=device, dtype=dtype),
+        put_vals,
         accumulate=True,
     )
     A_adj_bin = (A_adj > 0).to(dtype)
@@ -704,7 +760,8 @@ def compute_saliency_loss_from_rows(
     qry_col = row_qry.to(device=device, dtype=torch.long).unsqueeze(1)
     M_causal = ((src_idx <= qry_col) & (src_idx != qry_col)).to(dtype)
 
-    annot_mask = M_causal * A_adj_bin
+    # Weighted positives; binary negatives (non-annotated causal sources).
+    annot_mask = M_causal * A_adj
     non_annot_mask = M_causal * (1.0 - A_adj_bin)
 
     # Drop sink / special-token sources from the NEGATIVE set so the loss never
@@ -876,14 +933,17 @@ def compute_saliency_loss_from_rows(
         Qi = scores.shape[0]
         per_q_losses = []
         for q in range(Qi):
-            p_idx = annot_I[q].bool().nonzero(as_tuple=True)[0]
+            p_idx = (annot_I[q] > 0).nonzero(as_tuple=True)[0]
             n_idx = nonannot_I[q].bool().nonzero(as_tuple=True)[0]
             if p_idx.numel() == 0 or n_idx.numel() == 0:
                 continue
             pos = scores[q, p_idx]                            # [|A|]
             neg = scores[q, n_idx]                            # [|N|]
+            w = annot_I[q, p_idx]                             # [|A|] edge weights
             diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau  # [|A|, |N|]
-            per_q_losses.append(F.softplus(diff).mean())
+            hinge = F.softplus(diff)
+            denom = (w.sum() * float(n_idx.numel())).clamp_min(1.0)
+            per_q_losses.append((hinge * w.unsqueeze(1)).sum() / denom)
         if per_q_losses:
             loss = torch.stack(per_q_losses).mean().to(dtype)
         else:
@@ -908,8 +968,9 @@ def compute_saliency_loss_from_rows(
         Qi_, T_ = scores.shape
         k_neg = int(neg_sample_k) if neg_sample_k else 0
 
-        annot_b = annot_I.bool()      # [Qi, T]
+        annot_b = annot_I > 0       # [Qi, T] bool membership
         nonannot_b = nonannot_I.bool()  # [Qi, T]
+        pos_w = annot_I             # [Qi, T] float weights (>=1 on positives)
 
         # Optional uniform-random per-query subsampling of negatives. We
         # implement randperm-equivalence via topk of uniform noise restricted
@@ -949,8 +1010,12 @@ def compute_saliency_loss_from_rows(
                     continue
                 pos = scores[q, p_idx]
                 neg = scores[q, n_idx]
+                w = pos_w[q, p_idx]  # [|A|]
                 diff = (neg.unsqueeze(0) - pos.unsqueeze(1)) / tau
-                per_q.append(F.relu(margin + diff).mean())
+                hinge = F.relu(margin + diff)  # [|A|, |N|]
+                # Weight each positive's pairs by edge weight; normalize by Σ w·|N|
+                denom = (w.sum() * float(n_idx.numel())).clamp_min(1.0)
+                per_q.append((hinge * w.unsqueeze(1)).sum() / denom)
             if per_q:
                 loss = torch.stack(per_q).mean().to(dtype)
             else:
@@ -960,8 +1025,9 @@ def compute_saliency_loss_from_rows(
             diff = (scores.unsqueeze(1) - scores.unsqueeze(2)) / tau  # diff[q,i,j] = (s[q,j]-s[q,i])/tau
             pair_loss = F.relu(margin + diff)                          # [Qi, T, T]
             pair_mask = annot_b.unsqueeze(2) & neg_mask.unsqueeze(1)   # [Qi, T_pos, T_neg]
-            pair_mask_f = pair_mask.to(pair_loss.dtype)
-            n_pairs_per_q = pair_mask_f.sum(dim=(1, 2))                # [Qi]
+            # Scale by positive edge weight so bump-weight emphasizes that pair
+            pair_mask_f = pair_mask.to(pair_loss.dtype) * pos_w.unsqueeze(2)
+            n_pairs_per_q = pair_mask_f.sum(dim=(1, 2))                # [Qi] = Σ_i w_i · |N|
             sum_loss_per_q = (pair_loss * pair_mask_f).sum(dim=(1, 2))  # [Qi]
             valid_q = n_pairs_per_q > 0
             if bool(valid_q.any()):
@@ -1004,6 +1070,7 @@ def saliency_loss_from_outputs(
         outputs,  # HF output with attentions + hidden_states
         annot_pairs: list[Tensor] | Tensor,  # flat [B, 3] or list of [Number of pairs, 2]
         *,
+        annot_weights: list[Tensor] | Tensor | None = None,  # parallel to annot_pairs; default 1
         saliency_layer: int = -1,
         exclude_source_mask: Tensor | None = None,
         alpha: float = 1.5,
@@ -1031,6 +1098,8 @@ def saliency_loss_from_outputs(
     `outputs` must have `.attentions` (non-None) and `.hidden_states`.
     `annot_pairs` may be either a flat [B, 3] tensor (batch_idx, pos_a, pos_b)
     or a list of [Number of pairs, 2] tensors.
+    `annot_weights` (optional) are per-edge multipliers (>=1); higher weight
+    emphasizes that positive in the saliency objective (continue-train bump).
     """
     n_layers = len(outputs.attentions)
     li = int(saliency_layer) if int(saliency_layer) >= 0 else n_layers + int(saliency_layer)
@@ -1043,11 +1112,12 @@ def saliency_loss_from_outputs(
     last_hidden_in = outputs.hidden_states[li]  # [B, T, D]
 
     B, T, _ = last_hidden_in.shape
-    row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
+    row_batch, row_qry, src_all, inv, w_all = _annotation_rows_from_pairs(
         annot_pairs,
         B=B,
         T=T,
         device=last_hidden_in.device,
+        annot_weights=annot_weights,
     )
     if row_qry.numel() == 0:
         return SaliencyDiagnostics(
@@ -1077,6 +1147,7 @@ def saliency_loss_from_outputs(
         row_qry,
         src_all,
         inv,
+        src_weights=w_all,
         exclude_source_rows=exclude_rows,
         alpha=alpha,
         eps=eps,
@@ -1481,7 +1552,7 @@ def edge_prediction_loss(
     Returns a scalar in ``hidden_states.dtype`` (0 if the batch has no edges)."""
     B, T, _ = hidden_states.shape
     device = hidden_states.device
-    row_batch, row_qry, src_all, inv = _annotation_rows_from_pairs(
+    row_batch, row_qry, src_all, inv, _w_all = _annotation_rows_from_pairs(
         annot_pairs, B=B, T=T, device=device)
     if row_qry.numel() == 0:
         return hidden_states.new_zeros(())

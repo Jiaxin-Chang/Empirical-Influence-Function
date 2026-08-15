@@ -3473,7 +3473,8 @@ export function ReportPanel({
                             + ` · out ${String(result.outputDir || '')}`;
                         setContinueResultSummary(summary);
                         setContinueAdapterActive(true);
-                        setTtavLaunchStatus(`Continue-train done · ${summary}`);
+                        // Metrics live only under Continue train; don't repeat in status strip.
+                        setTtavLaunchStatus(null);
                         // Live probes now use continued adapter — refresh probs + saliency panels.
                         refreshTokenProbs();
                         void refreshSaliencyPanels();

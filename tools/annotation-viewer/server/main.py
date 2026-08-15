@@ -481,6 +481,14 @@ class AddEdgeBody(BaseModel):
     dst: int
     subtype: str = Field(..., description="annotation subtype")
     source: str = "Manual"
+    weight: float = Field(1.0, description="positive edge weight (default 1)")
+
+
+class BumpWeightBody(BaseModel):
+    src: int
+    dst: int
+    subtype: str
+    delta: float = Field(1.0, description="add this to weight (use -1 to decrease)")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -592,11 +600,18 @@ def get_sample(idx: int):
     for e in obj.get("attention_edges") or []:
         if not isinstance(e, dict):
             continue
+        try:
+            w = float(e.get("weight", 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        if w <= 0:
+            w = 1.0
         edges.append(
             {
                 "src": int(e["src"]),
                 "dst": int(e["dst"]),
                 "subtype": str(e.get("subtype") or ""),
+                "weight": w,
             }
         )
 
@@ -763,7 +778,12 @@ def add_edge(idx: int, body: AddEdgeBody):
             ):
                 raise HTTPException(409, "edge already exists")
 
-        edges.append({"src": body.src, "dst": body.dst, "subtype": body.subtype})
+        edges.append({
+            "src": body.src,
+            "dst": body.dst,
+            "subtype": body.subtype,
+            "weight": max(1.0, float(body.weight or 1.0)),
+        })
         obj["attention_edges"] = edges
 
         anns = list(obj.get("annotations") or [])
@@ -773,13 +793,87 @@ def add_edge(idx: int, body: AddEdgeBody):
                 "token_j_idx": body.dst,
                 "subtype": body.subtype,
                 "source": body.source,
+                "weight": max(1.0, float(body.weight or 1.0)),
             }
         )
         obj["annotations"] = anns
         _sync_meta(obj)
         persist = _upsert_continue(idx, obj)
 
-    return {"ok": True, "n_edges": len(edges), "edge": body.model_dump(), **persist}
+    return {"ok": True, "n_edges": len(edges), "edge": {
+        "src": body.src, "dst": body.dst, "subtype": body.subtype,
+        "weight": max(1.0, float(body.weight or 1.0)),
+    }, **persist}
+
+
+@app.post("/api/sample/{idx}/edges/bump-weight")
+def bump_edge_weight(idx: int, body: BumpWeightBody):
+    """Increase/decrease an existing edge's weight; always upserts continue subset.
+
+    Used when a pair is already annotated but the annotator wants to emphasize it
+    for continue-train (saliency loss weights the positive by ``weight``).
+    """
+    if body.subtype not in SUBTYPES:
+        raise HTTPException(400, f"unknown subtype {body.subtype}; choose from {SUBTYPES}")
+    if _data_path is None:
+        raise HTTPException(400, "No data file open.")
+    delta = float(body.delta)
+    if delta == 0:
+        raise HTTPException(400, "delta must be non-zero")
+
+    with _state_lock:
+        obj, _, _ = _effective_sample(idx)
+        edges = list(obj.get("attention_edges") or [])
+        found = None
+        for e in edges:
+            if (
+                isinstance(e, dict)
+                and int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
+            ):
+                found = e
+                break
+        if found is None:
+            raise HTTPException(404, "edge not found — add it first, then bump weight")
+
+        try:
+            old_w = float(found.get("weight", 1.0))
+        except (TypeError, ValueError):
+            old_w = 1.0
+        new_w = max(1.0, old_w + delta)
+        found["weight"] = new_w
+
+        # Keep parallel annotations list in sync when present.
+        anns = list(obj.get("annotations") or [])
+        for a in anns:
+            if not isinstance(a, dict):
+                continue
+            if (
+                int(a.get("token_i_idx", -1)) == body.src
+                and int(a.get("token_j_idx", -1)) == body.dst
+                and str(a.get("subtype", "")) == body.subtype
+            ):
+                a["weight"] = new_w
+        obj["annotations"] = anns
+        obj["attention_edges"] = edges
+        _sync_meta(obj)
+        persist = _upsert_continue(idx, obj)
+
+    return {
+        "ok": True,
+        "n_edges": len(edges),
+        "edge": {
+            "src": body.src,
+            "dst": body.dst,
+            "subtype": body.subtype,
+            "weight": new_w,
+        },
+        "old_weight": old_w,
+        "new_weight": new_w,
+        **persist,
+    }
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train annotation viewer server")

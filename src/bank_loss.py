@@ -229,23 +229,38 @@ def _import_saliency_loss_from_outputs():
     )
 
 
-def _annot_pairs_from_edges(edges, n_tokens: int, device) -> list[torch.Tensor]:
-    pairs = []
+def _annot_pairs_from_edges(
+    edges, n_tokens: int, device
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Return (pairs [N,2], weights [N]) for one sample; weight defaults to 1.0."""
+    pairs: list[list[int]] = []
+    weights: list[float] = []
     for e in edges or []:
         try:
             if isinstance(e, (list, tuple)) and len(e) >= 2:
                 a, b = int(e[0]), int(e[1])
+                w = float(e[2]) if len(e) >= 3 else 1.0
             else:
                 a = int(e.get("src", e.get("source", -1)))
                 b = int(e.get("dst", e.get("target", -1)))
+                try:
+                    w = float(e.get("weight", 1.0))
+                except (TypeError, ValueError):
+                    w = 1.0
         except (TypeError, ValueError, AttributeError):
             continue
         qi, qj = (a, b) if a < b else (b, a)
         if 0 <= qi < qj < n_tokens:
             pairs.append([qi, qj])
+            weights.append(max(1.0, w))
     if not pairs:
-        return [torch.zeros(0, 2, dtype=torch.long, device=device)]
-    return [torch.tensor(pairs, dtype=torch.long, device=device)]
+        empty_p = torch.zeros(0, 2, dtype=torch.long, device=device)
+        empty_w = torch.zeros(0, dtype=torch.float32, device=device)
+        return [empty_p], [empty_w]
+    return (
+        [torch.tensor(pairs, dtype=torch.long, device=device)],
+        [torch.tensor(weights, dtype=torch.float32, device=device)],
+    )
 
 
 def _sdpa_context():
@@ -382,7 +397,7 @@ def compute_bank_loss(
         logits=None,
     )
 
-    annot_pairs = _annot_pairs_from_edges(edges, n_tokens, device)
+    annot_pairs, annot_weights = _annot_pairs_from_edges(edges, n_tokens, device)
     exclude = None
     if cfg.exclude_sink_prefix > 0 or (cfg.exclude_special_tokens and special_ids):
         em = torch.zeros_like(input_ids, dtype=torch.bool)
@@ -397,6 +412,7 @@ def compute_bank_loss(
         model,
         sal_outputs,
         annot_pairs,
+        annot_weights=annot_weights,
         saliency_layer=li,
         exclude_source_mask=exclude,
         alpha=cfg.alpha,

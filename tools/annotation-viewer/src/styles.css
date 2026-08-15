@@ -290,6 +290,33 @@ button, input, select {
   cursor: pointer;
 }
 
+.edgeWeight {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted, #667085);
+  min-width: 2.5rem;
+}
+
+.weightBtns {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.weightBtn {
+  border: 1px solid var(--line, #d0d5dd);
+  background: #fff;
+  color: #344054;
+  border-radius: 5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+.weightBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .addRow {
   display: flex;
   flex-wrap: wrap;

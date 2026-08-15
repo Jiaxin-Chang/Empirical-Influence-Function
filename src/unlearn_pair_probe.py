@@ -677,7 +677,7 @@ def _compute_filtered_train_grads(
                 saliency_loss_from_outputs = _import_saliency_loss_from_outputs()
                 n_tokens = int(local["input_ids"].size(1))
                 edges = [{"src": int(train_source_index), "dst": int(train_target_index)}]
-                annot_pairs = _annot_pairs_from_edges(edges, n_tokens, device)
+                annot_pairs, annot_weights = _annot_pairs_from_edges(edges, n_tokens, device)
                 exclude = None
                 if loss_cfg.exclude_sink_prefix > 0:
                     em = torch.zeros_like(local["input_ids"], dtype=torch.bool)
@@ -688,6 +688,7 @@ def _compute_filtered_train_grads(
                     model,
                     outputs,
                     annot_pairs,
+                    annot_weights=annot_weights,
                     saliency_layer=loss_cfg.saliency_layer,
                     exclude_source_mask=exclude,
                     alpha=loss_cfg.alpha,
