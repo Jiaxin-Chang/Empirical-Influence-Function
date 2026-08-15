@@ -279,9 +279,14 @@ def compute_bank_loss(
         return loss, "ce_only"
 
     # CRITICAL: do NOT set output_attentions=True — that materializes HxTxT for
-    # every layer. At FIM ChatML seq≈4k–8k this alone fills an 80–96GB GPU.
-    # Match the last-layer probe path: hidden_states only, then recompute the
-    # single saliency layer's attention probs.
+    # every layer. At FIM ChatML seq≈2k+ with eager attn this fills an 80–96GB GPU.
+    # Prefer sdpa/flash for the main forward; recompute only the saliency layer.
+    attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
+    print(
+        f"[bank-loss] ce_saliency forward attn_impl={attn_impl!r} "
+        f"seq={int(input_ids.size(1))} (single-layer attn recompute)",
+        flush=True,
+    )
     outputs = model(
         **inputs,
         output_attentions=False,
@@ -314,15 +319,18 @@ def compute_bank_loss(
         li = n_layers + li
     li = max(0, min(li, max(0, n_layers - 1)))
     hid_in = outputs.hidden_states[li]
+    # Drop references to other layer states we don't need for the saliency branch
+    # indexing (the CE graph still retains what it needs via outputs.loss).
+    slim_hidden = [None] * len(outputs.hidden_states)
+    slim_hidden[li] = hid_in
     attn_sel = _recompute_layer_attn_probs(model, hid_in, layer_index=li)
-    # Fake HF attentions tuple so saliency_loss_from_outputs can index [li].
     fake_attns = [None] * n_layers
     fake_attns[li] = attn_sel
     sal_outputs = SimpleNamespace(
         attentions=tuple(fake_attns),
-        hidden_states=outputs.hidden_states,
+        hidden_states=tuple(slim_hidden),
         loss=outputs.loss,
-        logits=getattr(outputs, "logits", None),
+        logits=None,
     )
 
     annot_pairs = _annot_pairs_from_edges(edges, n_tokens, device)

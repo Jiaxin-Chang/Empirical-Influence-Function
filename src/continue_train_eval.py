@@ -346,6 +346,16 @@ def run_continue_training(
     for m in model.modules():
         if isinstance(m, torch.nn.Dropout):
             m.eval()
+    # Gradient checkpointing only runs in train mode; keep it on.
+    try:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    except TypeError:
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
 
     params = _trainable_lora_params(model)
     if not params:
@@ -363,7 +373,13 @@ def run_continue_training(
     while step < int(cfg.max_steps):
         sample = train_samples[step % n_train]
         batch, edges = _sample_batch(sample, tokenizer, device)
+        seq_len = int(batch["input_ids"].size(1))
         opt.zero_grad(set_to_none=True)
+        if step == 0 and torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         loss, mode_used = compute_bank_loss(
             model,
             batch,
@@ -384,9 +400,18 @@ def run_continue_training(
         if progress_cb is not None:
             progress_cb(step, int(cfg.max_steps), loss_v, mode_used)
         if step == 1 or step % 10 == 0 or step == int(cfg.max_steps):
+            mem_note = ""
+            if torch.cuda.is_available():
+                try:
+                    peak = torch.cuda.max_memory_allocated() / 1e9
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    mem_note = f" peak={peak:.1f}G free={free_b/1e9:.1f}/{total_b/1e9:.1f}G"
+                except Exception:
+                    pass
             print(
                 f"[continue-train] step {step}/{cfg.max_steps} "
-                f"loss={loss_v:.4f} mode={mode_used} n_subset={n_train}",
+                f"loss={loss_v:.4f} mode={mode_used} seq={seq_len} n_subset={n_train}"
+                f"{mem_note}",
                 flush=True,
             )
         del batch, loss
@@ -814,6 +839,22 @@ def _print_per_sample_delta_report(report: dict[str, Any]) -> None:
             )
 
 
+def _pick_continue_attn_implementation() -> str:
+    """Continue-train does NOT need output_attentions (saliency recomputes one layer).
+
+    Using eager here OOMs at seq≈2k on 80–96GB GPUs because every decoder layer
+    saves HxTxT for backward. Prefer flash_attention_2, else sdpa.
+    """
+    raw = (os.environ.get("EIF_CONTINUE_ATTN_IMPL") or "").strip().lower()
+    if raw in ("eager", "sdpa", "flash_attention_2"):
+        return raw
+    try:
+        import flash_attn  # noqa: F401
+        return "flash_attention_2"
+    except Exception:
+        return "sdpa"
+
+
 def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> dict[str, Any]:
     if not cfg.adapter_path or not Path(cfg.adapter_path).is_dir():
         raise FileNotFoundError(f"adapter_path not found: {cfg.adapter_path!r}")
@@ -826,18 +867,51 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
     _evict_cached_models()
     torch.manual_seed(int(cfg.seed))
 
+    attn_impl = _pick_continue_attn_implementation()
     print(f"[continue-train] loading adapter={cfg.adapter_path}", flush=True)
     print(f"[continue-train] subset={train_jsonl}", flush=True)
     print(f"[continue-eval] test={cfg.test_data}", flush=True)
-
-    model, tokenizer = load_model_and_tokenizer(
-        model_path=cfg.adapter_path,
-        base_model_path=cfg.base_model_path,
-        attn_implementation="eager",
+    print(
+        f"[continue-train] attn_implementation={attn_impl} "
+        f"(saliency uses single-layer recompute; avoid eager)",
+        flush=True,
     )
+
+    try:
+        model, tokenizer = load_model_and_tokenizer(
+            model_path=cfg.adapter_path,
+            base_model_path=cfg.base_model_path,
+            attn_implementation=attn_impl,
+        )
+    except Exception as exc:
+        if attn_impl != "sdpa":
+            print(
+                f"[continue-train][WARN] load with {attn_impl!r} failed ({exc}); "
+                "falling back to sdpa",
+                flush=True,
+            )
+            attn_impl = "sdpa"
+            model, tokenizer = load_model_and_tokenizer(
+                model_path=cfg.adapter_path,
+                base_model_path=cfg.base_model_path,
+                attn_implementation=attn_impl,
+            )
+        else:
+            raise
     for n, p in model.named_parameters():
         if "lora_" in n:
             p.requires_grad_(True)
+    # Re-assert checkpointing after PEFT wrap (critical with long ChatML).
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    try:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    except TypeError:
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "config"):
+        model.config.use_cache = False
 
     train_samples = load_train_samples(train_jsonl)
     eval_samples = load_eval_samples(cfg.test_data)

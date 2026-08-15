@@ -1656,8 +1656,27 @@ function PairCard({
                 <span className={styles.pairId}>{pair.id}</span>
 
                 <span className={styles.cosSim} style={{ background: bg, color: fg }}>
-                    {pair.cos_sim.toFixed(4)}
+                    {(pair.score ?? pair.cos_sim).toFixed(4)}
                 </span>
+                {(() => {
+                    const st = pair as CorrelationPair & {
+                        struct_score?: number;
+                        text_score?: number;
+                        ast?: Record<string, string>;
+                        retrieval?: string;
+                    };
+                    if (st.retrieval !== 'structural_ast' && st.struct_score == null) return null;
+                    const ast = st.ast || {};
+                    return (
+                        <span style={{ fontSize: 10, color: '#6d28d9', fontWeight: 600 }}>
+                            {ast.train_lca
+                                ? `lca=${ast.train_lca}/${ast.train_relation || '?'}`
+                                : 'AST'}
+                            {' · '}struct {(st.struct_score ?? 0).toFixed(3)}
+                            {' · '}text {(st.text_score ?? 0).toFixed(3)}
+                        </span>
+                    );
+                })()}
 
                 <span className={styles.corrTag} style={{ background: '#eff6ff', borderColor: '#bfdbfe', color: '#1d4ed8' }}>
                     <span className={styles.corrLabel}>test </span>
@@ -2075,6 +2094,7 @@ export function ReportPanel({
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
     const [structuralAttributionEnabled, setStructuralAttributionEnabled] = useState(false);
     const [structuralPairs, setStructuralPairs] = useState<CorrelationPair[]>([]);
+    const [structuralTrainDetails, setStructuralTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
     const [structuralBusy, setStructuralBusy] = useState(false);
     const [structuralError, setStructuralError] = useState<string | null>(null);
     const [structuralMeta, setStructuralMeta] = useState<string | null>(null);
@@ -2383,33 +2403,19 @@ export function ReportPanel({
             .slice(0, 10);
     }, [allDisplayPairs]);
 
-    const structuralTrainGroups = useMemo(() => {
-        const map = new Map<number, CorrelationPair[]>();
-        structuralPairs.forEach(p => {
-            if (!map.has(p.train_sample_id)) map.set(p.train_sample_id, []);
-            map.get(p.train_sample_id)!.push(p);
-        });
-        return Array.from(map.entries())
-            .map(([id, pairs]) => ({
-                id,
-                pairs: [...pairs].sort(
-                    (a, b) => (b.score ?? b.cos_sim) - (a.score ?? a.cos_sim),
-                ),
-                bestSim: Math.max(...pairs.map(p => p.score ?? p.cos_sim)),
-            }))
-            .sort((a, b) => b.bestSim - a.bestSim)
-            .slice(0, 10);
-    }, [structuralPairs]);
-
     const resolveTrainDetail = useCallback((id: number): TrainSampleDetail | undefined => {
+        const key = String(id);
         if (attrMode === 'manual') {
-            return manualTrainDetails[String(id)] ?? report.train_sample_details[String(id)];
+            return manualTrainDetails[key] ?? report.train_sample_details[key];
         }
         if (attrMode === 'gold') {
-            return goldTrainDetails[String(id)] ?? report.train_sample_details[String(id)];
+            return goldTrainDetails[key] ?? report.train_sample_details[key];
         }
-        return report.train_sample_details[String(id)];
-    }, [attrMode, manualTrainDetails, goldTrainDetails, report.train_sample_details]);
+        return report.train_sample_details[key];
+    }, [
+        attrMode, manualTrainDetails, goldTrainDetails,
+        report.train_sample_details,
+    ]);
 
     const trainPanelEmptyHint = useMemo(() => {
         if (attrMode === 'manual') {
@@ -2953,16 +2959,22 @@ export function ReportPanel({
                     ? parsed.pairs as CorrelationPair[]
                     : [];
                 setStructuralPairs(pairs);
+                const details = (
+                    typeof parsed.trainSampleDetails === 'object'
+                    && parsed.trainSampleDetails !== null
+                ) ? parsed.trainSampleDetails as Record<string, TrainSampleDetail> : {};
+                setStructuralTrainDetails(details);
                 const q = (parsed.query || {}) as Record<string, unknown>;
                 const ast = (q.ast || {}) as Record<string, unknown>;
                 setStructuralMeta(
-                    `AST全量枚举 · ${pairs.length} top`
+                    `按pair · ${pairs.length} top`
                     + (typeof parsed.nScoredPairs === 'number' ? ` / scored=${parsed.nScoredPairs}` : '')
                     + (ast.lca ? ` · query lca=${String(ast.lca)}/${String(ast.relation || '')}` : '')
                     + ` · w=0.8/0.2`,
                 );
             } catch (error) {
                 setStructuralPairs([]);
+                setStructuralTrainDetails({});
                 setStructuralError(error instanceof Error ? error.message : 'Structural retrieve failed');
             } finally {
                 setStructuralBusy(false);
@@ -2973,12 +2985,14 @@ export function ReportPanel({
     useEffect(() => {
         if (!structuralAttributionEnabled) {
             setStructuralPairs([]);
+            setStructuralTrainDetails({});
             setStructuralError(null);
             setStructuralMeta(null);
             return;
         }
         if (!activeQueryEdge) {
             setStructuralPairs([]);
+            setStructuralTrainDetails({});
             setStructuralMeta(null);
             return;
         }
@@ -4168,29 +4182,36 @@ export function ReportPanel({
                                                 color: '#6b7280',
                                                 borderBottom: '1px solid #e9d5ff',
                                             }}>
-                                                分数=0.8·结构+0.2·文本；lca/relation=两端 AST 最低公共祖先与树关系；
-                                                黄=source / 橙=target。点 TRAIN 打开标注页也会黄/橙高亮（仅可视化）。
+                                                按 pair 展示（非按 train 聚合）。黄=source / 橙=target；
+                                                分数=0.8·结构+0.2·文本。点 TRAIN# 打开标注页也会黄/橙高亮。
                                             </div>
-                                            <div className={styles.trainGroupList} style={{ padding: '8px 0 16px' }}>
-                                                {structuralTrainGroups.map(({ id, pairs }) => (
-                                                    <TrainSampleGroup
-                                                        key={`ast-${id}`}
-                                                        trainIdx={id}
-                                                        pairs={pairs}
-                                                        detail={resolveTrainDetail(id)}
-                                                        gtEdgesByTarget={trainGtEdges?.[String(id)]}
-                                                        onUnlearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'unlearn')}
-                                                        onLearnPair={importedReportActive ? undefined : (pair) => handlePairIntervene(pair, 'learn')}
-                                                        onRecoverIntervention={importedReportActive ? undefined : handleRecoverIntervention}
-                                                        interveningPairId={interveningPairId}
-                                                        interveningDirection={interveningDirection}
+                                            <div className={styles.pairList} style={{ padding: '8px 10px 16px' }}>
+                                                {structuralPairs.map((pair) => (
+                                                    <PairCard
+                                                        key={pair.id}
+                                                        pair={pair}
+                                                        detail={
+                                                            structuralTrainDetails[String(pair.train_sample_id)]
+                                                            ?? resolveTrainDetail(pair.train_sample_id)
+                                                        }
+                                                        annotatedSourceIndices={annotatedSourcesForPairs(
+                                                            trainGtEdges?.[String(pair.train_sample_id)],
+                                                            [pair],
+                                                        )}
+                                                        onUnlearn={importedReportActive ? undefined : () => handlePairIntervene(pair, 'unlearn')}
+                                                        onLearn={importedReportActive ? undefined : () => handlePairIntervene(pair, 'learn')}
+                                                        onRecover={importedReportActive ? undefined : handleRecoverIntervention}
+                                                        unlearnBusy={interveningPairId === pair.id && interveningDirection === 'unlearn'}
+                                                        learnBusy={interveningPairId === pair.id && interveningDirection === 'learn'}
                                                         recoverBusy={recoverBusy}
-                                                        activeInterventionPairId={activeInterventionPairId}
-                                                        interventionSteps={interventionSteps}
+                                                        unlearnResult={unlearnResultsByPairId[pair.id] ?? null}
+                                                        interveneActiveForPair={activeInterventionPairId === pair.id}
+                                                        interventionSteps={
+                                                            activeInterventionPairId === pair.id ? interventionSteps : undefined
+                                                        }
                                                         interveneLr={pairInterveneLr}
-                                                        unlearnResults={unlearnResultsByPairId}
-                                                        onOpenAnnotationViewer={handleOpenAnnotationViewer}
-                                                        pairDefaultExpanded
+                                                        onOpenAnnotationViewer={() => handleOpenAnnotationViewer(pair)}
+                                                        defaultExpanded
                                                     />
                                                 ))}
                                             </div>

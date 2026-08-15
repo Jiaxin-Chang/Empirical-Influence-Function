@@ -944,6 +944,23 @@ def retrieve_structural_pairs(
                 }))
 
     top_rows = [row for _, row in nlargest(max(1, int(top_k)), scored, key=lambda x: x[0])]
+    # Attach train token streams for UI code boxes (per-pair yellow/orange highlight).
+    by_id = {int(s.train_sample_id): s for s in samples}
+    train_details: dict[str, Any] = {}
+    for row in top_rows:
+        tid = int(row["train_sample_id"])
+        key = str(tid)
+        if key in train_details:
+            continue
+        sample = by_id.get(tid)
+        if sample is None:
+            continue
+        train_details[key] = {
+            "full_tokens": list(sample.tokens),
+            "answer_start_index": int(sample.answer_start),
+            "coarse_cos_sim": float(row.get("cos_sim") or 0.0),
+            "saliencies_by_token": {},
+        }
     print(
         f"[structural-ast] scored={n_scored} kept≥{min_score}:{len(scored)} "
         f"empty_skip={n_skipped_empty} top={len(top_rows)} "
@@ -975,4 +992,5 @@ def retrieve_structural_pairs(
             },
         },
         "pairs": top_rows,
+        "trainSampleDetails": train_details,
     }
