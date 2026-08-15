@@ -1,5 +1,22 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": [],
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+  "remote.autoForwardPorts": true,
+  "remote.restoreForwardedPorts": true,
+  "remote.portsAttributes": {
+    "5174": {
+      "label": "annotation-viewer",
+      "onAutoForward": "notify"
+    },
+    "5273": {
+      "label": "correlation-report",
+      "onAutoForward": "notify"
+    },
+    "8765": {
+      "label": "eif-api-8765",
+      "onAutoForward": "silent"
+    },
+    "8766": {
+      "label": "eif-api-8766",
+      "onAutoForward": "silent"
+    }
+  }
 }

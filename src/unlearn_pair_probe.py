@@ -148,12 +148,14 @@ def _get_model(model_path: str, base_model_path: str | None):
                     os.path.abspath(g_model) == key[0]
                     and os.path.abspath(g_base or "") == key[1]
                 ):
-                    _GOLD_SESSION["model"] = model
-                    _GOLD_SESSION["tokenizer"] = tokenizer
+                    # Never replace a live gold model with a second load — that
+                    # raced with stage2/3 and left float32 LoRA vs bf16 base.
+                    if _GOLD_SESSION.get("model") is None:
+                        _GOLD_SESSION["model"] = model
+                        _GOLD_SESSION["tokenizer"] = tokenizer
         except Exception:
             pass
         return model, tokenizer
-
     with torch.inference_mode(False):
         # Prefer an already-loaded gold-live session when paths match (save VRAM).
         try:
@@ -1222,6 +1224,11 @@ def compute_next_token_probs(
 
     resolved_model, resolved_base = _resolve_paths(report, model_path, base_model_path)
     model, tokenizer = _get_model(resolved_model, resolved_base)
+    try:
+        from src.intervention_experiment import ensure_peft_lora_dtype
+        ensure_peft_lora_dtype(model, torch.bfloat16)
+    except Exception:
+        pass
     device = _device_of(model)
 
     if isinstance(stored_ids, list) and len(stored_ids) == len(tokens):

@@ -68,10 +68,12 @@ def _resolve_corr_report_path(report_file_name: str):
     return None
 PREPARE_STATUS_LOCK = Lock()
 PREPARE_STATUS: dict[str, dict] = {}
-# Serializes weight-mutating probes so concurrent Unlearn clicks don't race the
-# shared in-process model cache.
-UNLEARN_PROBE_LOCK = Lock()
-GOLD_LIVE_LOCK = Lock()
+# One lock for gold-live + unlearn/probs: they share (or overwrite) the same
+# in-process PEFT model. Separate locks allowed parallel loads and mid-flight
+# session swaps, which intermittently triggered bf16/float matmul errors.
+SHARED_MODEL_LOCK = Lock()
+UNLEARN_PROBE_LOCK = SHARED_MODEL_LOCK
+GOLD_LIVE_LOCK = SHARED_MODEL_LOCK
 CONTINUE_TRAIN_LOCK = Lock()
 CONTINUE_TRAIN_JOBS: dict[str, dict] = {}
 CONTINUE_TRAIN_JOBS_LOCK = Lock()

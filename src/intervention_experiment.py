@@ -403,7 +403,9 @@ def _cast_lora_params_to_dtype(model, dtype: torch.dtype) -> int:
     """Cast PEFT LoRA tensors to match base (adapters often load as float32).
 
     Calling bf16 activations into float32 ``lora_A`` raises
-    ``mat1 BFloat16 != float`` during last-layer ALTI recompute / Stage3.
+    ``mat1 BFloat16 != float``; casting activations down to float32 before a
+    bf16 ``base_layer`` raises ``mat1 float != mat2 BFloat16``. Aligning every
+    ``lora_*`` param/buffer once at load (and before gold/stage3) avoids both.
     """
     n = 0
     for name, p in model.named_parameters():
@@ -413,8 +415,23 @@ def _cast_lora_params_to_dtype(model, dtype: torch.dtype) -> int:
             continue
         p.data = p.data.to(dtype)
         n += 1
+    for name, buf in model.named_buffers():
+        if "lora_" not in name:
+            continue
+        if not torch.is_floating_point(buf) or buf.dtype == dtype:
+            continue
+        buf.data = buf.data.to(dtype)
+        n += 1
     return n
 
+
+def ensure_peft_lora_dtype(model, dtype: torch.dtype = torch.bfloat16) -> int:
+    """Re-align LoRA to ``dtype`` if anything drifted back to float32."""
+    if getattr(model, "_eif_grad_space", None) != "lora" and not any(
+        "lora_" in n for n, _ in model.named_parameters()
+    ):
+        return 0
+    return _cast_lora_params_to_dtype(model, dtype)
 
 def load_model_and_tokenizer(
     model_path: str | None = None,

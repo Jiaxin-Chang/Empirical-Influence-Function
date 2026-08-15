@@ -1347,23 +1347,23 @@ def prepare_last_layer_grad_checkpointing(model) -> None:
 def _peft_linear_forward(linear, x: Tensor) -> Tensor:
     """Call a (possibly PEFT) Linear without bf16/float32 matmul mismatch.
 
-    PEFT adapters often stay float32 while base Qwen weights are bf16. Casting
-    the activation to the adapter dtype (or base dtype when no adapter) avoids
-    ``mat1 BFloat16 != float``.
+    PEFT adapters often load as float32 while base Qwen weights are bf16.
+    Always run the fused module at **base** weight dtype. Casting ``x`` to the
+    LoRA dtype (old behavior) made ``base_layer`` see float32 vs bf16 and raise
+    ``mat1 float != mat2 BFloat16``. If LoRA A/B are still float32, align them
+    in-place first so ``lora_B(lora_A(x))`` matches.
     """
     base = getattr(linear, "base_layer", linear)
-    lora_A = getattr(linear, "lora_A", None)
-    if lora_A is not None:
-        # lora_A may be ModuleDict (per-adapter) or a single Linear.
-        try:
-            first = next(lora_A.parameters())
-            x_in = x.to(dtype=first.dtype)
-            out = linear(x_in)
-            return out.to(dtype=x.dtype)
-        except StopIteration:
-            pass
-    return linear(x.to(dtype=base.weight.dtype))
-
+    target = base.weight.dtype
+    for attr in ("lora_A", "lora_B"):
+        container = getattr(linear, attr, None)
+        if container is None or not hasattr(container, "parameters"):
+            continue
+        for p in container.parameters():
+            if p.is_floating_point() and p.dtype != target:
+                p.data = p.data.to(dtype=target)
+    out = linear(x.to(dtype=target))
+    return out if out.dtype == x.dtype else out.to(dtype=x.dtype)
 
 def _recompute_layer_attn_probs(model, hid_in: Tensor, layer_index: int = -1) -> Tensor:
     """Recompute one decoder layer's attention probs from that layer's input.

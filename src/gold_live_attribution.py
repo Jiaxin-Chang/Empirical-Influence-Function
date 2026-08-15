@@ -42,6 +42,7 @@ from src.intervention_experiment import (
     _load_or_build_saliency_train_bank,
     _project_flat_grad,
     _score_prescreen_sketch_cache,
+    ensure_peft_lora_dtype,
     find_first_valid_token_index,
     get_context_window,
     is_trivial_token,
@@ -326,6 +327,7 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         str(train_path),
     )
     if _SESSION is not None and _SESSION.get("key") == key:
+        ensure_peft_lora_dtype(_SESSION["model"], torch.bfloat16)
         return _SESSION
 
     print(f"[gold-live] loading model adapter={model_path} base={base_path or '-'}", flush=True)
@@ -334,6 +336,9 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
             model_path=model_path,
             base_model_path=base_path,
         )
+    n_cast = ensure_peft_lora_dtype(model, torch.bfloat16)
+    if n_cast:
+        print(f"[gold-live] re-aligned {n_cast} LoRA tensors to bfloat16", flush=True)
     device = _device_of(model)
     prepare_last_layer_grad_checkpointing(model)
 
@@ -466,6 +471,7 @@ def gold_saliency_top_k(
     model = session["model"]
     tokenizer = session["tokenizer"]
     device = session["device"]
+    ensure_peft_lora_dtype(model, torch.bfloat16)
     k = max(1, int(top_k if top_k is not None else _env_int("EIF_GOLD_TOP_SALIENCY", 4)))
 
     tokens, ids, prompt_len = _gold_tokens_and_ids(report, tokenizer)
@@ -709,6 +715,8 @@ def gold_retrieve_and_stage3(
     device = session["device"]
     bank = session["bank"]
     n_trains = max(1, int(top_trains if top_trains is not None else _env_int("EIF_GOLD_TOP_TRAINS", 10)))
+    # Defensive: shared unlearn/probs paths can leave LoRA in float32.
+    ensure_peft_lora_dtype(model, torch.bfloat16)
 
     tokens, ids, prompt_len = _gold_tokens_and_ids(report, tokenizer)
     if not (0 <= source_index < target_index < len(ids)):
