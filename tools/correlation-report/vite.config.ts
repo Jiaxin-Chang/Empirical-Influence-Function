@@ -375,9 +375,8 @@ const EIF_API_PROXY = {
   },
 }
 
-// Pin a dedicated port so this app never collides with TTAV's vite (5173).
-// strictPort makes vite fail loudly instead of silently drifting to 5174,
-// which was causing "am I on the report or on TTAV?" confusion.
+// Pin a dedicated port so this app never collides with TTAV's vite (5173)
+// or annotation-viewer (5174). strictPort: fail if busy — never auto-bump.
 const EIF_REPORT_PORT = 5273
 
 export default defineConfig({

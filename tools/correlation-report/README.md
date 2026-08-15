@@ -35,7 +35,7 @@ pnpm install
 pnpm dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:5273`（固定端口；占用则 `pnpm dev` 直接失败，不会改端口）。
 
 Static build:
 
@@ -43,7 +43,7 @@ Static build:
 cd tools/correlation-report
 pnpm run build
 cd dist
-python3 -m http.server 5173 --bind 0.0.0.0
+python3 -m http.server 5273 --bind 0.0.0.0
 ```
 
 The app can load bundled files under `dist/data/` and also **import JSON in the browser** (nothing is uploaded to a server).
