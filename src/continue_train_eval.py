@@ -90,7 +90,7 @@ def _resolve_path(raw: str | None) -> str | None:
     return str(p.resolve())
 
 
-def default_paths_from_env() -> dict[str, str | None]:
+def default_paths_from_env() -> dict[str, Any]:
     from src.eif_adapter_env import adapter_path_for_family
 
     # Small subset only — do NOT fall back to full EIF_TRAIN_DATA.
@@ -113,6 +113,25 @@ def default_paths_from_env() -> dict[str, str | None]:
         or (os.environ.get("EIF_ADAPTER_PATH") or "").strip()
     )
     base = base_model_path_from_env() or (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip() or None
+
+    def _max_steps_default() -> int:
+        raw = (os.environ.get("EIF_CONTINUE_MAX_STEPS") or "").strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        return 20
+
+    def _lr_default() -> float:
+        raw = (os.environ.get("EIF_CONTINUE_LR") or "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+        return 2e-5
+
     return {
         "adapter_path": _resolve_path(adapter),
         "base_model_path": _resolve_path(base) if base else None,
@@ -121,6 +140,8 @@ def default_paths_from_env() -> dict[str, str | None]:
         "test_data": _resolve_path(test),
         "eval_before_cache": _resolve_path(eval_before_cache),
         "output_dir": _resolve_path(out) or str(REPO_ROOT / "outputs" / "continue_trial"),
+        "max_steps": _max_steps_default(),
+        "learning_rate": _lr_default(),
     }
 
 

@@ -812,7 +812,7 @@ function inferSampleIdFromMeta(meta: AllTokensExperimentMeta, report?: AllTokens
 // ─── Token helpers ────────────────────────────────────────────────────────────
 
 function decodeToken(t: string): string {
-    return t.replaceAll('Ċ', '\n').replaceAll('Ġ', ' ').replaceAll('ĉ', '  ');
+    return String(t ?? '').replaceAll('Ċ', '\n').replaceAll('Ġ', ' ').replaceAll('ĉ', '  ');
 }
 
 function decodeTokens(tokens: string[]): string[] {
@@ -1520,6 +1520,7 @@ function PairCard({
     interventionSteps,
     interveneLr,
     onOpenAnnotationViewer,
+    onAutoAnnotateContinue,
     defaultExpanded = false,
 }: {
     pair: CorrelationPair;
@@ -1681,18 +1682,18 @@ function PairCard({
 
                 <span className={styles.corrTag} style={{ background: '#eff6ff', borderColor: '#bfdbfe', color: '#1d4ed8' }}>
                     <span className={styles.corrLabel}>test </span>
-                    <strong>{pair.test_correlation.source_token.trim() || '·'}</strong>
+                    <strong>{(pair.test_correlation.source_token ?? '').trim() || '·'}</strong>
                     <span className={styles.arrow}> → </span>
-                    <strong>{pair.test_correlation.target_token.trim() || '·'}</strong>
+                    <strong>{(pair.test_correlation.target_token ?? '').trim() || '·'}</strong>
                 </span>
 
                 <span className={styles.corrArrow}>⇔</span>
 
                 <span className={styles.corrTag} style={{ background: '#fffbeb', borderColor: '#fde68a', color: '#92400e' }}>
                     <span className={styles.corrLabel}>train </span>
-                    <strong>{pair.train_correlation.source_token.trim() || '·'}</strong>
+                    <strong>{(pair.train_correlation.source_token ?? '').trim() || '·'}</strong>
                     <span className={styles.arrow}> → </span>
-                    <strong>{pair.train_correlation.target_token.trim() || '·'}</strong>
+                    <strong>{(pair.train_correlation.target_token ?? '').trim() || '·'}</strong>
                     <span className={styles.offset}>+{pair.train_correlation.response_token_offset}</span>
                 </span>
 
@@ -2119,8 +2120,10 @@ export function ReportPanel({
     const [interventionSteps, setInterventionSteps] = useState(0);
     const [pairInterveneLr, setPairInterveneLr] = useState(DEFAULT_PAIR_INTERVENE_LR);
     const [pairInterveneLrInput, setPairInterveneLrInput] = useState(String(DEFAULT_PAIR_INTERVENE_LR));
-    const [continueStepsInput, setContinueStepsInput] = useState('50');
+    const [continueStepsInput, setContinueStepsInput] = useState('20');
     const [continueLrInput, setContinueLrInput] = useState('2e-5');
+    const [continueStepsDefault, setContinueStepsDefault] = useState(20);
+    const [continueLrDefault, setContinueLrDefault] = useState('2e-5');
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
@@ -2250,6 +2253,39 @@ export function ReportPanel({
             visualizerMode,
         } satisfies TtavLaunchPrefs));
     }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl, visualizerMode]);
+
+    // Sync Continue train steps/lr defaults from eif_api.env (EIF_CONTINUE_MAX_STEPS).
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const resp = await fetch(`${eifApiUrl.replace(/\/$/, '')}/api/continue-train-eval-defaults`);
+                if (!resp.ok || cancelled) return;
+                const data = await resp.json() as {
+                    status?: string;
+                    defaults?: { max_steps?: number; learning_rate?: number };
+                };
+                if (data.status !== 'success' || !data.defaults || cancelled) return;
+                const steps = Number(data.defaults.max_steps);
+                if (Number.isFinite(steps) && steps >= 1) {
+                    const s = String(Math.floor(steps));
+                    setContinueStepsDefault(Math.floor(steps));
+                    setContinueStepsInput(prev => (prev === '50' || prev === '20' ? s : prev));
+                }
+                const lr = Number(data.defaults.learning_rate);
+                if (Number.isFinite(lr) && lr > 0) {
+                    const lrStr = lr.toExponential ? Number(lr).toExponential().replace(/\.0+e/, 'e').replace(/e\+?/, 'e') : String(lr);
+                    // Prefer compact 2e-5 style
+                    const nice = Number(lr) === 2e-5 ? '2e-5' : String(lr);
+                    setContinueLrDefault(nice);
+                    setContinueLrInput(prev => (prev === '2e-5' ? nice : prev));
+                }
+            } catch {
+                // keep local defaults
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [eifApiUrl]);
 
     const [fullTokensDisplay, setFullTokensDisplay] = useState<string[] | null>(
         () => report.test_sample_baseline.full_tokens_display ?? null,
@@ -3458,7 +3494,10 @@ export function ReportPanel({
 
     const handleContinueTrainEval = useCallback(() => {
         if (importedReportActive) return;
-        const maxSteps = Math.max(1, Math.floor(Number(continueStepsInput)) || 50);
+        const maxSteps = Math.max(
+            1,
+            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+        );
         const learningRate = Number(continueLrInput);
         if (!Number.isFinite(learningRate) || learningRate <= 0) {
             setTtavLaunchError('续训 lr 必须是 > 0 的数字（如 2e-5）');
@@ -3567,7 +3606,7 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueStepsInput, continueLrInput, eifApiUrl, refreshTokenProbs, refreshSaliencyPanels]);
+    }, [importedReportActive, continueStepsInput, continueLrInput, continueStepsDefault, eifApiUrl, refreshTokenProbs, refreshSaliencyPanels]);
 
     const handleContinueAdapterRecover = useCallback(() => {
         if (importedReportActive) return;
@@ -4338,6 +4377,7 @@ export function ReportPanel({
                                                 value={continueStepsInput}
                                                 disabled={continueBusy}
                                                 onChange={(e) => setContinueStepsInput(e.target.value)}
+                                                title={`Default from EIF_CONTINUE_MAX_STEPS (eif_api.env): ${continueStepsDefault}`}
                                                 style={{
                                                     width: 56,
                                                     padding: '2px 6px',
@@ -4355,7 +4395,7 @@ export function ReportPanel({
                                                 value={continueLrInput}
                                                 disabled={continueBusy}
                                                 onChange={(e) => setContinueLrInput(e.target.value)}
-                                                title="AdamW lr on LoRA (e.g. 2e-5). Not the Learn/Unlearn η."
+                                                title={`AdamW lr on LoRA. Default ${continueLrDefault}. Not the Learn/Unlearn η.`}
                                                 style={{
                                                     width: 64,
                                                     padding: '2px 6px',
@@ -4366,6 +4406,9 @@ export function ReportPanel({
                                                 }}
                                             />
                                         </label>
+                                        <span style={{ color: '#94a3b8', fontSize: 11 }}>
+                                            当前 steps {continueStepsInput} · default {continueStepsDefault}
+                                        </span>
                                         <button
                                             type="button"
                                             disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
