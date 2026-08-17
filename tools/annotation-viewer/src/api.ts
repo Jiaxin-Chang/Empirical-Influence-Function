@@ -1,4 +1,5 @@
 export const SUBTYPE_COLORS: Record<string, string> = {
+  route: '#6d28d9',
   bracket: '#2563eb',
   defuse: '#16a34a',
   call: '#ca8a04',
@@ -10,6 +11,7 @@ export const SUBTYPE_COLORS: Record<string, string> = {
 }
 
 export const SUBTYPE_LABELS: Record<string, string> = {
+  route: '注意力路由（续训 saliency）',
   bracket: '括号/定界符配对',
   defuse: '变量声明 → 使用点',
   call: '被调函数 → 实参',
@@ -20,7 +22,13 @@ export const SUBTYPE_LABELS: Record<string, string> = {
   api: '库用法配对',
 }
 
-export type Edge = { src: number; dst: number; subtype: string; weight?: number }
+export type Edge = {
+  src: number
+  dst: number
+  subtype: string
+  weight?: number
+  contrib?: 'source' | 'user_add' | 'user_bump' | 'llm_auto' | string
+}
 
 export type SampleSummary = {
   index: number
@@ -41,6 +49,7 @@ export type SampleDetail = {
   input_ids: number[]
   answer_start: number
   attention_edges: Edge[]
+  n_continue_edges?: number
   annotation_meta: Record<string, unknown>
   subtypes: string[]
   in_continue?: boolean
@@ -137,6 +146,7 @@ export const api = {
     jsonFetch<{
       ok: boolean
       n_edges: number
+      n_continue_edges?: number
       action?: string
       continue_path?: string
       n_continue?: number
@@ -147,4 +157,56 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(edge),
     }),
+
+  autoAnnotate: (
+    idx: number,
+    body: {
+      probe_src_token?: string
+      probe_dst_token?: string
+      probe_tokens?: string[]
+      probe_answer_start?: number
+      probe_focus_src?: number
+      probe_focus_dst?: number
+      probe_mid_text?: string
+      probe_fim_view?: string
+      probe_id?: string
+      hint_train_src?: number
+      hint_train_dst?: number
+      focus_src?: number
+      focus_dst?: number
+      focus_src_token?: string
+      focus_dst_token?: string
+      query_mode?: string
+      mid_text?: string
+      max_edges?: number
+    },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      n_continue_edges?: number
+      proposed?: Edge[]
+      raw_preview?: string
+      action?: string
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/sample/${idx}/auto-annotate`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  getProbeFocus: (probeId: string) =>
+    jsonFetch<{
+      ok: boolean
+      probe: {
+        probe_tokens: string[]
+        probe_answer_start: number
+        probe_focus_src: number
+        probe_focus_dst: number
+        probe_src_token?: string
+        probe_dst_token?: string
+        probe_mid_text?: string | null
+        query_mode?: string
+      }
+    }>(`/api/probe-focus-cache/${probeId}`),
 }

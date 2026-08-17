@@ -21,7 +21,7 @@ CLI:
     --adapter-path $EIF_ADAPTER_PATH_SALIENCY \\
     --continue-train-data path/to/small_annotated.jsonl \\
     --test-data path/to/test.jsonl \\
-    --max-steps 50 --lr 2e-5
+    --max-steps 20 --lr 2e-5
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ class ContinueTrainConfig:
     train_data: str  # small annotated subset only
     test_data: str
     output_dir: str
-    max_steps: int = 50
+    max_steps: int = 20
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
     eval_before: bool = True
@@ -988,6 +988,26 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         loss_mode_override=cfg.loss_mode,
     )
     bank_cfg.loss_mode = cfg.loss_mode if cfg.loss_mode in ("ce_only", "ce_saliency") else bank_cfg.loss_mode
+    # Continue-train often wants a smaller λ than the original SFT (default 1.5
+    # tends to hurt generation on tiny subsets). Prefer EIF_CONTINUE_SALIENCY_LAMBDA,
+    # then EIF_BANK_SALIENCY_LAMBDA; leave unset to keep adapter/bank defaults.
+    cont_lam = (os.environ.get("EIF_CONTINUE_SALIENCY_LAMBDA") or "").strip()
+    bank_lam = (os.environ.get("EIF_BANK_SALIENCY_LAMBDA") or "").strip()
+    lam_override = cont_lam or bank_lam
+    if lam_override:
+        try:
+            bank_cfg.saliency_lambda = float(lam_override)
+        except ValueError:
+            print(
+                f"[continue-train][WARN] invalid saliency λ override {lam_override!r}; "
+                f"keeping λ={bank_cfg.saliency_lambda}",
+                flush=True,
+            )
+    print(
+        f"[continue-train] bank loss_mode={bank_cfg.loss_mode} "
+        f"type={bank_cfg.saliency_loss_type} λ={bank_cfg.saliency_lambda}",
+        flush=True,
+    )
 
     def _prog(stage: str, message: str, **extra):
         if progress_cb is not None:
@@ -1182,13 +1202,22 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
             "or pass trainSampleIds (will slice from EIF_TRAIN_DATA)."
         )
 
+    def _default_max_steps() -> int:
+        raw = (os.environ.get("EIF_CONTINUE_MAX_STEPS") or "").strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        return 20
+
     return ContinueTrainConfig(
         adapter_path=adapter,
         base_model_path=base,
         train_data=train or "",
         test_data=test,
         output_dir=out or str(REPO_ROOT / "outputs" / "continue_trial"),
-        max_steps=max(1, int(req.get("maxSteps", 50))),
+        max_steps=max(1, int(req.get("maxSteps", _default_max_steps()))),
         learning_rate=float(req.get("learningRate", 2e-5)),
         loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
         eval_before=bool(req.get("evalBefore", True)),
@@ -1224,7 +1253,7 @@ def main():
         help="Precomputed baseline line_hit JSONL (EIF_CONTINUE_EVAL_BEFORE_CACHE); skips GPU eval_before",
     )
     p.add_argument("--output-dir", default=defaults["output_dir"])
-    p.add_argument("--max-steps", type=int, default=50)
+    p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--loss-mode", default="ce_saliency", choices=["ce_only", "ce_saliency"])
     p.add_argument("--no-eval-before", action="store_true")

@@ -35,7 +35,7 @@ export default function App() {
   const [saliency, setSaliency] = useState<SaliencyHit[]>([])
   const [saliencyMsg, setSaliencyMsg] = useState<string>('')
   const [mode, setMode] = useState<Mode>('inspect')
-  const [addSubtype, setAddSubtype] = useState('defuse')
+  const [addSubtype, setAddSubtype] = useState('route')
   const [addSrc, setAddSrc] = useState<number | null>(null)
   const [pendingEdge, setPendingEdge] = useState<Edge | null>(null)
   const [status, setStatus] = useState('')
@@ -44,6 +44,18 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [listOffset, setListOffset] = useState(0)
   const [jumpIdx, setJumpIdx] = useState('0')
+  const [queryMode, setQueryMode] = useState('manual')
+  /** Probe/test focus surfaces from correlation-report deep link. */
+  const [probeSrcToken, setProbeSrcToken] = useState('')
+  const [probeDstToken, setProbeDstToken] = useState('')
+  const [probePayload, setProbePayload] = useState<{
+    probe_tokens?: string[]
+    probe_answer_start?: number
+    probe_focus_src?: number
+    probe_focus_dst?: number
+    probe_mid_text?: string | null
+    probe_id?: string
+  } | null>(null)
   const PAGE = 100
 
   const refreshList = useCallback(async (q: string, offset = 0, append = false) => {
@@ -140,11 +152,39 @@ export default function App() {
           )
           await refreshList('', 0, false)
 
-          // Deep link from correlation-report: ?sample=0&target=123&source=45
+          // Deep link: train sample + train analog highlight + probe surfaces
+          // ?sample=0&target=123&source=45&probeSrc=foo&probeDst=bar&queryMode=gold&autoAnnotate=1
           const params = new URLSearchParams(window.location.search)
           const sampleRaw = params.get('sample')
           const targetRaw = params.get('target')
           const sourceRaw = params.get('source')
+          const probeSrcRaw = (params.get('probeSrc') || '').trim()
+          const probeDstRaw = (params.get('probeDst') || '').trim()
+          if (probeSrcRaw) setProbeSrcToken(probeSrcRaw)
+          if (probeDstRaw) setProbeDstToken(probeDstRaw)
+          const qm = (params.get('queryMode') || params.get('mode') || 'manual').trim()
+          setQueryMode(qm || 'manual')
+          const probeId = (params.get('probeId') || '').trim()
+          if (probeId) {
+            try {
+              const cached = await api.getProbeFocus(probeId)
+              const p = cached.probe
+              setProbePayload({
+                probe_tokens: p.probe_tokens,
+                probe_answer_start: p.probe_answer_start,
+                probe_focus_src: p.probe_focus_src,
+                probe_focus_dst: p.probe_focus_dst,
+                probe_mid_text: p.probe_mid_text ?? null,
+                probe_id: probeId,
+              })
+              if (p.probe_src_token) setProbeSrcToken(String(p.probe_src_token))
+              if (p.probe_dst_token) setProbeDstToken(String(p.probe_dst_token))
+              if (p.query_mode) setQueryMode(String(p.query_mode))
+            } catch {
+              setProbePayload({ probe_id: probeId })
+            }
+          }
+          const auto = (params.get('autoAnnotate') || '').trim() === '1'
           if (sampleRaw != null && sampleRaw !== '') {
             const sampleIdx = Number(sampleRaw)
             const targetIdx =
@@ -157,6 +197,16 @@ export default function App() {
                 targetIdx != null && Number.isInteger(targetIdx) ? targetIdx : null,
                 sourceIdx != null && Number.isInteger(sourceIdx) ? sourceIdx : null,
               )
+              if (
+                auto &&
+                sourceIdx != null &&
+                Number.isInteger(sourceIdx) &&
+                targetIdx != null &&
+                Number.isInteger(targetIdx)
+              ) {
+                // Defer auto-annotate until sample state is ready via URL flag handled below.
+                ;(window as unknown as { __eifAutoAnnotate?: boolean }).__eifAutoAnnotate = true
+              }
             }
           }
         }
@@ -303,6 +353,61 @@ export default function App() {
     }
   }
 
+  const runAutoAnnotate = async (
+    hintTrainSrc: number | null,
+    hintTrainDst: number | null,
+    modeHint?: string,
+  ) => {
+    if (selectedIdx == null || !sample) return
+    setBusy(true)
+    setError('')
+    try {
+      const probeSrc =
+        probeSrcToken ||
+        (hintTrainSrc != null ? sample.tokens[hintTrainSrc] ?? '' : '')
+      const probeDst =
+        probeDstToken ||
+        (hintTrainDst != null ? sample.tokens[hintTrainDst] ?? '' : '')
+      const res = await api.autoAnnotate(selectedIdx, {
+        probe_src_token: probeSrc,
+        probe_dst_token: probeDst,
+        probe_tokens: probePayload?.probe_tokens,
+        probe_answer_start: probePayload?.probe_answer_start,
+        probe_focus_src: probePayload?.probe_focus_src,
+        probe_focus_dst: probePayload?.probe_focus_dst,
+        probe_mid_text: probePayload?.probe_mid_text || undefined,
+        probe_id: probePayload?.probe_id,
+        hint_train_src: hintTrainSrc ?? undefined,
+        hint_train_dst: hintTrainDst ?? undefined,
+        query_mode: modeHint || queryMode,
+        // omit max_edges → server reads ANNOTATE_MAX_EDGES from eif_api.env
+      })
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
+      await loadSample(selectedIdx, hintTrainDst, hintTrainSrc)
+      await refreshList(query, 0, false)
+      setStatus(
+        `LLM 自动标注完成：续训边 ${res.n_continue_edges ?? res.proposed?.length ?? 0} 条` +
+          ` · 可视化 ${res.n_edges} 条` +
+          (h.continue_path ? ` → ${h.n_continue} 条样本` : ''),
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Deep-link autoAnnotate=1 after sample loaded.
+  useEffect(() => {
+    const flag = (window as unknown as { __eifAutoAnnotate?: boolean }).__eifAutoAnnotate
+    if (!flag || !sample || selectedIdx == null || focusSource == null || target == null) return
+    ;(window as unknown as { __eifAutoAnnotate?: boolean }).__eifAutoAnnotate = false
+    void runAutoAnnotate(focusSource, target, queryMode)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sample, selectedIdx, focusSource, target])
+
   const underlineStyle = (subtypes: string[]): CSSProperties | undefined => {
     if (!subtypes.length) return undefined
     // CSS can only show one underline color; prefer first, tooltip lists all.
@@ -320,8 +425,8 @@ export default function App() {
       <header className="header">
         <h1>Train Annotation Viewer</h1>
         <p>
-          浏览源 train JSONL（只读）。新增 / 删除标注会 upsert 到续训小集
-          （ANNOTATION_CONTINUE_TRAIN_DATA），不写回原文件。
+          浏览源 train JSONL（只读）。可视化显示完整标注；续训小集只写入
+          <strong> 用户新增 / 加权 / LLM 自动标注</strong> 的边（不复制旧标注）。
         </p>
       </header>
 
@@ -567,7 +672,31 @@ export default function App() {
                         ? ` / 样本共 ${sample.attention_edges.length}`
                         : ''}
                       ）
+                      {typeof sample.n_continue_edges === 'number' ? (
+                        <span className="hint" style={{ fontWeight: 400, marginLeft: 8 }}>
+                          续训边 {sample.n_continue_edges}
+                        </span>
+                      ) : null}
                     </h3>
+                    {focusSource != null && (
+                      <div className="addRow" style={{ marginBottom: 8 }}>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          title="用测试集 focus 机制，在本条训练集样本上让 LLM 提续训边（不含旧标注）"
+                          onClick={() => void runAutoAnnotate(focusSource, target, queryMode)}
+                        >
+                          LLM 自动标注 → 续训
+                        </button>
+                        <span className="hint">
+                          probe {probeSrcToken || '·'} → {probeDstToken || '·'}
+                          {focusSource != null && target != null
+                            ? ` · train hint @${focusSource}→@${target}`
+                            : ''}{' '}
+                          （{queryMode}）
+                        </span>
+                      </div>
+                    )}
                     {!relatedEdges.length && <p className="hint">该 target 没有 annotation edge</p>}
                     {relatedEdges.map(e => (
                       <div className="edgeRow" key={`${e.src}-${e.dst}-${e.subtype}`}>
@@ -578,6 +707,17 @@ export default function App() {
                           }}
                         >
                           {e.subtype}
+                        </span>
+                        <span
+                          className="hint"
+                          title="source=语料原标注; user_add/bump/llm_auto=进入续训"
+                          style={{
+                            color:
+                              e.contrib && e.contrib !== 'source' ? '#6d28d9' : '#98a2b3',
+                            fontWeight: e.contrib && e.contrib !== 'source' ? 700 : 400,
+                          }}
+                        >
+                          {e.contrib || 'source'}
                         </span>
                         <span>
                           src @{e.src}{' '}

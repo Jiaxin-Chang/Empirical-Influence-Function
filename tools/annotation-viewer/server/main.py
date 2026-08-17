@@ -97,6 +97,7 @@ _TOKENIZER_RAW = (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
 DEFAULT_TOKENIZER = Path(_TOKENIZER_RAW).expanduser() if _TOKENIZER_RAW else Path()
 
 SUBTYPES = [
+    "route",  # continue-train attention-routing (default for manual / LLM)
     "bracket",
     "defuse",
     "call",
@@ -129,6 +130,9 @@ _model = None
 _model_path: str | None = None
 _saliency_cache_dir: Path | None = None
 _saliency_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
+# Cross-origin probe FIM payloads from correlation-report (sessionStorage cannot share).
+_probe_focus_cache: dict[str, dict[str, Any]] = {}
+_PROBE_FOCUS_CACHE_MAX = 64
 
 
 def _disk_saliency_path(idx: int) -> Path | None:
@@ -314,17 +318,126 @@ def _lookup_continue(source_idx: int, source_obj: dict[str, Any]) -> tuple[str, 
 def _effective_sample(idx: int) -> tuple[dict[str, Any], bool, str]:
     """Source row overlaid with continue-train edit if present.
 
+    Display uses full viz edge list; continue JSONL ``attention_edges`` may be
+    a subset (user-add / weight-bump / llm-auto only).
+
     Returns (obj, from_continue, sample_key).
     """
     source = _read_sample(idx)
     key, cont_idx = _lookup_continue(idx, source)
     if cont_idx is None:
-        return source, False, key
+        obj = _compose_display_obj(source, None, from_continue=False)
+        return obj, False, key
     overlay = _read_continue_by_idx(cont_idx)
-    # Prefer continue annotations; keep source fields if continue omitted them.
+    obj = _compose_display_obj(source, overlay, from_continue=True)
+    return obj, True, key
+
+
+CONTINUE_CONTRIBS = frozenset({"user_add", "user_bump", "llm_auto"})
+
+
+def _edge_key(e: dict[str, Any]) -> tuple[int, int, str]:
+    return (int(e["src"]), int(e["dst"]), str(e.get("subtype") or ""))
+
+
+def _normalize_edge(
+    e: dict[str, Any],
+    *,
+    contrib: str | None = None,
+    weight: float | None = None,
+) -> dict[str, Any]:
+    try:
+        w = float(weight if weight is not None else e.get("weight", 1.0))
+    except (TypeError, ValueError):
+        w = 1.0
+    if w <= 0:
+        w = 1.0
+    c = contrib if contrib is not None else str(e.get("contrib") or "source")
+    out = {
+        "src": int(e["src"]),
+        "dst": int(e["dst"]),
+        "subtype": str(e.get("subtype") or ""),
+        "weight": max(1.0, w),
+        "contrib": c,
+    }
+    if e.get("reason"):
+        out["reason"] = e["reason"]
+    if e.get("source"):
+        out["source"] = e["source"]
+    return out
+
+
+def _is_continue_edge(e: dict[str, Any]) -> bool:
+    return str(e.get("contrib") or "") in CONTINUE_CONTRIBS
+
+
+def _source_baseline_edges(source: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for e in source.get("attention_edges") or []:
+        if isinstance(e, dict) and "src" in e and "dst" in e:
+            out.append(_normalize_edge(e, contrib="source"))
+    return out
+
+
+def _viz_and_continue_from_overlay(
+    source: dict[str, Any],
+    overlay: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (viz_edges, continue_edges) for a continue overlay row."""
+    raw_viz = overlay.get("viz_attention_edges")
+    raw_cont = overlay.get("attention_edges") or []
+
+    if isinstance(raw_viz, list):
+        viz = [_normalize_edge(e) for e in raw_viz if isinstance(e, dict) and "src" in e and "dst" in e]
+        cont = [
+            _normalize_edge(e)
+            for e in raw_cont
+            if isinstance(e, dict) and "src" in e and "dst" in e and _is_continue_edge(_normalize_edge(e))
+        ]
+        # If continue edges lack contrib tags (partial write), keep listed ones as user_add.
+        if raw_cont and not cont:
+            cont = [
+                _normalize_edge(e, contrib=str(e.get("contrib") or "user_add"))
+                for e in raw_cont
+                if isinstance(e, dict) and "src" in e and "dst" in e
+            ]
+        return viz, cont
+
+    # Legacy continue rows stored the full display list in attention_edges.
+    # Treat them as viz; only keep edges already tagged for continue, else none
+    # (force user to re-add / bump under the new policy).
+    legacy = [
+        _normalize_edge(e)
+        for e in raw_cont
+        if isinstance(e, dict) and "src" in e and "dst" in e
+    ]
+    cont = [e for e in legacy if _is_continue_edge(e)]
+    if not cont and legacy:
+        # Old files had no contrib field — do not silently continue-train on all
+        # inherited edges; viz still shows the saved full list.
+        viz = [_normalize_edge(e, contrib=str(e.get("contrib") or "source")) for e in legacy]
+        return viz, []
+    return legacy, cont
+
+
+def _compose_display_obj(
+    source: dict[str, Any],
+    overlay: dict[str, Any] | None,
+    *,
+    from_continue: bool,
+) -> dict[str, Any]:
+    if overlay is None:
+        obj = dict(source)
+        obj["attention_edges"] = _source_baseline_edges(source)
+        obj["_continue_edge_count"] = 0
+        return obj
+    viz, cont = _viz_and_continue_from_overlay(source, overlay)
     merged = dict(source)
     merged.update(overlay)
-    return merged, True, key
+    merged["attention_edges"] = viz
+    merged["_continue_edge_count"] = len(cont)
+    merged["_from_continue"] = from_continue
+    return merged
 
 
 def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
@@ -348,12 +461,10 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
         action = "inserted"
     else:
         _continue_offsets = _rewrite_jsonl_line(path, _continue_offsets, existing, obj)
-        # Offsets changed; rebuild key map (line order preserved).
         _rebuild_continue_index()
         cont_idx = _continue_key_to_idx.get(keys[0], existing)
         action = "updated"
 
-    # Register every alias key so uid / source_idx lookups both hit.
     for k in keys:
         _continue_key_to_idx[k] = cont_idx
 
@@ -364,7 +475,63 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
         "key": keys[0],
         "continue_path": str(path),
         "n_continue": max(0, len(_continue_offsets) - 1),
+        "n_continue_edges": len(obj.get("attention_edges") or []),
     }
+
+
+def _write_continue_payload(
+    source_idx: int,
+    source: dict[str, Any],
+    *,
+    viz_edges: list[dict[str, Any]],
+    continue_edges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist continue row: attention_edges = continue-only; viz_* = display."""
+    obj = dict(source)
+    obj.pop("_continue_edge_count", None)
+    obj.pop("_from_continue", None)
+    viz_n = [_normalize_edge(e) for e in viz_edges]
+    cont_n = [
+        _normalize_edge(e)
+        for e in continue_edges
+        if _is_continue_edge(_normalize_edge(e))
+    ]
+    by_key = {_edge_key(e): e for e in viz_n}
+    for e in cont_n:
+        by_key[_edge_key(e)] = e
+    viz_n = list(by_key.values())
+    obj["viz_attention_edges"] = viz_n
+    obj["attention_edges"] = cont_n
+    anns = []
+    for e in viz_n:
+        anns.append({
+            "token_i_idx": e["src"],
+            "token_j_idx": e["dst"],
+            "subtype": e["subtype"],
+            "source": e.get("source") or e.get("contrib") or "Manual",
+            "weight": e.get("weight", 1.0),
+            "contrib": e.get("contrib"),
+        })
+    obj["annotations"] = anns
+    _sync_meta(obj)
+    meta = obj.get("annotation_meta")
+    if isinstance(meta, dict):
+        meta["continue_attention_edges"] = len(cont_n)
+        meta["viz_attention_edges"] = len(viz_n)
+    return _upsert_continue(source_idx, obj)
+
+
+def _current_viz_and_continue(idx: int) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (source_row, viz_edges, continue_edges)."""
+    source = _read_sample(idx)
+    key, cont_idx = _lookup_continue(idx, source)
+    del key
+    if cont_idx is None:
+        viz = _source_baseline_edges(source)
+        return source, viz, []
+    overlay = _read_continue_by_idx(cont_idx)
+    viz, cont = _viz_and_continue_from_overlay(source, overlay)
+    return source, viz, cont
 
 def _resolve_tokenizer_path() -> str:
     if _tokenizer_path:
@@ -597,6 +764,7 @@ def get_sample(idx: int):
     tokens = _surface_tokens_from_obj(obj, input_ids)
 
     edges = []
+    n_continue_edges = 0
     for e in obj.get("attention_edges") or []:
         if not isinstance(e, dict):
             continue
@@ -606,14 +774,23 @@ def get_sample(idx: int):
             w = 1.0
         if w <= 0:
             w = 1.0
+        contrib = str(e.get("contrib") or "source")
+        if contrib in CONTINUE_CONTRIBS:
+            n_continue_edges += 1
         edges.append(
             {
                 "src": int(e["src"]),
                 "dst": int(e["dst"]),
                 "subtype": str(e.get("subtype") or ""),
                 "weight": w,
+                "contrib": contrib,
             }
         )
+    # Prefer explicit continue count from overlay when present.
+    try:
+        n_continue_edges = int(obj.get("_continue_edge_count") or n_continue_edges)
+    except (TypeError, ValueError):
+        pass
 
     return {
         "index": idx,
@@ -624,6 +801,7 @@ def get_sample(idx: int):
         "input_ids": input_ids,
         "answer_start": _answer_start(labels),
         "attention_edges": edges,
+        "n_continue_edges": n_continue_edges,
         "annotation_meta": obj.get("annotation_meta") or {},
         "subtypes": SUBTYPES,
         "in_continue": from_continue,
@@ -718,39 +896,38 @@ def delete_edge(idx: int, body: DeleteEdgeBody):
         raise HTTPException(400, "No data file open.")
 
     with _state_lock:
-        obj, _, _ = _effective_sample(idx)
-        edges = list(obj.get("attention_edges") or [])
-        before = len(edges)
-        edges = [
+        source, viz, cont = _current_viz_and_continue(idx)
+        before = len(viz)
+        viz = [
             e
-            for e in edges
+            for e in viz
             if not (
-                isinstance(e, dict)
-                and int(e.get("src", -1)) == body.src
+                int(e.get("src", -1)) == body.src
                 and int(e.get("dst", -1)) == body.dst
                 and str(e.get("subtype", "")) == body.subtype
             )
         ]
-        if len(edges) == before:
+        if len(viz) == before:
             raise HTTPException(404, "edge not found in attention_edges")
-        obj["attention_edges"] = edges
-
-        # Best-effort: also drop a matching simple-token annotation if indices coincide.
-        anns = list(obj.get("annotations") or [])
-        obj["annotations"] = [
-            a
-            for a in anns
+        cont = [
+            e
+            for e in cont
             if not (
-                isinstance(a, dict)
-                and int(a.get("token_i_idx", -1)) == body.src
-                and int(a.get("token_j_idx", -1)) == body.dst
-                and str(a.get("subtype", "")) == body.subtype
+                int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
             )
         ]
-        _sync_meta(obj)
-        persist = _upsert_continue(idx, obj)
+        persist = _write_continue_payload(
+            idx, source, viz_edges=viz, continue_edges=cont,
+        )
 
-    return {"ok": True, "n_edges": len(edges), **persist}
+    return {
+        "ok": True,
+        "n_edges": len(viz),
+        "n_continue_edges": len(cont),
+        **persist,
+    }
 
 
 @app.post("/api/sample/{idx}/edges/add")
@@ -763,55 +940,50 @@ def add_edge(idx: int, body: AddEdgeBody):
         raise HTTPException(400, "No data file open.")
 
     with _state_lock:
-        obj, _, _ = _effective_sample(idx)
-        n = len(obj.get("input_ids") or [])
+        source, viz, cont = _current_viz_and_continue(idx)
+        n = len(source.get("input_ids") or [])
         if not (0 <= body.src < n and 0 <= body.dst < n):
             raise HTTPException(400, f"src/dst out of range 0..{n-1}")
 
-        edges = list(obj.get("attention_edges") or [])
-        for e in edges:
+        for e in viz:
             if (
-                isinstance(e, dict)
-                and int(e.get("src", -1)) == body.src
+                int(e.get("src", -1)) == body.src
                 and int(e.get("dst", -1)) == body.dst
                 and str(e.get("subtype", "")) == body.subtype
             ):
                 raise HTTPException(409, "edge already exists")
 
-        edges.append({
-            "src": body.src,
-            "dst": body.dst,
-            "subtype": body.subtype,
-            "weight": max(1.0, float(body.weight or 1.0)),
-        })
-        obj["attention_edges"] = edges
-
-        anns = list(obj.get("annotations") or [])
-        anns.append(
+        edge = _normalize_edge(
             {
-                "token_i_idx": body.src,
-                "token_j_idx": body.dst,
+                "src": body.src,
+                "dst": body.dst,
                 "subtype": body.subtype,
                 "source": body.source,
-                "weight": max(1.0, float(body.weight or 1.0)),
-            }
+                "weight": body.weight,
+            },
+            contrib="user_add",
         )
-        obj["annotations"] = anns
-        _sync_meta(obj)
-        persist = _upsert_continue(idx, obj)
+        viz = list(viz) + [edge]
+        cont = list(cont) + [edge]
+        persist = _write_continue_payload(
+            idx, source, viz_edges=viz, continue_edges=cont,
+        )
 
-    return {"ok": True, "n_edges": len(edges), "edge": {
-        "src": body.src, "dst": body.dst, "subtype": body.subtype,
-        "weight": max(1.0, float(body.weight or 1.0)),
-    }, **persist}
+    return {
+        "ok": True,
+        "n_edges": len(viz),
+        "n_continue_edges": len(cont),
+        "edge": edge,
+        **persist,
+    }
 
 
 @app.post("/api/sample/{idx}/edges/bump-weight")
 def bump_edge_weight(idx: int, body: BumpWeightBody):
-    """Increase/decrease an existing edge's weight; always upserts continue subset.
+    """Bump weight on an edge; marks it for continue-train (user_bump).
 
-    Used when a pair is already annotated but the annotator wants to emphasize it
-    for continue-train (saliency loss weights the positive by ``weight``).
+    Continue subset only stores user-added / bumped / llm-auto edges — not the
+    full source annotation set. Visualization still shows the full viz list.
     """
     if body.subtype not in SUBTYPES:
         raise HTTPException(400, f"unknown subtype {body.subtype}; choose from {SUBTYPES}")
@@ -822,13 +994,11 @@ def bump_edge_weight(idx: int, body: BumpWeightBody):
         raise HTTPException(400, "delta must be non-zero")
 
     with _state_lock:
-        obj, _, _ = _effective_sample(idx)
-        edges = list(obj.get("attention_edges") or [])
+        source, viz, cont = _current_viz_and_continue(idx)
         found = None
-        for e in edges:
+        for e in viz:
             if (
-                isinstance(e, dict)
-                and int(e.get("src", -1)) == body.src
+                int(e.get("src", -1)) == body.src
                 and int(e.get("dst", -1)) == body.dst
                 and str(e.get("subtype", "")) == body.subtype
             ):
@@ -842,35 +1012,275 @@ def bump_edge_weight(idx: int, body: BumpWeightBody):
         except (TypeError, ValueError):
             old_w = 1.0
         new_w = max(1.0, old_w + delta)
+        prev_contrib = str(found.get("contrib") or "source")
+        # Keep user_add / llm_auto; promote source → user_bump for continue.
+        new_contrib = prev_contrib if prev_contrib in CONTINUE_CONTRIBS else "user_bump"
         found["weight"] = new_w
+        found["contrib"] = new_contrib
 
-        # Keep parallel annotations list in sync when present.
-        anns = list(obj.get("annotations") or [])
-        for a in anns:
-            if not isinstance(a, dict):
-                continue
-            if (
-                int(a.get("token_i_idx", -1)) == body.src
-                and int(a.get("token_j_idx", -1)) == body.dst
-                and str(a.get("subtype", "")) == body.subtype
-            ):
-                a["weight"] = new_w
-        obj["annotations"] = anns
-        obj["attention_edges"] = edges
-        _sync_meta(obj)
-        persist = _upsert_continue(idx, obj)
+        cont_by = {_edge_key(e): e for e in cont}
+        cont_by[_edge_key(found)] = _normalize_edge(found, contrib=new_contrib, weight=new_w)
+        cont = list(cont_by.values())
+
+        persist = _write_continue_payload(
+            idx, source, viz_edges=viz, continue_edges=cont,
+        )
 
     return {
         "ok": True,
-        "n_edges": len(edges),
+        "n_edges": len(viz),
+        "n_continue_edges": len(cont),
         "edge": {
             "src": body.src,
             "dst": body.dst,
             "subtype": body.subtype,
             "weight": new_w,
+            "contrib": new_contrib,
         },
         "old_weight": old_w,
         "new_weight": new_w,
+        **persist,
+    }
+
+
+class ProbeFocusCacheBody(BaseModel):
+    probe_tokens: list[str]
+    probe_answer_start: int = 0
+    probe_focus_src: int
+    probe_focus_dst: int
+    probe_src_token: str = ""
+    probe_dst_token: str = ""
+    probe_mid_text: str | None = None
+    query_mode: str = "manual"
+
+
+@app.post("/api/probe-focus-cache")
+def put_probe_focus_cache(body: ProbeFocusCacheBody):
+    """Store probe/test FIM context for a later auto-annotate call (cross-origin)."""
+    import uuid
+
+    if not body.probe_tokens:
+        raise HTTPException(400, "probe_tokens required")
+    pid = uuid.uuid4().hex[:16]
+    payload = body.model_dump()
+    with _state_lock:
+        while len(_probe_focus_cache) >= _PROBE_FOCUS_CACHE_MAX:
+            # Drop oldest insertion order (Py3.7+ dict).
+            _probe_focus_cache.pop(next(iter(_probe_focus_cache)))
+        _probe_focus_cache[pid] = payload
+    return {"ok": True, "probe_id": pid}
+
+
+@app.get("/api/probe-focus-cache/{probe_id}")
+def get_probe_focus_cache(probe_id: str):
+    with _state_lock:
+        payload = _probe_focus_cache.get(probe_id)
+    if payload is None:
+        raise HTTPException(404, "probe focus cache miss or expired")
+    return {"ok": True, "probe": payload}
+
+
+class AutoAnnotateBody(BaseModel):
+    """Probe/test focus (full FIM context) → annotate edges on this train sample.
+
+    Edges returned by the LLM are always indices on *this train sample*.
+    Probe indices must never be written as train edges.
+    """
+
+    probe_src_token: str = ""
+    probe_dst_token: str = ""
+    focus_src_token: str = ""
+    focus_dst_token: str = ""
+    # Full probe/test sequence for FIM view (SOURCE/TARGET marked server-side).
+    probe_tokens: list[str] | None = None
+    probe_answer_start: int | None = None
+    probe_focus_src: int | None = None
+    probe_focus_dst: int | None = None
+    # Predict: model completion as MID. Gold/manual: omit (use probe tokens' MID).
+    probe_mid_text: str | None = None
+    # Optional prebuilt probe FIM markdown (fallback if tokens omitted).
+    probe_fim_view: str | None = None
+    # Or load probe fields from server cache (set by correlation-report).
+    probe_id: str | None = None
+    # Viewer yellow highlight only (not injected into LLM prompt).
+    hint_train_src: int | None = None
+    hint_train_dst: int | None = None
+    focus_src: int | None = None
+    focus_dst: int | None = None
+    query_mode: str = Field(
+        "manual",
+        description="predict | gold | manual — selects probe MID; not shown to the LLM",
+    )
+    # Train-sample MID override (rare); normally train gold completion.
+    mid_text: str | None = None
+    # When omitted, server uses ANNOTATE_MAX_EDGES from eif_api.env (default 8).
+    max_edges: int | None = Field(None, ge=1, le=32)
+
+
+def _annotate_max_edges(override: int | None) -> int:
+    if override is not None:
+        return max(1, min(32, int(override)))
+    raw = (os.environ.get("ANNOTATE_MAX_EDGES") or os.environ.get("EIF_ANNOTATE_MAX_EDGES") or "8").strip()
+    try:
+        return max(1, min(32, int(raw)))
+    except ValueError:
+        return 8
+
+
+@app.post("/api/sample/{idx}/auto-annotate")
+def auto_annotate(idx: int, body: AutoAnnotateBody):
+    """LLM-propose continue-train edges for a probe focus mechanism.
+
+    Continuesubset ``attention_edges`` become the LLM edges (plus any prior
+    user_add/user_bump). Source corpus labels are not copied into continue.
+    Visualization merges source + continue contrib edges.
+    """
+    if _data_path is None:
+        raise HTTPException(400, "No data file open.")
+
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue(idx)
+        input_ids = [int(x) for x in (source.get("input_ids") or [])]
+        labels_raw = source.get("labels", source.get("label")) or []
+        labels = [int(x) for x in labels_raw] if isinstance(labels_raw, list) else []
+        tokens = _surface_tokens_from_obj(source, input_ids)
+        n = len(tokens)
+
+        probe_src = (body.probe_src_token or body.focus_src_token or "").strip()
+        probe_dst = (body.probe_dst_token or body.focus_dst_token or "").strip()
+
+        hint_src = body.hint_train_src
+        hint_dst = body.hint_train_dst
+        if hint_src is None and body.focus_src is not None:
+            hint_src = int(body.focus_src)
+        if hint_dst is None and body.focus_dst is not None:
+            hint_dst = int(body.focus_dst)
+        if hint_src is not None and not (0 <= int(hint_src) < n):
+            hint_src = None
+        if hint_dst is not None and not (0 <= int(hint_dst) < n):
+            hint_dst = None
+
+        probe_tokens = (
+            [str(t) for t in body.probe_tokens] if body.probe_tokens else None
+        )
+        probe_mid = str(body.probe_mid_text) if body.probe_mid_text else None
+        probe_answer_start = body.probe_answer_start
+        probe_focus_src = body.probe_focus_src
+        probe_focus_dst = body.probe_focus_dst
+        probe_fim_view = body.probe_fim_view
+
+        if body.probe_id:
+            with _state_lock:
+                cached = _probe_focus_cache.get(str(body.probe_id))
+            if cached:
+                if not probe_tokens and cached.get("probe_tokens"):
+                    probe_tokens = [str(t) for t in cached["probe_tokens"]]
+                if probe_answer_start is None and cached.get("probe_answer_start") is not None:
+                    probe_answer_start = int(cached["probe_answer_start"])
+                if probe_focus_src is None and cached.get("probe_focus_src") is not None:
+                    probe_focus_src = int(cached["probe_focus_src"])
+                if probe_focus_dst is None and cached.get("probe_focus_dst") is not None:
+                    probe_focus_dst = int(cached["probe_focus_dst"])
+                if not probe_mid and cached.get("probe_mid_text"):
+                    probe_mid = str(cached["probe_mid_text"])
+                if not probe_src and cached.get("probe_src_token"):
+                    probe_src = str(cached["probe_src_token"]).strip()
+                if not probe_dst and cached.get("probe_dst_token"):
+                    probe_dst = str(cached["probe_dst_token"]).strip()
+
+        if not probe_src and probe_focus_src is not None and probe_tokens:
+            i = int(probe_focus_src)
+            if 0 <= i < len(probe_tokens):
+                probe_src = str(probe_tokens[i])
+        if not probe_dst and probe_focus_dst is not None and probe_tokens:
+            i = int(probe_focus_dst)
+            if 0 <= i < len(probe_tokens):
+                probe_dst = str(probe_tokens[i])
+        if not probe_src and hint_src is not None:
+            probe_src = str(tokens[int(hint_src)])
+        if not probe_dst and hint_dst is not None:
+            probe_dst = str(tokens[int(hint_dst)])
+        if not probe_src or not probe_dst:
+            raise HTTPException(
+                400,
+                "probe_src_token and probe_dst_token required "
+                "(or probe_focus_* / probe_id / hint_train_* fallback)",
+            )
+
+        if labels and len(labels) == n:
+            answer_start = _answer_start(labels)
+        else:
+            answer_start = _answer_start([-100] * n)
+
+        train_mid_override = str(body.mid_text) if body.mid_text else None
+
+    try:
+        from server.auto_annotate import call_llm_auto_annotate
+
+        proposed, raw = call_llm_auto_annotate(
+            tokens=tokens,
+            probe_src_token=str(probe_src),
+            probe_dst_token=str(probe_dst),
+            language=str(source.get("language") or ""),
+            max_edges=_annotate_max_edges(body.max_edges),
+            answer_start=int(answer_start),
+            mid_override=train_mid_override,
+            sample_id=int(idx),
+            sample_uid=str(source.get("uid") or "") or None,
+            labels=labels if labels else None,
+            probe_tokens=probe_tokens,
+            probe_answer_start=probe_answer_start,
+            probe_focus_src=probe_focus_src,
+            probe_focus_dst=probe_focus_dst,
+            probe_mid_override=probe_mid,
+            probe_fim_view=probe_fim_view,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"auto-annotate LLM failed: {exc}") from exc
+
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue(idx)
+        cont_keep = [
+            e for e in cont
+            if str(e.get("contrib") or "") in ("user_add", "user_bump")
+        ]
+        viz_keep = [
+            e for e in viz
+            if str(e.get("contrib") or "") != "llm_auto"
+        ]
+        new_llm: list[dict[str, Any]] = []
+        for p in proposed:
+            edge = _normalize_edge(
+                {
+                    "src": p["src"],
+                    "dst": p["dst"],
+                    "subtype": p["subtype"],
+                    "reason": p.get("reason") or "",
+                    "source": "LLMAuto",
+                    "weight": 1.0,
+                },
+                contrib="llm_auto",
+            )
+            new_llm.append(edge)
+
+        by_viz = {_edge_key(e): e for e in viz_keep}
+        for e in cont_keep + new_llm:
+            by_viz[_edge_key(e)] = e
+        viz_out = list(by_viz.values())
+        cont_out = cont_keep + new_llm
+        cont_map = {_edge_key(e): e for e in cont_out}
+        cont_out = list(cont_map.values())
+
+        persist = _write_continue_payload(
+            idx, source, viz_edges=viz_out, continue_edges=cont_out,
+        )
+
+    return {
+        "ok": True,
+        "n_edges": len(viz_out),
+        "n_continue_edges": len(cont_out),
+        "proposed": new_llm,
+        "raw_preview": (raw or "")[:2000],
         **persist,
     }
 

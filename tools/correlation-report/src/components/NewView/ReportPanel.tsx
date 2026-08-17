@@ -1539,6 +1539,7 @@ function PairCard({
     interveneLr?: number;
     /** Open annotation-viewer focused on this train sample + source/target. */
     onOpenAnnotationViewer?: () => void;
+    onAutoAnnotateContinue?: () => void;
     defaultExpanded?: boolean;
 }) {
     const [expanded, setExpanded] = useState(defaultExpanded);
@@ -1714,6 +1715,28 @@ function PairCard({
                 >
                     TRAIN #{pair.train_sample_id}
                 </span>
+                {onAutoAnnotateContinue && (
+                    <button
+                        type="button"
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onAutoAnnotateContinue();
+                        }}
+                        title="打开 annotation-viewer 并用 LLM 围绕该 train pair 自动标注 → 写入续训小集（不含旧标注）"
+                        style={{
+                            border: '1px solid #c4b5fd',
+                            background: '#f5f3ff',
+                            color: '#6d28d9',
+                            borderRadius: 999,
+                            padding: '2px 8px',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        自动标注
+                    </button>
+                )}
                 <span className={styles.expandIcon}>{expanded ? '▼' : '▶'}</span>
             </div>
 
@@ -1834,6 +1857,7 @@ function TrainSampleGroup({
     interveneLr,
     unlearnResults,
     onOpenAnnotationViewer,
+    onAutoAnnotateContinue,
     pairDefaultExpanded = false,
 }: {
     trainIdx: number;
@@ -1860,6 +1884,7 @@ function TrainSampleGroup({
     interveneLr?: number;
     unlearnResults?: Record<string, UnlearnPairResult>;
     onOpenAnnotationViewer?: (pair: CorrelationPair) => void;
+    onAutoAnnotateContinue?: (pair: CorrelationPair) => void;
     pairDefaultExpanded?: boolean;
 }) {
     const [collapsed, setCollapsed] = useState(false);
@@ -1978,6 +2003,11 @@ function TrainSampleGroup({
                                 onOpenAnnotationViewer={
                                     onOpenAnnotationViewer
                                         ? () => onOpenAnnotationViewer(pair)
+                                        : undefined
+                                }
+                                onAutoAnnotateContinue={
+                                    onAutoAnnotateContinue
+                                        ? () => onAutoAnnotateContinue(pair)
                                         : undefined
                                 }
                                 defaultExpanded={pairDefaultExpanded}
@@ -2777,15 +2807,60 @@ export function ReportPanel({
         });
     };
 
-    const handleOpenAnnotationViewer = (pair: CorrelationPair) => {
+    const handleOpenAnnotationViewer = (pair: CorrelationPair, opts?: { autoAnnotate?: boolean }) => {
         const base = (
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
         )?.trim() || 'http://127.0.0.1:5174';
-        const url = new URL(base);
-        url.searchParams.set('sample', String(pair.train_sample_id));
-        url.searchParams.set('target', String(pair.train_correlation.target_token_index));
-        url.searchParams.set('source', String(pair.train_correlation.source_token_index));
-        window.open(url.toString(), '_blank', 'noopener,noreferrer');
+        void (async () => {
+            const url = new URL(base);
+            url.searchParams.set('sample', String(pair.train_sample_id));
+            url.searchParams.set('target', String(pair.train_correlation.target_token_index));
+            url.searchParams.set('source', String(pair.train_correlation.source_token_index));
+            const mode =
+                attrMode === 'gold' ? 'gold' : attrMode === 'manual' ? 'manual' : 'predict';
+            // predict → model tokens (MID = model output); gold/manual → correct tokens.
+            const probeTokens = mode === 'predict' ? modelTokens : correctTokens;
+            const probeSrcIdx = pair.test_correlation.source_token_index;
+            const probeDstIdx = pair.test_correlation.target_token_index;
+            const probeSrcTok =
+                decodeToken(pair.test_correlation.source_token).trim()
+                || decodeToken(probeTokens[probeSrcIdx] ?? '').trim()
+                || '·';
+            const probeDstTok =
+                decodeToken(pair.test_correlation.target_token).trim()
+                || decodeToken(probeTokens[probeDstIdx] ?? '').trim()
+                || '·';
+            url.searchParams.set('probeSrc', probeSrcTok);
+            url.searchParams.set('probeDst', probeDstTok);
+            url.searchParams.set('queryMode', mode);
+            const payload = {
+                probe_tokens: probeTokens,
+                probe_answer_start: promptLen,
+                probe_focus_src: probeSrcIdx,
+                probe_focus_dst: probeDstIdx,
+                probe_src_token: probeSrcTok,
+                probe_dst_token: probeDstTok,
+                probe_mid_text: null as string | null,
+                query_mode: mode,
+            };
+            try {
+                const resp = await fetch(`${base.replace(/\/$/, '')}/api/probe-focus-cache`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                if (resp.ok) {
+                    const data = await resp.json() as { probe_id?: string };
+                    if (data.probe_id) url.searchParams.set('probeId', data.probe_id);
+                }
+            } catch {
+                // Viewer can still run with surfaces-only if cache POST fails.
+            }
+            if (opts?.autoAnnotate) {
+                url.searchParams.set('autoAnnotate', '1');
+            }
+            window.open(url.toString(), '_blank', 'noopener,noreferrer');
+        })();
     };
 
     const fetchTokenProbs = useCallback((mode: 'predict' | 'gold', targetIndex: number) => {
@@ -4015,17 +4090,28 @@ export function ReportPanel({
                                             gap: 8,
                                             alignItems: 'center',
                                         }}>
-                                            <span style={{ fontWeight: 700 }}>edge saliency</span>
+                                            <span style={{ fontWeight: 700, color: '#5b21b6', fontSize: 13 }}>
+                                                edge saliency
+                                            </span>
                                             {manualEdgeSaliencyBusy ? (
-                                                <span style={{ color: '#7c3aed' }}>计算中…</span>
+                                                <span style={{ color: '#7c3aed', fontWeight: 700 }}>计算中…</span>
                                             ) : manualEdgeSaliencyErr ? (
                                                 <span style={{ color: '#b91c1c' }}>{manualEdgeSaliencyErr}</span>
                                             ) : manualEdgeSaliency != null ? (
-                                                <span className={styles.sourceChipSal}>
+                                                <span
+                                                    style={{
+                                                        color: '#6d28d9',
+                                                        fontWeight: 800,
+                                                        fontSize: 22,
+                                                        lineHeight: 1.1,
+                                                        fontVariantNumeric: 'tabular-nums',
+                                                        letterSpacing: '-0.02em',
+                                                    }}
+                                                >
                                                     {manualEdgeSaliency.toFixed(4)}
                                                 </span>
                                             ) : (
-                                                <span style={{ color: '#9ca3af' }}>—</span>
+                                                <span style={{ color: '#9ca3af', fontSize: 18, fontWeight: 700 }}>—</span>
                                             )}
                                             <span style={{ color: '#9ca3af', fontSize: 11 }}>
                                                 {continueAdapterActive
@@ -4413,6 +4499,9 @@ export function ReportPanel({
                                                             interveneLr={pairInterveneLr}
                                                             unlearnResults={unlearnResultsByPairId}
                                                             onOpenAnnotationViewer={handleOpenAnnotationViewer}
+                                                            onAutoAnnotateContinue={(pair) =>
+                                                                handleOpenAnnotationViewer(pair, { autoAnnotate: true })
+                                                            }
                                                         />
                                                     ))}
                                                 </div>
@@ -4489,6 +4578,9 @@ export function ReportPanel({
                                                         }
                                                         interveneLr={pairInterveneLr}
                                                         onOpenAnnotationViewer={() => handleOpenAnnotationViewer(pair)}
+                                                        onAutoAnnotateContinue={() =>
+                                                            handleOpenAnnotationViewer(pair, { autoAnnotate: true })
+                                                        }
                                                         defaultExpanded
                                                     />
                                                 ))}
@@ -4528,6 +4620,9 @@ export function ReportPanel({
                                                 interveneLr={pairInterveneLr}
                                                 unlearnResults={unlearnResultsByPairId}
                                                 onOpenAnnotationViewer={handleOpenAnnotationViewer}
+                                                onAutoAnnotateContinue={(pair) =>
+                                                    handleOpenAnnotationViewer(pair, { autoAnnotate: true })
+                                                }
                                             />
                                         ))}
                                     </div>
