@@ -241,3 +241,4 @@ ttav_bundles/
 correlation_matching_results/
 checkpoint-full
 token_embeddings/
+smoke_train_data.jsonl

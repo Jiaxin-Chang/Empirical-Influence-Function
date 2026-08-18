@@ -2377,6 +2377,7 @@ export function ReportPanel({
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
     const [tokenProbError, setTokenProbError] = useState<string | null>(null);
     const [tokenProbFocus, setTokenProbFocus] = useState<{ mode: 'predict' | 'gold'; index: number } | null>(null);
+    const tokenProbFocusRef = useRef<{ mode: 'predict' | 'gold'; index: number } | null>(null);
     const [probViewFamily, setProbViewFamily] = useState('live');
     const [degradePairs, setDegradePairs] = useState<CorrelationPair[]>([]);
     const [degradeTrainDetails, setDegradeTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
@@ -3142,20 +3143,30 @@ export function ReportPanel({
         })();
     };
 
-    const fetchTokenProbs = useCallback((mode: 'predict' | 'gold', targetIndex: number) => {
+    const fetchTokenProbs = useCallback((
+        mode: 'predict' | 'gold',
+        targetIndex: number,
+        opts?: { keepDegrade?: boolean; viewFamily?: string },
+    ) => {
         if (!report || !selectedMeta || importedReportActive) return;
         if (!(targetIndex > 0)) {
             setTokenProbError('Cannot score next-token probs at index 0.');
             setTokenProbResult(null);
             return;
         }
+        const prev = tokenProbFocusRef.current;
+        const focusChanged = !prev || prev.mode !== mode || prev.index !== targetIndex;
+        tokenProbFocusRef.current = { mode, index: targetIndex };
         setTokenProbFocus({ mode, index: targetIndex });
         setTokenProbBusy(true);
         setTokenProbError(null);
-        setDegradePairs([]);
-        setDegradeTrainDetails({});
-        setDegradeError(null);
-        setDegradeProgress(null);
+        if (focusChanged && !opts?.keepDegrade) {
+            setDegradePairs([]);
+            setDegradeTrainDetails({});
+            setDegradeError(null);
+            setDegradeProgress(null);
+        }
+        const viewFamily = opts?.viewFamily ?? probViewFamily;
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/next-token-probs'), {
@@ -3166,7 +3177,7 @@ export function ReportPanel({
                         mode,
                         targetIndex,
                         topK: 10,
-                        viewFamily: probViewFamily,
+                        viewFamily,
                         // Prefer eif_api.env (same as gold live); do not force report checkpoint.
                         modelPath: null,
                         baseModelPath: null,
@@ -3223,8 +3234,13 @@ export function ReportPanel({
         }
     }, [attrMode, manualTargetAbsIdx, importedReportActive, fetchTokenProbs]);
 
-    const refreshTokenProbs = useCallback(() => {
-        if (tokenProbFocus) fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index);
+    const refreshTokenProbs = useCallback((viewFamily?: string) => {
+        if (tokenProbFocus) {
+            fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index, {
+                keepDegrade: true,
+                viewFamily,
+            });
+        }
     }, [tokenProbFocus, fetchTokenProbs]);
 
     const fetchDegradeRetrieve = useCallback(() => {
@@ -3783,7 +3799,8 @@ export function ReportPanel({
                     `${direction === 'learn' ? 'Learn' : 'Unlearn'} ${pair.id} 完成`
                     + ` · step ${stepN} · ΔCE=${dCe} · Δsal=${dSal} · ${result.verdict ?? ''}`,
                 );
-                refreshTokenProbs();
+                setProbViewFamily('live');
+                refreshTokenProbs('live');
             } catch (error) {
                 const msg = error instanceof Error ? error.message : `${verb} failed`;
                 setUnlearnResultsByPairId(current => ({
