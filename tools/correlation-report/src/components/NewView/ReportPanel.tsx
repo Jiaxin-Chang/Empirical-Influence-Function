@@ -1477,12 +1477,6 @@ function formatProbPct(p: number): string {
     return `${pct.toFixed(3)}%`;
 }
 
-function formatSigned(n: number | undefined, digits = 3): string {
-    if (n == null || !Number.isFinite(n)) return '—';
-    const sign = n > 0 ? '+' : '';
-    return `${sign}${n.toFixed(digits)}`;
-}
-
 function NextTokenProbPanel({
     result,
     busy,
