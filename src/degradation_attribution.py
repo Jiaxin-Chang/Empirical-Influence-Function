@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -346,16 +347,17 @@ def _flat_logit_diff_grad(
 
 
 def _parse_train_edges(edges) -> list[tuple[int, int, float, str]]:
+    """Parse compact JSONL ``attention_edges`` (src/dst BPE indices + subtype)."""
     out: list[tuple[int, int, float, str]] = []
     for e in edges or []:
         try:
             if isinstance(e, (list, tuple)) and len(e) >= 2:
                 src, dst = int(e[0]), int(e[1])
                 w = float(e[2]) if len(e) >= 3 else 1.0
-                subtype = ""
+                subtype = str(e[3]) if len(e) >= 4 else ""
             else:
-                src = int(e.get("src", e.get("source", -1)))
-                dst = int(e.get("dst", e.get("target", -1)))
+                src = int(e.get("src", e.get("source", e.get("token_i_idx", -1))))
+                dst = int(e.get("dst", e.get("target", e.get("token_j_idx", -1))))
                 try:
                     w = float(e.get("weight", 1.0))
                 except (TypeError, ValueError):
@@ -377,12 +379,12 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 def _edge_grad_cache_sketch_dim() -> int:
-    """0 = store full last-layer LoRA grads (large). Default 8192 CountSketch."""
-    raw = (os.environ.get("EIF_DEGRADE_EDGE_CACHE_SKETCH") or "8192").strip()
+    """0 = exact last-layer LoRA cosine (default). >0 = CountSketch (legacy)."""
+    raw = (os.environ.get("EIF_DEGRADE_EDGE_CACHE_SKETCH") or "0").strip()
     try:
         return max(0, int(raw))
     except ValueError:
-        return 8192
+        return 0
 
 
 def _edge_grad_cache_root() -> Path:
@@ -424,6 +426,7 @@ def _edge_grad_cache_dir(
         "margin": float(getattr(bank_cfg, "margin_plus", 0) or 0),
         "filter": str(filter_tag or ""),
         "sketch": int(sketch_dim),
+        "match": "exact-lora" if int(sketch_dim) <= 0 else f"countsketch-{int(sketch_dim)}",
         "nTrains": int(n_trains),
         "nAnnot": int(n_annot),
     }
@@ -436,55 +439,101 @@ def _edge_grad_cache_dir(
     return d
 
 
-def _load_train_edge_cache(cache_dir: Path | None, train_idx: int) -> dict[str, torch.Tensor]:
-    if cache_dir is None:
-        return {}
-    path = cache_dir / f"train_{int(train_idx)}.pt"
-    if not path.is_file():
-        return {}
-    try:
-        blob = torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        blob = torch.load(str(path), map_location="cpu")
-    except Exception as exc:
-        print(f"[degrade] cache load failed {path.name}: {exc}", flush=True)
-        return {}
-    edges = blob.get("edges") if isinstance(blob, dict) else None
-    if not isinstance(edges, dict):
-        return {}
-    out: dict[str, torch.Tensor] = {}
-    for k, v in edges.items():
-        if torch.is_tensor(v):
-            out[str(k)] = v.detach().cpu()
-    return out
+class _TrainEdgeGradStore:
+    """Row-wise float16 memmap of per-edge match vectors (exact LoRA or sketch)."""
 
+    def __init__(self, cache_dir: Path, train_idx: int, keys: list[str], dim: int):
+        self.meta_path = cache_dir / f"train_{int(train_idx)}.json"
+        self.bin_path = cache_dir / f"train_{int(train_idx)}.f16"
+        self.keys = [str(k) for k in keys]
+        self.key_to_i = {k: i for i, k in enumerate(self.keys)}
+        self.dim = int(dim)
+        self.n = len(self.keys)
+        self.filled = [False] * self.n
+        nbytes = self.n * self.dim * 2
+        reuse = False
+        if self.meta_path.is_file() and self.bin_path.is_file():
+            try:
+                meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+                filled = meta.get("filled") or []
+                if (
+                    list(meta.get("keys") or []) == self.keys
+                    and int(meta.get("dim") or 0) == self.dim
+                    and int(self.bin_path.stat().st_size) == nbytes
+                    and len(filled) == self.n
+                ):
+                    self.filled = [bool(x) for x in filled]
+                    reuse = True
+            except Exception:
+                reuse = False
+        if not reuse:
+            self.filled = [False] * self.n
+            with open(self.bin_path, "wb") as fh:
+                fh.truncate(nbytes)
+            self._write_meta()
+        self.mm = np.memmap(
+            str(self.bin_path), dtype=np.float16, mode="r+", shape=(self.n, self.dim),
+        )
 
-def _save_train_edge_cache(
-    cache_dir: Path | None,
-    train_idx: int,
-    edges: dict[str, torch.Tensor],
-    *,
-    sketch_dim: int,
-    sketch_seed: int,
-) -> None:
-    if cache_dir is None or not edges:
-        return
-    path = cache_dir / f"train_{int(train_idx)}.pt"
-    tmp = path.with_suffix(".tmp")
-    packed = {
-        str(k): (v.detach().cpu().half() if v.dtype != torch.float16 else v.detach().cpu())
-        for k, v in edges.items()
-        if torch.is_tensor(v)
-    }
-    blob = {
-        "trainIdx": int(train_idx),
-        "sketchDim": int(sketch_dim),
-        "sketchSeed": int(sketch_seed),
-        "n": len(packed),
-        "edges": packed,
-    }
-    torch.save(blob, str(tmp))
-    tmp.replace(path)
+    @classmethod
+    def open(
+        cls,
+        cache_dir: Path | None,
+        train_idx: int,
+        keys: list[str],
+        dim: int,
+    ) -> "_TrainEdgeGradStore | None":
+        if cache_dir is None or int(dim) <= 0 or not keys:
+            return None
+        return cls(cache_dir, train_idx, keys, dim)
+
+    def get(self, key: str) -> torch.Tensor | None:
+        i = self.key_to_i.get(str(key))
+        if i is None or not self.filled[i]:
+            return None
+        row = np.array(self.mm[i], dtype=np.float32, copy=True)
+        return F.normalize(torch.from_numpy(row), dim=0, eps=1e-12)
+
+    def set(self, key: str, vec: torch.Tensor) -> None:
+        i = self.key_to_i.get(str(key))
+        if i is None:
+            return
+        v = vec.detach().cpu().float().reshape(-1)
+        if int(v.numel()) != self.dim:
+            print(
+                f"[degrade] cache skip {key}: dim {int(v.numel())} != {self.dim}",
+                flush=True,
+            )
+            return
+        v = F.normalize(v, dim=0, eps=1e-12)
+        self.mm[i] = v.numpy().astype(np.float16, copy=False)
+        self.filled[i] = True
+
+    def flush(self) -> None:
+        try:
+            self.mm.flush()
+        except Exception:
+            pass
+        self._write_meta()
+
+    def _write_meta(self) -> None:
+        tmp = self.meta_path.with_suffix(".json.tmp")
+        payload = {
+            "keys": self.keys,
+            "dim": self.dim,
+            "n": self.n,
+            "filled": self.filled,
+            "nFilled": int(sum(1 for x in self.filled if x)),
+        }
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(self.meta_path)
+
+    def close(self) -> None:
+        self.flush()
+        try:
+            del self.mm
+        except Exception:
+            pass
 
 
 def _seed_edge_grad(train_idx: int, src: int, dst: int) -> None:
@@ -571,13 +620,15 @@ def retrieve_degradation(
         n_trains=n_trains,
         n_annot=n_annot,
     )
+    match_name = "exact-lora" if sketch_dim <= 0 else f"countsketch-{sketch_dim}"
     if cache_dir is not None:
         print(
-            f"[degrade] edge-grad cache={cache_dir} "
-            f"sketch={sketch_dim or 'full'} seed={sketch_seed} "
-            f"(set EIF_DEGRADE_EDGE_CACHE=0 to disable)",
+            f"[degrade] edge-grad cache={cache_dir} match={match_name} "
+            f"(fp16 memmap; set EIF_DEGRADE_EDGE_CACHE=0 to disable)",
             flush=True,
         )
+    else:
+        print(f"[degrade] match={match_name} (cache off)", flush=True)
     _prog(
         stage="query",
         done=0,
@@ -649,6 +700,12 @@ def retrieve_degradation(
             device,
         )
         q = _to_match_vec(g_f, sketch_dim, sketch_seed)
+        match_dim = int(q.numel())
+        print(
+            f"[degrade] query grad dim={match_dim} match={match_name} "
+            f"(cache ≈ {n_annot * match_dim * 2 / 1e9:.2f} GB fp16 for {n_annot} edges)",
+            flush=True,
+        )
 
         prepare_last_layer_grad_checkpointing(model)
         scored: list[dict[str, Any]] = []
@@ -671,6 +728,17 @@ def retrieve_degradation(
             tr_ds = build_single_sample_dataset(sample)
             tr_batch = collator([tr_ds[0]])
             tr_batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in tr_batch.items()}
+            mask = tr_batch.get("attention_mask")
+            if torch.is_tensor(mask):
+                real_len = int(mask[0].sum().item())
+                if real_len > 0 and int(tr_batch["input_ids"].size(1)) != real_len:
+                    squeezed = {}
+                    for k, v in tr_batch.items():
+                        if torch.is_tensor(v) and v.dim() >= 2 and v.size(1) >= real_len:
+                            squeezed[k] = v[:, :real_len].contiguous()
+                        else:
+                            squeezed[k] = v
+                    tr_batch = squeezed
             seq_len = int(tr_batch["input_ids"].size(1))
             if seq_len > SEQUENCE_LENGTH_LIMIT:
                 print(
@@ -688,6 +756,13 @@ def retrieve_degradation(
                 )
                 continue
             ids_1d = tr_batch["input_ids"][0]
+            raw_ids = sample.get("input_ids") or []
+            if isinstance(raw_ids, list) and raw_ids and len(raw_ids) != int(ids_1d.numel()):
+                print(
+                    f"[degrade] WARN train#{train_idx} collate len={int(ids_1d.numel())} "
+                    f"vs jsonl input_ids={len(raw_ids)}; using collated ids",
+                    flush=True,
+                )
             full_token_ids = [int(x) for x in ids_1d.tolist()]
             full_tokens = [tokenizer.decode([i]) for i in full_token_ids]
             labels_1d = tr_batch["labels"][0].tolist()
@@ -703,14 +778,16 @@ def retrieve_degradation(
                 "coarse_cos_sim": 0.0,
                 "saliencies_by_token": {},
             }
-            train_cache = _load_train_edge_cache(cache_dir, train_idx)
+            store_keys = list(dict.fromkeys(_edge_cache_key(s, d) for s, d, _, _ in edge_list))
+            store = _TrainEdgeGradStore.open(cache_dir, train_idx, store_keys, match_dim)
             train_dirty = 0
             for src, dst, weight, subtype in edge_list:
                 src_tok = full_tokens[src] if 0 <= src < len(full_tokens) else ""
                 dst_tok = full_tokens[dst] if 0 <= dst < len(full_tokens) else ""
                 show = min(done + 1, n_annot) if n_annot else 0
                 ck = _edge_cache_key(src, dst)
-                hit = ck in train_cache
+                e = store.get(ck) if store is not None else None
+                hit = e is not None
                 _prog(
                     stage="edges",
                     done=show,
@@ -721,11 +798,13 @@ def retrieve_degradation(
                     dst=dst,
                     srcTok=src_tok,
                     dstTok=dst_tok,
+                    subtype=subtype,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses,
                     message=(
                         f"{show} / {n_annot}  · train#{train_idx} "
-                        f"{(src_tok or '').strip() or '·'}→{(dst_tok or '').strip() or '·'}"
+                        f"{subtype or 'edge'} "
+                        f"{(src_tok or '').strip() or '·'}@{src}→{(dst_tok or '').strip() or '·'}@{dst}"
                         f"{'  cache' if hit else '  compute'}"
                         f"  (hit {cache_hits} / miss {cache_misses})"
                     ),
@@ -734,11 +813,7 @@ def retrieve_degradation(
                     if not (0 <= src < seq_len and 0 <= dst < seq_len):
                         continue
                     n_edges_total += 1
-                    e = None
                     if hit:
-                        e = F.normalize(
-                            train_cache[ck].reshape(-1).float(), dim=0, eps=1e-12,
-                        )
                         cache_hits += 1
                     else:
                         _seed_edge_grad(train_idx, src, dst)
@@ -755,15 +830,13 @@ def retrieve_degradation(
                         if g_e is None or not torch.isfinite(g_e).all():
                             continue
                         e = _to_match_vec(g_e, sketch_dim, sketch_seed)
-                        train_cache[ck] = e.detach().cpu().half()
+                        if store is not None:
+                            store.set(ck, e)
+                            train_dirty += 1
+                            if train_dirty >= 8:
+                                store.flush()
+                                train_dirty = 0
                         cache_misses += 1
-                        train_dirty += 1
-                        if train_dirty >= 8:
-                            _save_train_edge_cache(
-                                cache_dir, train_idx, train_cache,
-                                sketch_dim=sketch_dim, sketch_seed=sketch_seed,
-                            )
-                            train_dirty = 0
                     if e is None or e.numel() != q.numel():
                         if e is not None:
                             print(
@@ -777,7 +850,7 @@ def retrieve_degradation(
                     src_ctx = get_context_window(tokenizer, ids_1d, src)
                     dst_ctx = get_context_window(tokenizer, ids_1d, dst)
                     scored.append({
-                        "id": f"degrade_tr{train_idx}_s{src}_t{dst}",
+                        "id": f"degrade_tr{train_idx}_s{src}_t{dst}_{subtype or 'edge'}",
                         "cos_sim": contrib,
                         "coarse_cos_sim": cos,
                         "score": contrib,
@@ -802,7 +875,7 @@ def retrieve_degradation(
                             "source_context": src_ctx,
                             "target_context": dst_ctx,
                         },
-                        "annotation": subtype or None,
+                        "annotation": subtype or "attention_edge",
                         "contrib": contrib,
                         "rawCos": cos,
                         "subtype": subtype,
@@ -810,11 +883,8 @@ def retrieve_degradation(
                     })
                 finally:
                     done += 1
-            if train_dirty:
-                _save_train_edge_cache(
-                    cache_dir, train_idx, train_cache,
-                    sketch_dim=sketch_dim, sketch_seed=sketch_seed,
-                )
+            if store is not None:
+                store.close()
             from src.unlearn_pair_probe import _release_cuda_memory
             _release_cuda_memory(model, reason=f"degrade_train{train_idx}")
 
@@ -845,7 +915,7 @@ def retrieve_degradation(
         print(
             f"[degrade] scored {n_edges_total} saliency edges; "
             f"cache hit={cache_hits} miss={cache_misses}; "
-            f"top contrib={[(p['train_sample_id'], p['train_correlation']['source_token'], p['train_correlation']['target_token'], round(p['cos_sim'], 4)) for p in top_pairs[:8]]}",
+            f"top contrib={[(p['train_sample_id'], p.get('subtype') or 'edge', p['train_correlation']['source_token_index'], p['train_correlation']['source_token'], p['train_correlation']['target_token_index'], p['train_correlation']['target_token'], round(p['cos_sim'], 4)) for p in top_pairs[:8]]}",
             flush=True,
         )
     finally:
@@ -893,6 +963,7 @@ def retrieve_degradation(
         "cacheMisses": cache_misses,
         "cacheDir": str(cache_dir) if cache_dir is not None else None,
         "cacheSketchDim": int(sketch_dim),
+        "match": match_name,
         "filterTag": session.get("filter_tag"),
         "sampleIdHint": infer_sample_id_from_report(report),
         "availableViews": list_compare_views(live_family),

@@ -1373,9 +1373,18 @@ function annotatedSourcesForPairs(
     pairs: CorrelationPair[],
 ): Set<number> {
     const out = new Set<number>();
-    if (!edgesByTarget) return out;
     for (const pair of pairs) {
-        const srcs = edgesByTarget[String(pair.train_correlation.target_token_index)];
+        const srcIdx = pair.train_correlation?.source_token_index;
+        // Degradation pairs are themselves jsonl attention_edges; mark even if
+        // /data/train-gt-edges.json overlay (continue subset) does not include them.
+        if (
+            pair.retrieval === 'degrade_sal_edge'
+            || Boolean(pair.annotation)
+            || Boolean(pair.subtype)
+        ) {
+            if (typeof srcIdx === 'number' && Number.isFinite(srcIdx)) out.add(srcIdx);
+        }
+        const srcs = edgesByTarget?.[String(pair.train_correlation.target_token_index)];
         if (!srcs) continue;
         for (const src of srcs) out.add(src);
     }
@@ -1422,7 +1431,7 @@ function TrainSampleViewer({
                                 hovered={linkedTokenIndex === i}
                                 annotated={isAnnotated}
                                 title={isAnnotated
-                                    ? `GT annotation source → target @${[...targetIndices].join(',')}`
+                                    ? `标注边 source → target @${[...targetIndices].join(',')}`
                                     : undefined}
                                 onHoverChange={onTokenHover
                                     ? (isHovered) => onTokenHover(isHovered ? i : null)
@@ -1901,8 +1910,29 @@ function PairCard({
                     <strong>{(pair.train_correlation.source_token ?? '').trim() || '·'}</strong>
                     <span className={styles.arrow}> → </span>
                     <strong>{(pair.train_correlation.target_token ?? '').trim() || '·'}</strong>
-                    <span className={styles.offset}>+{pair.train_correlation.response_token_offset}</span>
+                    <span className={styles.offset}>
+                        @{pair.train_correlation.source_token_index}→@{pair.train_correlation.target_token_index}
+                        {pair.train_correlation.response_token_offset != null
+                            ? ` +${pair.train_correlation.response_token_offset}`
+                            : ''}
+                    </span>
                 </span>
+                {(pair.retrieval === 'degrade_sal_edge' || pair.annotation || pair.subtype) && (
+                    <span
+                        title="来自 train JSONL 的 attention_edges（按边 L_sal 归因）"
+                        style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            color: '#047857',
+                            background: '#ecfdf5',
+                            border: '1px solid #a7f3d0',
+                            borderRadius: 999,
+                            padding: '1px 8px',
+                        }}
+                    >
+                        {pair.subtype || pair.annotation || 'attention_edge'}
+                    </span>
+                )}
 
                 <span
                     className={styles.trainBadge}
