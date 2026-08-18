@@ -14,9 +14,12 @@ Positive contrib = this saliency edge pushes the flip (New over Wrap).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 import torch
@@ -29,8 +32,10 @@ from src.eif_adapter_env import (
     normalize_view_family,
 )
 from src.intervention_experiment import (
+    PRESCREEN_SKETCH_SEED,
     SEQUENCE_LENGTH_LIMIT,
     _compute_bank_flat_grad_filtered,
+    _project_flat_grad,
     ensure_peft_lora_dtype,
     get_context_window,
 )
@@ -364,6 +369,137 @@ def _parse_train_edges(edges) -> list[tuple[int, int, float, str]]:
     return out
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def _edge_grad_cache_sketch_dim() -> int:
+    """0 = store full last-layer LoRA grads (large). Default 8192 CountSketch."""
+    raw = (os.environ.get("EIF_DEGRADE_EDGE_CACHE_SKETCH") or "8192").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 8192
+
+
+def _edge_grad_cache_root() -> Path:
+    raw = (os.environ.get("EIF_DEGRADE_EDGE_CACHE_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parents[1] / ".cache" / "degrade_sal_edge_grads"
+
+
+def _edge_cache_key(src: int, dst: int) -> str:
+    return f"{int(src)}_{int(dst)}"
+
+
+def _edge_grad_cache_dir(
+    *,
+    live_path: str,
+    train_path: str,
+    bank_cfg,
+    filter_tag: str,
+    sketch_dim: int,
+    n_trains: int,
+    n_annot: int,
+) -> Path | None:
+    if not _env_flag("EIF_DEGRADE_EDGE_CACHE", True):
+        return None
+    train_p = Path(train_path) if train_path else None
+    stamp = ""
+    if train_p is not None and train_p.is_file():
+        st = train_p.stat()
+        stamp = f"{st.st_mtime_ns}:{st.st_size}"
+    blob = {
+        "adapter": _abspath(live_path),
+        "train": _abspath(train_path),
+        "trainStamp": stamp,
+        "bank": getattr(bank_cfg, "cache_tag", ""),
+        "lossType": getattr(bank_cfg, "saliency_loss_type", ""),
+        "layer": int(getattr(bank_cfg, "saliency_layer", -1) or -1),
+        "negK": int(getattr(bank_cfg, "neg_sample_k", 0) or 0),
+        "margin": float(getattr(bank_cfg, "margin_plus", 0) or 0),
+        "filter": str(filter_tag or ""),
+        "sketch": int(sketch_dim),
+        "nTrains": int(n_trains),
+        "nAnnot": int(n_annot),
+    }
+    tag = hashlib.sha1(json.dumps(blob, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    d = _edge_grad_cache_root() / tag
+    d.mkdir(parents=True, exist_ok=True)
+    meta = d / "meta.json"
+    if not meta.is_file():
+        meta.write_text(json.dumps(blob, indent=2, ensure_ascii=False), encoding="utf-8")
+    return d
+
+
+def _load_train_edge_cache(cache_dir: Path | None, train_idx: int) -> dict[str, torch.Tensor]:
+    if cache_dir is None:
+        return {}
+    path = cache_dir / f"train_{int(train_idx)}.pt"
+    if not path.is_file():
+        return {}
+    try:
+        blob = torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        blob = torch.load(str(path), map_location="cpu")
+    except Exception as exc:
+        print(f"[degrade] cache load failed {path.name}: {exc}", flush=True)
+        return {}
+    edges = blob.get("edges") if isinstance(blob, dict) else None
+    if not isinstance(edges, dict):
+        return {}
+    out: dict[str, torch.Tensor] = {}
+    for k, v in edges.items():
+        if torch.is_tensor(v):
+            out[str(k)] = v.detach().cpu()
+    return out
+
+
+def _save_train_edge_cache(
+    cache_dir: Path | None,
+    train_idx: int,
+    edges: dict[str, torch.Tensor],
+    *,
+    sketch_dim: int,
+    sketch_seed: int,
+) -> None:
+    if cache_dir is None or not edges:
+        return
+    path = cache_dir / f"train_{int(train_idx)}.pt"
+    tmp = path.with_suffix(".tmp")
+    packed = {
+        str(k): (v.detach().cpu().half() if v.dtype != torch.float16 else v.detach().cpu())
+        for k, v in edges.items()
+        if torch.is_tensor(v)
+    }
+    blob = {
+        "trainIdx": int(train_idx),
+        "sketchDim": int(sketch_dim),
+        "sketchSeed": int(sketch_seed),
+        "n": len(packed),
+        "edges": packed,
+    }
+    torch.save(blob, str(tmp))
+    tmp.replace(path)
+
+
+def _seed_edge_grad(train_idx: int, src: int, dst: int) -> None:
+    seed = (int(train_idx) * 1_000_003 + int(src) * 97 + int(dst) * 13 + 42) % (2**31)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _to_match_vec(g: torch.Tensor, sketch_dim: int, sketch_seed: int) -> torch.Tensor:
+    if int(sketch_dim) > 0:
+        return _project_flat_grad(g, int(sketch_dim), int(sketch_seed))
+    return F.normalize(g.reshape(-1).float(), dim=0, eps=1e-12)
+
+
 def retrieve_degradation(
     report: dict[str, Any],
     *,
@@ -374,6 +510,7 @@ def retrieve_degradation(
     lost_token_id: int | None = None,
     top_trains: int | None = None,
     top_k: int = 10,
+    progress_cb=None,
 ) -> dict[str, Any]:
     """Rank train saliency edges by contrib = −cos(∇f, ∇L_sal(edge))."""
     from src.gold_live_attribution import (
@@ -404,6 +541,49 @@ def retrieve_degradation(
     collator = session["collator"]
     train_samples = session["train_samples"]
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+
+    def _prog(**info):
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(info)
+        except Exception:
+            pass
+
+    n_trains = len(train_samples)
+    n_annot = sum(
+        len(_parse_train_edges(s.get("attention_edges") or s.get("edges")))
+        for s in train_samples
+    )
+    sketch_dim = _edge_grad_cache_sketch_dim()
+    sketch_seed = int(PRESCREEN_SKETCH_SEED)
+    cache_dir = _edge_grad_cache_dir(
+        live_path=live_path,
+        train_path=str(session.get("train_path") or ""),
+        bank_cfg=bank_cfg,
+        filter_tag=str(session.get("filter_tag") or ""),
+        sketch_dim=sketch_dim,
+        n_trains=n_trains,
+        n_annot=n_annot,
+    )
+    if cache_dir is not None:
+        print(
+            f"[degrade] edge-grad cache={cache_dir} "
+            f"sketch={sketch_dim or 'full'} seed={sketch_seed} "
+            f"(set EIF_DEGRADE_EDGE_CACHE=0 to disable)",
+            flush=True,
+        )
+    _prog(
+        stage="query",
+        done=0,
+        total=n_annot,
+        nTrains=n_trains,
+        message=(
+            f"共 {n_annot} 条标注边，正在算 ∇f"
+            + (f"；缓存 {cache_dir.name}" if cache_dir is not None else "")
+            + "…"
+        ),
+    )
 
     tokens, ids, prompt_len = _completion_tokens_and_ids(report, tokenizer, mode=mode)
     t = int(target_index)
@@ -463,12 +643,22 @@ def retrieve_degradation(
             query_filter,
             device,
         )
-        q = F.normalize(g_f.reshape(-1).float(), dim=0, eps=1e-12)
+        q = _to_match_vec(g_f, sketch_dim, sketch_seed)
 
         prepare_last_layer_grad_checkpointing(model)
         scored: list[dict[str, Any]] = []
         details: dict[str, Any] = {}
         n_edges_total = 0
+        done = 0
+        cache_hits = 0
+        cache_misses = 0
+        _prog(
+            stage="edges",
+            done=0,
+            total=n_annot,
+            nTrains=n_trains,
+            message=f"0 / {n_annot} 标注边",
+        )
         for train_idx, sample in enumerate(train_samples):
             edge_list = _parse_train_edges(sample.get("attention_edges") or sample.get("edges"))
             if not edge_list:
@@ -481,6 +671,15 @@ def retrieve_degradation(
                 print(
                     f"[degrade] skip train#{train_idx} seq={seq_len} > {SEQUENCE_LENGTH_LIMIT}",
                     flush=True,
+                )
+                done += len(edge_list)
+                _prog(
+                    stage="edges",
+                    done=done,
+                    total=n_annot,
+                    nTrains=n_trains,
+                    trainIdx=train_idx,
+                    message=f"{done} / {n_annot}  · skip train#{train_idx} (seq too long)",
                 )
                 continue
             ids_1d = tr_batch["input_ids"][0]
@@ -499,70 +698,133 @@ def retrieve_degradation(
                 "coarse_cos_sim": 0.0,
                 "saliencies_by_token": {},
             }
+            train_cache = _load_train_edge_cache(cache_dir, train_idx)
+            train_dirty = 0
             for src, dst, weight, subtype in edge_list:
-                if not (0 <= src < seq_len and 0 <= dst < seq_len):
-                    continue
-                n_edges_total += 1
-                g_e = _compute_bank_flat_grad_filtered(
-                    model,
-                    tr_batch,
-                    query_filter,
-                    device,
-                    cfg=bank_cfg,
-                    edges=[{"src": src, "dst": dst, "weight": weight, "subtype": subtype}],
-                    special_ids=special_ids,
-                    saliency_only=True,
+                src_tok = full_tokens[src] if 0 <= src < len(full_tokens) else ""
+                dst_tok = full_tokens[dst] if 0 <= dst < len(full_tokens) else ""
+                show = min(done + 1, n_annot) if n_annot else 0
+                ck = _edge_cache_key(src, dst)
+                hit = ck in train_cache
+                _prog(
+                    stage="edges",
+                    done=show,
+                    total=n_annot,
+                    nTrains=n_trains,
+                    trainIdx=train_idx,
+                    src=src,
+                    dst=dst,
+                    srcTok=src_tok,
+                    dstTok=dst_tok,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses,
+                    message=(
+                        f"{show} / {n_annot}  · train#{train_idx} "
+                        f"{(src_tok or '').strip() or '·'}→{(dst_tok or '').strip() or '·'}"
+                        f"{'  cache' if hit else '  compute'}"
+                        f"  (hit {cache_hits} / miss {cache_misses})"
+                    ),
                 )
-                if g_e is None or not torch.isfinite(g_e).all():
-                    continue
-                e = F.normalize(g_e.reshape(-1).float(), dim=0, eps=1e-12)
-                if e.numel() != q.numel():
-                    print(
-                        f"[degrade] skip train#{train_idx} {src}->{dst}: "
-                        f"grad dim {e.numel()} vs query {q.numel()}",
-                        flush=True,
-                    )
-                    continue
-                cos = float((q * e).sum().item())
-                contrib = -cos
-                src_tok = full_tokens[src] if src < len(full_tokens) else tokenizer.decode([int(ids_1d[src])])
-                dst_tok = full_tokens[dst] if dst < len(full_tokens) else tokenizer.decode([int(ids_1d[dst])])
-                src_ctx = get_context_window(tokenizer, ids_1d, src)
-                dst_ctx = get_context_window(tokenizer, ids_1d, dst)
-                scored.append({
-                    "id": f"degrade_tr{train_idx}_s{src}_t{dst}",
-                    "cos_sim": contrib,
-                    "coarse_cos_sim": cos,
-                    "score": contrib,
-                    "retrieval": "degrade_sal_edge",
-                    "train_sample_id": int(train_idx),
-                    "test_correlation": {
-                        "source_token": flip["gainedToken"],
-                        "source_token_index": int(t),
-                        "target_token": flip["lostToken"],
-                        "target_token_index": int(t),
-                        "saliency_score": float(flip.get("deltaMargin") or 0.0),
-                    },
-                    "train_correlation": {
-                        "source_token": src_tok,
-                        "source_token_index": int(src),
-                        "target_token": dst_tok,
-                        "target_token_index": int(dst),
-                        "saliency_score": contrib,
-                        "response_token_offset": max(0, int(dst) - int(answer_start)),
-                    },
-                    "train_context": {
-                        "source_context": src_ctx,
-                        "target_context": dst_ctx,
-                    },
-                    "annotation": subtype or None,
-                    "contrib": contrib,
-                    "rawCos": cos,
-                    "subtype": subtype,
-                    "weight": weight,
-                })
+                try:
+                    if not (0 <= src < seq_len and 0 <= dst < seq_len):
+                        continue
+                    n_edges_total += 1
+                    e = None
+                    if hit:
+                        e = F.normalize(
+                            train_cache[ck].reshape(-1).float(), dim=0, eps=1e-12,
+                        )
+                        cache_hits += 1
+                    else:
+                        _seed_edge_grad(train_idx, src, dst)
+                        g_e = _compute_bank_flat_grad_filtered(
+                            model,
+                            tr_batch,
+                            query_filter,
+                            device,
+                            cfg=bank_cfg,
+                            edges=[{"src": src, "dst": dst, "weight": weight, "subtype": subtype}],
+                            special_ids=special_ids,
+                            saliency_only=True,
+                        )
+                        if g_e is None or not torch.isfinite(g_e).all():
+                            continue
+                        e = _to_match_vec(g_e, sketch_dim, sketch_seed)
+                        train_cache[ck] = e.detach().cpu().half()
+                        cache_misses += 1
+                        train_dirty += 1
+                        if train_dirty >= 8:
+                            _save_train_edge_cache(
+                                cache_dir, train_idx, train_cache,
+                                sketch_dim=sketch_dim, sketch_seed=sketch_seed,
+                            )
+                            train_dirty = 0
+                    if e is None or e.numel() != q.numel():
+                        if e is not None:
+                            print(
+                                f"[degrade] skip train#{train_idx} {src}->{dst}: "
+                                f"grad dim {e.numel()} vs query {q.numel()}",
+                                flush=True,
+                            )
+                        continue
+                    cos = float((q * e).sum().item())
+                    contrib = -cos
+                    src_ctx = get_context_window(tokenizer, ids_1d, src)
+                    dst_ctx = get_context_window(tokenizer, ids_1d, dst)
+                    scored.append({
+                        "id": f"degrade_tr{train_idx}_s{src}_t{dst}",
+                        "cos_sim": contrib,
+                        "coarse_cos_sim": cos,
+                        "score": contrib,
+                        "retrieval": "degrade_sal_edge",
+                        "train_sample_id": int(train_idx),
+                        "test_correlation": {
+                            "source_token": flip["gainedToken"],
+                            "source_token_index": int(t),
+                            "target_token": flip["lostToken"],
+                            "target_token_index": int(t),
+                            "saliency_score": float(flip.get("deltaMargin") or 0.0),
+                        },
+                        "train_correlation": {
+                            "source_token": src_tok or tokenizer.decode([int(ids_1d[src])]),
+                            "source_token_index": int(src),
+                            "target_token": dst_tok or tokenizer.decode([int(ids_1d[dst])]),
+                            "target_token_index": int(dst),
+                            "saliency_score": contrib,
+                            "response_token_offset": max(0, int(dst) - int(answer_start)),
+                        },
+                        "train_context": {
+                            "source_context": src_ctx,
+                            "target_context": dst_ctx,
+                        },
+                        "annotation": subtype or None,
+                        "contrib": contrib,
+                        "rawCos": cos,
+                        "subtype": subtype,
+                        "weight": weight,
+                    })
+                finally:
+                    done += 1
+            if train_dirty:
+                _save_train_edge_cache(
+                    cache_dir, train_idx, train_cache,
+                    sketch_dim=sketch_dim, sketch_seed=sketch_seed,
+                )
             from src.unlearn_pair_probe import _release_cuda_memory
             _release_cuda_memory(model, reason=f"degrade_train{train_idx}")
+
+        _prog(
+            stage="done",
+            done=n_annot,
+            total=n_annot,
+            nTrains=n_trains,
+            cacheHits=cache_hits,
+            cacheMisses=cache_misses,
+            message=(
+                f"完成：有效 {n_edges_total} / {n_annot} 条"
+                f"（cache hit {cache_hits} / miss {cache_misses}）"
+            ),
+        )
 
         scored.sort(key=lambda p: p["cos_sim"], reverse=True)
         top_pairs = scored[:n_keep]
@@ -577,6 +839,7 @@ def retrieve_degradation(
                 )
         print(
             f"[degrade] scored {n_edges_total} saliency edges; "
+            f"cache hit={cache_hits} miss={cache_misses}; "
             f"top contrib={[(p['train_sample_id'], p['train_correlation']['source_token'], p['train_correlation']['target_token'], round(p['cos_sim'], 4)) for p in top_pairs[:8]]}",
             flush=True,
         )
@@ -621,6 +884,10 @@ def retrieve_degradation(
         "correlationPairs": top_pairs,
         "trainSampleDetails": details,
         "nEdgesScored": n_edges_total,
+        "cacheHits": cache_hits,
+        "cacheMisses": cache_misses,
+        "cacheDir": str(cache_dir) if cache_dir is not None else None,
+        "cacheSketchDim": int(sketch_dim),
         "filterTag": session.get("filter_tag"),
         "sampleIdHint": infer_sample_id_from_report(report),
         "availableViews": list_compare_views(live_family),

@@ -832,10 +832,22 @@ def run_unlearn_pair_probe(
     answer_start = int(train_detail.get("answer_start_index") or 0)
     test_prompt_len = int(baseline.get("prompt_len") or 0)
 
-    if not (0 <= test_source_index < test_target_index < len(test_tokens)):
+    test_n = len(test_tokens)
+    next_token_probe = int(test_source_index) == int(test_target_index)
+    if next_token_probe:
+        if not (0 < int(test_target_index) < test_n):
+            raise ValueError(
+                f"Invalid next-token test index: {test_target_index}, seq_len={test_n}."
+            )
+        print(
+            f"[{direction_norm}] next-token probe at index {test_target_index} "
+            f"(degrade pair: no test saliency edge; score CE of this gold/predict token).",
+            flush=True,
+        )
+    elif not (0 <= test_source_index < test_target_index < test_n):
         raise ValueError(
             f"Invalid test edge indices: source={test_source_index}, "
-            f"target={test_target_index}, seq_len={len(test_tokens)}."
+            f"target={test_target_index}, seq_len={test_n}."
         )
     if not (0 <= train_source_index < train_target_index < len(train_tokens)):
         raise ValueError(
@@ -917,21 +929,22 @@ def run_unlearn_pair_probe(
     )
 
     reported_saliency = None
-    for corr in baseline.get("top_correlations") or []:
-        if int(corr.get("source_token_index", -1)) == int(test_source_index) and int(
-            corr.get("target_token_index", test_target_index)
-        ) == int(test_target_index):
-            reported_saliency = float(corr.get("saliency_score"))
-            break
-    if reported_saliency is None:
-        for row in report.get("per_token_results") or []:
-            if int(row.get("target_token_index", -1)) != int(test_target_index):
-                continue
-            for corr in row.get("top_correlations") or []:
-                if int(corr.get("source_token_index", -1)) == int(test_source_index):
-                    reported_saliency = float(corr.get("saliency_score"))
-                    break
-            break
+    if not next_token_probe:
+        for corr in baseline.get("top_correlations") or []:
+            if int(corr.get("source_token_index", -1)) == int(test_source_index) and int(
+                corr.get("target_token_index", test_target_index)
+            ) == int(test_target_index):
+                reported_saliency = float(corr.get("saliency_score"))
+                break
+        if reported_saliency is None:
+            for row in report.get("per_token_results") or []:
+                if int(row.get("target_token_index", -1)) != int(test_target_index):
+                    continue
+                for corr in row.get("top_correlations") or []:
+                    if int(corr.get("source_token_index", -1)) == int(test_source_index):
+                        reported_saliency = float(corr.get("saliency_score"))
+                        break
+                break
 
     base_losses = _target_token_losses(model, test_batch, [test_target_index], device)
     if base_losses.numel() == 0:
@@ -942,16 +955,21 @@ def run_unlearn_pair_probe(
     saliency_fn, saliency_mode = _resolve_saliency_fn(report)
     print(f"[{direction_norm}] saliency_mode={saliency_mode}", flush=True)
     print(
-        f"[{direction_norm}] test edge src={test_source_index} "
-        f"{test_tokens[test_source_index]!r} -> tgt={test_target_index} "
-        f"{test_tokens[test_target_index]!r} "
-        f"id_src={int(test_batch['input_ids'][0, test_source_index])} "
-        f"id_tgt={int(test_batch['input_ids'][0, test_target_index])}",
+        f"[{direction_norm}] test "
+        + (
+            f"next-token @ {test_target_index} {test_tokens[test_target_index]!r}"
+            if next_token_probe
+            else (
+                f"edge src={test_source_index} {test_tokens[test_source_index]!r} "
+                f"-> tgt={test_target_index} {test_tokens[test_target_index]!r}"
+            )
+        )
+        + f" id_tgt={int(test_batch['input_ids'][0, test_target_index])}",
         flush=True,
     )
 
     base_saliency = None
-    if recompute_saliency:
+    if recompute_saliency and not next_token_probe:
         base_saliency = _score_edge_saliency(
             model,
             test_batch,
@@ -1033,7 +1051,7 @@ def run_unlearn_pair_probe(
         )
 
         after_saliency = None
-        if recompute_saliency:
+        if recompute_saliency and not next_token_probe:
             after_saliency = _score_edge_saliency(
                 model,
                 test_batch,
@@ -1091,7 +1109,26 @@ def run_unlearn_pair_probe(
         else after_saliency - base_saliency
     )
 
-    if direction_norm == "unlearn":
+    if next_token_probe:
+        # Gold/predict token at t: unlearn a degrade culprit should recover this
+        # token (CE ↓). Stage3 copy-pair rule is the opposite (CE ↑).
+        if direction_norm == "unlearn":
+            verdict = "inconclusive"
+            if delta_ce < -1e-4:
+                verdict = "supports_causal"
+            elif abs(delta_ce) <= 1e-4:
+                verdict = "no_effect"
+            elif delta_ce > 1e-4:
+                verdict = "opposite_effect"
+        else:
+            verdict = "inconclusive"
+            if delta_ce > 1e-4:
+                verdict = "supports_causal"
+            elif abs(delta_ce) <= 1e-4:
+                verdict = "no_effect"
+            elif delta_ce < -1e-4:
+                verdict = "opposite_effect"
+    elif direction_norm == "unlearn":
         verdict = "inconclusive"
         if delta_ce > 1e-4 and (delta_saliency is None or delta_saliency < -1e-8):
             verdict = "supports_causal"
@@ -1160,6 +1197,7 @@ def run_unlearn_pair_probe(
             "targetIndex": int(test_target_index),
             "sourceToken": test_tokens[test_source_index],
             "targetToken": test_tokens[test_target_index],
+            "probe": "next_token" if next_token_probe else "saliency_edge",
             "reportedSaliency": reported_saliency,
             "saliencyMode": saliency_mode,
         },

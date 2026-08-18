@@ -163,6 +163,21 @@ interface DegradationFlip {
     deltaNllLost?: number;
 }
 
+interface DegradeProgress {
+    done: number;
+    total: number;
+    nTrains?: number;
+    trainIdx?: number | null;
+    src?: number | null;
+    dst?: number | null;
+    srcTok?: string;
+    dstTok?: string;
+    stage?: string;
+    message?: string;
+    cacheHits?: number;
+    cacheMisses?: number;
+}
+
 interface PerTokenResult {
     target_token_index: number;
     target_token: string;
@@ -1479,6 +1494,7 @@ function NextTokenProbPanel({
     degradePairs,
     degradeBusy,
     degradeError,
+    degradeProgress,
     onRetrieveDegrade,
 }: {
     result: NextTokenProbResult | null;
@@ -1492,6 +1508,7 @@ function NextTokenProbPanel({
     degradePairs?: CorrelationPair[];
     degradeBusy?: boolean;
     degradeError?: string | null;
+    degradeProgress?: DegradeProgress | null;
     onRetrieveDegrade?: () => void;
 }) {
     const rows = result?.top ?? [];
@@ -1624,6 +1641,35 @@ function NextTokenProbPanel({
                         >
                             {degradeBusy ? '按边归因中…' : '按边归因 L_sal'}
                         </button>
+                    )}
+                    {degradeBusy && (
+                        <div className={styles.degradeProgress}>
+                            <div className={styles.degradeProgressMeta}>
+                                {degradeProgress && degradeProgress.total > 0
+                                    ? `${degradeProgress.done} / ${degradeProgress.total} 标注边`
+                                    : '正在统计标注边…'}
+                                {typeof degradeProgress?.trainIdx === 'number'
+                                    ? `  · train #${degradeProgress.trainIdx}`
+                                    : ''}
+                                {typeof degradeProgress?.cacheHits === 'number'
+                                    || typeof degradeProgress?.cacheMisses === 'number'
+                                    ? `  · hit ${degradeProgress?.cacheHits ?? 0} / miss ${degradeProgress?.cacheMisses ?? 0}`
+                                    : ''}
+                            </div>
+                            <div className={styles.degradeProgressTrack}>
+                                <div
+                                    className={styles.degradeProgressFill}
+                                    style={{
+                                        width: degradeProgress && degradeProgress.total > 0
+                                            ? `${Math.min(100, (degradeProgress.done / degradeProgress.total) * 100)}%`
+                                            : '8%',
+                                    }}
+                                />
+                            </div>
+                            {degradeProgress?.message && (
+                                <div className={styles.degradeProgressMsg}>{degradeProgress.message}</div>
+                            )}
+                        </div>
                     )}
                     {degradeError && (
                         <div className={styles.degradeErr}>{degradeError}</div>
@@ -2318,6 +2364,7 @@ export function ReportPanel({
         setDegradePairs([]);
         setDegradeTrainDetails({});
         setDegradeError(null);
+        setDegradeProgress(null);
         setTtavLaunchStatus('指定 pair：先点 Model 上下文选 source，再点 Gold 选 target');
     }, [clearGoldLive, clearManualPair, setSelectedTokIdx]);
     const exitManualPairMode = useCallback(() => {
@@ -2335,6 +2382,7 @@ export function ReportPanel({
     const [degradeTrainDetails, setDegradeTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
     const [degradeBusy, setDegradeBusy] = useState(false);
     const [degradeError, setDegradeError] = useState<string | null>(null);
+    const [degradeProgress, setDegradeProgress] = useState<DegradeProgress | null>(null);
     // GT annotation edges from smoke_train_data_oversample_llm.jsonl (train 0..4).
     const [trainGtEdges, setTrainGtEdges] = useState<TrainGtEdges | null>(null);
     // The in-page plot appears only after Prepare sample / Open Visualizer /
@@ -2446,9 +2494,9 @@ export function ReportPanel({
                 }
                 const lr = Number(data.defaults.learning_rate);
                 if (Number.isFinite(lr) && lr > 0) {
-                    const lrStr = lr.toExponential ? Number(lr).toExponential().replace(/\.0+e/, 'e').replace(/e\+?/, 'e') : String(lr);
-                    // Prefer compact 2e-5 style
-                    const nice = Number(lr) === 2e-5 ? '2e-5' : String(lr);
+                    const nice = lr === 2e-5
+                        ? '2e-5'
+                        : lr.toExponential().replace(/\.0+e/, 'e').replace(/e\+/, 'e');
                     setContinueLrDefault(nice);
                     setContinueLrInput(prev => (prev === '2e-5' ? nice : prev));
                 }
@@ -2679,7 +2727,11 @@ export function ReportPanel({
 
     const trainPanelEmptyHint = useMemo(() => {
         if (degradeBusy) {
-            return '按边归因：正在对每条 train 的每条 attention edge 算 ∇L_sal…';
+            if (degradeProgress && degradeProgress.total > 0) {
+                return `按边归因：${degradeProgress.done} / ${degradeProgress.total} 标注边`
+                    + (typeof degradeProgress.trainIdx === 'number' ? ` · train #${degradeProgress.trainIdx}` : '');
+            }
+            return '按边归因：正在统计标注边并算 ∇f…';
         }
         if (degradeError) {
             return `按边归因失败：${degradeError}`;
@@ -2735,6 +2787,7 @@ export function ReportPanel({
         attrMode, manualSourceIdx, manualTargetAbsIdx, manualGradBusy, manualGradPairs.length,
         goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
+        degradeProgress,
     ]);
 
     // Gold sources in the shared prompt → yellow on Model stream (same indices).
@@ -2857,6 +2910,7 @@ export function ReportPanel({
         setGoldTrainDetails({});
         setDegradePairs([]);
         setDegradeTrainDetails({});
+        setDegradeProgress(null);
         if (next === null) return;
 
         setGoldBusy(true);
@@ -3101,6 +3155,7 @@ export function ReportPanel({
         setDegradePairs([]);
         setDegradeTrainDetails({});
         setDegradeError(null);
+        setDegradeProgress(null);
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/next-token-probs'), {
@@ -3178,7 +3233,38 @@ export function ReportPanel({
         if (probViewFamily === 'live') return;
         setDegradeBusy(true);
         setDegradeError(null);
+        setDegradeProgress({ done: 0, total: 0, message: '启动…' });
         void (async () => {
+            const pollOnce = () => {
+                void (async () => {
+                    try {
+                        const stResp = await fetch(
+                            buildEifApiUrl(eifApiUrl, '/api/degradation-retrieve-progress'),
+                        );
+                        const st = await stResp.json() as Record<string, unknown>;
+                        const done = typeof st.done === 'number' ? st.done : 0;
+                        const total = typeof st.total === 'number' ? st.total : 0;
+                        setDegradeProgress({
+                            done,
+                            total,
+                            nTrains: typeof st.nTrains === 'number' ? st.nTrains : undefined,
+                            trainIdx: typeof st.trainIdx === 'number' ? st.trainIdx : null,
+                            src: typeof st.src === 'number' ? st.src : null,
+                            dst: typeof st.dst === 'number' ? st.dst : null,
+                            srcTok: typeof st.srcTok === 'string' ? st.srcTok : '',
+                            dstTok: typeof st.dstTok === 'string' ? st.dstTok : '',
+                            stage: typeof st.stage === 'string' ? st.stage : undefined,
+                            message: typeof st.message === 'string' ? st.message : undefined,
+                            cacheHits: typeof st.cacheHits === 'number' ? st.cacheHits : undefined,
+                            cacheMisses: typeof st.cacheMisses === 'number' ? st.cacheMisses : undefined,
+                        });
+                    } catch {
+                        /* keep last progress */
+                    }
+                })();
+            };
+            pollOnce();
+            const poll = window.setInterval(pollOnce, 400);
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/degradation-retrieve'), {
                     method: 'POST',
@@ -3229,6 +3315,7 @@ export function ReportPanel({
                 setDegradePairs([]);
                 setDegradeTrainDetails({});
             } finally {
+                window.clearInterval(poll);
                 setDegradeBusy(false);
             }
         })();
@@ -3243,6 +3330,7 @@ export function ReportPanel({
         setDegradePairs([]);
         setDegradeTrainDetails({});
         setDegradeError(null);
+        setDegradeProgress(null);
     }, [selectedMeta?.fileName]);
 
     const saliencyFocusRef = useRef({
@@ -4528,6 +4616,7 @@ export function ReportPanel({
                                 degradePairs={degradePairs}
                                 degradeBusy={degradeBusy}
                                 degradeError={degradeError}
+                                degradeProgress={degradeProgress}
                                 onRetrieveDegrade={fetchDegradeRetrieve}
                             />
 

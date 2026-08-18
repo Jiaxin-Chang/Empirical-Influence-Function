@@ -78,6 +78,34 @@ CONTINUE_TRAIN_LOCK = Lock()
 CONTINUE_TRAIN_JOBS: dict[str, dict] = {}
 CONTINUE_TRAIN_JOBS_LOCK = Lock()
 
+DEGRADE_PROGRESS_LOCK = Lock()
+DEGRADE_PROGRESS: dict = {
+    "active": False,
+    "done": 0,
+    "total": 0,
+    "nTrains": 0,
+    "trainIdx": None,
+    "src": None,
+    "dst": None,
+    "srcTok": "",
+    "dstTok": "",
+    "stage": "idle",
+    "message": "",
+    "error": False,
+}
+
+
+def _set_degrade_progress(**fields):
+    with DEGRADE_PROGRESS_LOCK:
+        DEGRADE_PROGRESS.update(fields)
+        DEGRADE_PROGRESS["updatedAt"] = int(time() * 1000)
+
+
+def _get_degrade_progress() -> dict:
+    with DEGRADE_PROGRESS_LOCK:
+        return dict(DEGRADE_PROGRESS)
+
+
 def _set_continue_job(job_id: str, **fields):
     with CONTINUE_TRAIN_JOBS_LOCK:
         cur = dict(CONTINUE_TRAIN_JOBS.get(job_id) or {"jobId": job_id})
@@ -528,6 +556,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/degradation-retrieve-progress":
+            self._send_json(200, {"status": "success", **_get_degrade_progress()})
+            return
         if parsed.path == "/api/continue-train-eval-status":
             job_id = parse_qs(parsed.query).get("jobId", [""])[0].strip()
             if not job_id:
@@ -1399,8 +1430,27 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             f"[degrade] retrieve mode={mode} targetIndex={target_index} compare={compare_family}",
             flush=True,
         )
+        _set_degrade_progress(
+            active=True,
+            error=False,
+            done=0,
+            total=0,
+            nTrains=0,
+            trainIdx=None,
+            src=None,
+            dst=None,
+            srcTok="",
+            dstTok="",
+            stage="starting",
+            message="按边归因启动…",
+        )
         try:
             from src.degradation_attribution import retrieve_degradation
+
+            def progress(info):
+                if isinstance(info, dict):
+                    _set_degrade_progress(active=True, error=False, **info)
+
             with GOLD_LIVE_LOCK:
                 result = retrieve_degradation(
                     report,
@@ -1410,11 +1460,23 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     gained_token_id=int(gained_token_id) if gained_token_id is not None else None,
                     lost_token_id=int(lost_token_id) if lost_token_id is not None else None,
                     top_trains=int(top_trains) if top_trains is not None else None,
+                    progress_cb=progress,
                 )
         except Exception as exc:
             print(f"[degrade] retrieve failed: {exc}", flush=True)
+            _set_degrade_progress(
+                active=False,
+                error=True,
+                stage="error",
+                message=str(exc),
+            )
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
+        _set_degrade_progress(
+            active=False,
+            error=False,
+            stage="done",
+        )
         self._send_json(200, result)
 
     def _handle_prepare_train_probe(self):
