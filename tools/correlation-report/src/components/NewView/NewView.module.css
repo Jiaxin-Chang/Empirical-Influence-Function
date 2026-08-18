@@ -1047,6 +1047,123 @@
 .probBarFillTop {
     background: #fab387;
 }
+.probTokGained {
+    color: #f38ba8;
+}
+.probTokLost {
+    color: #89dceb;
+}
+.probViewTabs {
+    display: flex;
+    gap: 4px;
+    padding: 6px 12px 0;
+    flex-wrap: wrap;
+}
+.probViewTab {
+    border: 1px solid #45475a;
+    background: #313244;
+    color: #a6adc8;
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.probViewTab:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+.probViewTabActive {
+    border-color: #cba6f7;
+    background: #313244;
+    color: #cba6f7;
+}
+.degradeCard {
+    margin: 0 12px 10px;
+    padding: 8px 10px 10px;
+    border-top: 1px solid #313244;
+    color: #cdd6f4;
+    font-size: 11px;
+    line-height: 1.45;
+}
+.degradeTitle {
+    font-weight: 700;
+    color: #cba6f7;
+    margin-bottom: 4px;
+}
+.degradeFormula {
+    font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    color: #a6adc8;
+    margin-bottom: 6px;
+}
+.degradeFlip {
+    color: #f38ba8;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+.degradeNoFlip {
+    color: #a6adc8;
+    margin-bottom: 6px;
+}
+.degradeMetrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    color: #89b4fa;
+    margin-bottom: 8px;
+}
+.degradeBtn {
+    border: 1px solid #cba6f7;
+    background: #1e1e2e;
+    color: #cba6f7;
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.degradeBtn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+.degradeErr {
+    color: #f38ba8;
+    margin-top: 6px;
+}
+.degradeTrains {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.degradeTrainRow {
+    background: #181825;
+    border: 1px solid #313244;
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+.degradeTrainMeta {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    color: #a6adc8;
+    margin-bottom: 2px;
+}
+.degradeTagNew {
+    color: #f38ba8;
+    font-weight: 700;
+}
+.degradeTagWrap {
+    color: #a6e3a1;
+    font-weight: 700;
+}
+.degradeSnippet {
+    color: #cdd6f4;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
 .probInterveneBanner {
     margin: 0 12px 8px;
     padding: 6px 10px;

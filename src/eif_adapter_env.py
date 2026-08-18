@@ -140,6 +140,11 @@ def adapter_path_for_family(family: ReportFamily) -> str:
     """
     if _ACTIVE_ADAPTER_OVERRIDE:
         return _ACTIVE_ADAPTER_OVERRIDE
+    return env_adapter_path_for_family(family)
+
+
+def env_adapter_path_for_family(family: ReportFamily | str) -> str:
+    """Pinned CE / saliency path from eif_api.env (ignores continue-train override)."""
     if family == "ce":
         return _env_path("EIF_ADAPTER_PATH_CE", "EIF_ADAPTER_PATH", "EIF_MODEL_PATH")
     if family == "saliency":
@@ -149,6 +154,40 @@ def adapter_path_for_family(family: ReportFamily) -> str:
 
 def base_model_path_from_env() -> str:
     return _env_path("EIF_BASE_MODEL_PATH")
+
+
+def normalize_view_family(raw: str | None) -> str:
+    """Normalize UI/API adapter-view ids: live | ce | saliency | base."""
+    s = (raw or "live").strip().lower()
+    if s in ("", "live", "current", "active", "model"):
+        return "live"
+    if s in ("ce", "ce_only"):
+        return "ce"
+    if s in ("saliency", "ce_saliency", "sal"):
+        return "saliency"
+    if s in ("base", "pretrained"):
+        return "base"
+    raise ValueError(f"Unknown viewFamily={raw!r} (use live|ce|saliency|base)")
+
+
+def list_compare_views(live_family: ReportFamily | str | None = None) -> list[dict[str, Any]]:
+    """Tabs for the next-token panel: 当前 + env adapters + base."""
+    live = (live_family or "unknown")
+    if live not in ("ce", "saliency"):
+        live = "unknown"
+    views: list[dict[str, Any]] = [
+        {"id": "live", "label": "当前", "family": live},
+    ]
+    ce = env_adapter_path_for_family("ce")
+    sal = env_adapter_path_for_family("saliency")
+    base = base_model_path_from_env()
+    if ce:
+        views.append({"id": "ce", "label": "CE", "family": "ce", "path": ce})
+    if sal:
+        views.append({"id": "saliency", "label": "Saliency", "family": "saliency", "path": sal})
+    if base:
+        views.append({"id": "base", "label": "Base", "family": "base", "path": base})
+    return views
 
 
 def bank_loss_mode_for_family(family: ReportFamily) -> str | None:

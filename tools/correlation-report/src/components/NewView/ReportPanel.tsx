@@ -124,6 +124,53 @@ interface NextTokenProbResult {
     top?: NextTokenProbRow[];
     intervention?: { active?: boolean; direction?: string; pairId?: string | null };
     error?: string;
+    viewFamily?: string;
+    liveFamily?: string;
+    availableViews?: AdapterViewTab[];
+    flip?: DegradationFlip;
+}
+
+interface AdapterViewTab {
+    id: string;
+    label: string;
+    family?: string;
+    path?: string;
+}
+
+interface DegradationFlipSide {
+    argmaxId?: number;
+    argmaxToken?: string;
+    argmaxProb?: number;
+    logitGained?: number;
+    logitLost?: number;
+    logitMargin?: number;
+    pGained?: number;
+    pLost?: number;
+    nllLost?: number;
+}
+
+interface DegradationFlip {
+    viewFamily?: string;
+    liveFamily?: string;
+    gainedToken?: string;
+    gainedTokenId?: number;
+    lostToken?: string;
+    lostTokenId?: number;
+    flipped?: boolean;
+    live?: DegradationFlipSide;
+    compare?: DegradationFlipSide;
+    deltaMargin?: number;
+    deltaNllLost?: number;
+}
+
+interface DegradationTrainHit {
+    trainSampleId: number;
+    probeCos: number;
+    taskId?: string;
+    snippet?: string;
+    nEdges?: number;
+    mentionsNew?: boolean;
+    mentionsWrap?: boolean;
 }
 
 interface PerTokenResult {
@@ -1430,6 +1477,12 @@ function formatProbPct(p: number): string {
     return `${pct.toFixed(3)}%`;
 }
 
+function formatSigned(n: number | undefined, digits = 3): string {
+    if (n == null || !Number.isFinite(n)) return '—';
+    const sign = n > 0 ? '+' : '';
+    return `${sign}${n.toFixed(digits)}`;
+}
+
 function NextTokenProbPanel({
     result,
     busy,
@@ -1437,6 +1490,12 @@ function NextTokenProbPanel({
     interventionActive,
     interventionDirection,
     interventionSteps,
+    viewFamily,
+    onViewFamilyChange,
+    degradeTrains,
+    degradeBusy,
+    degradeError,
+    onRetrieveDegrade,
 }: {
     result: NextTokenProbResult | null;
     busy?: boolean;
@@ -1444,11 +1503,29 @@ function NextTokenProbPanel({
     interventionActive?: boolean;
     interventionDirection?: string | null;
     interventionSteps?: number;
+    viewFamily: string;
+    onViewFamilyChange?: (id: string) => void;
+    degradeTrains?: DegradationTrainHit[];
+    degradeBusy?: boolean;
+    degradeError?: string | null;
+    onRetrieveDegrade?: () => void;
 }) {
     const rows = result?.top ?? [];
     const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
     const modeLabel = result?.mode === 'gold' ? 'teacher-forced' : 'model predict';
     const steps = Math.max(1, interventionSteps ?? 1);
+    const views = result?.availableViews?.length
+        ? result.availableViews
+        : [
+            { id: 'live', label: '当前' },
+            { id: 'ce', label: 'CE' },
+            { id: 'base', label: 'Base' },
+        ];
+    const flip = result?.flip;
+    const showDegrade = viewFamily !== 'live' && flip != null && (result?.viewFamily === viewFamily);
+    const viewTitle = viewFamily === 'live'
+        ? '当前'
+        : (views.find(v => v.id === viewFamily)?.label ?? viewFamily);
 
     return (
         <div className={styles.probPanel}>
@@ -1458,6 +1535,7 @@ function NextTokenProbPanel({
                     {result?.targetIndex != null
                         ? ` · ${modeLabel} @ ${result.targetIndex}`
                         : ' (distribution that produced this token)'}
+                    {viewFamily !== 'live' ? ` · ${viewTitle}` : ''}
                 </div>
                 {result?.actualProb != null && (
                     <span className={styles.probPanelMeta}>
@@ -1465,6 +1543,24 @@ function NextTokenProbPanel({
                     </span>
                 )}
             </div>
+            {onViewFamilyChange && (
+                <div className={styles.probViewTabs} role="tablist" aria-label="adapter probability view">
+                    {views.map(v => (
+                        <button
+                            key={v.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={viewFamily === v.id}
+                            className={`${styles.probViewTab}${viewFamily === v.id ? ` ${styles.probViewTabActive}` : ''}`}
+                            disabled={busy || interventionActive}
+                            title={v.path || v.family || v.label}
+                            onClick={() => onViewFamilyChange(v.id)}
+                        >
+                            {v.label}
+                        </button>
+                    ))}
+                </div>
+            )}
             {interventionActive && (
                 <div className={styles.probInterveneBanner}>
                     Active {interventionDirection === 'learn' ? 'Learn' : 'Unlearn'}
@@ -1483,10 +1579,14 @@ function NextTokenProbPanel({
                 {!busy && rows.map((row, i) => {
                     const width = `${Math.max(0.5, (row.prob / maxP) * 100)}%`;
                     const display = decodeToken(row.token).replace(/\n/g, '\\n');
+                    const isGained = flip != null && row.tokenId === flip.gainedTokenId;
+                    const isLost = flip != null && row.tokenId === flip.lostTokenId;
                     return (
                         <div key={`${row.tokenId}-${i}`} className={styles.probRow}>
-                            <span className={`${styles.probTok}${row.isActual ? ` ${styles.probTokActual}` : ''}`}>
+                            <span className={`${styles.probTok}${row.isActual ? ` ${styles.probTokActual}` : ''}${isGained ? ` ${styles.probTokGained}` : ''}${isLost ? ` ${styles.probTokLost}` : ''}`}>
                                 {display || '·'}
+                                {isGained ? ' ↑live' : ''}
+                                {isLost ? ' ↓cmp' : ''}
                             </span>
                             <span className={styles.probPct}>{formatProbPct(row.prob)}</span>
                             <div className={styles.probBarTrack}>
@@ -1499,6 +1599,63 @@ function NextTokenProbPanel({
                     );
                 })}
             </div>
+            {showDegrade && flip && (
+                <div className={styles.degradeCard}>
+                    <div className={styles.degradeTitle}>
+                        退化归因 · 当前 vs {viewTitle}
+                    </div>
+                    <div className={styles.degradeFormula}>
+                        Δ = (logit_{decodeToken(flip.gainedToken ?? '')} − logit_{decodeToken(flip.lostToken ?? '')})
+                        <sub>当前</sub> − (·)<sub>{viewTitle}</sub>
+                    </div>
+                    {flip.flipped ? (
+                        <div className={styles.degradeFlip}>
+                            决策翻转：{viewTitle} argmax={JSON.stringify(decodeToken(flip.compare?.argmaxToken ?? ''))}
+                            {' → '}
+                            当前 argmax={JSON.stringify(decodeToken(flip.live?.argmaxToken ?? ''))}
+                        </div>
+                    ) : (
+                        <div className={styles.degradeNoFlip}>
+                            相对 {viewTitle} 没有翻转（两边 argmax 都是 {JSON.stringify(decodeToken(flip.live?.argmaxToken ?? ''))}）。
+                            可切到 Base 再比；下面仍可检索把质量推向 {JSON.stringify(decodeToken(flip.gainedToken ?? ''))} 的 train。
+                        </div>
+                    )}
+                    <div className={styles.degradeMetrics}>
+                        <span>Δ margin {formatSigned(flip.deltaMargin)}</span>
+                        <span>Δ NLL({JSON.stringify(decodeToken(flip.lostToken ?? ''))}) {formatSigned(flip.deltaNllLost)}</span>
+                        <span>当前 P(lost)={formatProbPct(flip.live?.pLost ?? NaN)}</span>
+                        <span>{viewTitle} P(lost)={formatProbPct(flip.compare?.pLost ?? NaN)}</span>
+                    </div>
+                    {onRetrieveDegrade && (
+                        <button
+                            type="button"
+                            className={styles.degradeBtn}
+                            disabled={degradeBusy || busy}
+                            onClick={onRetrieveDegrade}
+                        >
+                            {degradeBusy ? '检索中…' : '检索 Δ 同向 train'}
+                        </button>
+                    )}
+                    {degradeError && (
+                        <div className={styles.degradeErr}>{degradeError}</div>
+                    )}
+                    {degradeTrains && degradeTrains.length > 0 && (
+                        <div className={styles.degradeTrains}>
+                            {degradeTrains.map(tr => (
+                                <div key={tr.trainSampleId} className={styles.degradeTrainRow}>
+                                    <div className={styles.degradeTrainMeta}>
+                                        <span>train #{tr.trainSampleId}</span>
+                                        <span>cos {tr.probeCos.toFixed(4)}</span>
+                                        {tr.mentionsNew ? <span className={styles.degradeTagNew}>New</span> : null}
+                                        {tr.mentionsWrap ? <span className={styles.degradeTagWrap}>Wrap</span> : null}
+                                    </div>
+                                    <div className={styles.degradeSnippet}>{tr.snippet || tr.taskId || '—'}</div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
@@ -2163,6 +2320,10 @@ export function ReportPanel({
     const [tokenProbBusy, setTokenProbBusy] = useState(false);
     const [tokenProbError, setTokenProbError] = useState<string | null>(null);
     const [tokenProbFocus, setTokenProbFocus] = useState<{ mode: 'predict' | 'gold'; index: number } | null>(null);
+    const [probViewFamily, setProbViewFamily] = useState('live');
+    const [degradeTrains, setDegradeTrains] = useState<DegradationTrainHit[]>([]);
+    const [degradeBusy, setDegradeBusy] = useState(false);
+    const [degradeError, setDegradeError] = useState<string | null>(null);
     // GT annotation edges from smoke_train_data_oversample_llm.jsonl (train 0..4).
     const [trainGtEdges, setTrainGtEdges] = useState<TrainGtEdges | null>(null);
     // The in-page plot appears only after Prepare sample / Open Visualizer /
@@ -2909,6 +3070,8 @@ export function ReportPanel({
         setTokenProbFocus({ mode, index: targetIndex });
         setTokenProbBusy(true);
         setTokenProbError(null);
+        setDegradeTrains([]);
+        setDegradeError(null);
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/next-token-probs'), {
@@ -2919,6 +3082,7 @@ export function ReportPanel({
                         mode,
                         targetIndex,
                         topK: 10,
+                        viewFamily: probViewFamily,
                         // Prefer eif_api.env (same as gold live); do not force report checkpoint.
                         modelPath: null,
                         baseModelPath: null,
@@ -2951,7 +3115,7 @@ export function ReportPanel({
                 setTokenProbBusy(false);
             }
         })();
-    }, [report, selectedMeta, importedReportActive, eifApiUrl]);
+    }, [report, selectedMeta, importedReportActive, eifApiUrl, probViewFamily]);
 
     useEffect(() => {
         if (importedReportActive) return;
@@ -2978,6 +3142,72 @@ export function ReportPanel({
     const refreshTokenProbs = useCallback(() => {
         if (tokenProbFocus) fetchTokenProbs(tokenProbFocus.mode, tokenProbFocus.index);
     }, [tokenProbFocus, fetchTokenProbs]);
+
+    const fetchDegradeRetrieve = useCallback(() => {
+        if (!report || !selectedMeta || importedReportActive) return;
+        if (!tokenProbFocus || !(tokenProbFocus.index > 0)) return;
+        if (probViewFamily === 'live') return;
+        setDegradeBusy(true);
+        setDegradeError(null);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/degradation-retrieve'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        mode: tokenProbFocus.mode,
+                        targetIndex: tokenProbFocus.index,
+                        compareFamily: probViewFamily,
+                        gainedTokenId: tokenProbResult?.flip?.gainedTokenId,
+                        lostTokenId: tokenProbResult?.flip?.lostTokenId,
+                    }),
+                });
+                const rawText = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (rawText.trim()) {
+                    try {
+                        parsed = JSON.parse(rawText) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(
+                            `Degrade API returned non-JSON (HTTP ${resp.status}): ${rawText.slice(0, 240)}`,
+                        );
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    const message = typeof parsed.message === 'string'
+                        ? parsed.message
+                        : `Degrade retrieve failed (HTTP ${resp.status})`;
+                    throw new Error(message);
+                }
+                const trains = Array.isArray(parsed.relatedTrains)
+                    ? parsed.relatedTrains as DegradationTrainHit[]
+                    : [];
+                setDegradeTrains(trains);
+                if (parsed.flip && typeof parsed.flip === 'object') {
+                    setTokenProbResult(prev => (
+                        prev ? { ...prev, flip: parsed.flip as DegradationFlip } : prev
+                    ));
+                }
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Degradation retrieve failed';
+                setDegradeError(msg);
+                setDegradeTrains([]);
+            } finally {
+                setDegradeBusy(false);
+            }
+        })();
+    }, [
+        report, selectedMeta, importedReportActive, eifApiUrl,
+        tokenProbFocus, probViewFamily, tokenProbResult?.flip?.gainedTokenId,
+        tokenProbResult?.flip?.lostTokenId,
+    ]);
+
+    useEffect(() => {
+        setProbViewFamily('live');
+        setDegradeTrains([]);
+        setDegradeError(null);
+    }, [selectedMeta?.fileName]);
 
     const saliencyFocusRef = useRef({
         attrMode,
@@ -4252,6 +4482,12 @@ export function ReportPanel({
                                 interventionActive={Boolean(activeInterventionPairId)}
                                 interventionDirection={activeInterventionDirection}
                                 interventionSteps={interventionSteps}
+                                viewFamily={probViewFamily}
+                                onViewFamilyChange={setProbViewFamily}
+                                degradeTrains={degradeTrains}
+                                degradeBusy={degradeBusy}
+                                degradeError={degradeError}
+                                onRetrieveDegrade={fetchDegradeRetrieve}
                             />
 
                         </div>

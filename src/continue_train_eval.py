@@ -504,6 +504,7 @@ def run_continue_training(
 
 def load_eval_samples(jsonl_path: str) -> list[dict]:
     """Load eval rows: prefer prompt+label/response; else chat input/output."""
+    src_name = Path(jsonl_path).name
     rows: list[dict] = []
     with open(jsonl_path, encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
@@ -517,7 +518,8 @@ def load_eval_samples(jsonl_path: str) -> list[dict]:
                     "task_id": obj.get("task_id", f"row_{line_no}"),
                     "prompt": prompt,
                     "label": label,
-                    "source_line": line_no,
+                    "source_file": obj.get("source_file") or src_name,
+                    "source_line": int(obj.get("source_line") or line_no),
                 })
                 continue
             # Chat fallback used by EIF load_samples-style files.
@@ -534,7 +536,8 @@ def load_eval_samples(jsonl_path: str) -> list[dict]:
                     "task_id": obj.get("task_id", f"row_{line_no}"),
                     "prompt": user,
                     "label": gold,
-                    "source_line": line_no,
+                    "source_file": obj.get("source_file") or src_name,
+                    "source_line": int(obj.get("source_line") or line_no),
                 })
     if not rows:
         raise ValueError(f"No eval samples in {jsonl_path}")
@@ -611,10 +614,18 @@ def load_eval_before_cache(
         entry: dict[str, Any] = {
             "index": i,
             "task_id": sample.get("task_id") or row.get("task_id"),
+            "prompt": sample.get("prompt") or row.get("prompt"),
+            "label": sample.get("label") or row.get("label") or row.get("response"),
+            "predict": row.get("predict"),
+            "source_file": sample.get("source_file") or row.get("source_file"),
+            "source_line": sample.get("source_line") or row.get("source_line"),
+            "finish_reason": row.get("finish_reason"),
+            "prompt_tokens": row.get("prompt_tokens"),
+            "generated_tokens": row.get("generated_tokens"),
+            "thinking_enabled": bool(row.get("thinking_enabled", False)),
+            "score_mode": row.get("score_mode") or "full",
             "line_hit_pre": round(pre, 4),
             "line_hit_rec": round(rec, 4),
-            "finish_reason": row.get("finish_reason"),
-            "generated_tokens": row.get("generated_tokens"),
             "cache_match": how,
         }
         if also_truncate_score:
@@ -708,8 +719,13 @@ def evaluate_line_hit(
     max_new_tokens: int = 1024,
     also_truncate_score: bool = True,
     progress_cb=None,
+    source_file: str | None = None,
 ) -> dict[str, Any]:
-    """Return mean line_hit_pre / line_hit_rec (and optional trunc variants)."""
+    """Return mean line_hit_pre / line_hit_rec (and optional trunc variants).
+
+    ``perSample`` rows follow the AI4Go score-dump shape (prompt/label/predict +
+    line_hit_*), so they can be written as a JSONL artifact after continue-train.
+    """
     model.eval()
     pres: list[float] = []
     recs: list[float] = []
@@ -717,6 +733,7 @@ def evaluate_line_hit(
     trunc_recs: list[float] = []
     per_sample: list[dict[str, Any]] = []
     truncated_cases = 0
+    default_source = source_file or ""
 
     for i, sample in enumerate(samples):
         gen = generate_one(tokenizer, model, sample["prompt"], max_new_tokens)
@@ -725,17 +742,30 @@ def evaluate_line_hit(
         pres.append(pre)
         recs.append(rec)
         row: dict[str, Any] = {
-            "index": i,
             "task_id": sample.get("task_id"),
+            "prompt": sample["prompt"],
+            "label": sample["label"],
+            "predict": gen["predict"],
+            "source_file": sample.get("source_file") or default_source or None,
+            "source_line": sample.get("source_line", i + 1),
+            "finish_reason": gen.get("finish_reason"),
+            "prompt_tokens": gen.get("prompt_tokens"),
+            "generated_tokens": gen.get("generated_tokens"),
+            "thinking_enabled": False,
+            "score_mode": "full",
             "line_hit_pre": round(pre, 4),
             "line_hit_rec": round(rec, 4),
-            "finish_reason": gen.get("finish_reason"),
-            "generated_tokens": gen.get("generated_tokens"),
+            "index": i,
         }
+        if gen.get("thinking_removed"):
+            row["thinking_removed"] = True
+            if gen.get("predict_raw") is not None:
+                row["predict_raw"] = gen["predict_raw"]
         if also_truncate_score:
             predict_trunc = truncate_predict_to_label_lines(sample["label"], gen["predict"])
             if predict_trunc != gen["predict"]:
                 truncated_cases += 1
+                row["predict_trunc"] = predict_trunc
             t_pre = line_hit(sample["label"], predict_trunc, "precision")
             t_rec = line_hit(sample["label"], predict_trunc, "recall")
             trunc_pres.append(t_pre)
@@ -768,6 +798,33 @@ def evaluate_line_hit(
         summary["line_hit_rec_trunc"] = round(sum(trunc_recs) / len(trunc_recs), 4)
         summary["truncated_cases"] = truncated_cases
     return summary
+
+
+def write_eval_results_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> str:
+    """Write one AI4Go-style eval record per line (prompt/label/predict + scores)."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Stable key order for readability; drop None-only noise keys later.
+            payload = {k: v for k, v in row.items() if v is not None or k in (
+                "task_id", "prompt", "label", "predict", "line_hit_pre", "line_hit_rec",
+            )}
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    print(f"[continue-eval] wrote {len(rows)} rows → {out.resolve()}", flush=True)
+    return str(out.resolve())
+
+
+def _slim_eval_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop bulky perSample from meta/detail summaries (full rows live in JSONL)."""
+    if summary is None:
+        return None
+    out = {k: v for k, v in summary.items() if k != "perSample"}
+    per = summary.get("perSample") or []
+    out["nPerSample"] = len(per) if isinstance(per, list) else 0
+    return out
 
 
 def save_adapter(model, tokenizer, output_dir: str, meta: dict[str, Any]) -> str:
@@ -1061,6 +1118,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             model, tokenizer, eval_samples,
             max_new_tokens=cfg.max_new_tokens,
             also_truncate_score=cfg.also_truncate_score,
+            source_file=Path(cfg.test_data).name,
             progress_cb=lambda i, n, _r: _prog(
                 "eval_before", f"Eval before {i}/{n}", done=i, total=n,
             ),
@@ -1116,6 +1174,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         model, tokenizer, eval_samples,
         max_new_tokens=cfg.max_new_tokens,
         also_truncate_score=cfg.also_truncate_score,
+        source_file=Path(cfg.test_data).name,
         progress_cb=lambda i, n, _r: _prog(
             "eval_after", f"Eval after {i}/{n}", done=i, total=n,
         ),
@@ -1130,15 +1189,30 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
     per_sample_deltas = summarize_per_sample_line_hit_deltas(before, after)
     _print_per_sample_delta_report(per_sample_deltas)
 
+    out_root = Path(cfg.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    after_jsonl = write_eval_results_jsonl(
+        out_root / "continue_eval_after.jsonl",
+        list(after.get("perSample") or []),
+    )
+    before_jsonl = None
+    if before is not None and isinstance(before.get("perSample"), list):
+        before_jsonl = write_eval_results_jsonl(
+            out_root / "continue_eval_before.jsonl",
+            list(before.get("perSample") or []),
+        )
+
     meta = {
         "config": asdict(cfg),
         "continueTrainJsonl": train_jsonl,
         "trainStats": train_stats,
         "evalBeforeSource": eval_before_source,
         "evalBeforeCache": cache_path if eval_before_source == "cache" else None,
-        "before": None if before is None else {k: v for k, v in before.items() if k != "perSample"},
-        "after": {k: v for k, v in after.items() if k != "perSample"},
+        "before": _slim_eval_summary(before),
+        "after": _slim_eval_summary(after),
         "delta": delta,
+        "evalAfterJsonl": after_jsonl,
+        "evalBeforeJsonl": before_jsonl,
         "perSampleDeltas": {
             "nCompared": per_sample_deltas["nCompared"],
             "line_hit_pre": {
@@ -1162,17 +1236,25 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         },
         "nTrainWithEdges": n_edges,
     }
+    # Compact detail: scores + deltas; full prompt/predict live in the JSONL files.
     detail = {
-        "before": before,
-        "after": after,
+        "before": _slim_eval_summary(before),
+        "after": _slim_eval_summary(after),
         "perSampleDeltas": per_sample_deltas,
+        "evalAfterJsonl": after_jsonl,
+        "evalBeforeJsonl": before_jsonl,
     }
     out_dir = save_adapter(model, tokenizer, cfg.output_dir, meta)
     detail_path = Path(out_dir) / "continue_eval_detail.json"
     detail_path.write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
     meta["outputDir"] = out_dir
     meta["detailPath"] = str(detail_path)
-
+    print(
+        f"[continue-eval] saved detail={detail_path} "
+        f"after_jsonl={after_jsonl}"
+        + (f" before_jsonl={before_jsonl}" if before_jsonl else ""),
+        flush=True,
+    )
     # Make live probes (token probs / learn) use the continued adapter until recover.
     from src.eif_adapter_env import set_active_adapter_override
 

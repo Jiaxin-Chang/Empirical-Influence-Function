@@ -579,6 +579,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/next-token-probs":
             self._handle_next_token_probs()
             return
+        if parsed.path == "/api/degradation-retrieve":
+            self._handle_degradation_retrieve()
+            return
         if parsed.path == "/api/token-display-surfaces":
             self._handle_token_display_surfaces()
             return
@@ -1329,9 +1332,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         model_path = str(raw_model_path).strip() if raw_model_path else None
         raw_base_path = req.get("baseModelPath")
         base_model_path = str(raw_base_path).strip() if raw_base_path else None
+        view_family = str(req.get("viewFamily") or req.get("view_family") or "live").strip()
+        gained_token_id = req.get("gainedTokenId")
+        lost_token_id = req.get("lostTokenId")
 
         print(
-            f"[probs] mode={mode} targetIndex={target_index} topK={top_k}",
+            f"[probs] mode={mode} targetIndex={target_index} topK={top_k} view={view_family}",
             flush=True,
         )
         try:
@@ -1343,9 +1349,70 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     top_k=top_k,
                     model_path=model_path,
                     base_model_path=base_model_path,
+                    view_family=view_family,
+                    gained_token_id=int(gained_token_id) if gained_token_id is not None else None,
+                    lost_token_id=int(lost_token_id) if lost_token_id is not None else None,
                 )
         except Exception as exc:
             print(f"[probs] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _handle_degradation_retrieve(self):
+        """Bank retrieve for ∇(logit_gained − logit_lost) vs a compare adapter."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Degradation retrieve needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+
+        try:
+            target_index = int(req["targetIndex"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {
+                "status": "error",
+                "message": "targetIndex is required (int > 0)",
+            })
+            return
+
+        mode = str(req.get("mode", "predict") or "predict").strip().lower()
+        compare_family = str(req.get("compareFamily") or req.get("viewFamily") or "ce").strip()
+        top_trains = req.get("topTrains")
+        gained_token_id = req.get("gainedTokenId")
+        lost_token_id = req.get("lostTokenId")
+        print(
+            f"[degrade] retrieve mode={mode} targetIndex={target_index} compare={compare_family}",
+            flush=True,
+        )
+        try:
+            from src.degradation_attribution import retrieve_degradation
+            with GOLD_LIVE_LOCK:
+                result = retrieve_degradation(
+                    report,
+                    mode=mode,
+                    target_index=target_index,
+                    compare_family=compare_family,
+                    gained_token_id=int(gained_token_id) if gained_token_id is not None else None,
+                    lost_token_id=int(lost_token_id) if lost_token_id is not None else None,
+                    top_trains=int(top_trains) if top_trains is not None else None,
+                )
+        except Exception as exc:
+            print(f"[degrade] retrieve failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
         self._send_json(200, result)

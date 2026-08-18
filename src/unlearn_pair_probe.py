@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-import torch.nn.functional as F
 
 from src.attribution_evaluation import _target_token_losses
 from src.bank_loss import (
@@ -1199,12 +1198,19 @@ def compute_next_token_probs(
     top_k: int = 10,
     model_path: str | None = None,
     base_model_path: str | None = None,
+    view_family: str | None = None,
+    gained_token_id: int | None = None,
+    lost_token_id: int | None = None,
 ) -> dict[str, Any]:
     """Top-k next-token distribution that produces ``tokens[target_index]``.
 
     ``mode=predict`` uses model completion tokens; ``mode=gold`` uses teacher-forced
     gold tokens. Prefix is ``ids[:target_index]`` (causal LM predicts position t
     from tokens 0..t-1).
+
+    ``view_family``: live (default) | ce | saliency | base — same prefix, swapped
+    PEFT adapter (or disable_adapter for base). When not live, also returns
+    ``flip`` vs the live adapter.
 
     Model load must NOT run under ``torch.inference_mode`` — that permanently marks
     Parameters as inference tensors and breaks later learn/unlearn grads.
@@ -1289,44 +1295,54 @@ def compute_next_token_probs(
 
     prefix = torch.tensor([ids[:t]], dtype=torch.long, device=device)
     attn = torch.ones_like(prefix)
-    outputs = None
-    logits = None
-    probs = None
     actual_id = int(ids[t])
     actual_prob = 0.0
     top_rows: list[dict[str, Any]] = []
+    flip: dict[str, Any] | None = None
+    from src.degradation_attribution import (
+        _forward_last_logits,
+        apply_view_family,
+        build_flip_stats,
+        list_compare_views,
+        normalize_view_family,
+        top_rows_from_logits,
+    )
+    from src.eif_adapter_env import infer_report_family
+
+    live_family = infer_report_family(
+        str((report.get("experiment_meta") or {}).get("report_file") or ""),
+        report,
+    )
+    view = normalize_view_family(view_family)
+    logits_live = None
+    logits_view = None
     try:
         with torch.no_grad():
-            if device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = model(
-                        input_ids=prefix,
-                        attention_mask=attn,
-                        use_cache=False,
-                    )
+            logits_live = _forward_last_logits(model, prefix, attn)
+            if view == "live":
+                logits_view = logits_live
             else:
-                outputs = model(
-                    input_ids=prefix,
-                    attention_mask=attn,
-                    use_cache=False,
+                with apply_view_family(model, view, live_adapter_path=resolved_model):
+                    logits_view = _forward_last_logits(model, prefix, attn)
+            show = logits_view if view != "live" else logits_live
+            top_rows, actual_prob = top_rows_from_logits(
+                show, tokenizer, actual_id=actual_id, top_k=top_k,
+            )
+            if view != "live":
+                flip = build_flip_stats(
+                    tokenizer,
+                    logits_live,
+                    logits_view,
+                    actual_id=actual_id,
+                    actual_token=tokens[t],
+                    mode=mode_norm,
+                    view_family=view,
+                    live_family=live_family,
+                    gained_token_id=gained_token_id,
+                    lost_token_id=lost_token_id,
                 )
-            logits = outputs.logits[0, -1].float()
-            probs = F.softmax(logits, dim=-1)
-            k = max(1, min(int(top_k), int(probs.numel())))
-            values, indices = torch.topk(probs, k=k)
-
-            actual_prob = float(probs[actual_id].item())
-            top_rows = []
-            for p, tid in zip(values.tolist(), indices.tolist()):
-                tid_i = int(tid)
-                top_rows.append({
-                    "token": tokenizer.decode([tid_i]),
-                    "tokenId": tid_i,
-                    "prob": float(p),
-                    "isActual": tid_i == actual_id,
-                })
     finally:
-        del outputs, logits, probs, prefix, attn
+        del logits_live, logits_view, prefix, attn
         if disabled_input_grads and hasattr(model, "enable_input_require_grads"):
             try:
                 model.enable_input_require_grads()
@@ -1351,7 +1367,7 @@ def compute_next_token_probs(
                     m.eval()
         _release_cuda_memory(model, reason="next_token_probs")
 
-    return {
+    out: dict[str, Any] = {
         "status": "success",
         "mode": mode_norm,
         "targetIndex": t,
@@ -1361,4 +1377,10 @@ def compute_next_token_probs(
         "top": top_rows,
         "intervention": intervention_status(),
         "modelPath": resolved_model,
+        "viewFamily": view,
+        "liveFamily": live_family,
+        "availableViews": list_compare_views(live_family),
     }
+    if flip is not None:
+        out["flip"] = flip
+    return out

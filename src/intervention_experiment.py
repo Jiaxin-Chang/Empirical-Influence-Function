@@ -783,21 +783,37 @@ def top_nontrivial_saliency_sources(
     k: int,
     *,
     offset: int = 0,
+    skip_seq_start_if_top1: bool = True,
 ):
     """Return saliency sources ranked ``offset+1 .. offset+k`` (1-based ranks).
 
     Trivial / chat-template tokens are excluded before ranking.
     ``offset=0, k=4`` → ranks 1–4; ``offset=4, k=4`` → ranks 5–8.
+
+    After left-truncation, sequence position 0 is an attention sink and often
+    dominates every target. If it is the global top-1 (``offset==0``), drop it
+    and return the next ``k`` sources (old ranks 2..k+1 become 1..k).
     """
     k = max(1, int(k))
     offset = max(0, int(offset))
+    extra = 1 if skip_seq_start_if_top1 and offset == 0 else 0
     candidates = (
         (idx, score)
         for idx, score in enumerate(sal_vec)
         if not is_trivial_token(tokenizer, int(input_ids_1d[idx].item()))
     )
-    ranked = nlargest(offset + k, candidates, key=lambda x: x[1])
-    return ranked[offset : offset + k]
+    ranked = nlargest(offset + k + extra, candidates, key=lambda x: x[1])
+    window = ranked[offset : offset + k + extra]
+    if (
+        skip_seq_start_if_top1
+        and offset == 0
+        and window
+        and int(window[0][0]) == 0
+    ):
+        window = window[1 : 1 + k]
+    else:
+        window = window[:k]
+    return window
 
 
 def saliency_rank_filename_tag(
@@ -2793,6 +2809,7 @@ def run_causal_intervention_experiment(
                 "TOP_K_TRAIN_SAMPLES": TOP_K_TRAIN_SAMPLES,
                 "TOP_K_PROMPT_TOKENS": TOP_K_PROMPT_TOKENS,
                 "TOP_K_PROMPT_OFFSET": TOP_K_PROMPT_OFFSET,
+                "SKIP_SEQ_START_IF_TOP1": True,
                 "SALIENCY_RANKS": (
                     f"{TOP_K_PROMPT_OFFSET + 1}-{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
                 ),
@@ -2914,6 +2931,7 @@ def run_causal_intervention_experiment(
                 "config": {
                     "TOP_K_PROMPT_TOKENS": TOP_K_PROMPT_TOKENS,
                     "TOP_K_PROMPT_OFFSET": TOP_K_PROMPT_OFFSET,
+                    "SKIP_SEQ_START_IF_TOP1": True,
                     "SALIENCY_RANKS": (
                         f"{TOP_K_PROMPT_OFFSET + 1}-"
                         f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
@@ -3472,7 +3490,8 @@ if __name__ == "__main__":
         f"train_scan≈{TOP_TARGETS or 'all'}×{TOP_K_SOURCE_PER_TARGET}  "
         f"max_output_tokens={MAX_OUTPUT_TOKENS}  "
         f"saliency_ranks={TOP_K_PROMPT_OFFSET + 1}-"
-        f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS}"
+        f"{TOP_K_PROMPT_OFFSET + TOP_K_PROMPT_TOKENS} "
+        f"(skip seq-start if it is top-1)"
     )
     run_causal_intervention_experiment(
         model_path=args.model_path,

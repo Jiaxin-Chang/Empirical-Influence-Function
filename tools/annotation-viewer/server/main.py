@@ -1068,6 +1068,13 @@ def put_probe_focus_cache(body: ProbeFocusCacheBody):
             # Drop oldest insertion order (Py3.7+ dict).
             _probe_focus_cache.pop(next(iter(_probe_focus_cache)))
         _probe_focus_cache[pid] = payload
+    print(
+        f"[auto-annotate] cached probe_id={pid} "
+        f"tokens={len(body.probe_tokens)} "
+        f"focus={body.probe_src_token!r}→{body.probe_dst_token!r} "
+        f"mode={body.query_mode}",
+        flush=True,
+    )
     return {"ok": True, "probe_id": pid}
 
 
@@ -1214,6 +1221,19 @@ def auto_annotate(idx: int, body: AutoAnnotateBody):
 
         train_mid_override = str(body.mid_text) if body.mid_text else None
 
+    max_edges_n = _annotate_max_edges(body.max_edges)
+    uid = str(source.get("uid") or "") or None
+    print(
+        f"[auto-annotate] start train_sample={idx}"
+        f"{f' uid={uid}' if uid else ''}"
+        f" probe={probe_src!r}→{probe_dst!r}"
+        f" probe_tokens={'yes' if probe_tokens else 'no'}"
+        f" probe_id={body.probe_id or '-'}"
+        f" max_edges={max_edges_n}"
+        f" lang={source.get('language') or '-'}",
+        flush=True,
+    )
+
     try:
         from server.auto_annotate import call_llm_auto_annotate
 
@@ -1222,11 +1242,11 @@ def auto_annotate(idx: int, body: AutoAnnotateBody):
             probe_src_token=str(probe_src),
             probe_dst_token=str(probe_dst),
             language=str(source.get("language") or ""),
-            max_edges=_annotate_max_edges(body.max_edges),
+            max_edges=max_edges_n,
             answer_start=int(answer_start),
             mid_override=train_mid_override,
             sample_id=int(idx),
-            sample_uid=str(source.get("uid") or "") or None,
+            sample_uid=uid,
             labels=labels if labels else None,
             probe_tokens=probe_tokens,
             probe_answer_start=probe_answer_start,
@@ -1236,8 +1256,14 @@ def auto_annotate(idx: int, body: AutoAnnotateBody):
             probe_fim_view=probe_fim_view,
         )
     except Exception as exc:
+        print(f"[auto-annotate] FAIL train_sample={idx}: {exc}", flush=True)
         raise HTTPException(502, f"auto-annotate LLM failed: {exc}") from exc
 
+    print(
+        f"[auto-annotate] LLM ok train_sample={idx} edges={len(proposed)} "
+        f"raw_chars={len(raw or '')}",
+        flush=True,
+    )
     with _state_lock:
         source, viz, cont = _current_viz_and_continue(idx)
         cont_keep = [
@@ -1274,6 +1300,13 @@ def auto_annotate(idx: int, body: AutoAnnotateBody):
         persist = _write_continue_payload(
             idx, source, viz_edges=viz_out, continue_edges=cont_out,
         )
+
+    print(
+        f"[auto-annotate] done train_sample={idx} "
+        f"llm_edges={len(new_llm)} continue_edges={len(cont_out)} "
+        f"viz_edges={len(viz_out)} path={persist.get('continue_path') or '-'}",
+        flush=True,
+    )
 
     return {
         "ok": True,

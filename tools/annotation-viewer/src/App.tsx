@@ -725,6 +725,11 @@ export default function App() {
                           {' → '}
                           dst @{e.dst}
                         </span>
+                        {e.reason ? (
+                          <span className="hint" title={e.reason}>
+                            {e.reason}
+                          </span>
+                        ) : null}
                         <span className="edgeWeight" title="续训 saliency 正样本权重（默认 1，可 +/−）">
                           w={e.weight ?? 1}
                         </span>

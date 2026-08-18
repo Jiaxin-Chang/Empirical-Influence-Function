@@ -28,6 +28,7 @@ export type Edge = {
   subtype: string
   weight?: number
   contrib?: 'source' | 'user_add' | 'user_bump' | 'llm_auto' | string
+  reason?: string
 }
 
 export type SampleSummary = {

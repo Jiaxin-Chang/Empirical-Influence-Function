@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 
 CONTINUE_CONTRIBS = frozenset({"user_add", "user_bump", "llm_auto"})
@@ -284,6 +285,58 @@ def build_fim_marked_view(
     return out
 
 
+_SPECIAL_SURFACES = frozenset({
+    "<|im_start|>",
+    "<|im_end|>",
+    "<PRE>",
+    "<SUF>",
+    "<MID>",
+    "user",
+    "assistant",
+    "system",
+})
+
+
+def _is_junk_surface(surf: str) -> bool:
+    s = (surf or "").strip()
+    if not s:
+        return True
+    if s in _SPECIAL_SURFACES:
+        return True
+    if re.fullmatch(r"[\W_]+", s, flags=re.UNICODE):
+        return True
+    return False
+
+
+def _is_identish(surf: str) -> bool:
+    s = (surf or "").strip().lstrip("Ġ▁")
+    if not s or _is_junk_surface(s):
+        return False
+    return bool(re.search(r"[A-Za-z_\u4e00-\u9fff]", s))
+
+
+def _compact_indexed_tokens(
+    tokens: list[str],
+    *,
+    answer_start: int,
+    max_pre_idents: int = 180,
+    mid_ctx: int = 40,
+) -> list[dict[str, Any]]:
+    """Keep idents in PRE + window around MID; indices stay global."""
+    n = len(tokens)
+    ans = max(0, min(int(answer_start), n))
+    mid_lo = max(0, ans - mid_ctx)
+    keep: set[int] = set(range(mid_lo, n))
+    pre_idents: list[int] = []
+    for i in range(0, ans):
+        if _is_identish(_surface(tokens[i])):
+            pre_idents.append(i)
+    if len(pre_idents) > max_pre_idents:
+        pre_idents = pre_idents[-max_pre_idents:]
+    keep.update(pre_idents)
+    return [{"i": i, "t": _surface(tokens[i])} for i in sorted(keep)]
+
+
 def build_auto_annotate_messages(
     *,
     train_tokens: list[str],
@@ -307,7 +360,10 @@ def build_auto_annotate_messages(
         train_tokens,
         answer_start=train_answer_start,
         mid_override=train_mid_override,
-        include_indexed=True,
+        include_indexed=False,
+    )
+    indexed = _compact_indexed_tokens(
+        train_tokens, answer_start=int(train_answer_start),
     )
     sid = f"train_sample_id={sample_id}" if sample_id is not None else "this train sample"
     if sample_uid:
@@ -315,6 +371,7 @@ def build_auto_annotate_messages(
 
     src_tok = (probe_src_token or "").strip() or "·"
     dst_tok = (probe_dst_token or "").strip() or "·"
+    short_dst = len(dst_tok.strip()) <= 2
 
     # Build probe FIM with SOURCE/TARGET marks when tokens are available.
     probe_block = (probe_fim_view or "").strip()
@@ -340,6 +397,16 @@ def build_auto_annotate_messages(
             f"SOURCE {src_tok!r} → TARGET {dst_tok!r}\n"
         )
 
+    short_note = ""
+    if short_dst:
+        short_note = (
+            f"\nNote: probe TARGET surface {dst_tok!r} is a short subword "
+            "(often the first piece of an identifier). Do NOT match other tokens "
+            "just because they share that letter. Recover the full identifier from "
+            "neighboring tokens in the probe FIM, then find the analogous name / "
+            "binding / API use on the train sample.\n"
+        )
+
     system = (
         f"You are helping continue-train a {lang} code LLM with a saliency objective.\n\n"
         "Why we annotate\n"
@@ -348,39 +415,40 @@ def build_auto_annotate_messages(
         "For each annotated edge s→t, saliency_loss pushes the model to attribute "
         "more contribution / attention from source token s when predicting or "
         "representing target token t (and away from unrelated causal tokens).\n"
-        "So annotations are NOT generic AST labels — they are training signals that "
-        "teach useful token-to-token associations.\n\n"
+        "Annotations are training signals for useful associations — NOT nearby "
+        "keyword dumps, NOT AST taxonomy labels.\n\n"
         "Focus association (from probe / test attribution)\n"
         "------------------------------------------------\n"
-        "The user selected a FOCUS association on a *probe/test* example "
-        f"(SOURCE token {src_tok!r} → TARGET token {dst_tok!r}).\n"
-        "The full probe FIM view (PRE + MID + SUF) with SOURCE/TARGET marked in "
-        "bold is in the user message — use it to understand what relationship "
-        "those two tokens have in context.\n"
-        "They want continue-train to strengthen attention on the *same kind of* "
-        "association / predictive mechanism.\n"
-        "Propose a small set of directed edges *on the train sample* that, if used "
-        "as saliency positives, are most likely to help the model learn to attend "
-        "in ways that support that focus mechanism.\n\n"
-        f"You need to annotate on THIS train sample: {sid}\n"
-        "Below (user message) is that train sample's FIM view (PRE + MID + SUF) "
-        "and an indexed token list. Every edge src/dst must be an index from that "
-        "train list only (not from the probe/test view).\n"
-        f"Every edge must use subtype \"{ROUTE_SUBTYPE}\" "
-        "(do not use bracket/defuse/call/… types).\n\n"
+        "The user selected a FOCUS on a *probe/test* example "
+        f"(SOURCE {src_tok!r} → TARGET {dst_tok!r}).\n"
+        "Read the probe FIM with SOURCE/TARGET marked and understand the "
+        "*mechanism* (copy a name, bind a type, route an API, close a bracket, …).\n"
+        f"{short_note}"
+        "Propose a small set of directed edges on the *train* sample that teach "
+        "the same mechanism. Probe indices are invalid on train.\n\n"
+        f"Annotate THIS train sample: {sid}\n"
+        "User message: (1) probe FIM (2) train FIM (3) compact indexed tokens "
+        "(identifier-like PRE tokens + window around MID). "
+        "Every edge src/dst must be from that list.\n"
+        f"Every edge subtype must be \"{ROUTE_SUBTYPE}\".\n\n"
         "Return JSON only:\n"
         f'{{ "edges": [ {{"src": <int>, "dst": <int>, "subtype": "{ROUTE_SUBTYPE}", '
-        '"reason": <short why this helps the focus mechanism>}} ] }}\n'
-        "Rules:\n"
-        "- Prefer edges that share the same copy / span / binding / call / "
-        "dataflow / naming / … relationship as the probe focus, or that form a "
-        "short chain supporting that mechanism on this train sample.\n"
-        "- You may include any train edge whose relationship you judge similar to "
-        "the user-selected SOURCE→TARGET pair; say that similarity briefly in "
-        "``reason``.\n"
-        f"- At most {max(1, int(max_edges))} edges; precision over recall.\n"
-        "- ``src`` / ``dst`` must be integers from the train indexed token list "
-        f"(valid range 0..{max(0, len(train_tokens) - 1)}). Never invent indices.\n"
+        '"reason": <one short clause naming the concrete link>}} ] }}\n'
+        "Hard rules (precision ≫ recall):\n"
+        "- Prefer: same-name / identifier-span copy, def→use, type→name, "
+        "callee→'(', API/string routing, bracket open→close — matching the "
+        "probe focus mechanism.\n"
+        "- Each reason must name a concrete link. Vague reasons are invalid.\n"
+        "- Forbid edges that only share a letter/substring with no shared "
+        "identifier/binding/call/dataflow role "
+        "(e.g. random Exist/IP/! → first letter of a variable).\n"
+        "- Forbid ChatML/FIM markers, whitespace-only, or punctuation-only "
+        "as src or dst.\n"
+        "- If dst is in MID/completion, require src < dst (causal).\n"
+        f"- At most {max(1, int(max_edges))} edges; 1–3 good edges beat 8 junk; "
+        "empty is better than junk.\n"
+        "- Indices must appear in the compact list "
+        f"(valid range 0..{max(0, len(train_tokens) - 1)}).\n"
     )
 
     user = (
@@ -388,8 +456,9 @@ def build_auto_annotate_messages(
         f"{probe_block}\n\n"
         "=== TRAIN sample to annotate (PRE + MID + SUF) ===\n"
         f"{train_view['fim_view']}\n\n"
-        "=== Indexed tokens of the TRAIN sample (use these indices in JSON) ===\n"
-        f"{json.dumps(train_view['indexed_tokens'], ensure_ascii=False)}\n"
+        "=== Compact indexed tokens of TRAIN "
+        "(idents in PRE + window around MID; use only these indices) ===\n"
+        f"{json.dumps(indexed, ensure_ascii=False)}\n"
     )
     return [
         {"role": "system", "content": system},
@@ -494,6 +563,15 @@ def call_llm_auto_annotate(
         probe_mid_override=probe_mid_override,
         probe_fim_view=probe_fim_view,
     )
+    sys_chars = len(messages[0]["content"]) if messages else 0
+    user_chars = len(messages[1]["content"]) if len(messages) > 1 else 0
+    print(
+        f"[auto-annotate] calling LLM backend={backend} model={model} "
+        f"max_tokens={max_tokens} prompt_chars=system:{sys_chars}+user:{user_chars} "
+        f"train_tokens={len(tokens)} probe_tokens={len(probe_tokens) if probe_tokens else 0}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
     client = _build_client()
     kwargs: dict[str, Any] = {
         "model": model,
@@ -510,8 +588,13 @@ def call_llm_auto_annotate(
             **kwargs,
             response_format={"type": "json_object"},
         )
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[auto-annotate] json_object response_format failed ({exc}); retry plain",
+            flush=True,
+        )
         resp = client.chat.completions.create(**kwargs)
+    elapsed = time.perf_counter() - t0
     raw = ""
     try:
         raw = resp.choices[0].message.content or ""
@@ -521,17 +604,41 @@ def call_llm_auto_annotate(
     n = len(tokens)
     cleaned: list[dict[str, Any]] = []
     seen: set[tuple[int, int, str]] = set()
+    dropped = 0
+    dropped_reasons: list[str] = []
     for e in edges:
         src, dst, sub = int(e["src"]), int(e["dst"]), str(e["subtype"])
         if src == dst:
+            dropped += 1
+            dropped_reasons.append(f"{src}→{dst}:same")
             continue
         if not (0 <= src < n and 0 <= dst < n):
+            dropped += 1
+            dropped_reasons.append(f"{src}→{dst}:oor")
+            continue
+        if ans > 0 and dst >= ans and not (src < dst):
+            dropped += 1
+            dropped_reasons.append(f"{src}→{dst}:noncausal")
+            continue
+        src_s = _surface(tokens[src])
+        dst_s = _surface(tokens[dst])
+        if _is_junk_surface(src_s) or _is_junk_surface(dst_s):
+            dropped += 1
+            dropped_reasons.append(f"{src}→{dst}:junk({src_s!r}/{dst_s!r})")
             continue
         key = (src, dst, sub)
         if key in seen:
+            dropped += 1
+            dropped_reasons.append(f"{src}→{dst}:dup")
             continue
         seen.add(key)
         cleaned.append(e)
         if len(cleaned) >= max(1, int(max_edges)):
             break
+    print(
+        f"[auto-annotate] LLM returned in {elapsed:.1f}s "
+        f"parsed={len(edges)} kept={len(cleaned)} dropped={dropped}"
+        + (f" ({', '.join(dropped_reasons[:8])})" if dropped_reasons else ""),
+        flush=True,
+    )
     return cleaned, raw
