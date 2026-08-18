@@ -1517,6 +1517,7 @@ def _compute_bank_flat_grad_filtered(
     cfg,
     edges,
     special_ids,
+    saliency_only: bool = False,
 ) -> torch.Tensor | None:
     """Flat ∇_θ L_train on filtered params (same θ space as ALTI-gradient features)."""
     from src.bank_loss import BankLossConfig
@@ -1526,7 +1527,7 @@ def _compute_bank_flat_grad_filtered(
         raise RuntimeError("No parameters matched param_filter_fn for saliency train bank.")
 
     if cfg is None:
-        cfg = BankLossConfig(loss_mode="ce_only")
+        cfg = BankLossConfig(loss_mode="ce_saliency" if saliency_only else "ce_only")
 
     model.eval()
     model.zero_grad(set_to_none=True)
@@ -1545,6 +1546,7 @@ def _compute_bank_flat_grad_filtered(
                 cfg=cfg,
                 edges=edges,
                 special_ids=special_ids,
+                saliency_only=saliency_only,
             )
             if loss is None or not torch.isfinite(loss):
                 return None

@@ -163,16 +163,6 @@ interface DegradationFlip {
     deltaNllLost?: number;
 }
 
-interface DegradationTrainHit {
-    trainSampleId: number;
-    probeCos: number;
-    taskId?: string;
-    snippet?: string;
-    nEdges?: number;
-    mentionsNew?: boolean;
-    mentionsWrap?: boolean;
-}
-
 interface PerTokenResult {
     target_token_index: number;
     target_token: string;
@@ -1486,7 +1476,7 @@ function NextTokenProbPanel({
     interventionSteps,
     viewFamily,
     onViewFamilyChange,
-    degradeTrains,
+    degradePairs,
     degradeBusy,
     degradeError,
     onRetrieveDegrade,
@@ -1499,7 +1489,7 @@ function NextTokenProbPanel({
     interventionSteps?: number;
     viewFamily: string;
     onViewFamilyChange?: (id: string) => void;
-    degradeTrains?: DegradationTrainHit[];
+    degradePairs?: CorrelationPair[];
     degradeBusy?: boolean;
     degradeError?: string | null;
     onRetrieveDegrade?: () => void;
@@ -1616,7 +1606,7 @@ function NextTokenProbPanel({
                     ) : (
                         <div className={styles.degradeNoFlip}>
                             相对 {viewTitle} 没有翻转（两边 argmax 都是 {JSON.stringify(decodeToken(flip.live?.argmaxToken ?? ''))}）。
-                            可切到 Base 再比；下面仍可检索把质量推向 {JSON.stringify(decodeToken(flip.gainedToken ?? ''))} 的 train。
+                            可切到 Base 再比；仍可按边归因，看哪些 L_sal 把质量推向 {JSON.stringify(decodeToken(flip.gainedToken ?? ''))}。
                         </div>
                     )}
                     <div className={styles.degradeMetrics}>
@@ -1632,25 +1622,33 @@ function NextTokenProbPanel({
                             disabled={degradeBusy || busy}
                             onClick={onRetrieveDegrade}
                         >
-                            {degradeBusy ? '检索中…' : '检索 Δ 同向 train'}
+                            {degradeBusy ? '按边归因中…' : '按边归因 L_sal'}
                         </button>
                     )}
                     {degradeError && (
                         <div className={styles.degradeErr}>{degradeError}</div>
                     )}
-                    {degradeTrains && degradeTrains.length > 0 && (
+                    {degradePairs && degradePairs.length > 0 && (
                         <div className={styles.degradeTrains}>
-                            {degradeTrains.map(tr => (
-                                <div key={tr.trainSampleId} className={styles.degradeTrainRow}>
-                                    <div className={styles.degradeTrainMeta}>
-                                        <span>train #{tr.trainSampleId}</span>
-                                        <span>cos {tr.probeCos.toFixed(4)}</span>
-                                        {tr.mentionsNew ? <span className={styles.degradeTagNew}>New</span> : null}
-                                        {tr.mentionsWrap ? <span className={styles.degradeTagWrap}>Wrap</span> : null}
+                            <div className={styles.degradeNoFlip}>
+                                contrib = −cos(∇f, ∇L_sal)。正值 = 这条边顺着 New←Wrap。完整列表在右侧梯度栏，可 Unlearn 验证。
+                            </div>
+                            {degradePairs.slice(0, 8).map(p => {
+                                const src = decodeToken(p.train_correlation.source_token).trim() || '·';
+                                const dst = decodeToken(p.train_correlation.target_token).trim() || '·';
+                                const contrib = p.cos_sim;
+                                return (
+                                    <div key={p.id} className={styles.degradeTrainRow}>
+                                        <div className={styles.degradeTrainMeta}>
+                                            <span>train #{p.train_sample_id}</span>
+                                            <span>{src} → {dst}</span>
+                                            <span style={{ color: contrib > 0 ? '#f38ba8' : '#a6adc8' }}>
+                                                contrib {contrib >= 0 ? '+' : ''}{contrib.toFixed(4)}
+                                            </span>
+                                        </div>
                                     </div>
-                                    <div className={styles.degradeSnippet}>{tr.snippet || tr.taskId || '—'}</div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
                 </div>
@@ -1813,7 +1811,14 @@ function PairCard({
 
                 <span className={styles.pairId}>{pair.id}</span>
 
-                <span className={styles.cosSim} style={{ background: bg, color: fg }}>
+                <span
+                    className={styles.cosSim}
+                    style={{ background: bg, color: fg }}
+                    title={pair.retrieval === 'degrade_sal_edge'
+                        ? 'contrib = −cos(∇f, ∇L_sal)'
+                        : 'cos_sim'}
+                >
+                    {pair.retrieval === 'degrade_sal_edge' ? 'contrib ' : ''}
                     {(pair.score ?? pair.cos_sim).toFixed(4)}
                 </span>
                 {(() => {
@@ -2064,7 +2069,10 @@ function TrainSampleGroup({
         <div className={styles.trainGroup}>
             <div className={styles.trainGroupHeader} onClick={() => setCollapsed(c => !c)}>
                 <span className={styles.trainGroupId}>TRAIN #{trainIdx}</span>
-                <span className={styles.trainGroupCoarse}>coarse {(detail?.coarse_cos_sim ?? pairs[0]?.coarse_cos_sim ?? 0).toFixed(4)}</span>
+                <span className={styles.trainGroupCoarse}>
+                    {pairs[0]?.retrieval === 'degrade_sal_edge' ? 'contrib' : 'coarse'}{' '}
+                    {(detail?.coarse_cos_sim ?? pairs[0]?.coarse_cos_sim ?? 0).toFixed(4)}
+                </span>
                 <span className={styles.trainGroupCount}>{pairs.length} pairs</span>
                 <span className={styles.cosSim} style={{ background: bg, color: fg }}>best {bestSim.toFixed(4)}</span>
                 <span style={{ marginLeft: 8, fontSize: 11, color: '#6b7280', fontWeight: 600 }}>
@@ -2307,6 +2315,9 @@ export function ReportPanel({
         setStructuralAttributionEnabled(true);
         setModelSaliencySelected(false);
         setTtavLaunchError(null);
+        setDegradePairs([]);
+        setDegradeTrainDetails({});
+        setDegradeError(null);
         setTtavLaunchStatus('指定 pair：先点 Model 上下文选 source，再点 Gold 选 target');
     }, [clearGoldLive, clearManualPair, setSelectedTokIdx]);
     const exitManualPairMode = useCallback(() => {
@@ -2320,7 +2331,8 @@ export function ReportPanel({
     const [tokenProbError, setTokenProbError] = useState<string | null>(null);
     const [tokenProbFocus, setTokenProbFocus] = useState<{ mode: 'predict' | 'gold'; index: number } | null>(null);
     const [probViewFamily, setProbViewFamily] = useState('live');
-    const [degradeTrains, setDegradeTrains] = useState<DegradationTrainHit[]>([]);
+    const [degradePairs, setDegradePairs] = useState<CorrelationPair[]>([]);
+    const [degradeTrainDetails, setDegradeTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
     const [degradeBusy, setDegradeBusy] = useState(false);
     const [degradeError, setDegradeError] = useState<string | null>(null);
     // GT annotation edges from smoke_train_data_oversample_llm.jsonl (train 0..4).
@@ -2600,6 +2612,10 @@ export function ReportPanel({
         const keep = (p: CorrelationPair) =>
             p.cos_sim >= threshold && !(hideZero && p.cos_sim === 0);
 
+        if (degradePairs.length > 0) {
+            return [...degradePairs].sort((a, b) => b.cos_sim - a.cos_sim);
+        }
+
         // Manual pair: gradient Stage3 on the user-picked gold edge.
         if (attrMode === 'manual') {
             return manualGradPairs
@@ -2626,7 +2642,7 @@ export function ReportPanel({
             .sort((a, b) => b.cos_sim - a.cos_sim);
     }, [
         attrMode, selectedResult, selectedTestCorrIdx, threshold, hideZero,
-        goldPairs, goldSelectedCorrIdx, manualGradPairs,
+        goldPairs, goldSelectedCorrIdx, manualGradPairs, degradePairs,
     ]);
 
     // Group pairs by train_sample_id; keep Top-10 trains by best pair cos for this edge.
@@ -2648,6 +2664,7 @@ export function ReportPanel({
 
     const resolveTrainDetail = useCallback((id: number): TrainSampleDetail | undefined => {
         const key = String(id);
+        if (degradeTrainDetails[key]) return degradeTrainDetails[key];
         if (attrMode === 'manual') {
             return manualTrainDetails[key] ?? report.train_sample_details[key];
         }
@@ -2656,11 +2673,20 @@ export function ReportPanel({
         }
         return report.train_sample_details[key];
     }, [
-        attrMode, manualTrainDetails, goldTrainDetails,
+        attrMode, manualTrainDetails, goldTrainDetails, degradeTrainDetails,
         report.train_sample_details,
     ]);
 
     const trainPanelEmptyHint = useMemo(() => {
+        if (degradeBusy) {
+            return '按边归因：正在对每条 train 的每条 attention edge 算 ∇L_sal…';
+        }
+        if (degradeError) {
+            return `按边归因失败：${degradeError}`;
+        }
+        if (degradePairs.length > 0) {
+            return 'contrib = −cos(∇f, ∇L_sal)。正值 = 这条边顺着当前相对对照的翻转；可在卡片上 Unlearn 验证。';
+        }
         if (attrMode === 'manual') {
             if (manualSourceIdx === null && manualTargetAbsIdx === null) {
                 return '指定 pair：点 Model 灰色上下文选 source，再点 Gold 选 target；上下栏分别跑梯度 Stage3 与结构检索。';
@@ -2705,6 +2731,7 @@ export function ReportPanel({
         }
         return 'No matching pairs for this source→target edge. Try lowering the cos_sim threshold.';
     }, [
+        degradeBusy, degradeError, degradePairs.length,
         attrMode, manualSourceIdx, manualTargetAbsIdx, manualGradBusy, manualGradPairs.length,
         goldLocalIdx, goldBusy, goldTopCorrelations.length, goldSelectedCorrIdx,
         selectedResult, selectedTestCorrIdx, importedReportActive, allDisplayPairs.length,
@@ -2828,6 +2855,8 @@ export function ReportPanel({
         setGoldSelectedCorrIdx(next);
         setGoldPairs([]);
         setGoldTrainDetails({});
+        setDegradePairs([]);
+        setDegradeTrainDetails({});
         if (next === null) return;
 
         setGoldBusy(true);
@@ -3069,7 +3098,8 @@ export function ReportPanel({
         setTokenProbFocus({ mode, index: targetIndex });
         setTokenProbBusy(true);
         setTokenProbError(null);
-        setDegradeTrains([]);
+        setDegradePairs([]);
+        setDegradeTrainDetails({});
         setDegradeError(null);
         void (async () => {
             try {
@@ -3179,10 +3209,15 @@ export function ReportPanel({
                         : `Degrade retrieve failed (HTTP ${resp.status})`;
                     throw new Error(message);
                 }
-                const trains = Array.isArray(parsed.relatedTrains)
-                    ? parsed.relatedTrains as DegradationTrainHit[]
+                const pairs = Array.isArray(parsed.correlationPairs)
+                    ? parsed.correlationPairs as CorrelationPair[]
                     : [];
-                setDegradeTrains(trains);
+                const details = (
+                    parsed.trainSampleDetails
+                    && typeof parsed.trainSampleDetails === 'object'
+                ) ? parsed.trainSampleDetails as Record<string, TrainSampleDetail> : {};
+                setDegradePairs(pairs);
+                setDegradeTrainDetails(details);
                 if (parsed.flip && typeof parsed.flip === 'object') {
                     setTokenProbResult(prev => (
                         prev ? { ...prev, flip: parsed.flip as DegradationFlip } : prev
@@ -3191,7 +3226,8 @@ export function ReportPanel({
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Degradation retrieve failed';
                 setDegradeError(msg);
-                setDegradeTrains([]);
+                setDegradePairs([]);
+                setDegradeTrainDetails({});
             } finally {
                 setDegradeBusy(false);
             }
@@ -3204,7 +3240,8 @@ export function ReportPanel({
 
     useEffect(() => {
         setProbViewFamily('live');
-        setDegradeTrains([]);
+        setDegradePairs([]);
+        setDegradeTrainDetails({});
         setDegradeError(null);
     }, [selectedMeta?.fileName]);
 
@@ -3581,14 +3618,14 @@ export function ReportPanel({
         const verb = direction === 'learn' ? 'Learning' : 'Unlearning';
         setTtavLaunchStatus(`${verb} pair ${pair.id}…`);
 
+        const trainKey = String(pair.train_sample_id);
         const trainDetail =
-            attrMode === 'manual'
-                ? (manualTrainDetails[String(pair.train_sample_id)]
-                    ?? report.train_sample_details[String(pair.train_sample_id)])
+            degradeTrainDetails[trainKey]
+            ?? (attrMode === 'manual'
+                ? (manualTrainDetails[trainKey] ?? report.train_sample_details[trainKey])
                 : attrMode === 'gold'
-                    ? (goldTrainDetails[String(pair.train_sample_id)]
-                        ?? report.train_sample_details[String(pair.train_sample_id)])
-                    : report.train_sample_details[String(pair.train_sample_id)];
+                    ? (goldTrainDetails[trainKey] ?? report.train_sample_details[trainKey])
+                    : report.train_sample_details[trainKey]);
 
         void (async () => {
             try {
@@ -3674,7 +3711,8 @@ export function ReportPanel({
         })();
     }, [
         report, selectedMeta, importedReportActive, eifApiUrl, selectedSampleId,
-        attrMode, goldTrainDetails, manualTrainDetails, refreshTokenProbs, pairInterveneLr,
+        attrMode, goldTrainDetails, manualTrainDetails, degradeTrainDetails,
+        refreshTokenProbs, pairInterveneLr,
     ]);
 
     const handleRecoverIntervention = useCallback(() => {
@@ -4452,9 +4490,13 @@ export function ReportPanel({
                                                 type="button"
                                                 title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(c.target_token || selectedResult.target_token).trim()} for train retrieval`}
                                                 className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
-                                                onClick={() => setSelectedTestCorrIdx(
-                                                    prev => prev === c.source_token_index ? null : c.source_token_index
-                                                )}
+                                                onClick={() => {
+                                                    setDegradePairs([]);
+                                                    setDegradeTrainDetails({});
+                                                    setSelectedTestCorrIdx(
+                                                        prev => prev === c.source_token_index ? null : c.source_token_index,
+                                                    );
+                                                }}
                                             >
                                                 <div className={styles.corrBtnLeft}>
                                                     <span className={styles.corrLabel}>source → target</span>
@@ -4483,7 +4525,7 @@ export function ReportPanel({
                                 interventionSteps={interventionSteps}
                                 viewFamily={probViewFamily}
                                 onViewFamilyChange={setProbViewFamily}
-                                degradeTrains={degradeTrains}
+                                degradePairs={degradePairs}
                                 degradeBusy={degradeBusy}
                                 degradeError={degradeError}
                                 onRetrieveDegrade={fetchDegradeRetrieve}
@@ -4742,7 +4784,9 @@ export function ReportPanel({
                                                 color: '#1d4ed8',
                                             }}>
                                                 上 · 梯度归因
-                                                {attrMode === 'manual' ? ' · 指定 pair' : ''}
+                                                {degradePairs.length > 0
+                                                    ? ' · L_sal 按边'
+                                                    : (attrMode === 'manual' ? ' · 指定 pair' : '')}
                                             </div>
                                             {trainGroups.length === 0 ? (
                                                 <div className={styles.emptyState} style={{ padding: '24px 0' }}>

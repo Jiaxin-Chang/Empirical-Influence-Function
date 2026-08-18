@@ -306,15 +306,20 @@ def compute_bank_loss(
     cfg: BankLossConfig,
     edges=None,
     special_ids: set[int] | None = None,
+    saliency_only: bool = False,
 ):
-    """Scalar training objective for one bank example (CE or CE+saliency)."""
+    """Scalar training objective for one bank example (CE or CE+saliency).
+
+    ``saliency_only=True`` returns ``L_sal`` for the given edges (no CE), used by
+    pair-level degradation attribution.
+    """
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     inputs = {"input_ids": input_ids, "labels": labels}
     if "attention_mask" in batch:
         inputs["attention_mask"] = batch["attention_mask"].to(device)
 
-    need_saliency = cfg.loss_mode == "ce_saliency" and bool(edges)
+    need_saliency = (cfg.loss_mode == "ce_saliency" or saliency_only) and bool(edges)
     if not need_saliency:
         with _sdpa_context():
             outputs = model(**inputs, use_cache=False, return_dict=True)
@@ -426,4 +431,6 @@ def compute_bank_loss(
         margin_plus=cfg.margin_plus,
         neg_sample_k=cfg.neg_sample_k,
     )
+    if saliency_only:
+        return diag.loss, "saliency_only"
     return ce + float(cfg.saliency_lambda) * diag.loss, "ce_saliency"

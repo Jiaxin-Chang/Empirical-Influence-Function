@@ -1,12 +1,15 @@
 """Decision-flip (degradation) attribution: compare adapters at one prefix.
 
-Target quantity at teacher-forced / predict position t::
+Target quantity::
 
-    Δ = (logit_gained − logit_lost)_live − (logit_gained − logit_lost)_compare
+    f = logit_gained − logit_lost
+    Δ = f_live − f_compare
 
-Default pair is live argmax vs compare-view argmax (gold mode: lost = gold token).
-Who is responsible ≈ train-bank rows whose sketched ∇L_train aligns with
-∇_θ (logit_gained − logit_lost) on the live adapter.
+Pair-level score (descent) for train edge e::
+
+    contrib(e) = −cos(∇f, ∇L_sal(e))
+
+Positive contrib = this saliency edge pushes the flip (New over Wrap).
 """
 
 from __future__ import annotations
@@ -14,7 +17,6 @@ from __future__ import annotations
 import math
 import os
 from contextlib import contextmanager
-from heapq import nlargest
 from typing import Any, Iterator
 
 import torch
@@ -27,11 +29,10 @@ from src.eif_adapter_env import (
     normalize_view_family,
 )
 from src.intervention_experiment import (
-    PRESCREEN_SKETCH_DIM,
-    PRESCREEN_SKETCH_SEED,
-    _project_flat_grad,
-    _score_prescreen_sketch_cache,
+    SEQUENCE_LENGTH_LIMIT,
+    _compute_bank_flat_grad_filtered,
     ensure_peft_lora_dtype,
+    get_context_window,
 )
 from src.loss import prepare_last_layer_grad_checkpointing
 
@@ -339,30 +340,28 @@ def _flat_logit_diff_grad(
             pass
 
 
-def _train_snippet(tokenizer, sample: dict[str, Any], *, max_chars: int = 180) -> dict[str, Any]:
-    ids = [int(x) for x in (sample.get("input_ids") or [])]
-    labels = [int(x) for x in (sample.get("labels") or [])]
-    edges = sample.get("attention_edges") or []
-    start = 0
-    for i, lab in enumerate(labels):
-        if lab != -100:
-            start = i
-            break
-    window = ids[max(0, start - 24): start + 48]
-    text = tokenizer.decode(window) if window else ""
-    text = " ".join(text.split())
-    if len(text) > max_chars:
-        text = text[: max_chars - 1] + "…"
-    comp_ids = [tid for tid, lab in zip(ids, labels) if lab != -100]
-    comp = tokenizer.decode(comp_ids[:64]) if comp_ids else ""
-    low = comp.lower()
-    return {
-        "taskId": str(sample.get("task_id") or sample.get("uid") or ""),
-        "snippet": text,
-        "nEdges": len(edges) if isinstance(edges, list) else 0,
-        "mentionsNew": (".new" in low) or ("new(" in low),
-        "mentionsWrap": (".wrap" in low) or ("wrap(" in low),
-    }
+def _parse_train_edges(edges) -> list[tuple[int, int, float, str]]:
+    out: list[tuple[int, int, float, str]] = []
+    for e in edges or []:
+        try:
+            if isinstance(e, (list, tuple)) and len(e) >= 2:
+                src, dst = int(e[0]), int(e[1])
+                w = float(e[2]) if len(e) >= 3 else 1.0
+                subtype = ""
+            else:
+                src = int(e.get("src", e.get("source", -1)))
+                dst = int(e.get("dst", e.get("target", -1)))
+                try:
+                    w = float(e.get("weight", 1.0))
+                except (TypeError, ValueError):
+                    w = 1.0
+                subtype = str(e.get("subtype") or "")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if src < 0 or dst < 0 or src == dst:
+            continue
+        out.append((src, dst, max(1.0, w), subtype))
+    return out
 
 
 def retrieve_degradation(
@@ -376,13 +375,13 @@ def retrieve_degradation(
     top_trains: int | None = None,
     top_k: int = 10,
 ) -> dict[str, Any]:
-    """Score train bank against ∇(logit_gained − logit_lost) on the live adapter."""
+    """Rank train saliency edges by contrib = −cos(∇f, ∇L_sal(edge))."""
     from src.gold_live_attribution import (
         _completion_tokens_and_ids,
         _ensure_session,
-        _env_int,
         infer_sample_id_from_report,
     )
+    from src.NIF import build_single_sample_dataset
 
     compare = normalize_view_family(compare_family)
     if compare == "live":
@@ -392,15 +391,21 @@ def retrieve_degradation(
     model = session["model"]
     tokenizer = session["tokenizer"]
     device = session["device"]
-    bank = session["bank"]
     live_path = str(session.get("model_path") or "")
     live_family = infer_report_family(
         str((report.get("experiment_meta") or {}).get("report_file") or ""),
         report,
     )
-    n_trains = max(1, int(top_trains if top_trains is not None else _env_int("EIF_GOLD_TOP_TRAINS", 5)))
+    n_keep = max(1, int(top_trains if top_trains is not None else 20))
+    bank_cfg = session.get("bank_cfg")
+    if bank_cfg is None:
+        from src.bank_loss import load_bank_loss_config
+        bank_cfg = load_bank_loss_config(live_path, live_family or "")
+    collator = session["collator"]
+    train_samples = session["train_samples"]
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
 
-    tokens, ids, _prompt_len = _completion_tokens_and_ids(report, tokenizer, mode=mode)
+    tokens, ids, prompt_len = _completion_tokens_and_ids(report, tokenizer, mode=mode)
     t = int(target_index)
     if not (0 < t < len(ids)):
         raise ValueError(f"target_index={t} out of range for degradation retrieve (len={len(ids)}).")
@@ -449,7 +454,7 @@ def retrieve_degradation(
 
         live_adapter = _active_adapter_name(model)
         query_filter = _live_adapter_filter(session["param_filter"], live_adapter)
-        flat = _flat_logit_diff_grad(
+        g_f = _flat_logit_diff_grad(
             model,
             prefix,
             attn,
@@ -458,23 +463,121 @@ def retrieve_degradation(
             query_filter,
             device,
         )
-        probe_sketch = _project_flat_grad(flat, PRESCREEN_SKETCH_DIM, PRESCREEN_SKETCH_SEED)
-        edge_scores = _score_prescreen_sketch_cache(probe_sketch, bank, device)
-        related = nlargest(n_trains, edge_scores, key=lambda x: x[1])
-        train_samples = session["train_samples"]
-        trains = []
-        for idx, score in related:
-            i = int(idx)
-            row: dict[str, Any] = {
-                "trainSampleId": i,
-                "probeCos": float(score),
+        q = F.normalize(g_f.reshape(-1).float(), dim=0, eps=1e-12)
+
+        prepare_last_layer_grad_checkpointing(model)
+        scored: list[dict[str, Any]] = []
+        details: dict[str, Any] = {}
+        n_edges_total = 0
+        for train_idx, sample in enumerate(train_samples):
+            edge_list = _parse_train_edges(sample.get("attention_edges") or sample.get("edges"))
+            if not edge_list:
+                continue
+            tr_ds = build_single_sample_dataset(sample)
+            tr_batch = collator([tr_ds[0]])
+            tr_batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in tr_batch.items()}
+            seq_len = int(tr_batch["input_ids"].size(1))
+            if seq_len > SEQUENCE_LENGTH_LIMIT:
+                print(
+                    f"[degrade] skip train#{train_idx} seq={seq_len} > {SEQUENCE_LENGTH_LIMIT}",
+                    flush=True,
+                )
+                continue
+            ids_1d = tr_batch["input_ids"][0]
+            full_token_ids = [int(x) for x in ids_1d.tolist()]
+            full_tokens = [tokenizer.decode([i]) for i in full_token_ids]
+            labels_1d = tr_batch["labels"][0].tolist()
+            answer_start = 0
+            for li, lab in enumerate(labels_1d):
+                if int(lab) != -100:
+                    answer_start = li
+                    break
+            details[str(train_idx)] = {
+                "full_tokens": full_tokens,
+                "full_token_ids": full_token_ids,
+                "answer_start_index": answer_start,
+                "coarse_cos_sim": 0.0,
+                "saliencies_by_token": {},
             }
-            if 0 <= i < len(train_samples):
-                row.update(_train_snippet(tokenizer, train_samples[i]))
-            trains.append(row)
+            for src, dst, weight, subtype in edge_list:
+                if not (0 <= src < seq_len and 0 <= dst < seq_len):
+                    continue
+                n_edges_total += 1
+                g_e = _compute_bank_flat_grad_filtered(
+                    model,
+                    tr_batch,
+                    query_filter,
+                    device,
+                    cfg=bank_cfg,
+                    edges=[{"src": src, "dst": dst, "weight": weight, "subtype": subtype}],
+                    special_ids=special_ids,
+                    saliency_only=True,
+                )
+                if g_e is None or not torch.isfinite(g_e).all():
+                    continue
+                e = F.normalize(g_e.reshape(-1).float(), dim=0, eps=1e-12)
+                if e.numel() != q.numel():
+                    print(
+                        f"[degrade] skip train#{train_idx} {src}->{dst}: "
+                        f"grad dim {e.numel()} vs query {q.numel()}",
+                        flush=True,
+                    )
+                    continue
+                cos = float((q * e).sum().item())
+                contrib = -cos
+                src_tok = full_tokens[src] if src < len(full_tokens) else tokenizer.decode([int(ids_1d[src])])
+                dst_tok = full_tokens[dst] if dst < len(full_tokens) else tokenizer.decode([int(ids_1d[dst])])
+                src_ctx = get_context_window(tokenizer, ids_1d, src)
+                dst_ctx = get_context_window(tokenizer, ids_1d, dst)
+                scored.append({
+                    "id": f"degrade_tr{train_idx}_s{src}_t{dst}",
+                    "cos_sim": contrib,
+                    "coarse_cos_sim": cos,
+                    "score": contrib,
+                    "retrieval": "degrade_sal_edge",
+                    "train_sample_id": int(train_idx),
+                    "test_correlation": {
+                        "source_token": flip["gainedToken"],
+                        "source_token_index": int(t),
+                        "target_token": flip["lostToken"],
+                        "target_token_index": int(t),
+                        "saliency_score": float(flip.get("deltaMargin") or 0.0),
+                    },
+                    "train_correlation": {
+                        "source_token": src_tok,
+                        "source_token_index": int(src),
+                        "target_token": dst_tok,
+                        "target_token_index": int(dst),
+                        "saliency_score": contrib,
+                        "response_token_offset": max(0, int(dst) - int(answer_start)),
+                    },
+                    "train_context": {
+                        "source_context": src_ctx,
+                        "target_context": dst_ctx,
+                    },
+                    "annotation": subtype or None,
+                    "contrib": contrib,
+                    "rawCos": cos,
+                    "subtype": subtype,
+                    "weight": weight,
+                })
+            from src.unlearn_pair_probe import _release_cuda_memory
+            _release_cuda_memory(model, reason=f"degrade_train{train_idx}")
+
+        scored.sort(key=lambda p: p["cos_sim"], reverse=True)
+        top_pairs = scored[:n_keep]
+        used = {str(p["train_sample_id"]) for p in top_pairs}
+        details = {k: v for k, v in details.items() if k in used}
+        for p in top_pairs:
+            key = str(p["train_sample_id"])
+            if key in details:
+                details[key]["coarse_cos_sim"] = max(
+                    float(details[key].get("coarse_cos_sim") or 0),
+                    float(p["cos_sim"]),
+                )
         print(
-            f"[degrade] retrieve {flip['gainedToken']!r} vs {flip['lostToken']!r} "
-            f"compare={compare} top={[(r['trainSampleId'], round(r['probeCos'], 4)) for r in trains]}",
+            f"[degrade] scored {n_edges_total} saliency edges; "
+            f"top contrib={[(p['train_sample_id'], p['train_correlation']['source_token'], p['train_correlation']['target_token'], round(p['cos_sim'], 4)) for p in top_pairs[:8]]}",
             flush=True,
         )
     finally:
@@ -506,15 +609,18 @@ def retrieve_degradation(
         "status": "success",
         "mode": (mode or "predict").strip().lower(),
         "targetIndex": t,
+        "promptLen": prompt_len,
         "compareFamily": compare,
         "liveFamily": live_family,
-        "query": "grad(logit_gained - logit_lost) vs train bank",
+        "query": "contrib=-cos(grad(logit_gained-logit_lost), grad L_sal(edge))",
         "flip": flip,
         "liveTop": live_rows,
         "compareTop": view_rows,
         "liveActualProb": live_p,
         "compareActualProb": view_p,
-        "relatedTrains": trains,
+        "correlationPairs": top_pairs,
+        "trainSampleDetails": details,
+        "nEdgesScored": n_edges_total,
         "filterTag": session.get("filter_tag"),
         "sampleIdHint": infer_sample_id_from_report(report),
         "availableViews": list_compare_views(live_family),
