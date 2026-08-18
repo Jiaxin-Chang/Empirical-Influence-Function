@@ -974,6 +974,7 @@
     padding: 8px 12px;
     border-bottom: 1px solid #313244;
     background: #181825;
+    flex-wrap: wrap;
 }
 .probPanelTitle {
     font-size: 11px;
@@ -1056,8 +1057,8 @@
 .probViewTabs {
     display: flex;
     gap: 4px;
-    padding: 6px 12px 0;
     flex-wrap: wrap;
+    flex-shrink: 0;
 }
 .probViewTab {
     border: 1px solid #45475a;
@@ -1077,6 +1078,12 @@
     border-color: #cba6f7;
     background: #313244;
     color: #cba6f7;
+}
+.degradeHint {
+    padding: 4px 12px 6px;
+    font-size: 11px;
+    color: #cba6f7;
+    border-bottom: 1px solid #313244;
 }
 .degradeCard {
     margin: 0 12px 10px;

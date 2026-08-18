@@ -1537,28 +1537,33 @@ function NextTokenProbPanel({
                         : ' (distribution that produced this token)'}
                     {viewFamily !== 'live' ? ` · ${viewTitle}` : ''}
                 </div>
+                {onViewFamilyChange && (
+                    <div className={styles.probViewTabs} role="tablist" aria-label="adapter probability view">
+                        {views.map(v => (
+                            <button
+                                key={v.id}
+                                type="button"
+                                role="tab"
+                                aria-selected={viewFamily === v.id}
+                                className={`${styles.probViewTab}${viewFamily === v.id ? ` ${styles.probViewTabActive}` : ''}`}
+                                disabled={busy || interventionActive}
+                                title={v.path || v.family || v.label}
+                                onClick={() => onViewFamilyChange(v.id)}
+                            >
+                                {v.label}
+                            </button>
+                        ))}
+                    </div>
+                )}
                 {result?.actualProb != null && (
                     <span className={styles.probPanelMeta}>
                         P(actual={JSON.stringify(decodeToken(result.actualToken ?? ''))})={formatProbPct(result.actualProb)}
                     </span>
                 )}
             </div>
-            {onViewFamilyChange && (
-                <div className={styles.probViewTabs} role="tablist" aria-label="adapter probability view">
-                    {views.map(v => (
-                        <button
-                            key={v.id}
-                            type="button"
-                            role="tab"
-                            aria-selected={viewFamily === v.id}
-                            className={`${styles.probViewTab}${viewFamily === v.id ? ` ${styles.probViewTabActive}` : ''}`}
-                            disabled={busy || interventionActive}
-                            title={v.path || v.family || v.label}
-                            onClick={() => onViewFamilyChange(v.id)}
-                        >
-                            {v.label}
-                        </button>
-                    ))}
+            {viewFamily === 'live' && onViewFamilyChange && (
+                <div className={styles.degradeHint}>
+                    切 CE / Base 对比同一位置的概率，并打开退化归因
                 </div>
             )}
             {interventionActive && (
