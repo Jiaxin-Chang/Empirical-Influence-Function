@@ -555,6 +555,11 @@ def retrieve_degradation(
         len(_parse_train_edges(s.get("attention_edges") or s.get("edges")))
         for s in train_samples
     )
+    print(
+        f"[degrade] train_path={session.get('train_path')} "
+        f"samples={n_trains} parsed_edges={n_annot}",
+        flush=True,
+    )
     sketch_dim = _edge_grad_cache_sketch_dim()
     sketch_seed = int(PRESCREEN_SKETCH_SEED)
     cache_dir = _edge_grad_cache_dir(

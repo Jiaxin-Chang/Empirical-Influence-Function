@@ -66,6 +66,36 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _SESSION: dict[str, Any] | None = None
 
 
+def _file_stamp(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return (int(st.st_mtime_ns), int(st.st_size))
+
+
+def _raw_edge_count(samples: list[dict]) -> int:
+    n = 0
+    for s in samples:
+        edges = s.get("attention_edges") or s.get("edges") or []
+        n += len(edges) if isinstance(edges, list) else 0
+    return n
+
+
+def _warn_train_path_mismatch(train_path: Path) -> None:
+    repo_smoke = REPO_ROOT / "smoke_train_data.jsonl"
+    try:
+        used = train_path.resolve()
+        alt = repo_smoke.resolve() if repo_smoke.is_file() else None
+    except OSError:
+        return
+    if alt is None or used == alt:
+        return
+    print(
+        f"[gold-live][WARN] EIF_TRAIN_DATA={used} "
+        f"but repo also has {alt}. Degrade/gold scans EIF_TRAIN_DATA only. "
+        f"Copy the new jsonl over, or point EIF_TRAIN_DATA at the repo file.",
+        flush=True,
+    )
+
+
 def _is_placeholder_path(value: str) -> bool:
     v = value.strip()
     if not v:
@@ -321,6 +351,7 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     _hydrate_eif_env()
     model_path, base_path = _resolve_model_paths(report)
     train_path = _resolve_train_data()
+    train_stamp = _file_stamp(train_path)
     key = (
         os.path.abspath(model_path),
         os.path.abspath(base_path) if base_path else "",
@@ -328,6 +359,27 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     )
     if _SESSION is not None and _SESSION.get("key") == key:
         ensure_peft_lora_dtype(_SESSION["model"], torch.bfloat16)
+        if _SESSION.get("train_stamp") != train_stamp:
+            print(
+                f"[gold-live] train JSONL changed on disk ({train_path}); "
+                f"reloading samples without reloading the model",
+                flush=True,
+            )
+            samples = load_train_samples(str(train_path))
+            _SESSION["train_samples"] = samples
+            _SESSION["train_stamp"] = train_stamp
+            _SESSION["train_detail_cache"] = {}
+            print(
+                f"[gold-live] reloaded trains={len(samples)} "
+                f"raw_edges={_raw_edge_count(samples)} path={train_path}",
+                flush=True,
+            )
+            _warn_train_path_mismatch(train_path)
+            print(
+                "[gold-live][WARN] saliency train bank may still match the old JSONL; "
+                "degrade pair scan uses the reloaded samples.",
+                flush=True,
+            )
         return _SESSION
 
     print(f"[gold-live] loading model adapter={model_path} base={base_path or '-'}", flush=True)
@@ -450,11 +502,15 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         "model_path": model_path,
         "base_path": base_path,
         "train_path": str(train_path),
+        "train_stamp": train_stamp,
         "train_detail_cache": {},
     }
+    _warn_train_path_mismatch(train_path)
     print(
-        f"[gold-live] ready trains={len(train_samples)} bank_rows="
-        f"{int(bank['sample_ids'].numel())} filter={filter_tag}",
+        f"[gold-live] ready trains={len(train_samples)} "
+        f"raw_edges={_raw_edge_count(train_samples)} "
+        f"bank_rows={int(bank['sample_ids'].numel())} filter={filter_tag} "
+        f"train={train_path}",
         flush=True,
     )
     return _SESSION
