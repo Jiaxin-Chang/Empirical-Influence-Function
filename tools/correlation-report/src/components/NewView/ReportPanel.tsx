@@ -178,6 +178,50 @@ interface DegradeProgress {
     cacheMisses?: number;
 }
 
+interface LlmTrainSearchHit {
+    line?: number;
+    task_id?: string;
+    train_sample_id?: number;
+    n_attention_edges?: number;
+    edge_subtypes?: string[];
+    prompt_preview?: string;
+    response_preview?: string;
+    preview?: string;
+}
+
+interface LlmTrainSearchExprResult {
+    name?: string;
+    expression?: string;
+    why?: string;
+    corpus_hits?: LlmTrainSearchHit[];
+    local_bank_hits?: LlmTrainSearchHit[];
+    corpus_error?: string;
+}
+
+interface LlmTrainExprItem {
+    name?: string;
+    expression?: string;
+    why?: string;
+}
+
+interface LlmTrainRetrieveResult {
+    status?: string;
+    analysis?: {
+        gold_pattern_summary?: string;
+        reasoning?: string;
+        required_code_patterns?: string[];
+        required_annotation_subtypes?: string[];
+        ideal_train_sample_traits?: string[];
+        negative_traits?: string[];
+        corpus_search_expressions?: LlmTrainExprItem[];
+    };
+    search_results?: LlmTrainSearchExprResult[];
+    corpus_path?: string | null;
+    local_bank_path?: string | null;
+    llm?: { model?: string; raw?: string };
+    message?: string;
+}
+
 interface PerTokenResult {
     target_token_index: number;
     target_token: string;
@@ -2382,6 +2426,11 @@ export function ReportPanel({
     const [structuralBusy, setStructuralBusy] = useState(false);
     const [structuralError, setStructuralError] = useState<string | null>(null);
     const [structuralMeta, setStructuralMeta] = useState<string | null>(null);
+    const [llmTrainBusy, setLlmTrainBusy] = useState(false);
+    const [llmTrainError, setLlmTrainError] = useState<string | null>(null);
+    const [llmTrainResult, setLlmTrainResult] = useState<LlmTrainRetrieveResult | null>(null);
+    const [llmTrainPanelOpen, setLlmTrainPanelOpen] = useState(false);
+    const [llmTrainExprsOnly, setLlmTrainExprsOnly] = useState(false);
     const enterManualPairMode = useCallback(() => {
         setAttrMode('manual');
         setSelectedTokIdx(null);
@@ -3743,6 +3792,60 @@ export function ReportPanel({
         fetchStructuralPairs(activeQueryEdge);
     }, [structuralAttributionEnabled, activeQueryEdge, fetchStructuralPairs]);
 
+    const fetchLlmTrainRetrieve = useCallback((opts?: { exprsOnly?: boolean }) => {
+        if (importedReportActive) return;
+        const exprsOnly = Boolean(opts?.exprsOnly);
+        const fimPrompt = decodeTokens(correctTokens.slice(0, promptLen)).join('');
+        const goldCompletion = decodeTokens(goldResponseTokens).join('');
+        if (!fimPrompt.trim() || !goldCompletion.trim()) {
+            setLlmTrainError('缺少 FIM prompt 或 gold completion');
+            return;
+        }
+        setLlmTrainBusy(true);
+        setLlmTrainError(null);
+        setLlmTrainPanelOpen(true);
+        setLlmTrainExprsOnly(exprsOnly);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/llm-train-retrieve'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fimPrompt,
+                        goldCompletion,
+                        topK: 12,
+                        runCorpusSearch: !exprsOnly,
+                        searchLocalBank: !exprsOnly,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: LlmTrainRetrieveResult = {};
+                if (raw.trim()) {
+                    parsed = JSON.parse(raw) as LlmTrainRetrieveResult;
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `LLM train retrieve failed (HTTP ${resp.status})`,
+                    );
+                }
+                setLlmTrainResult(parsed);
+            } catch (error) {
+                setLlmTrainResult(null);
+                setLlmTrainError(error instanceof Error ? error.message : 'LLM train retrieve failed');
+            } finally {
+                setLlmTrainBusy(false);
+            }
+        })();
+    }, [
+        importedReportActive,
+        correctTokens,
+        promptLen,
+        goldResponseTokens,
+        eifApiUrl,
+    ]);
+
     const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {
         if (!report || !selectedMeta || importedReportActive) return;
 
@@ -4706,6 +4809,59 @@ export function ReportPanel({
                                                 AST全量枚举 + 磁盘缓存 · 结构:文本=8:2
                                             </span>
                                         )}
+                                        <button
+                                            type="button"
+                                            disabled={llmTrainBusy || importedReportActive}
+                                            onClick={() => fetchLlmTrainRetrieve()}
+                                            title="对当前整条测试 FIM + gold，调用 eif_api.env 的 OpenAPI，分析需要哪些训练样本/标注，并在语料上检索布尔表达式"
+                                            style={{
+                                                border: '1px solid #0ea5e9',
+                                                background: llmTrainBusy ? '#e0f2fe' : '#f0f9ff',
+                                                color: '#0369a1',
+                                                borderRadius: 999,
+                                                padding: '3px 10px',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: llmTrainBusy ? 'wait' : 'pointer',
+                                            }}
+                                        >
+                                            {llmTrainBusy && !llmTrainExprsOnly ? 'LLM 分析中…' : 'LLM 训练样本归因'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={llmTrainBusy || importedReportActive}
+                                            onClick={() => fetchLlmTrainRetrieve({ exprsOnly: true })}
+                                            title="[调试] 只调 LLM，不检索语料；面板仅展示 corpus_search_expressions"
+                                            style={{
+                                                border: '1px dashed #f59e0b',
+                                                background: llmTrainBusy && llmTrainExprsOnly ? '#fef3c7' : '#fffbeb',
+                                                color: '#b45309',
+                                                borderRadius: 999,
+                                                padding: '3px 10px',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: llmTrainBusy ? 'wait' : 'pointer',
+                                            }}
+                                        >
+                                            {llmTrainBusy && llmTrainExprsOnly ? '取表达式…' : '调试·只看表达式'}
+                                        </button>
+                                        {llmTrainResult && (
+                                            <button
+                                                type="button"
+                                                onClick={() => setLlmTrainPanelOpen(o => !o)}
+                                                style={{
+                                                    border: '1px solid #bae6fd',
+                                                    background: '#fff',
+                                                    color: '#0284c7',
+                                                    borderRadius: 999,
+                                                    padding: '3px 8px',
+                                                    fontSize: 11,
+                                                    cursor: 'pointer',
+                                                }}
+                                            >
+                                                {llmTrainPanelOpen ? '收起 LLM' : '展开 LLM'}
+                                            </button>
+                                        )}
                                     </div>
                                 )}
                                 {!importedReportActive && (
@@ -4891,6 +5047,179 @@ export function ReportPanel({
                                         borderBottom: '1px solid #e5e7eb',
                                     }}>
                                         {ttavLaunchError ?? ttavLaunchStatus}
+                                    </div>
+                                )}
+
+                                {(llmTrainPanelOpen || llmTrainBusy || llmTrainError) && (
+                                    <div style={{
+                                        margin: '8px 12px',
+                                        padding: '10px 12px',
+                                        borderRadius: 8,
+                                        border: '1px solid #bae6fd',
+                                        background: '#f0f9ff',
+                                        fontSize: 12,
+                                        color: '#0c4a6e',
+                                        maxHeight: 360,
+                                        overflow: 'auto',
+                                    }}>
+                                        <div style={{ fontWeight: 800, marginBottom: 6, color: '#0369a1' }}>
+                                            {llmTrainExprsOnly
+                                                ? 'LLM 表达式（调试 · 未检索语料）'
+                                                : 'LLM 训练样本归因（整条 test · OpenAPI）'}
+                                        </div>
+                                        {llmTrainBusy && (
+                                            <div style={{ color: '#0284c7' }}>
+                                                {llmTrainExprsOnly ? '调用大模型，等待表达式…' : '调用大模型分析 FIM + gold…'}
+                                            </div>
+                                        )}
+                                        {llmTrainError && (
+                                            <div style={{ color: '#b91c1c' }}>{llmTrainError}</div>
+                                        )}
+                                        {llmTrainResult?.analysis && llmTrainExprsOnly && (
+                                            <>
+                                                {(llmTrainResult.analysis.corpus_search_expressions ?? []).length === 0 ? (
+                                                    <div style={{ color: '#b45309' }}>
+                                                        模型未返回 corpus_search_expressions（可看下方 raw）
+                                                    </div>
+                                                ) : (
+                                                    (llmTrainResult.analysis.corpus_search_expressions ?? []).map((sr, idx) => (
+                                                        <div
+                                                            key={`dbg-${sr.name ?? 'expr'}-${idx}`}
+                                                            style={{
+                                                                marginTop: idx > 0 ? 10 : 0,
+                                                                padding: '8px 10px',
+                                                                borderRadius: 6,
+                                                                background: '#fff',
+                                                                border: '1px solid #fde68a',
+                                                            }}
+                                                        >
+                                                            <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 4 }}>
+                                                                {idx + 1}. {sr.name || `expr${idx + 1}`}
+                                                            </div>
+                                                            <pre style={{
+                                                                margin: 0,
+                                                                fontSize: 11,
+                                                                whiteSpace: 'pre-wrap',
+                                                                wordBreak: 'break-all',
+                                                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                                color: '#1e3a8a',
+                                                            }}>
+                                                                {sr.expression || '—'}
+                                                            </pre>
+                                                            {sr.why && (
+                                                                <div style={{ fontSize: 11, color: '#78716c', marginTop: 4 }}>
+                                                                    {sr.why}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ))
+                                                )}
+                                                {llmTrainResult.llm?.model && (
+                                                    <div style={{ marginTop: 8, fontSize: 10, color: '#94a3b8' }}>
+                                                        model: {llmTrainResult.llm.model}
+                                                    </div>
+                                                )}
+                                                {llmTrainResult.llm?.raw && (
+                                                    <details style={{ marginTop: 8, fontSize: 11 }}>
+                                                        <summary style={{ cursor: 'pointer', color: '#64748b' }}>
+                                                            raw JSON
+                                                        </summary>
+                                                        <pre style={{
+                                                            marginTop: 6,
+                                                            maxHeight: 160,
+                                                            overflow: 'auto',
+                                                            fontSize: 10,
+                                                            whiteSpace: 'pre-wrap',
+                                                        }}>
+                                                            {llmTrainResult.llm.raw}
+                                                        </pre>
+                                                    </details>
+                                                )}
+                                            </>
+                                        )}
+                                        {llmTrainResult?.analysis && !llmTrainExprsOnly && (
+                                            <>
+                                                {llmTrainResult.analysis.gold_pattern_summary && (
+                                                    <div style={{ marginBottom: 6 }}>
+                                                        <strong>模式：</strong>
+                                                        {llmTrainResult.analysis.gold_pattern_summary}
+                                                    </div>
+                                                )}
+                                                {llmTrainResult.analysis.reasoning && (
+                                                    <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
+                                                        {llmTrainResult.analysis.reasoning}
+                                                    </div>
+                                                )}
+                                                {llmTrainResult.analysis.required_annotation_subtypes?.length ? (
+                                                    <div style={{ marginBottom: 6 }}>
+                                                        <strong>建议标注 subtype：</strong>
+                                                        {llmTrainResult.analysis.required_annotation_subtypes.join(', ')}
+                                                    </div>
+                                                ) : null}
+                                                {(llmTrainResult.search_results ?? []).map((sr, idx) => (
+                                                    <div
+                                                        key={`${sr.name ?? 'expr'}-${idx}`}
+                                                        style={{
+                                                            marginTop: 8,
+                                                            paddingTop: 8,
+                                                            borderTop: '1px solid #e0f2fe',
+                                                        }}
+                                                    >
+                                                        <div style={{ fontWeight: 700, color: '#075985' }}>
+                                                            {sr.name || `expr${idx + 1}`}
+                                                        </div>
+                                                        <code style={{ fontSize: 11, wordBreak: 'break-all' }}>
+                                                            {sr.expression}
+                                                        </code>
+                                                        {sr.why && (
+                                                            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                                                                {sr.why}
+                                                            </div>
+                                                        )}
+                                                        {sr.corpus_error && (
+                                                            <div style={{ color: '#b91c1c', fontSize: 11 }}>
+                                                                corpus: {sr.corpus_error}
+                                                            </div>
+                                                        )}
+                                                        {(sr.corpus_hits?.length ?? 0) > 0 && (
+                                                            <div style={{ marginTop: 4, fontSize: 11 }}>
+                                                                <strong>大语料命中 {sr.corpus_hits?.length}：</strong>
+                                                                {(sr.corpus_hits ?? []).slice(0, 5).map(h => (
+                                                                    <div key={`c-${h.line}-${h.task_id}`} style={{ marginLeft: 8 }}>
+                                                                        L{h.line}
+                                                                        {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                        {h.response_preview
+                                                                            ? ` · ${h.response_preview.slice(0, 80)}`
+                                                                            : ''}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        {(sr.local_bank_hits?.length ?? 0) > 0 && (
+                                                            <div style={{ marginTop: 4, fontSize: 11 }}>
+                                                                <strong>本地 bank 命中 {sr.local_bank_hits?.length}：</strong>
+                                                                {(sr.local_bank_hits ?? []).slice(0, 5).map(h => (
+                                                                    <div key={`b-${h.train_sample_id}`} style={{ marginLeft: 8 }}>
+                                                                        TRAIN #{h.train_sample_id}
+                                                                        {h.n_attention_edges != null
+                                                                            ? ` · ${h.n_attention_edges} edges`
+                                                                            : ''}
+                                                                        {h.edge_subtypes?.length
+                                                                            ? ` · ${h.edge_subtypes.join('/')}`
+                                                                            : ''}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                                {llmTrainResult.corpus_path && (
+                                                    <div style={{ marginTop: 8, fontSize: 10, color: '#64748b' }}>
+                                                        corpus: {llmTrainResult.corpus_path}
+                                                    </div>
+                                                )}
+                                            </>
+                                        )}
                                     </div>
                                 )}
 

@@ -1,0 +1,376 @@
+"""LLM-based train-sample retrieval for a whole test FIM (not saliency-pair attribution).
+
+Uses OpenAI-compatible API from repo-root ``eif_api.env`` (same as auto-annotate).
+The model proposes boolean substring search expressions over a training corpus;
+the server evaluates them and returns matching rows.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
+
+
+def _build_openai_client():
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("pip install openai") from exc
+
+    api_key = (
+        _env("DASHSCOPE_API_KEY")
+        or _env("OPENAI_API_KEY")
+        or _env("ANNOTATE_API_KEY")
+    )
+    if not api_key:
+        raise RuntimeError(
+            "Set DASHSCOPE_API_KEY or OPENAI_API_KEY in eif_api.env"
+        )
+    base_url = (
+        _env("OPENAI_BASE_URL")
+        or _env("ANNOTATE_BASE_URL")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _extra_body() -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    raw = _env("ANNOTATE_EXTRA_BODY_JSON")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                body.update(parsed)
+        except json.JSONDecodeError:
+            pass
+    think = _env("ANNOTATE_ENABLE_THINKING", _env("ENABLE_THINKING", "")).lower()
+    if think in ("1", "true", "yes", "on"):
+        body.setdefault("enable_thinking", True)
+    elif think in ("0", "false", "no", "off"):
+        body["enable_thinking"] = False
+    return body
+
+
+def _strip_code_fence(text: str) -> str:
+    t = (text or "").strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return t
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    raw = _strip_code_fence(text)
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(raw[start : end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    raise ValueError("LLM response is not valid JSON object")
+
+
+def build_llm_train_retrieve_messages(
+    *,
+    fim_prompt: str,
+    gold_completion: str,
+    example_expression: str | None = None,
+) -> list[dict[str, str]]:
+    """Assemble system + user messages for train-sample need analysis."""
+    example_expr = example_expression or (
+        '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
+    )
+    system = (
+        "你是 Go 代码补全与 saliency 训练数据专家。"
+        "用户给出一条 FIM（Fill-in-the-Middle）测试题及其 gold 补全（<MID> 处应填内容）。"
+        "你的任务是判断：模型要稳定生成该 gold，需要从哪些**训练样本**中学习，"
+        "尤其是哪些 **attention_edges 标注**（source→target 的代码关联，如 defuse/call/return/api 等）。\n\n"
+        "请输出**严格 JSON**（不要 markdown 包裹），字段：\n"
+        "{\n"
+        '  "gold_pattern_summary": "一句话概括 gold 的代码模式",\n'
+        '  "reasoning": "为什么需要这些训练样本/标注（中文，3-8句）",\n'
+        '  "required_code_patterns": ["模式1", "模式2"],\n'
+        '  "required_annotation_subtypes": ["defuse", "call", ...],\n'
+        '  "corpus_search_expressions": [\n'
+        "    {\n"
+        '      "name": "简短英文名",\n'
+        '      "expression": "布尔子串表达式",\n'
+        '      "why": "为何用此式在训练语料中检索"\n'
+        "    }\n"
+        "  ],\n"
+        '  "ideal_train_sample_traits": ["理想训练样本应具备的特征"],\n'
+        '  "negative_traits": ["应避免的噪声样本特征"]\n'
+        "}\n\n"
+        "corpus_search_expressions 的 expression 语法：\n"
+        '- 字面量用双引号，如 "err != nil {"\n'
+        '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
+        '- AND 连接必须同时出现，如 A AND B AND C\n'
+        f"- 示例：{example_expr}\n"
+        "请给出 2-5 条 expression，从宽到窄，覆盖 gold 所需的不同代码/错误处理模式。"
+    )
+    user = (
+        "下面是一道 FIM 测试题（含 <PRE>/<SUF>/<MID> 标记）及其 gold 补全。\n"
+        "请分析：要答对 gold，训练集里应有哪些类型的样本与标注？\n"
+        "并给出可在大规模 Go 训练 JSONL（每行 prompt+response）上检索的布尔表达式。\n\n"
+        "=== FIM PROMPT ===\n"
+        f"{fim_prompt.strip()}\n\n"
+        "=== GOLD (<MID> 处正确答案) ===\n"
+        f"{gold_completion.strip()}\n"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _eval_literal(text: str, lit: str) -> bool:
+    s = lit.strip().strip('"').strip("'")
+    return bool(s) and s in text
+
+
+def _eval_or_term(text: str, term: str) -> bool:
+    t = term.strip()
+    if t.startswith("(") and t.endswith(")"):
+        t = t[1:-1].strip()
+    if re.search(r"\s+OR\s+", t, re.IGNORECASE):
+        parts = re.split(r"\s+OR\s+", t, flags=re.IGNORECASE)
+        return any(_eval_or_term(text, p) for p in parts)
+    return _eval_literal(text, t)
+
+
+def eval_boolean_expression(text: str, expression: str) -> bool:
+    """Evaluate ``(A OR B) AND C`` style substring expression."""
+    expr = (expression or "").strip()
+    if not expr:
+        return False
+    parts = re.split(r"\s+AND\s+", expr, flags=re.IGNORECASE)
+    return all(_eval_or_term(text, p.strip()) for p in parts if p.strip())
+
+
+def _sample_haystack(row: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    for key in ("prompt", "input", "query"):
+        v = row.get(key)
+        if isinstance(v, str) and v:
+            chunks.append(v)
+            break
+    for key in ("response", "label", "output", "gold"):
+        v = row.get(key)
+        if isinstance(v, str) and v:
+            chunks.append(v)
+            break
+    if not chunks and isinstance(row.get("input_ids"), list):
+        chunks.append(f"compact_n_tokens={len(row['input_ids'])}")
+    return "\n".join(chunks)
+
+
+def search_corpus_jsonl(
+    corpus_path: str,
+    expression: str,
+    *,
+    top_k: int = 20,
+    max_scan: int | None = None,
+) -> list[dict[str, Any]]:
+    path = Path(corpus_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"corpus not found: {corpus_path}")
+    hits: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as fh:
+        for line_idx, line in enumerate(fh):
+            if max_scan is not None and line_idx >= max_scan:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            hay = _sample_haystack(row)
+            if not eval_boolean_expression(hay, expression):
+                continue
+            resp = row.get("response") or row.get("label") or row.get("output") or ""
+            hits.append({
+                "line": line_idx,
+                "task_id": row.get("task_id"),
+                "prompt_preview": (hay[:280] + "…") if len(hay) > 280 else hay,
+                "response_preview": (str(resp)[:200] + "…") if len(str(resp)) > 200 else str(resp),
+            })
+            if len(hits) >= top_k:
+                break
+    return hits
+
+
+def search_local_train_bank(
+    expression: str,
+    *,
+    top_k: int = 20,
+) -> list[dict[str, Any]]:
+    """Search compact ``EIF_TRAIN_DATA`` rows (smoke bank) by line index."""
+    train_path = _env("EIF_TRAIN_DATA") or _env("ANNOTATION_TRAIN_DATA")
+    if not train_path or not Path(train_path).is_file():
+        return []
+    hits: list[dict[str, Any]] = []
+    with Path(train_path).open(encoding="utf-8") as fh:
+        for train_idx, line in enumerate(fh):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            edges = row.get("attention_edges") or row.get("edges") or []
+            n_edges = len(edges) if isinstance(edges, list) else 0
+            # Decode compact rows via tokenizer-free placeholder: search by ids length only
+            # if no text — caller usually uses large chat corpus for text search.
+            hay = _sample_haystack(row)
+            if not hay.strip() and isinstance(row.get("input_ids"), list):
+                continue
+            if not eval_boolean_expression(hay, expression):
+                continue
+            subtypes: set[str] = set()
+            if isinstance(edges, list):
+                for e in edges:
+                    if isinstance(e, dict):
+                        st = str(e.get("subtype") or "").strip()
+                        if st:
+                            subtypes.add(st)
+            hits.append({
+                "train_sample_id": train_idx,
+                "n_attention_edges": n_edges,
+                "edge_subtypes": sorted(subtypes)[:12],
+                "preview": hay[:320] + ("…" if len(hay) > 320 else ""),
+            })
+            if len(hits) >= top_k:
+                break
+    return hits
+
+
+def call_llm_train_retrieve(
+    *,
+    fim_prompt: str,
+    gold_completion: str,
+    model: str | None = None,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    client = _build_openai_client()
+    model_name = model or _env("ANNOTATE_MODEL") or _env("LLM_RETRIEVE_MODEL") or "qwen-plus"
+    mt = max_tokens or int(_env("ANNOTATE_MAX_TOKENS") or "4096")
+    messages = build_llm_train_retrieve_messages(
+        fim_prompt=fim_prompt,
+        gold_completion=gold_completion,
+    )
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": mt,
+    }
+    extra = _extra_body()
+    if extra:
+        kwargs["extra_body"] = extra
+    print(f"[llm-train] model={model_name} prompt_chars={len(fim_prompt)} gold_chars={len(gold_completion)}", flush=True)
+    resp = client.chat.completions.create(**kwargs)
+    raw = (resp.choices[0].message.content or "").strip()
+    parsed = _parse_json_object(raw)
+    return {
+        "model": model_name,
+        "raw": raw,
+        "analysis": parsed,
+        "messages": messages,
+    }
+
+
+def retrieve_llm_train_samples(
+    *,
+    fim_prompt: str,
+    gold_completion: str,
+    corpus_path: str | None = None,
+    top_k: int = 15,
+    max_corpus_scan: int | None = None,
+    run_corpus_search: bool = True,
+    search_local_bank: bool = True,
+) -> dict[str, Any]:
+    if not (fim_prompt or "").strip():
+        raise ValueError("fim_prompt is required")
+    if not (gold_completion or "").strip():
+        raise ValueError("gold_completion is required")
+
+    llm_out = call_llm_train_retrieve(
+        fim_prompt=fim_prompt,
+        gold_completion=gold_completion,
+    )
+    analysis = llm_out.get("analysis") or {}
+    exprs = analysis.get("corpus_search_expressions") or []
+    if not isinstance(exprs, list):
+        exprs = []
+
+    corpus = corpus_path or _env("EIF_LLM_TRAIN_CORPUS") or _env("EIF_TRAIN_CORPUS") or ""
+    search_results: list[dict[str, Any]] = []
+    local_bank_results: list[dict[str, Any]] = []
+
+    for item in exprs:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "expr")
+        expression = str(item.get("expression") or "").strip()
+        why = str(item.get("why") or "")
+        if not expression:
+            continue
+        entry: dict[str, Any] = {
+            "name": name,
+            "expression": expression,
+            "why": why,
+            "corpus_hits": [],
+            "local_bank_hits": [],
+        }
+        if run_corpus_search and corpus and Path(corpus).is_file():
+            try:
+                entry["corpus_hits"] = search_corpus_jsonl(
+                    corpus,
+                    expression,
+                    top_k=top_k,
+                    max_scan=max_corpus_scan,
+                )
+                entry["corpus_path"] = corpus
+            except Exception as exc:
+                entry["corpus_error"] = str(exc)
+        if search_local_bank:
+            entry["local_bank_hits"] = search_local_train_bank(expression, top_k=top_k)
+        search_results.append(entry)
+
+    return {
+        "status": "success",
+        "query": {
+            "fim_prompt_chars": len(fim_prompt),
+            "gold_completion_chars": len(gold_completion),
+            "gold_preview": gold_completion[:400],
+        },
+        "llm": llm_out,
+        "analysis": analysis,
+        "search_results": search_results,
+        "corpus_path": corpus or None,
+        "local_bank_path": _env("EIF_TRAIN_DATA") or _env("ANNOTATION_TRAIN_DATA") or None,
+    }
