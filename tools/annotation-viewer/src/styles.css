@@ -123,6 +123,15 @@ button, input, select {
   align-items: start;
 }
 
+/* Corpus deep-link: no sample list — main panel must span full width. */
+.layout.layout--full {
+  grid-template-columns: 1fr;
+}
+
+.layout.layout--full > .panel {
+  min-width: 0;
+}
+
 @media (max-width: 960px) {
   .layout { grid-template-columns: 1fr; }
 }

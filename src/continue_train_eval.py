@@ -64,6 +64,12 @@ class ContinueTrainConfig:
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
     eval_before: bool = True
+    # Full EIF_TEST_DATA line_hit after train (off when only predicting current test).
+    eval_after_full: bool = True
+    # Optional: predict this test row after train (prompt/label or task_id lookup).
+    current_test_task_id: str | None = None
+    current_test_prompt: str | None = None
+    current_test_label: str | None = None
     # Precomputed baseline line_hit JSONL (skip GPU eval_before when set + file exists).
     eval_before_cache: str | None = None
     max_new_tokens: int = 1024
@@ -844,8 +850,8 @@ def save_adapter(model, tokenizer, output_dir: str, meta: dict[str, Any]) -> str
     return str(out.resolve())
 
 
-def _metric_delta(before: dict | None, after: dict) -> dict[str, float | None]:
-    if before is None:
+def _metric_delta(before: dict | None, after: dict | None) -> dict[str, float | None]:
+    if before is None or after is None:
         return {
             "line_hit_pre": None,
             "line_hit_rec": None,
@@ -981,6 +987,149 @@ def _pick_continue_attn_implementation() -> str:
         return "flash_attention_2"
     except Exception:
         return "sdpa"
+
+
+def _resolve_current_test_sample(
+    cfg: ContinueTrainConfig,
+    eval_samples: list[dict],
+) -> dict[str, Any] | None:
+    """Pick the report's current test row for post-train greedy decode."""
+    tid = (cfg.current_test_task_id or "").strip()
+    if tid:
+        for row in eval_samples:
+            if str(row.get("task_id") or "") == tid:
+                return row
+    prompt = (cfg.current_test_prompt or "").strip()
+    label = (cfg.current_test_label or "").strip()
+    if prompt and label:
+        return {
+            "task_id": tid or None,
+            "prompt": prompt,
+            "label": label,
+        }
+    if eval_samples:
+        return eval_samples[0]
+    return None
+
+
+def run_continue_line_hit_compare(cfg: ContinueTrainConfig, progress_cb=None) -> dict[str, Any]:
+    """Eval-only: baseline (cache) vs continued adapter on full EIF_TEST_DATA."""
+    from src.eif_adapter_env import get_active_adapter_override
+
+    continued = (get_active_adapter_override() or "").strip()
+    if not continued or not Path(continued).is_dir():
+        raise ValueError(
+            "No continued adapter active. Run 续训 first, or set continuedAdapterPath."
+        )
+    if not cfg.test_data or not Path(cfg.test_data).is_file():
+        raise FileNotFoundError(f"test_data not found: {cfg.test_data!r}")
+
+    def _prog(stage: str, message: str, **extra):
+        if progress_cb is not None:
+            progress_cb(stage, message, extra)
+
+    eval_samples = load_eval_samples(cfg.test_data)
+    cache_path = (cfg.eval_before_cache or "").strip()
+    cache_ok = bool(cache_path and Path(cache_path).is_file())
+
+    _evict_cached_models()
+    before = None
+    eval_before_source = None
+    if cache_ok:
+        _prog("eval_before", "Loading baseline line_hit from cache…")
+        before = load_eval_before_cache(
+            cache_path,
+            eval_samples,
+            also_truncate_score=cfg.also_truncate_score,
+        )
+        eval_before_source = "cache"
+    elif cfg.eval_before:
+        _prog("eval_before", "Evaluating baseline adapter (line_hit)…")
+        base_cfg = ContinueTrainConfig(
+            adapter_path=cfg.adapter_path,
+            base_model_path=cfg.base_model_path,
+            train_data=cfg.train_data,
+            test_data=cfg.test_data,
+            output_dir=cfg.output_dir,
+            max_new_tokens=cfg.max_new_tokens,
+            also_truncate_score=cfg.also_truncate_score,
+        )
+        attn_impl = _pick_continue_attn_implementation()
+        model, tokenizer = load_model_and_tokenizer(
+            model_path=base_cfg.adapter_path,
+            base_model_path=base_cfg.base_model_path,
+            attn_implementation=attn_impl,
+        )
+        before = evaluate_line_hit(
+            model, tokenizer, eval_samples,
+            max_new_tokens=cfg.max_new_tokens,
+            also_truncate_score=cfg.also_truncate_score,
+            source_file=Path(cfg.test_data).name,
+        )
+        eval_before_source = "live"
+        del model
+        _evict_cached_models()
+    else:
+        raise ValueError(
+            "line_hit compare needs EIF_CONTINUE_EVAL_BEFORE_CACHE "
+            "or evalBefore=true for live baseline."
+        )
+
+    _prog("eval_after", "Evaluating continued adapter (line_hit)…")
+    attn_impl = _pick_continue_attn_implementation()
+    model, tokenizer = load_model_and_tokenizer(
+        model_path=continued,
+        base_model_path=cfg.base_model_path,
+        attn_implementation=attn_impl,
+    )
+    after = evaluate_line_hit(
+        model, tokenizer, eval_samples,
+        max_new_tokens=cfg.max_new_tokens,
+        also_truncate_score=cfg.also_truncate_score,
+        source_file=Path(cfg.test_data).name,
+        progress_cb=lambda i, n, _r: _prog(
+            "eval_after", f"Eval after {i}/{n}", done=i, total=n,
+        ),
+    )
+    delta = _metric_delta(before, after)
+    per_sample_deltas = summarize_per_sample_line_hit_deltas(before, after)
+    _print_per_sample_delta_report(per_sample_deltas)
+
+    out_root = Path(cfg.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    after_jsonl = write_eval_results_jsonl(
+        out_root / "continue_eval_after_compare.jsonl",
+        list(after.get("perSample") or []),
+    )
+
+    meta = {
+        "mode": "line_hit_compare",
+        "continuedAdapterPath": continued,
+        "evalBeforeSource": eval_before_source,
+        "before": _slim_eval_summary(before),
+        "after": _slim_eval_summary(after),
+        "delta": delta,
+        "perSampleDeltas": {
+            "nCompared": per_sample_deltas["nCompared"],
+            "line_hit_pre": {
+                "increased": [e["index"] for e in per_sample_deltas["line_hit_pre"]["increased"]],
+                "decreased": [e["index"] for e in per_sample_deltas["line_hit_pre"]["decreased"]],
+                "nIncreased": len(per_sample_deltas["line_hit_pre"]["increased"]),
+                "nDecreased": len(per_sample_deltas["line_hit_pre"]["decreased"]),
+            },
+            "line_hit_rec": {
+                "increased": [e["index"] for e in per_sample_deltas["line_hit_rec"]["increased"]],
+                "decreased": [e["index"] for e in per_sample_deltas["line_hit_rec"]["decreased"]],
+                "nIncreased": len(per_sample_deltas["line_hit_rec"]["increased"]),
+                "nDecreased": len(per_sample_deltas["line_hit_rec"]["decreased"]),
+            },
+        },
+        "evalAfterJsonl": after_jsonl,
+    }
+    _prog("completed", "line_hit compare finished.", result=meta)
+    del model
+    _evict_cached_models()
+    return {"status": "success", **meta}
 
 
 def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> dict[str, Any]:
@@ -1169,32 +1318,72 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         ),
     )
 
-    _prog("eval_after", "Evaluating continued adapter (line_hit)…")
-    after = evaluate_line_hit(
-        model, tokenizer, eval_samples,
-        max_new_tokens=cfg.max_new_tokens,
-        also_truncate_score=cfg.also_truncate_score,
-        source_file=Path(cfg.test_data).name,
-        progress_cb=lambda i, n, _r: _prog(
-            "eval_after", f"Eval after {i}/{n}", done=i, total=n,
-        ),
-    )
-    print(
-        f"[continue-eval] AFTER line_hit_pre={after['line_hit_pre']} "
-        f"line_hit_rec={after['line_hit_rec']}",
-        flush=True,
-    )
+    current_test_out: dict[str, Any] | None = None
+    if (
+        cfg.current_test_prompt
+        or cfg.current_test_label
+        or cfg.current_test_task_id
+    ):
+        _prog("predict_current", "Generating on current test sample…")
+        cur = _resolve_current_test_sample(cfg, eval_samples)
+        if cur is not None:
+            gen = generate_one(tokenizer, model, cur["prompt"], cfg.max_new_tokens)
+            pre = line_hit(cur["label"], gen["predict"], "precision")
+            rec = line_hit(cur["label"], gen["predict"], "recall")
+            current_test_out = {
+                "task_id": cur.get("task_id"),
+                "prompt": cur["prompt"],
+                "label": cur["label"],
+                "predict": gen["predict"],
+                "line_hit_pre": round(pre, 4),
+                "line_hit_rec": round(rec, 4),
+                "finish_reason": gen.get("finish_reason"),
+            }
+            print(
+                f"[continue-eval] current test task_id={cur.get('task_id')!r} "
+                f"pre={pre:.4f} rec={rec:.4f}",
+                flush=True,
+            )
+            print(
+                f"[continue-eval] predict:\n{gen['predict'][:2000]}",
+                flush=True,
+            )
+
+    after = None
+    if cfg.eval_after_full:
+        _prog("eval_after", "Evaluating continued adapter (line_hit)…")
+        after = evaluate_line_hit(
+            model, tokenizer, eval_samples,
+            max_new_tokens=cfg.max_new_tokens,
+            also_truncate_score=cfg.also_truncate_score,
+            source_file=Path(cfg.test_data).name,
+            progress_cb=lambda i, n, _r: _prog(
+                "eval_after", f"Eval after {i}/{n}", done=i, total=n,
+            ),
+        )
+        print(
+            f"[continue-eval] AFTER line_hit_pre={after['line_hit_pre']} "
+            f"line_hit_rec={after['line_hit_rec']}",
+            flush=True,
+        )
 
     delta = _metric_delta(before, after)
-    per_sample_deltas = summarize_per_sample_line_hit_deltas(before, after)
-    _print_per_sample_delta_report(per_sample_deltas)
+    per_sample_deltas = (
+        summarize_per_sample_line_hit_deltas(before, after)
+        if before is not None and after is not None
+        else None
+    )
+    if per_sample_deltas:
+        _print_per_sample_delta_report(per_sample_deltas)
 
     out_root = Path(cfg.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    after_jsonl = write_eval_results_jsonl(
-        out_root / "continue_eval_after.jsonl",
-        list(after.get("perSample") or []),
-    )
+    after_jsonl = None
+    if after is not None and isinstance(after.get("perSample"), list):
+        after_jsonl = write_eval_results_jsonl(
+            out_root / "continue_eval_after.jsonl",
+            list(after.get("perSample") or []),
+        )
     before_jsonl = None
     if before is not None and isinstance(before.get("perSample"), list):
         before_jsonl = write_eval_results_jsonl(
@@ -1211,9 +1400,13 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         "before": _slim_eval_summary(before),
         "after": _slim_eval_summary(after),
         "delta": delta,
+        "currentTest": current_test_out,
         "evalAfterJsonl": after_jsonl,
         "evalBeforeJsonl": before_jsonl,
-        "perSampleDeltas": {
+        "nTrainWithEdges": n_edges,
+    }
+    if per_sample_deltas:
+        meta["perSampleDeltas"] = {
             "nCompared": per_sample_deltas["nCompared"],
             "line_hit_pre": {
                 "increased": [e["index"] for e in per_sample_deltas["line_hit_pre"]["increased"]],
@@ -1233,14 +1426,13 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
                 "increasedDetail": per_sample_deltas["line_hit_rec"]["increased"][:50],
                 "decreasedDetail": per_sample_deltas["line_hit_rec"]["decreased"][:50],
             },
-        },
-        "nTrainWithEdges": n_edges,
-    }
+        }
     # Compact detail: scores + deltas; full prompt/predict live in the JSONL files.
     detail = {
         "before": _slim_eval_summary(before),
         "after": _slim_eval_summary(after),
         "perSampleDeltas": per_sample_deltas,
+        "currentTest": current_test_out,
         "evalAfterJsonl": after_jsonl,
         "evalBeforeJsonl": before_jsonl,
     }
@@ -1266,7 +1458,13 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
         flush=True,
     )
 
-    _prog("completed", "Continue-train + line_hit eval finished.", result=meta)
+    _prog(
+        "completed",
+        "Continue-train finished."
+        + (" current-test predict done." if current_test_out else "")
+        + (" line_hit eval done." if after is not None else ""),
+        result=meta,
+    )
     del model
     _evict_cached_models()
     return {"status": "success", **meta}
@@ -1314,6 +1512,11 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
                 pass
         return 20
 
+    ct = req.get("currentTest") if isinstance(req.get("currentTest"), dict) else {}
+    ct_task = str(ct.get("taskId") or ct.get("task_id") or "").strip() or None
+    ct_prompt = str(ct.get("prompt") or "").strip() or None
+    ct_label = str(ct.get("label") or ct.get("gold") or "").strip() or None
+
     return ContinueTrainConfig(
         adapter_path=adapter,
         base_model_path=base,
@@ -1324,6 +1527,10 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         learning_rate=float(req.get("learningRate", 2e-5)),
         loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
         eval_before=bool(req.get("evalBefore", True)),
+        eval_after_full=bool(req.get("evalAfterFull", True)),
+        current_test_task_id=ct_task,
+        current_test_prompt=ct_prompt,
+        current_test_label=ct_label,
         eval_before_cache=eval_before_cache,
         max_new_tokens=max(16, int(req.get("maxNewTokens", 1024))),
         seed=int(req.get("seed", 42)),

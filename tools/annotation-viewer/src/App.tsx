@@ -52,6 +52,11 @@ export default function App() {
   const [listOffset, setListOffset] = useState(0)
   const [jumpIdx, setJumpIdx] = useState('0')
   const [duplicateCopies, setDuplicateCopies] = useState(2)
+  const [gsPreviewId, setGsPreviewId] = useState<string | null>(null)
+  const [gsUseLlm, setGsUseLlm] = useState(true)
+  const [gsBusy, setGsBusy] = useState(false)
+  const [llmSemPreviewId, setLlmSemPreviewId] = useState<string | null>(null)
+  const [llmSemBusy, setLlmSemBusy] = useState(false)
   const [queryMode, setQueryMode] = useState('manual')
   /** Probe/test focus surfaces from correlation-report deep link. */
   const [probeSrcToken, setProbeSrcToken] = useState('')
@@ -160,6 +165,8 @@ export default function App() {
       setSaliencyMsg('')
       setPendingEdge(null)
       setAddSrc(null)
+      setGsPreviewId(null)
+      setLlmSemPreviewId(null)
       setJumpIdx(String(line))
       const contNote = detail.in_continue
         ? ' · 已在续训小集'
@@ -494,6 +501,135 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sample, selectedIdx, focusSource, target])
 
+  const runGraphsignalPreview = async () => {
+    if (!corpusMode || corpusLine == null) return
+    setGsBusy(true)
+    setError('')
+    try {
+      const res = await api.graphsignalAnnotatePreview(
+        corpusLine,
+        { use_llm: gsUseLlm },
+        corpusOpts,
+      )
+      setSample(res.sample)
+      setGsPreviewId(res.preview_id)
+      setTarget(null)
+      setFocusSource(null)
+      setSaliency([])
+      setSaliencyMsg('')
+      setStatus(
+        `GraphSignal 预览 L${corpusLine} · ${res.n_edges} 条边`
+        + `（${res.use_llm ? 'tree-sitter+LLM' : 'tree-sitter'}）· 请接受或拒绝`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setGsBusy(false)
+    }
+  }
+
+  const acceptGraphsignalPreview = async () => {
+    if (!corpusMode || corpusLine == null || !gsPreviewId) return
+    setGsBusy(true)
+    setError('')
+    try {
+      const res = await api.graphsignalAnnotateAccept(corpusLine, gsPreviewId, corpusOpts)
+      setSample(res.sample)
+      setGsPreviewId(null)
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
+      setStatus(
+        `已接受 GraphSignal 标注 · 续训边 ${res.n_continue_edges ?? res.n_edges} 条`
+        + ` · 小集共 ${h.n_continue ?? res.n_continue ?? '?'} 条`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setGsBusy(false)
+    }
+  }
+
+  const rejectGraphsignalPreview = async () => {
+    if (!corpusMode || corpusLine == null || !gsPreviewId) return
+    setGsBusy(true)
+    setError('')
+    try {
+      const res = await api.graphsignalAnnotateReject(corpusLine, gsPreviewId, corpusOpts)
+      setSample(res.sample)
+      setGsPreviewId(null)
+      setTarget(null)
+      setStatus(`已拒绝 GraphSignal 预览 · 回退到 L${corpusLine} 当前状态`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setGsBusy(false)
+    }
+  }
+
+  const runLlmSemanticPreview = async () => {
+    if (!corpusMode || corpusLine == null) return
+    setLlmSemBusy(true)
+    setError('')
+    try {
+      const res = await api.llmSemanticAnnotatePreview(corpusLine, {}, corpusOpts)
+      setSample(res.sample)
+      setLlmSemPreviewId(res.preview_id)
+      setTarget(null)
+      setFocusSource(null)
+      setSaliency([])
+      setSaliencyMsg('')
+      setStatus(
+        `LLM 语义标注预览 L${corpusLine} · ${res.n_edges} 条边`
+        + `（${res.answer_token_count ?? '?'} 个答案 token`
+        + `${res.llm_calls != null ? ` · ${res.llm_calls} 次 LLM 调用` : ''}）· 请接受或拒绝`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLlmSemBusy(false)
+    }
+  }
+
+  const acceptLlmSemanticPreview = async () => {
+    if (!corpusMode || corpusLine == null || !llmSemPreviewId) return
+    setLlmSemBusy(true)
+    setError('')
+    try {
+      const res = await api.llmSemanticAnnotateAccept(corpusLine, llmSemPreviewId, corpusOpts)
+      setSample(res.sample)
+      setLlmSemPreviewId(null)
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
+      setStatus(
+        `已接受 LLM 语义标注 · 续训边 ${res.n_continue_edges ?? res.n_edges} 条`
+        + ` · 小集共 ${h.n_continue ?? res.n_continue ?? '?'} 条`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLlmSemBusy(false)
+    }
+  }
+
+  const rejectLlmSemanticPreview = async () => {
+    if (!corpusMode || corpusLine == null || !llmSemPreviewId) return
+    setLlmSemBusy(true)
+    setError('')
+    try {
+      const res = await api.llmSemanticAnnotateReject(corpusLine, llmSemPreviewId, corpusOpts)
+      setSample(res.sample)
+      setLlmSemPreviewId(null)
+      setTarget(null)
+      setStatus(`已拒绝 LLM 语义预览 · 回退到 L${corpusLine} 当前状态`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLlmSemBusy(false)
+    }
+  }
+
   const duplicateToContinue = async () => {
     if (!sample || selectedIdx == null) return
     const nCont = sample.n_continue_edges ?? 0
@@ -544,7 +680,7 @@ export default function App() {
         <h1>Train Annotation Viewer</h1>
         <p>
           {corpusMode
-            ? '大语料手动标注：该样本无预标注，添加/删除的边写入续训小集。'
+            ? '大语料标注：GraphSignal（结构）或 LLM 语义（逐 token 注意力推断）；预览后接受写入续训小集。'
             : (
               <>
                 浏览源 train JSONL（只读）。可视化显示完整标注；续训小集只写入
@@ -554,6 +690,7 @@ export default function App() {
         </p>
       </header>
 
+      {!corpusMode && (
       <div className="toolbar">
         <label className="grow">
           数据文件路径
@@ -618,12 +755,13 @@ export default function App() {
         </button>
         <span className="status">{nSamples ? `${nSamples} samples` : ''}</span>
       </div>
+      )}
 
       {(status || error) && (
         <div className={`status ${error ? 'error' : ''}`}>{error || status}</div>
       )}
 
-      <div className="layout">
+      <div className={`layout ${corpusMode ? 'layout--full' : ''}`}>
         {!corpusMode && (
         <aside className="panel">
           <h2>
@@ -792,6 +930,111 @@ export default function App() {
               </div>
 
               <div className="sideActions">
+                {corpusMode && (
+                  <div className="card" style={{ borderColor: gsPreviewId ? '#fbbf24' : undefined }}>
+                    <h3>GraphSignal 自动标注</h3>
+                    <p className="hint" style={{ marginBottom: 8 }}>
+                      使用内置 GraphSignal 管线（tree-sitter 结构边
+                      {gsUseLlm ? ' + LLM 语义边' : ''}）。预览后渲染边；接受写入续训小集（llm_auto），拒绝回退。
+                      {(sample.n_continue_edges ?? 0) > 0 && !gsPreviewId
+                        ? ' 已有续训边时接受会保留手动边，但 token 索引可能因重编码而不一致。'
+                        : ''}
+                    </p>
+                    <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <input
+                          type="checkbox"
+                          checked={gsUseLlm}
+                          disabled={gsBusy || busy || Boolean(gsPreviewId)}
+                          onChange={ev => setGsUseLlm(ev.target.checked)}
+                        />
+                        启用 LLM 边
+                      </label>
+                      {!gsPreviewId ? (
+                        <button
+                          type="button"
+                          disabled={gsBusy || busy || llmSemBusy || Boolean(llmSemPreviewId)}
+                          onClick={() => void runGraphsignalPreview()}
+                        >
+                          {gsBusy ? '标注中…' : 'GraphSignal 标注'}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            disabled={gsBusy || busy}
+                            style={{
+                              borderColor: '#86efac',
+                              background: '#f0fdf4',
+                              color: '#15803d',
+                              fontWeight: 700,
+                            }}
+                            onClick={() => void acceptGraphsignalPreview()}
+                          >
+                            {gsBusy ? '…' : '接受 → 续训小集'}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={gsBusy || busy}
+                            onClick={() => void rejectGraphsignalPreview()}
+                          >
+                            拒绝（回退）
+                          </button>
+                          <span className="hint">预览中 · {sample.attention_edges.length} 条边</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {corpusMode && (
+                  <div className="card" style={{ borderColor: llmSemPreviewId ? '#fbbf24' : undefined }}>
+                    <h3>LLM 语义标注（注意力推断）</h3>
+                    <p className="hint" style={{ marginBottom: 8 }}>
+                      跳过 tree-sitter：给定 FIM 题目 + 正确答案，对每个答案 token 单独问 LLM
+                      「正确生成该 token 时，上下文哪些 token 应被关注？」每个 token 最多 15 条源边（subtype=semantic）。
+                      耗时 ≈ 答案 token 数 × 1 次 LLM 调用。
+                    </p>
+                    <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
+                      {!llmSemPreviewId ? (
+                        <button
+                          type="button"
+                          disabled={llmSemBusy || busy || gsBusy || Boolean(gsPreviewId)}
+                          onClick={() => void runLlmSemanticPreview()}
+                        >
+                          {llmSemBusy ? '逐 token 标注中…' : 'LLM 语义标注'}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            disabled={llmSemBusy || busy}
+                            style={{
+                              borderColor: '#86efac',
+                              background: '#f0fdf4',
+                              color: '#15803d',
+                              fontWeight: 700,
+                            }}
+                            onClick={() => void acceptLlmSemanticPreview()}
+                          >
+                            {llmSemBusy ? '…' : '接受 → 续训小集'}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={llmSemBusy || busy}
+                            onClick={() => void rejectLlmSemanticPreview()}
+                          >
+                            拒绝（回退）
+                          </button>
+                          <span className="hint">预览中 · {sample.attention_edges.length} 条边</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {continuePath && (
                   <div className="card">
                     <h3>续训小集 · 复制样本</h3>

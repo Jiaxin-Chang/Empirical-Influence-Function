@@ -215,6 +215,107 @@ export const api = {
       body: JSON.stringify({ copies }),
     }),
 
+  graphsignalAnnotatePreview: (
+    line: number,
+    body?: { use_llm?: boolean; max_edges?: number },
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      n_edges: number
+      use_llm: boolean
+      message?: string
+      sample: SampleDetail
+    }>(`/api/corpus/sample/${line}/graphsignal-annotate/preview${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+
+  graphsignalAnnotateAccept: (
+    line: number,
+    previewId: string,
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      n_edges: number
+      n_continue_edges?: number
+      proposed?: Edge[]
+      sample: SampleDetail
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/corpus/sample/${line}/graphsignal-annotate/accept${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId }),
+    }),
+
+  graphsignalAnnotateReject: (
+    line: number,
+    previewId: string,
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      sample: SampleDetail
+    }>(`/api/corpus/sample/${line}/graphsignal-annotate/reject${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId }),
+    }),
+
+  llmSemanticAnnotatePreview: (
+    line: number,
+    body?: { max_sources_per_token?: number; max_answer_tokens?: number },
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      n_edges: number
+      llm_calls?: number
+      answer_token_count?: number
+      message?: string
+      sample: SampleDetail
+    }>(`/api/corpus/sample/${line}/llm-semantic-annotate/preview${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+
+  llmSemanticAnnotateAccept: (
+    line: number,
+    previewId: string,
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      n_edges: number
+      n_continue_edges?: number
+      proposed?: Edge[]
+      sample: SampleDetail
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/corpus/sample/${line}/llm-semantic-annotate/accept${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId }),
+    }),
+
+  llmSemanticAnnotateReject: (
+    line: number,
+    previewId: string,
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      preview_id: string
+      sample: SampleDetail
+    }>(`/api/corpus/sample/${line}/llm-semantic-annotate/reject${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId }),
+    }),
+
   deleteEdge: (idx: number, edge: Edge) =>
     jsonFetch<{
       ok: boolean

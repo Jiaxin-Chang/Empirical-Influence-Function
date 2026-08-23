@@ -2411,6 +2411,13 @@ export function ReportPanel({
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
+    const [continueCurrentTestOutput, setContinueCurrentTestOutput] = useState<{
+        task_id?: string;
+        label?: string;
+        predict?: string;
+        line_hit_pre?: number;
+        line_hit_rec?: number;
+    } | null>(null);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
     /** After continue-train: live predict top-k overlay (null = use report JSON). */
@@ -2435,6 +2442,11 @@ export function ReportPanel({
     const [llmTrainExprHits, setLlmTrainExprHits] = useState<Record<number, LlmTrainSearchHit[]>>({});
     const [llmTrainExprSearchBusy, setLlmTrainExprSearchBusy] = useState(false);
     const [llmTrainExprSearchError, setLlmTrainExprSearchError] = useState<string | null>(null);
+    const [llmTrainExprSearchStats, setLlmTrainExprSearchStats] = useState<Record<number, {
+        scanned_lines?: number;
+        stop_reason?: string;
+        elapsed_ms?: number;
+    }>>({});
     const enterManualPairMode = useCallback(() => {
         setAttrMode('manual');
         setSelectedTokIdx(null);
@@ -2656,6 +2668,14 @@ export function ReportPanel({
         () => (correctTokens.length > promptLen ? correctTokens.slice(promptLen) : correctTokens),
         [correctTokens, promptLen],
     );
+    const continueCurrentTestPayload = useMemo(() => {
+        if (!report) return null;
+        const taskId = report.experiment_meta.task_id;
+        const prompt = decodeTokens(correctTokens.slice(0, promptLen)).join('');
+        const label = decodeTokens(goldResponseTokens).join('');
+        if (!prompt.trim() || !label.trim()) return null;
+        return { taskId, prompt, label };
+    }, [report, correctTokens, promptLen, goldResponseTokens]);
     const selectedSampleId = inferSampleIdFromMeta(selectedMeta, report);
 
     // Keep the floating plot aligned with the model/output section.
@@ -3811,6 +3831,7 @@ export function ReportPanel({
         setLlmTrainExprsOnly(exprsOnly);
         setLlmTrainActiveExprIdx(null);
         setLlmTrainExprHits({});
+        setLlmTrainExprSearchStats({});
         setLlmTrainExprSearchError(null);
         void (async () => {
             try {
@@ -3870,7 +3891,17 @@ export function ReportPanel({
                     }),
                 });
                 const raw = await resp.text();
-                let parsed: { status?: string; hits?: LlmTrainSearchHit[]; message?: string } = {};
+                let parsed: {
+                    status?: string;
+                    hits?: LlmTrainSearchHit[];
+                    message?: string;
+                    search_stats?: {
+                        scanned_lines?: number;
+                        stop_reason?: string;
+                        elapsed_ms?: number;
+                        cached?: boolean;
+                    };
+                } = {};
                 if (raw.trim()) {
                     parsed = JSON.parse(raw) as typeof parsed;
                 }
@@ -3885,6 +3916,12 @@ export function ReportPanel({
                     ...prev,
                     [exprIdx]: parsed.hits ?? [],
                 }));
+                if (parsed.search_stats) {
+                    setLlmTrainExprSearchStats(prev => ({
+                        ...prev,
+                        [exprIdx]: parsed.search_stats ?? {},
+                    }));
+                }
             } catch (error) {
                 setLlmTrainExprSearchError(
                     error instanceof Error ? error.message : 'Corpus search failed',
@@ -4063,6 +4100,37 @@ export function ReportPanel({
         })();
     }, [eifApiUrl, refreshTokenProbs]);
 
+    const pollContinueJob = useCallback(async (
+        jobId: string,
+        onComplete: (result: Record<string, unknown>) => void,
+    ) => {
+        for (;;) {
+            await new Promise(r => setTimeout(r, 2000));
+            const stResp = await fetch(
+                `${buildEifApiUrl(eifApiUrl, '/api/continue-train-eval-status')}?jobId=${encodeURIComponent(jobId)}`,
+            );
+            const stRaw = await stResp.text();
+            let st: Record<string, unknown> = {};
+            if (stRaw.trim()) {
+                try {
+                    st = JSON.parse(stRaw) as Record<string, unknown>;
+                } catch {
+                    continue;
+                }
+            }
+            const stage = String(st.stage || '');
+            const message = typeof st.message === 'string' ? st.message : stage;
+            setTtavLaunchStatus(`[${jobId}] ${message}`);
+            if (stage === 'completed') {
+                onComplete((st.result || {}) as Record<string, unknown>);
+                return;
+            }
+            if (stage === 'error' || st.error === true) {
+                throw new Error(message || 'Continue job failed');
+            }
+        }
+    }, [eifApiUrl]);
+
     const handleContinueTrainEval = useCallback(() => {
         if (importedReportActive) return;
         const maxSteps = Math.max(
@@ -4074,22 +4142,24 @@ export function ReportPanel({
             setTtavLaunchError('续训 lr 必须是 > 0 的数字（如 2e-5）');
             return;
         }
-        // Train only on ANNOTATION_CONTINUE_TRAIN_DATA (small annotated subset).
-        // Do NOT pass related-train ids / full EIF_TRAIN_DATA — that is not continue-train.
         setContinueBusy(true);
         setContinueResultSummary(null);
+        setContinueCurrentTestOutput(null);
         setTtavLaunchError(null);
-        setTtavLaunchStatus('续训：小集 → 评测 line_hit（eval_before 优先读 EIF_CONTINUE_EVAL_BEFORE_CACHE）…');
+        setTtavLaunchStatus('续训小集 → 当前 test greedy 生成…');
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
+                        mode: 'train',
                         maxSteps,
                         learningRate,
                         lossMode: 'ce_saliency',
-                        evalBefore: true,
+                        evalBefore: false,
+                        evalAfterFull: false,
+                        currentTest: continueCurrentTestPayload ?? undefined,
                     }),
                 });
                 const raw = await resp.text();
@@ -4111,64 +4181,30 @@ export function ReportPanel({
                 const jobId = String(parsed.jobId || '');
                 if (!jobId) throw new Error('Continue-train response missing jobId');
                 setContinueJobId(jobId);
-                setTtavLaunchStatus(`Continue-train job ${jobId} running…`);
-
-                for (;;) {
-                    await new Promise(r => setTimeout(r, 2000));
-                    const stResp = await fetch(
-                        `${buildEifApiUrl(eifApiUrl, '/api/continue-train-eval-status')}?jobId=${encodeURIComponent(jobId)}`,
-                    );
-                    const stRaw = await stResp.text();
-                    let st: Record<string, unknown> = {};
-                    if (stRaw.trim()) {
-                        try {
-                            st = JSON.parse(stRaw) as Record<string, unknown>;
-                        } catch {
-                            continue;
-                        }
+                await pollContinueJob(jobId, (result) => {
+                    const cur = (result.currentTest || {}) as Record<string, unknown>;
+                    const fmt = (v: unknown) =>
+                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
+                        setContinueCurrentTestOutput({
+                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
+                            label: typeof cur.label === 'string' ? cur.label : undefined,
+                            predict: cur.predict,
+                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
+                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
+                        });
+                        setContinueResultSummary(
+                            `续训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
+                            + ` rec=${fmt(cur.line_hit_rec)}`,
+                        );
+                    } else {
+                        setContinueResultSummary('续训完成（未拿到当前 test 生成结果）');
                     }
-                    const stage = String(st.stage || '');
-                    const message = typeof st.message === 'string' ? st.message : stage;
-                    setTtavLaunchStatus(`[${jobId}] ${message}`);
-                    if (stage === 'completed') {
-                        const result = (st.result || {}) as Record<string, unknown>;
-                        const before = (result.before || {}) as Record<string, number | null>;
-                        const after = (result.after || {}) as Record<string, number | null>;
-                        const delta = (result.delta || {}) as Record<string, number | null>;
-                        const per = (result.perSampleDeltas || {}) as Record<string, unknown>;
-                        const preBlock = (per.line_hit_pre || {}) as Record<string, unknown>;
-                        const recBlock = (per.line_hit_rec || {}) as Record<string, unknown>;
-                        const fmt = (v: number | null | undefined) =>
-                            typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
-                        const fmtIdx = (v: unknown, n: unknown) => {
-                            const arr = Array.isArray(v) ? v.map(String) : [];
-                            const count = typeof n === 'number' ? n : arr.length;
-                            const head = arr.slice(0, 12).join(',');
-                            return `${count}[${head}${arr.length > 12 ? '…' : ''}]`;
-                        };
-                        const summary =
-                            `line_hit_pre ${fmt(before.line_hit_pre)} → ${fmt(after.line_hit_pre)}`
-                            + ` (Δ ${fmt(delta.line_hit_pre)})`
-                            + ` · line_hit_rec ${fmt(before.line_hit_rec)} → ${fmt(after.line_hit_rec)}`
-                            + ` (Δ ${fmt(delta.line_hit_rec)})`
-                            + ` · test↑pre ${fmtIdx(preBlock.increased, preBlock.nIncreased)}`
-                            + ` ↓pre ${fmtIdx(preBlock.decreased, preBlock.nDecreased)}`
-                            + ` · test↑rec ${fmtIdx(recBlock.increased, recBlock.nIncreased)}`
-                            + ` ↓rec ${fmtIdx(recBlock.decreased, recBlock.nDecreased)}`
-                            + ` · out ${String(result.outputDir || '')}`;
-                        setContinueResultSummary(summary);
-                        setContinueAdapterActive(true);
-                        // Metrics live only under Continue train; don't repeat in status strip.
-                        setTtavLaunchStatus(null);
-                        // Live probes now use continued adapter — refresh probs + saliency panels.
-                        refreshTokenProbs();
-                        void refreshSaliencyPanels();
-                        break;
-                    }
-                    if (stage === 'error' || st.error === true) {
-                        throw new Error(message || 'Continue-train failed');
-                    }
-                }
+                    setContinueAdapterActive(true);
+                    setTtavLaunchStatus(null);
+                    refreshTokenProbs();
+                    void refreshSaliencyPanels();
+                });
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Continue-train failed';
                 setTtavLaunchError(msg);
@@ -4177,7 +4213,178 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueStepsInput, continueLrInput, continueStepsDefault, eifApiUrl, refreshTokenProbs, refreshSaliencyPanels]);
+    }, [
+        importedReportActive,
+        continueStepsInput,
+        continueLrInput,
+        continueStepsDefault,
+        eifApiUrl,
+        continueCurrentTestPayload,
+        pollContinueJob,
+        refreshTokenProbs,
+        refreshSaliencyPanels,
+    ]);
+
+    const handleContinueTrainCeOnly = useCallback(() => {
+        if (importedReportActive) return;
+        const maxSteps = Math.max(
+            1,
+            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+        );
+        const learningRate = Number(continueLrInput);
+        if (!Number.isFinite(learningRate) || learningRate <= 0) {
+            setTtavLaunchError('续训 lr 必须是 > 0 的数字（如 2e-5）');
+            return;
+        }
+        setContinueBusy(true);
+        setContinueResultSummary(null);
+        setContinueCurrentTestOutput(null);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('纯 CE 续训小集 → 当前 test greedy 生成…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mode: 'train',
+                        maxSteps,
+                        learningRate,
+                        lossMode: 'ce_only',
+                        evalBefore: false,
+                        evalAfterFull: false,
+                        currentTest: continueCurrentTestPayload ?? undefined,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Continue-train API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Continue-train failed (HTTP ${resp.status})`,
+                    );
+                }
+                const jobId = String(parsed.jobId || '');
+                if (!jobId) throw new Error('Continue-train response missing jobId');
+                setContinueJobId(jobId);
+                await pollContinueJob(jobId, (result) => {
+                    const cur = (result.currentTest || {}) as Record<string, unknown>;
+                    const fmt = (v: unknown) =>
+                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
+                        setContinueCurrentTestOutput({
+                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
+                            label: typeof cur.label === 'string' ? cur.label : undefined,
+                            predict: cur.predict,
+                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
+                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
+                        });
+                        setContinueResultSummary(
+                            `CE 续训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
+                            + ` rec=${fmt(cur.line_hit_rec)}`,
+                        );
+                    } else {
+                        setContinueResultSummary('CE 续训完成（未拿到当前 test 生成结果）');
+                    }
+                    setContinueAdapterActive(true);
+                    setTtavLaunchStatus(null);
+                    refreshTokenProbs();
+                    void refreshSaliencyPanels();
+                });
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Continue-train failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [
+        importedReportActive,
+        continueStepsInput,
+        continueLrInput,
+        continueStepsDefault,
+        eifApiUrl,
+        continueCurrentTestPayload,
+        pollContinueJob,
+        refreshTokenProbs,
+        refreshSaliencyPanels,
+    ]);
+
+    const handleContinueLineHitCompare = useCallback(() => {
+        if (importedReportActive || !continueAdapterActive) return;
+        setContinueBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('对比 line_hit：baseline vs 续训 adapter（全测试集）…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mode: 'compare',
+                        evalBefore: true,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    parsed = JSON.parse(raw) as Record<string, unknown>;
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Compare failed (HTTP ${resp.status})`,
+                    );
+                }
+                const jobId = String(parsed.jobId || '');
+                if (!jobId) throw new Error('Compare response missing jobId');
+                setContinueJobId(jobId);
+                await pollContinueJob(jobId, (result) => {
+                    const before = (result.before || {}) as Record<string, number | null>;
+                    const after = (result.after || {}) as Record<string, number | null>;
+                    const delta = (result.delta || {}) as Record<string, number | null>;
+                    const per = (result.perSampleDeltas || {}) as Record<string, unknown>;
+                    const preBlock = (per.line_hit_pre || {}) as Record<string, unknown>;
+                    const recBlock = (per.line_hit_rec || {}) as Record<string, unknown>;
+                    const fmt = (v: number | null | undefined) =>
+                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                    const fmtIdx = (v: unknown, n: unknown) => {
+                        const arr = Array.isArray(v) ? v.map(String) : [];
+                        const count = typeof n === 'number' ? n : arr.length;
+                        const head = arr.slice(0, 12).join(',');
+                        return `${count}[${head}${arr.length > 12 ? '…' : ''}]`;
+                    };
+                    setContinueResultSummary(
+                        `对比 · line_hit_pre ${fmt(before.line_hit_pre)} → ${fmt(after.line_hit_pre)}`
+                        + ` (Δ ${fmt(delta.line_hit_pre)})`
+                        + ` · line_hit_rec ${fmt(before.line_hit_rec)} → ${fmt(after.line_hit_rec)}`
+                        + ` (Δ ${fmt(delta.line_hit_rec)})`
+                        + ` · test↑pre ${fmtIdx(preBlock.increased, preBlock.nIncreased)}`
+                        + ` ↓pre ${fmtIdx(preBlock.decreased, preBlock.nDecreased)}`
+                        + ` · test↑rec ${fmtIdx(recBlock.increased, recBlock.nIncreased)}`
+                        + ` ↓rec ${fmtIdx(recBlock.decreased, recBlock.nDecreased)}`,
+                    );
+                    setTtavLaunchStatus(null);
+                });
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Compare failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [importedReportActive, continueAdapterActive, eifApiUrl, pollContinueJob]);
 
     const handleContinueAdapterRecover = useCallback(() => {
         if (importedReportActive) return;
@@ -5048,7 +5255,7 @@ export function ReportPanel({
                                             type="button"
                                             disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
                                             onClick={handleContinueTrainEval}
-                                            title="只在 ANNOTATION_CONTINUE_TRAIN_DATA（新标注小集）上从当前 saliency adapter 续训 CE+saliency；评测只看 line_hit_pre / line_hit_rec（EIF_TEST_DATA）"
+                                            title="在续训小集上 CE+saliency 续训，完成后对当前 test 样本 greedy 生成（不跑全测试集）"
                                             style={{
                                                 padding: '2px 10px',
                                                 borderRadius: 6,
@@ -5060,7 +5267,50 @@ export function ReportPanel({
                                                 cursor: continueBusy ? 'wait' : 'pointer',
                                             }}
                                         >
-                                            {continueBusy ? 'Training…' : '续训(小集) + line_hit'}
+                                            {continueBusy ? 'Training…' : '续训(CE+saliency)'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
+                                            onClick={handleContinueTrainCeOnly}
+                                            title="纯 CE loss 续训（无 saliency）；Recover 原 adapter 后可与 CE+saliency 对比"
+                                            style={{
+                                                padding: '2px 10px',
+                                                borderRadius: 6,
+                                                border: '1px solid #fde68a',
+                                                background: continueBusy ? '#fef9c3' : '#fffbeb',
+                                                color: '#a16207',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: continueBusy ? 'wait' : 'pointer',
+                                            }}
+                                        >
+                                            {continueBusy ? 'Training…' : '续训(CE)'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={
+                                                continueBusy
+                                                || Boolean(interveningPairId)
+                                                || recoverBusy
+                                                || continueRecoverBusy
+                                                || !continueAdapterActive
+                                            }
+                                            onClick={handleContinueLineHitCompare}
+                                            title="全 EIF_TEST_DATA line_hit 对比：baseline（cache/原 adapter）vs 续训 adapter"
+                                            style={{
+                                                padding: '2px 10px',
+                                                borderRadius: 6,
+                                                border: '1px solid #c4b5fd',
+                                                background: continueBusy ? '#ede9fe' : '#f5f3ff',
+                                                color: '#6d28d9',
+                                                fontSize: 11,
+                                                fontWeight: 700,
+                                                cursor: continueBusy || !continueAdapterActive ? 'not-allowed' : 'pointer',
+                                                opacity: continueAdapterActive ? 1 : 0.45,
+                                            }}
+                                        >
+                                            {continueBusy ? '…' : '对比 line_hit'}
                                         </button>
                                         <button
                                             type="button"
@@ -5102,6 +5352,48 @@ export function ReportPanel({
                                             <span style={{ color: '#166534', width: '100%' }}>
                                                 {continueResultSummary}
                                             </span>
+                                        )}
+                                        {continueCurrentTestOutput?.predict && (
+                                            <details open style={{ width: '100%', marginTop: 4 }}>
+                                                <summary style={{ cursor: 'pointer', fontSize: 11, color: '#15803d', fontWeight: 700 }}>
+                                                    续训后当前 test 输出
+                                                    {continueCurrentTestOutput.task_id
+                                                        ? ` · ${continueCurrentTestOutput.task_id}`
+                                                        : ''}
+                                                </summary>
+                                                <pre style={{
+                                                    marginTop: 6,
+                                                    padding: 8,
+                                                    fontSize: 10,
+                                                    lineHeight: 1.45,
+                                                    whiteSpace: 'pre-wrap',
+                                                    wordBreak: 'break-word',
+                                                    background: '#f0fdf4',
+                                                    border: '1px solid #bbf7d0',
+                                                    borderRadius: 6,
+                                                    maxHeight: 220,
+                                                    overflow: 'auto',
+                                                }}>
+                                                    {continueCurrentTestOutput.predict}
+                                                </pre>
+                                                {continueCurrentTestOutput.label && (
+                                                    <details style={{ marginTop: 4 }}>
+                                                        <summary style={{ cursor: 'pointer', fontSize: 10, color: '#64748b' }}>
+                                                            gold 对照
+                                                        </summary>
+                                                        <pre style={{
+                                                            marginTop: 4,
+                                                            padding: 6,
+                                                            fontSize: 10,
+                                                            whiteSpace: 'pre-wrap',
+                                                            background: '#f8fafc',
+                                                            borderRadius: 4,
+                                                        }}>
+                                                            {continueCurrentTestOutput.label}
+                                                        </pre>
+                                                    </details>
+                                                )}
+                                            </details>
                                         )}
                                     </div>
                                 )}
@@ -5212,6 +5504,18 @@ export function ReportPanel({
                                                                     <div style={{ fontSize: 11, fontWeight: 700, color: '#075985', marginBottom: 4 }}>
                                                                         检索结果（点击行 → 手动标注）
                                                                     </div>
+                                                                    {llmTrainExprSearchStats[idx] && (
+                                                                        <div style={{ fontSize: 10, color: '#94a3b8', marginBottom: 4 }}>
+                                                                            扫描 {llmTrainExprSearchStats[idx].scanned_lines?.toLocaleString() ?? '?'} 行
+                                                                            {llmTrainExprSearchStats[idx].stop_reason === 'top_k'
+                                                                                ? '（凑满 topK 提前停止，非全库）'
+                                                                                : ''}
+                                                                            {llmTrainExprSearchStats[idx].elapsed_ms != null
+                                                                                ? ` · ${llmTrainExprSearchStats[idx].elapsed_ms}ms`
+                                                                                : ''}
+                                                                            · 无 cache
+                                                                        </div>
+                                                                    )}
                                                                     {hits.map(h => (
                                                                         <div
                                                                             key={`dbg-hit-${h.line}-${h.task_id}`}

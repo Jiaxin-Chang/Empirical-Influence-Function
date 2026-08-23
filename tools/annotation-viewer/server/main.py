@@ -22,6 +22,8 @@ import json
 import os
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +149,11 @@ _saliency_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
 # Cross-origin probe FIM payloads from correlation-report (sessionStorage cannot share).
 _probe_focus_cache: dict[str, dict[str, Any]] = {}
 _PROBE_FOCUS_CACHE_MAX = 64
+# GraphSignal corpus auto-annotate previews (accept/reject before writing continue).
+_gs_preview_cache: dict[str, dict[str, Any]] = {}
+_GS_PREVIEW_CACHE_MAX = 32
+_GS_PREVIEW_TTL_SEC = 3600
+_llm_sem_preview_cache: dict[str, dict[str, Any]] = {}
 
 
 def _disk_saliency_path(idx: int) -> Path | None:
@@ -927,6 +934,20 @@ class DuplicateContinueBody(BaseModel):
     )
 
 
+class GraphsignalAnnotateBody(BaseModel):
+    use_llm: bool | None = None
+    max_edges: int | None = Field(None, ge=1, le=256)
+
+
+class GraphsignalPreviewActionBody(BaseModel):
+    preview_id: str = Field(..., min_length=8)
+
+
+class LlmSemanticAnnotateBody(BaseModel):
+    max_sources_per_token: int | None = Field(None, ge=1, le=15)
+    max_answer_tokens: int | None = Field(None, ge=1, le=256)
+
+
 def _duplicate_continue_rows(
     source: dict[str, Any],
     viz: list[dict[str, Any]],
@@ -1274,6 +1295,448 @@ def duplicate_corpus_continue(line: int, body: DuplicateContinueBody, corpusPath
         **persist,
         "n_continue_edges": len(cont),
     }
+
+
+def _prune_gs_preview_cache() -> None:
+    now = time.time()
+    stale = [
+        pid for pid, ent in _gs_preview_cache.items()
+        if now - float(ent.get("created_at") or 0) > _GS_PREVIEW_TTL_SEC
+    ]
+    for pid in stale:
+        _gs_preview_cache.pop(pid, None)
+    while len(_gs_preview_cache) > _GS_PREVIEW_CACHE_MAX:
+        oldest = min(
+            _gs_preview_cache.items(),
+            key=lambda kv: float(kv[1].get("created_at") or 0),
+        )[0]
+        _gs_preview_cache.pop(oldest, None)
+
+
+def _graphsignal_llm_edges(raw_edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for e in raw_edges:
+        if not isinstance(e, dict) or "src" not in e or "dst" not in e:
+            continue
+        out.append(
+            _normalize_edge(
+                {
+                    "src": e["src"],
+                    "dst": e["dst"],
+                    "subtype": e.get("subtype") or "",
+                    "weight": e.get("weight", 1.0),
+                    "source": "GraphSignal",
+                },
+                contrib="llm_auto",
+            )
+        )
+    return out
+
+
+def _build_graphsignal_annotated_source(
+    line: int,
+    raw_row: dict[str, Any],
+    annotated: dict[str, Any],
+    *,
+    use_llm: bool,
+) -> dict[str, Any]:
+    base = _encode_corpus_row(line, raw_row)
+    base["input_ids"] = [int(x) for x in (annotated.get("input_ids") or [])]
+    base["label"] = [int(x) for x in (annotated.get("label") or [])]
+    raw_edges = annotated.get("attention_edges") or []
+    base["attention_edges"] = [
+        _normalize_edge(e, contrib="llm_auto")
+        for e in raw_edges
+        if isinstance(e, dict) and "src" in e and "dst" in e
+    ]
+    meta = dict(base.get("annotation_meta") or {})
+    meta.update({
+        "corpus": True,
+        "graphsignal": True,
+        "graphsignal_use_llm": bool(use_llm),
+        "graphsignal_n_edges": len(base["attention_edges"]),
+        "unannotated_source": False,
+    })
+    base["annotation_meta"] = meta
+    return base
+
+
+def _sample_detail_from_graphsignal_preview(
+    line: int,
+    annotated_source: dict[str, Any],
+    *,
+    from_continue: bool,
+    key: str,
+) -> dict[str, Any]:
+    detail = _sample_detail_from_obj(-1, annotated_source, from_continue=from_continue, key=key)
+    detail["corpus_line"] = int(line)
+    detail["corpus_path"] = annotated_source.get("source_corpus_path")
+    detail["corpus_mode"] = True
+    detail["graphsignal_preview"] = True
+    return detail
+
+
+@app.post("/api/corpus/sample/{line}/graphsignal-annotate/preview")
+def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpusPath: str = ""):
+    """Run GraphSignal (tree-sitter + optional LLM) on a corpus row; preview only."""
+    override = corpusPath.strip() or None
+    from server.graphsignal_annotate import annotate_corpus_row, default_use_llm
+
+    use_llm = default_use_llm() if body.use_llm is None else bool(body.use_llm)
+    with _state_lock:
+        raw_row = _read_corpus_raw_row(line, corpus_path=override)
+        source_enc = _encode_corpus_row(line, raw_row)
+        key, _ = _lookup_continue(-1, source_enc)
+        try:
+            annotated = annotate_corpus_row(
+                raw_row,
+                _get_tokenizer(),
+                max_teacher_edges=body.max_edges,
+                use_llm=use_llm,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(501, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            print(f"[graphsignal] FAIL corpus line={line}: {exc}", flush=True)
+            raise HTTPException(502, f"GraphSignal annotate failed: {exc}") from exc
+
+        annotated_source = _build_graphsignal_annotated_source(
+            line, raw_row, annotated, use_llm=use_llm,
+        )
+        preview_id = uuid.uuid4().hex
+        _prune_gs_preview_cache()
+        _gs_preview_cache[preview_id] = {
+            "preview_id": preview_id,
+            "line": int(line),
+            "corpus_path": override or (str(_corpus_path) if _corpus_path else ""),
+            "annotated_source": annotated_source,
+            "raw_edges": list(annotated.get("attention_edges") or []),
+            "use_llm": use_llm,
+            "created_at": time.time(),
+        }
+        sample = _sample_detail_from_graphsignal_preview(
+            line, annotated_source, from_continue=False, key=key,
+        )
+
+    n_edges = len(annotated_source.get("attention_edges") or [])
+    print(
+        f"[graphsignal] preview corpus line={line} preview_id={preview_id[:8]} "
+        f"edges={n_edges} use_llm={use_llm}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "preview_id": preview_id,
+        "n_edges": n_edges,
+        "use_llm": use_llm,
+        "sample": sample,
+        "message": (
+            f"GraphSignal 预览 {n_edges} 条边"
+            f"（{'tree-sitter+LLM' if use_llm else '仅 tree-sitter'}）。"
+            "接受后写入续训小集；拒绝则回退。"
+        ),
+    }
+
+
+@app.post("/api/corpus/sample/{line}/graphsignal-annotate/accept")
+def graphsignal_annotate_accept(line: int, body: GraphsignalPreviewActionBody, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    pid = str(body.preview_id or "").strip()
+    with _state_lock:
+        entry = _gs_preview_cache.get(pid)
+        if not entry or int(entry.get("line", -1)) != int(line):
+            raise HTTPException(404, "GraphSignal preview not found or expired")
+        if override and str(entry.get("corpus_path") or "") not in ("", override):
+            raise HTTPException(400, "preview corpus path mismatch")
+        if not override and entry.get("corpus_path"):
+            override = str(entry["corpus_path"]) or None
+
+        annotated_source = dict(entry["annotated_source"])
+        new_llm = _graphsignal_llm_edges(entry.get("raw_edges") or [])
+
+        source_enc = _encode_corpus_row(line, _read_corpus_raw_row(line, corpus_path=override))
+        _, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        cont_keep = [
+            e for e in cont
+            if str(e.get("contrib") or "") in ("user_add", "user_bump")
+        ]
+        viz_keep = [
+            e for e in viz
+            if str(e.get("contrib") or "") != "llm_auto"
+        ]
+        by_viz = {_edge_key(e): e for e in viz_keep}
+        for e in cont_keep + new_llm:
+            by_viz[_edge_key(e)] = e
+        viz_out = list(by_viz.values())
+        cont_out = cont_keep + new_llm
+        cont_map = {_edge_key(e): e for e in cont_out}
+        cont_out = list(cont_map.values())
+
+        merged_source = dict(source_enc)
+        merged_source["input_ids"] = annotated_source["input_ids"]
+        merged_source["label"] = annotated_source["label"]
+        meta = dict(merged_source.get("annotation_meta") or {})
+        meta.update(annotated_source.get("annotation_meta") or {})
+        merged_source["annotation_meta"] = meta
+
+        persist = _write_continue_corpus_payload(
+            line,
+            merged_source,
+            viz_edges=viz_out,
+            continue_edges=cont_out,
+        )
+        _gs_preview_cache.pop(pid, None)
+        _, cont_idx = _lookup_continue(-1, merged_source)
+        obj, _, key2 = _effective_corpus_sample(line, corpus_path=override)
+        sample = _sample_detail_from_obj(-1, obj, from_continue=cont_idx is not None, key=key2)
+
+    print(
+        f"[graphsignal] accept corpus line={line} llm_edges={len(new_llm)} "
+        f"continue_edges={len(cont_out)} path={persist.get('continue_path') or '-'}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "preview_id": pid,
+        "n_edges": len(viz_out),
+        "n_continue_edges": len(cont_out),
+        "proposed": new_llm,
+        "sample": sample,
+        **persist,
+    }
+
+
+@app.post("/api/corpus/sample/{line}/graphsignal-annotate/reject")
+def graphsignal_annotate_reject(line: int, body: GraphsignalPreviewActionBody, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    pid = str(body.preview_id or "").strip()
+    with _state_lock:
+        entry = _gs_preview_cache.pop(pid, None)
+        if entry and int(entry.get("line", -1)) != int(line):
+            _gs_preview_cache[pid] = entry
+            raise HTTPException(400, "preview line mismatch")
+        obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
+        sample = _sample_detail_from_obj(-1, obj, from_continue=from_continue, key=key)
+    return {"ok": True, "preview_id": pid, "sample": sample}
+
+
+def _prune_llm_sem_preview_cache() -> None:
+    now = time.time()
+    stale = [
+        pid for pid, ent in _llm_sem_preview_cache.items()
+        if now - float(ent.get("created_at") or 0) > _GS_PREVIEW_TTL_SEC
+    ]
+    for pid in stale:
+        _llm_sem_preview_cache.pop(pid, None)
+    while len(_llm_sem_preview_cache) > _GS_PREVIEW_CACHE_MAX:
+        oldest = min(
+            _llm_sem_preview_cache.items(),
+            key=lambda kv: float(kv[1].get("created_at") or 0),
+        )[0]
+        _llm_sem_preview_cache.pop(oldest, None)
+
+
+def _llm_semantic_llm_edges(raw_edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for e in raw_edges:
+        if not isinstance(e, dict) or "src" not in e or "dst" not in e:
+            continue
+        out.append(
+            _normalize_edge(
+                {
+                    "src": e["src"],
+                    "dst": e["dst"],
+                    "subtype": str(e.get("subtype") or "semantic"),
+                    "reason": e.get("reason") or "",
+                    "weight": e.get("weight", 1.0),
+                    "source": "LLMSemantic",
+                },
+                contrib="llm_auto",
+            )
+        )
+    return out
+
+
+def _build_llm_semantic_annotated_source(
+    line: int,
+    raw_row: dict[str, Any],
+    annotated: dict[str, Any],
+) -> dict[str, Any]:
+    base = _encode_corpus_row(line, raw_row)
+    base["input_ids"] = [int(x) for x in (annotated.get("input_ids") or [])]
+    base["label"] = [int(x) for x in (annotated.get("label") or [])]
+    raw_edges = annotated.get("attention_edges") or []
+    base["attention_edges"] = [
+        _normalize_edge(
+            {
+                "src": e["src"],
+                "dst": e["dst"],
+                "subtype": str(e.get("subtype") or "semantic"),
+                "reason": e.get("reason") or "",
+            },
+            contrib="llm_auto",
+        )
+        for e in raw_edges
+        if isinstance(e, dict) and "src" in e and "dst" in e
+    ]
+    meta = dict(base.get("annotation_meta") or {})
+    sem_meta = annotated.get("_llm_semantic_meta") or {}
+    meta.update({
+        "corpus": True,
+        "llm_semantic": True,
+        "llm_semantic_n_edges": len(base["attention_edges"]),
+        "llm_semantic_meta": sem_meta,
+        "unannotated_source": False,
+    })
+    base["annotation_meta"] = meta
+    return base
+
+
+@app.post("/api/corpus/sample/{line}/llm-semantic-annotate/preview")
+def llm_semantic_annotate_preview(line: int, body: LlmSemanticAnnotateBody, corpusPath: str = ""):
+    """Per-token LLM attention-routing annotation; preview only."""
+    override = corpusPath.strip() or None
+    from server.llm_semantic_annotate import annotate_corpus_row_semantic
+
+    with _state_lock:
+        raw_row = _read_corpus_raw_row(line, corpus_path=override)
+        source_enc = _encode_corpus_row(line, raw_row)
+        key, _ = _lookup_continue(-1, source_enc)
+        try:
+            annotated = annotate_corpus_row_semantic(
+                raw_row,
+                _get_tokenizer(),
+                max_sources_per_token=body.max_sources_per_token,
+                max_answer_tokens=body.max_answer_tokens,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            print(f"[llm-semantic] FAIL corpus line={line}: {exc}", flush=True)
+            raise HTTPException(502, f"LLM semantic annotate failed: {exc}") from exc
+
+        annotated_source = _build_llm_semantic_annotated_source(line, raw_row, annotated)
+        preview_id = uuid.uuid4().hex
+        _prune_llm_sem_preview_cache()
+        _llm_sem_preview_cache[preview_id] = {
+            "preview_id": preview_id,
+            "line": int(line),
+            "corpus_path": override or (str(_corpus_path) if _corpus_path else ""),
+            "annotated_source": annotated_source,
+            "raw_edges": list(annotated.get("attention_edges") or []),
+            "meta": dict(annotated.get("_llm_semantic_meta") or {}),
+            "created_at": time.time(),
+        }
+        sample = _sample_detail_from_graphsignal_preview(
+            line, annotated_source, from_continue=False, key=key,
+        )
+        sample["llm_semantic_preview"] = True
+
+    sem_meta = annotated.get("_llm_semantic_meta") or {}
+    n_edges = len(annotated_source.get("attention_edges") or [])
+    print(
+        f"[llm-semantic] preview corpus line={line} preview_id={preview_id[:8]} "
+        f"edges={n_edges} llm_calls={sem_meta.get('llm_calls')}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "preview_id": preview_id,
+        "n_edges": n_edges,
+        "llm_calls": sem_meta.get("llm_calls"),
+        "answer_token_count": sem_meta.get("answer_token_count"),
+        "sample": sample,
+        "message": (
+            f"LLM 语义标注预览 {n_edges} 条边"
+            f"（{sem_meta.get('answer_token_count', '?')} 个答案 token ×"
+            f" 最多 {sem_meta.get('max_sources_per_token', 15)} 源/token）。"
+            "接受后写入续训小集；拒绝则回退。"
+        ),
+    }
+
+
+@app.post("/api/corpus/sample/{line}/llm-semantic-annotate/accept")
+def llm_semantic_annotate_accept(line: int, body: GraphsignalPreviewActionBody, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    pid = str(body.preview_id or "").strip()
+    with _state_lock:
+        entry = _llm_sem_preview_cache.get(pid)
+        if not entry or int(entry.get("line", -1)) != int(line):
+            raise HTTPException(404, "LLM semantic preview not found or expired")
+        if override and str(entry.get("corpus_path") or "") not in ("", override):
+            raise HTTPException(400, "preview corpus path mismatch")
+        if not override and entry.get("corpus_path"):
+            override = str(entry["corpus_path"]) or None
+
+        annotated_source = dict(entry["annotated_source"])
+        new_llm = _llm_semantic_llm_edges(entry.get("raw_edges") or [])
+
+        source_enc = _encode_corpus_row(line, _read_corpus_raw_row(line, corpus_path=override))
+        _, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        cont_keep = [
+            e for e in cont
+            if str(e.get("contrib") or "") in ("user_add", "user_bump")
+        ]
+        viz_keep = [
+            e for e in viz
+            if str(e.get("contrib") or "") != "llm_auto"
+        ]
+        by_viz = {_edge_key(e): e for e in viz_keep}
+        for e in cont_keep + new_llm:
+            by_viz[_edge_key(e)] = e
+        viz_out = list(by_viz.values())
+        cont_out = cont_keep + new_llm
+        cont_map = {_edge_key(e): e for e in cont_out}
+        cont_out = list(cont_map.values())
+
+        merged_source = dict(source_enc)
+        merged_source["input_ids"] = annotated_source["input_ids"]
+        merged_source["label"] = annotated_source["label"]
+        meta = dict(merged_source.get("annotation_meta") or {})
+        meta.update(annotated_source.get("annotation_meta") or {})
+        merged_source["annotation_meta"] = meta
+
+        persist = _write_continue_corpus_payload(
+            line,
+            merged_source,
+            viz_edges=viz_out,
+            continue_edges=cont_out,
+        )
+        _llm_sem_preview_cache.pop(pid, None)
+        _, cont_idx = _lookup_continue(-1, merged_source)
+        obj, _, key2 = _effective_corpus_sample(line, corpus_path=override)
+        sample = _sample_detail_from_obj(-1, obj, from_continue=cont_idx is not None, key=key2)
+
+    print(
+        f"[llm-semantic] accept corpus line={line} llm_edges={len(new_llm)} "
+        f"continue_edges={len(cont_out)} path={persist.get('continue_path') or '-'}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "preview_id": pid,
+        "n_edges": len(viz_out),
+        "n_continue_edges": len(cont_out),
+        "proposed": new_llm,
+        "sample": sample,
+        **persist,
+    }
+
+
+@app.post("/api/corpus/sample/{line}/llm-semantic-annotate/reject")
+def llm_semantic_annotate_reject(line: int, body: GraphsignalPreviewActionBody, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    pid = str(body.preview_id or "").strip()
+    with _state_lock:
+        entry = _llm_sem_preview_cache.pop(pid, None)
+        if entry and int(entry.get("line", -1)) != int(line):
+            _llm_sem_preview_cache[pid] = entry
+            raise HTTPException(400, "preview line mismatch")
+        obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
+        sample = _sample_detail_from_obj(-1, obj, from_continue=from_continue, key=key)
+    return {"ok": True, "preview_id": pid, "sample": sample}
 
 
 @app.get("/api/sample/{idx}/saliency/{target}")

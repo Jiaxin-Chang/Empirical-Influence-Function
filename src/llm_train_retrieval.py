@@ -290,14 +290,19 @@ def search_corpus_jsonl(
     *,
     top_k: int = 20,
     max_scan: int | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     path = Path(corpus_path)
     if not path.is_file():
         raise FileNotFoundError(f"corpus not found: {corpus_path}")
     hits: list[dict[str, Any]] = []
+    stop_reason = "eof"
+    scanned = 0
     with path.open(encoding="utf-8") as fh:
         for line_idx, line in enumerate(fh):
+            scanned = line_idx + 1
             if max_scan is not None and line_idx >= max_scan:
+                stop_reason = "max_scan"
                 break
             line = line.strip()
             if not line:
@@ -319,7 +324,13 @@ def search_corpus_jsonl(
                 "response_preview": (str(resp)[:200] + "…") if len(str(resp)) > 200 else str(resp),
             })
             if len(hits) >= top_k:
+                stop_reason = "top_k"
                 break
+    if stats is not None:
+        stats["scanned_lines"] = scanned
+        stats["stop_reason"] = stop_reason
+        stats["top_k"] = top_k
+        stats["cached"] = False
     return hits
 
 

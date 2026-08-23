@@ -37,6 +37,7 @@ from src.continue_train_eval import (
     build_config_from_request,
     default_paths_from_env,
     run_continue_train_and_eval,
+    run_continue_line_hit_compare,
 )
 from src.eif_adapter_env import (
     get_active_adapter_status,
@@ -136,6 +137,7 @@ def _get_continue_job(job_id: str) -> dict:
 def _run_continue_train_job(job_id: str, req: dict):
     try:
         cfg = build_config_from_request(req)
+        mode = str(req.get("mode") or "train").strip().lower()
 
         def progress(stage: str, message: str, extra: dict | None = None):
             payload = {
@@ -153,11 +155,14 @@ def _run_continue_train_job(job_id: str, req: dict):
             _set_continue_job(job_id, **payload)
 
         with CONTINUE_TRAIN_LOCK:
-            result = run_continue_train_and_eval(cfg, progress_cb=progress)
+            if mode == "compare":
+                result = run_continue_line_hit_compare(cfg, progress_cb=progress)
+            else:
+                result = run_continue_train_and_eval(cfg, progress_cb=progress)
         _set_continue_job(
             job_id,
             stage="completed",
-            message="Continue-train + eval finished.",
+            message="Continue job finished.",
             active=False,
             error=False,
             result=result,
@@ -1576,6 +1581,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
         try:
             from src.llm_train_retrieval import search_corpus_jsonl
+            import time
 
             corpus = corpus_path or (
                 (os.environ.get("EIF_LLM_TRAIN_CORPUS") or os.environ.get("EIF_TRAIN_CORPUS") or "").strip()
@@ -1586,12 +1592,16 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     "message": "No corpus path (set EIF_LLM_TRAIN_CORPUS or pass corpusPath)",
                 })
                 return
+            search_stats: dict = {}
+            t0 = time.perf_counter()
             hits = search_corpus_jsonl(
                 corpus,
                 expression,
                 top_k=top_k,
                 max_scan=max_scan_i,
+                stats=search_stats,
             )
+            search_stats["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         except Exception as exc:
             print(f"[llm-corpus-search] failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
@@ -1603,6 +1613,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "corpus_path": corpus,
             "hits": hits,
             "n_hits": len(hits),
+            "search_stats": search_stats,
         })
 
     def _handle_prepare_train_probe(self):
