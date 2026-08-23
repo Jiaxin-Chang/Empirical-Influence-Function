@@ -2313,6 +2313,31 @@ export interface AllTokensExperimentMeta {
     fileName: string;
 }
 
+function inferContinueAdapterFamily(
+    fileName: string,
+    report?: AllTokensReport | null,
+): 'ce' | 'saliency' | 'unknown' {
+    const meta = report?.experiment_meta as { report_family?: string; adapter_family?: string } | undefined;
+    const stamped = String(meta?.report_family || meta?.adapter_family || '').trim().toLowerCase();
+    if (stamped === 'ce' || stamped === 'ce_only') return 'ce';
+    if (stamped === 'saliency' || stamped === 'ce_saliency') return 'saliency';
+    const rel = String(fileName || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    const top = rel.split('/')[0]?.toLowerCase() || '';
+    if (top === 'ce') return 'ce';
+    if (top === 'saliency') return 'saliency';
+    const low = rel.toLowerCase();
+    if (low.includes('ce_only') || low.startsWith('ce_')) return 'ce';
+    if (low.includes('saliency') || low.includes('cesal')) return 'saliency';
+    return 'unknown';
+}
+
+function continueAdapterPayload(family: 'ce' | 'saliency' | 'unknown', fileName: string) {
+    return {
+        reportFamily: family === 'unknown' ? undefined : family,
+        reportFileName: fileName || undefined,
+    };
+}
+
 export interface ReportPanelProps {
     report: AllTokensReport;
     meta: AllTokensExperimentMeta;
@@ -2408,6 +2433,7 @@ export function ReportPanel({
     const [continueLrInput, setContinueLrInput] = useState('2e-5');
     const [continueStepsDefault, setContinueStepsDefault] = useState(20);
     const [continueLrDefault, setContinueLrDefault] = useState('2e-5');
+    const [continueStartAdapterPath, setContinueStartAdapterPath] = useState<string | null>(null);
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
@@ -2514,6 +2540,7 @@ export function ReportPanel({
         : meta.fileName.startsWith('saliency/')
             ? '[saliency] '
             : '';
+    const continueAdapterFamily = inferContinueAdapterFamily(meta.fileName, report);
     const rawLabel = modelLabel
         || report.experiment_meta.model_name
         || meta.label
@@ -2575,13 +2602,27 @@ export function ReportPanel({
         let cancelled = false;
         void (async () => {
             try {
-                const resp = await fetch(`${eifApiUrl.replace(/\/$/, '')}/api/continue-train-eval-defaults`);
+                const qs = new URLSearchParams();
+                if (continueAdapterFamily !== 'unknown') qs.set('reportFamily', continueAdapterFamily);
+                if (meta.fileName) qs.set('reportFileName', meta.fileName);
+                const q = qs.toString();
+                const resp = await fetch(
+                    `${eifApiUrl.replace(/\/$/, '')}/api/continue-train-eval-defaults${q ? `?${q}` : ''}`,
+                );
                 if (!resp.ok || cancelled) return;
                 const data = await resp.json() as {
                     status?: string;
-                    defaults?: { max_steps?: number; learning_rate?: number };
+                    defaults?: {
+                        max_steps?: number;
+                        learning_rate?: number;
+                        adapter_path?: string;
+                        adapter_family?: string;
+                    };
                 };
                 if (data.status !== 'success' || !data.defaults || cancelled) return;
+                if (typeof data.defaults.adapter_path === 'string' && data.defaults.adapter_path.trim()) {
+                    setContinueStartAdapterPath(data.defaults.adapter_path.trim());
+                }
                 const steps = Number(data.defaults.max_steps);
                 if (Number.isFinite(steps) && steps >= 1) {
                     const s = String(Math.floor(steps));
@@ -2601,7 +2642,7 @@ export function ReportPanel({
             }
         })();
         return () => { cancelled = true; };
-    }, [eifApiUrl]);
+    }, [eifApiUrl, continueAdapterFamily, meta.fileName]);
 
     const [fullTokensDisplay, setFullTokensDisplay] = useState<string[] | null>(
         () => report.test_sample_baseline.full_tokens_display ?? null,
@@ -4133,6 +4174,10 @@ export function ReportPanel({
 
     const handleContinueTrainEval = useCallback(() => {
         if (importedReportActive) return;
+        if (continueAdapterFamily === 'unknown') {
+            setTtavLaunchError('无法从当前 report 路径判断 CE/saliency adapter（需要 ce/*.json 或 saliency/*.json）');
+            return;
+        }
         const maxSteps = Math.max(
             1,
             Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
@@ -4146,7 +4191,9 @@ export function ReportPanel({
         setContinueResultSummary(null);
         setContinueCurrentTestOutput(null);
         setTtavLaunchError(null);
-        setTtavLaunchStatus('续训小集 → 当前 test greedy 生成…');
+        setTtavLaunchStatus(
+            `续训小集 → 当前 test greedy 生成…（起点 ${continueAdapterFamily === 'ce' ? 'EIF_ADAPTER_PATH_CE' : 'EIF_ADAPTER_PATH_SALIENCY'}）`,
+        );
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
@@ -4160,6 +4207,7 @@ export function ReportPanel({
                         evalBefore: false,
                         evalAfterFull: false,
                         currentTest: continueCurrentTestPayload ?? undefined,
+                        ...continueAdapterPayload(continueAdapterFamily, meta.fileName),
                     }),
                 });
                 const raw = await resp.text();
@@ -4220,6 +4268,8 @@ export function ReportPanel({
         continueStepsDefault,
         eifApiUrl,
         continueCurrentTestPayload,
+        continueAdapterFamily,
+        meta.fileName,
         pollContinueJob,
         refreshTokenProbs,
         refreshSaliencyPanels,
@@ -4227,6 +4277,10 @@ export function ReportPanel({
 
     const handleContinueTrainCeOnly = useCallback(() => {
         if (importedReportActive) return;
+        if (continueAdapterFamily === 'unknown') {
+            setTtavLaunchError('无法从当前 report 路径判断 CE/saliency adapter（需要 ce/*.json 或 saliency/*.json）');
+            return;
+        }
         const maxSteps = Math.max(
             1,
             Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
@@ -4240,7 +4294,9 @@ export function ReportPanel({
         setContinueResultSummary(null);
         setContinueCurrentTestOutput(null);
         setTtavLaunchError(null);
-        setTtavLaunchStatus('纯 CE 续训小集 → 当前 test greedy 生成…');
+        setTtavLaunchStatus(
+            `纯 CE 续训小集 → 当前 test greedy 生成…（起点 ${continueAdapterFamily === 'ce' ? 'EIF_ADAPTER_PATH_CE' : 'EIF_ADAPTER_PATH_SALIENCY'}）`,
+        );
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
@@ -4254,6 +4310,7 @@ export function ReportPanel({
                         evalBefore: false,
                         evalAfterFull: false,
                         currentTest: continueCurrentTestPayload ?? undefined,
+                        ...continueAdapterPayload(continueAdapterFamily, meta.fileName),
                     }),
                 });
                 const raw = await resp.text();
@@ -4314,6 +4371,8 @@ export function ReportPanel({
         continueStepsDefault,
         eifApiUrl,
         continueCurrentTestPayload,
+        continueAdapterFamily,
+        meta.fileName,
         pollContinueJob,
         refreshTokenProbs,
         refreshSaliencyPanels,
@@ -4332,6 +4391,7 @@ export function ReportPanel({
                     body: JSON.stringify({
                         mode: 'compare',
                         evalBefore: true,
+                        ...continueAdapterPayload(continueAdapterFamily, meta.fileName),
                     }),
                 });
                 const raw = await resp.text();
@@ -4384,7 +4444,7 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueAdapterActive, eifApiUrl, pollContinueJob]);
+    }, [importedReportActive, continueAdapterActive, eifApiUrl, pollContinueJob, continueAdapterFamily, meta.fileName]);
 
     const handleContinueAdapterRecover = useCallback(() => {
         if (importedReportActive) return;
@@ -5248,8 +5308,14 @@ export function ReportPanel({
                                                 }}
                                             />
                                         </label>
-                                        <span style={{ color: '#94a3b8', fontSize: 11 }}>
+                                        <span style={{ color: '#94a3b8', fontSize: 11 }} title={continueStartAdapterPath || undefined}>
                                             当前 steps {continueStepsInput} · default {continueStepsDefault}
+                                            {' · 起点 '}
+                                            {continueAdapterFamily === 'ce'
+                                                ? 'CE adapter'
+                                                : continueAdapterFamily === 'saliency'
+                                                    ? 'saliency adapter'
+                                                    : '未知（需 ce/ 或 saliency/ 路径）'}
                                         </span>
                                         <button
                                             type="button"

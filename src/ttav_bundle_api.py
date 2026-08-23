@@ -575,9 +575,15 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "success", **get_active_adapter_status()})
             return
         if parsed.path == "/api/continue-train-eval-defaults":
+            qs = parse_qs(parsed.query)
+            report_file = (qs.get("reportFileName") or [""])[0].strip() or None
+            report_family = (qs.get("reportFamily") or [""])[0].strip() or None
             self._send_json(200, {
                 "status": "success",
-                "defaults": default_paths_from_env(),
+                "defaults": default_paths_from_env(
+                    report_file_name=report_file,
+                    report_family=report_family,
+                ),
             })
             return
         if parsed.path != "/api/prepare-ttav-bundle-status":
@@ -832,6 +838,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             error=False,
             config={
                 "adapterPath": cfg.adapter_path,
+                "adapterFamily": cfg.adapter_family,
                 "trainData": cfg.train_data,
                 "trainSampleIds": cfg.train_sample_ids,
                 "sourceTrainData": cfg.source_train_data,
@@ -857,6 +864,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "message": "Continue-train job started (small subset + line_hit)",
             "config": {
                 "adapterPath": cfg.adapter_path,
+                "adapterFamily": cfg.adapter_family,
                 "trainData": cfg.train_data,
                 "trainSampleIds": cfg.train_sample_ids,
                 "testData": cfg.test_data,

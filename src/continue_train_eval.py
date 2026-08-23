@@ -63,6 +63,7 @@ class ContinueTrainConfig:
     max_steps: int = 20
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
+    adapter_family: str = "unknown"  # ce | saliency | unknown
     eval_before: bool = True
     # Full EIF_TEST_DATA line_hit after train (off when only predicting current test).
     eval_after_full: bool = True
@@ -96,9 +97,58 @@ def _resolve_path(raw: str | None) -> str | None:
     return str(p.resolve())
 
 
-def default_paths_from_env() -> dict[str, Any]:
-    from src.eif_adapter_env import adapter_path_for_family
+def _normalize_adapter_family(raw: str | None) -> str:
+    s = str(raw or "").strip().lower()
+    if s in ("ce", "ce_only"):
+        return "ce"
+    if s in ("saliency", "ce_saliency", "sal"):
+        return "saliency"
+    return ""
 
+
+def resolve_continue_start_adapter(
+    *,
+    adapter_path: str | None = None,
+    report_family: str | None = None,
+    report_file_name: str | None = None,
+) -> tuple[str, str]:
+    """Pick the LoRA dir to continue FROM (env CE/saliency pin, not live override).
+
+    Returns ``(resolved_path, family)`` where family is ce|saliency|unknown.
+    """
+    from src.eif_adapter_env import env_adapter_path_for_family, infer_report_family
+
+    explicit = str(adapter_path or "").strip()
+    if explicit:
+        family = _normalize_adapter_family(report_family)
+        if not family:
+            family = infer_report_family(report_file_name or "")
+        return _resolve_path(explicit), family if family in ("ce", "saliency") else "unknown"
+
+    family = _normalize_adapter_family(report_family)
+    if family not in ("ce", "saliency"):
+        family = infer_report_family(report_file_name or "")
+    if family in ("ce", "saliency"):
+        path = env_adapter_path_for_family(family)
+        if path:
+            return _resolve_path(path), family
+        raise ValueError(
+            f"No adapter for report family {family!r}. "
+            f"Set EIF_ADAPTER_PATH_{'CE' if family == 'ce' else 'SALIENCY'} in eif_api.env."
+        )
+    # CLI / unknown report: keep historical saliency fallback.
+    fallback = (
+        env_adapter_path_for_family("saliency")
+        or (os.environ.get("EIF_ADAPTER_PATH") or "").strip()
+    )
+    return _resolve_path(fallback), "unknown"
+
+
+def default_paths_from_env(
+    *,
+    report_file_name: str | None = None,
+    report_family: str | None = None,
+) -> dict[str, Any]:
     # Small subset only — do NOT fall back to full EIF_TRAIN_DATA.
     continue_train = (os.environ.get("ANNOTATION_CONTINUE_TRAIN_DATA") or "").strip()
     source_train = (
@@ -113,10 +163,9 @@ def default_paths_from_env() -> dict[str, Any]:
     out = (os.environ.get("EIF_CONTINUE_OUTPUT_DIR") or "").strip() or str(
         REPO_ROOT / "outputs" / "continue_trial"
     )
-    adapter = (
-        (os.environ.get("EIF_ADAPTER_PATH_SALIENCY") or "").strip()
-        or adapter_path_for_family("saliency")
-        or (os.environ.get("EIF_ADAPTER_PATH") or "").strip()
+    adapter, family = resolve_continue_start_adapter(
+        report_family=report_family,
+        report_file_name=report_file_name,
     )
     base = base_model_path_from_env() or (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip() or None
 
@@ -139,7 +188,8 @@ def default_paths_from_env() -> dict[str, Any]:
         return 2e-5
 
     return {
-        "adapter_path": _resolve_path(adapter),
+        "adapter_path": adapter,
+        "adapter_family": family,
         "base_model_path": _resolve_path(base) if base else None,
         "continue_train_data": _resolve_path(continue_train),
         "source_train_data": _resolve_path(source_train),
@@ -1472,8 +1522,22 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
 
 def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrainConfig:
     req = req or {}
-    defaults = default_paths_from_env()
-    adapter = _resolve_path(req.get("adapterPath") or defaults["adapter_path"])
+    defaults = default_paths_from_env(
+        report_file_name=str(req.get("reportFileName") or req.get("report_file") or "") or None,
+        report_family=str(req.get("reportFamily") or req.get("adapterFamily") or "") or None,
+    )
+    adapter, family = resolve_continue_start_adapter(
+        adapter_path=str(req.get("adapterPath") or "") or None,
+        report_family=str(req.get("reportFamily") or req.get("adapterFamily") or "") or None,
+        report_file_name=str(req.get("reportFileName") or req.get("report_file") or "") or None,
+    )
+    if not adapter:
+        adapter = defaults["adapter_path"]
+        family = str(defaults.get("adapter_family") or family)
+    print(
+        f"[continue-train] start adapter family={family} path={adapter}",
+        flush=True,
+    )
     base = _resolve_path(req.get("baseModelPath") or defaults["base_model_path"])
     # Prefer explicit small subset path; do not default to full EIF_TRAIN_DATA.
     train = _resolve_path(req.get("trainData") or defaults["continue_train_data"])
@@ -1494,7 +1558,10 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
                 pass
 
     if not adapter:
-        raise ValueError("adapterPath / EIF_ADAPTER_PATH_SALIENCY is required")
+        raise ValueError(
+            "adapterPath required: pass reportFamily=ce|saliency (from opened report) "
+            "or set EIF_ADAPTER_PATH_CE / EIF_ADAPTER_PATH_SALIENCY"
+        )
     if not test:
         raise ValueError("testData / EIF_TEST_DATA is required")
     if not train and not train_ids:
@@ -1526,6 +1593,7 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         max_steps=max(1, int(req.get("maxSteps", _default_max_steps()))),
         learning_rate=float(req.get("learningRate", 2e-5)),
         loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
+        adapter_family=family if family in ("ce", "saliency") else "unknown",
         eval_before=bool(req.get("evalBefore", True)),
         eval_after_full=bool(req.get("evalAfterFull", True)),
         current_test_task_id=ct_task,
