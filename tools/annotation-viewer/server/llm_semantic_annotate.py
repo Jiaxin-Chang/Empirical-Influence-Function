@@ -61,20 +61,34 @@ def _answer_indices(labels: list[int], answer_start: int) -> list[int]:
 
 
 def _extract_fim_view(prompt: str, response: str) -> dict[str, str]:
-    """Best-effort FIM decomposition for the LLM prompt."""
+    """Best-effort FIM decomposition for the LLM prompt.
+
+    Supports both common layouts:
+      ``<PRE> prefix <SUF> suffix <MID>``  (Code Llama / many jsonl dumps)
+      ``<PRE> prefix <MID> hole <SUF> suffix``
+    """
     p = str(prompt or "")
     r = str(response or "")
-    pre = suf = ""
-    if FIM_PRE in p and FIM_MID in p:
+    pre = suf = hole = ""
+    if FIM_PRE in p:
         after_pre = p.split(FIM_PRE, 1)[1]
-        if FIM_SUF in after_pre:
-            pre, rest = after_pre.split(FIM_MID, 1)
-            mid_suf, suf = rest.split(FIM_SUF, 1)
-            hole = mid_suf
-        else:
+        i_suf = after_pre.find(FIM_SUF)
+        i_mid = after_pre.find(FIM_MID)
+        if i_suf >= 0 and i_mid >= 0:
+            if i_mid < i_suf:
+                pre, rest = after_pre.split(FIM_MID, 1)
+                parts = rest.split(FIM_SUF, 1)
+                hole = parts[0]
+                suf = parts[1] if len(parts) > 1 else ""
+            else:
+                pre, rest = after_pre.split(FIM_SUF, 1)
+                parts = rest.split(FIM_MID, 1)
+                suf = parts[0]
+                hole = parts[1] if len(parts) > 1 else ""
+        elif i_mid >= 0:
             pre, hole = after_pre.split(FIM_MID, 1)
-    else:
-        hole = ""
+        elif i_suf >= 0:
+            pre, suf = after_pre.split(FIM_SUF, 1)
     return {
         "prefix": pre.strip(),
         "suffix": suf.strip(),
