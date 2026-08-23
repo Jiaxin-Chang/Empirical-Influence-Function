@@ -3,7 +3,7 @@
 Interactive loop intent:
   1) put newly annotated samples into ANNOTATION_CONTINUE_TRAIN_DATA
      (NOT the full original train set)
-  2) continue-train a few epochs (shuffle each epoch) from the report-family adapter
+  2) continue-train a few AdamW steps from the report-family adapter
   3) re-score EIF_TEST_DATA with line_hit_pre / line_hit_rec (same math as
      AI4Go ``hw_test_data/eval_gold_strip_three_models.py``)
 
@@ -21,7 +21,7 @@ CLI:
     --adapter-path $EIF_ADAPTER_PATH_SALIENCY \\
     --continue-train-data path/to/small_annotated.jsonl \\
     --test-data path/to/test.jsonl \\
-    --epochs 2 --lr 2e-5
+    --max-steps 20 --lr 2e-5
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -61,7 +60,7 @@ class ContinueTrainConfig:
     train_data: str  # small annotated subset only
     test_data: str
     output_dir: str
-    max_epochs: int = 2
+    max_steps: int = 20
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
     adapter_family: str = "unknown"  # ce | saliency | unknown
@@ -170,14 +169,14 @@ def default_paths_from_env(
     )
     base = base_model_path_from_env() or (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip() or None
 
-    def _max_epochs_default() -> int:
-        raw = (os.environ.get("EIF_CONTINUE_EPOCHS") or "").strip()
+    def _max_steps_default() -> int:
+        raw = (os.environ.get("EIF_CONTINUE_MAX_STEPS") or "").strip()
         if raw:
             try:
                 return max(1, int(raw))
             except ValueError:
                 pass
-        return 2
+        return 20
 
     def _lr_default() -> float:
         raw = (os.environ.get("EIF_CONTINUE_LR") or "").strip()
@@ -197,7 +196,7 @@ def default_paths_from_env(
         "test_data": _resolve_path(test),
         "eval_before_cache": _resolve_path(eval_before_cache),
         "output_dir": _resolve_path(out) or str(REPO_ROOT / "outputs" / "continue_trial"),
-        "max_epochs": _max_epochs_default(),
+        "max_steps": _max_steps_default(),
         "learning_rate": _lr_default(),
     }
 
@@ -495,76 +494,70 @@ def run_continue_training(
 
     losses: list[float] = []
     t0 = time.time()
-    n_epochs = max(1, int(cfg.max_epochs))
-    planned_updates = n_epochs * n_train
-    rng = random.Random(int(cfg.seed))
-    step = 0
+    n_steps = max(1, int(cfg.max_steps))
     first_opt = True
     print(
-        f"[continue-train] {n_epochs} epoch(s) × {n_train} samples "
-        f"(shuffle each epoch, seed={cfg.seed})",
+        f"[continue-train] {n_steps} step(s) over {n_train} samples "
+        f"(cycle with step % n)",
         flush=True,
     )
-    for epoch in range(1, n_epochs + 1):
-        order = list(range(n_train))
-        rng.shuffle(order)
-        for sample_i, idx in enumerate(order, start=1):
-            sample = train_samples[idx]
-            batch, edges = _sample_batch(
-                sample, tokenizer, device, max_seq_len=max_seq,
-            )
-            seq_len = int(batch["input_ids"].size(1))
-            opt.zero_grad(set_to_none=True)
-            if first_opt and torch.cuda.is_available():
+    completed = 0
+    for step in range(1, n_steps + 1):
+        sample = train_samples[(step - 1) % n_train]
+        batch, edges = _sample_batch(
+            sample, tokenizer, device, max_seq_len=max_seq,
+        )
+        seq_len = int(batch["input_ids"].size(1))
+        opt.zero_grad(set_to_none=True)
+        if first_opt and torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        loss, mode_used = compute_bank_loss(
+            model,
+            batch,
+            device=device,
+            cfg=bank_cfg,
+            edges=edges,
+            special_ids=special_ids,
+        )
+        if loss is None:
+            del batch
+            continue
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        first_opt = False
+        loss_v = float(loss.detach().float().cpu())
+        losses.append(loss_v)
+        completed = step
+        if progress_cb is not None:
+            progress_cb(step, n_steps, loss_v, mode_used)
+        log_every = 1 if n_steps <= 20 else 10
+        if step == 1 or step % log_every == 0 or step == n_steps:
+            mem_note = ""
+            if torch.cuda.is_available():
                 try:
-                    torch.cuda.reset_peak_memory_stats()
+                    peak = torch.cuda.max_memory_allocated() / 1e9
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    mem_note = f" peak={peak:.1f}G free={free_b/1e9:.1f}/{total_b/1e9:.1f}G"
                 except Exception:
                     pass
-            loss, mode_used = compute_bank_loss(
-                model,
-                batch,
-                device=device,
-                cfg=bank_cfg,
-                edges=edges,
-                special_ids=special_ids,
+            print(
+                f"[continue-train] step {step}/{n_steps} "
+                f"sample={(step - 1) % n_train} "
+                f"loss={loss_v:.4f} mode={mode_used} seq={seq_len}"
+                f"{mem_note}",
+                flush=True,
             )
-            if loss is None:
-                del batch
-                continue
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            opt.step()
-            first_opt = False
-            loss_v = float(loss.detach().float().cpu())
-            losses.append(loss_v)
-            step += 1
-            if progress_cb is not None:
-                progress_cb(step, planned_updates, loss_v, mode_used)
-            log_every = 1 if n_train <= 8 else 10
-            if step == 1 or step % log_every == 0 or sample_i == n_train:
-                mem_note = ""
-                if torch.cuda.is_available():
-                    try:
-                        peak = torch.cuda.max_memory_allocated() / 1e9
-                        free_b, total_b = torch.cuda.mem_get_info()
-                        mem_note = f" peak={peak:.1f}G free={free_b/1e9:.1f}/{total_b/1e9:.1f}G"
-                    except Exception:
-                        pass
-                print(
-                    f"[continue-train] epoch {epoch}/{n_epochs} "
-                    f"sample {sample_i}/{n_train} opt_step={step} "
-                    f"loss={loss_v:.4f} mode={mode_used} seq={seq_len}"
-                    f"{mem_note}",
-                    flush=True,
-                )
-            del batch, loss
-            if step % 20 == 0:
-                _release_cuda()
+        del batch, loss
+        if step % 20 == 0:
+            _release_cuda()
 
     model.eval()
     return {
-        "epochs": n_epochs,
-        "steps": step,
+        "steps": completed,
         "meanLoss": float(sum(losses) / max(1, len(losses))),
         "lastLoss": float(losses[-1]) if losses else None,
         "elapsedSec": round(time.time() - t0, 2),
@@ -1266,7 +1259,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
     print(
         f"[continue-train] subset_size={len(train_samples)} "
         f"(with_edges={n_edges}/{len(train_samples)}) "
-        f"eval_n={len(eval_samples)} epochs={cfg.max_epochs} lr={cfg.learning_rate}",
+        f"eval_n={len(eval_samples)} steps={cfg.max_steps} lr={cfg.learning_rate}",
         flush=True,
     )
     if n_edges == 0 and cfg.loss_mode == "ce_saliency":
@@ -1358,7 +1351,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
 
     _prog(
         "training",
-        f"Continue-training {cfg.max_epochs} epoch(s) on {len(train_samples)} samples…",
+        f"Continue-training {cfg.max_steps} step(s) on {len(train_samples)} samples…",
     )
     if train_samples:
         try:
@@ -1590,7 +1583,9 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
             "or pass trainSampleIds (will slice from EIF_TRAIN_DATA)."
         )
 
-    raw_epochs = req.get("maxEpochs", req.get("epochs", defaults["max_epochs"]))
+    raw_steps = req.get("maxSteps", req.get("max_steps"))
+    if raw_steps is None:
+        raw_steps = req.get("maxEpochs", req.get("epochs", defaults["max_steps"]))
 
     ct = req.get("currentTest") if isinstance(req.get("currentTest"), dict) else {}
     ct_task = str(ct.get("taskId") or ct.get("task_id") or "").strip() or None
@@ -1603,7 +1598,7 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         train_data=train or "",
         test_data=test,
         output_dir=out or str(REPO_ROOT / "outputs" / "continue_trial"),
-        max_epochs=max(1, int(raw_epochs)),
+        max_steps=max(1, int(raw_steps)),
         learning_rate=float(req.get("learningRate", 2e-5)),
         loss_mode=str(req.get("lossMode", "ce_saliency") or "ce_saliency").strip().lower(),
         adapter_family=family if family in ("ce", "saliency") else "unknown",
@@ -1644,8 +1639,8 @@ def main():
         help="Precomputed baseline line_hit JSONL (EIF_CONTINUE_EVAL_BEFORE_CACHE); skips GPU eval_before",
     )
     p.add_argument("--output-dir", default=defaults["output_dir"])
-    p.add_argument("--epochs", type=int, default=int(defaults.get("max_epochs") or 2),
-                   help="Full passes over the continue-train subset (shuffle each epoch)")
+    p.add_argument("--max-steps", type=int, default=int(defaults.get("max_steps") or 20),
+                   help="AdamW updates; cycles the continue-train subset with step % n")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--loss-mode", default="ce_saliency", choices=["ce_only", "ce_saliency"])
     p.add_argument("--no-eval-before", action="store_true")
@@ -1669,7 +1664,7 @@ def main():
         train_data=str(args.continue_train_data or ""),
         test_data=str(args.test_data or ""),
         output_dir=str(args.output_dir or ""),
-        max_epochs=args.epochs,
+        max_steps=args.max_steps,
         learning_rate=args.lr,
         loss_mode=args.loss_mode,
         eval_before=not args.no_eval_before,
