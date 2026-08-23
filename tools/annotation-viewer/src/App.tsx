@@ -630,6 +630,28 @@ export default function App() {
     }
   }
 
+  const clearCorpusAnnotations = async () => {
+    if (!corpusMode || corpusLine == null) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await api.clearCorpusDisplay(corpusLine, corpusOpts)
+      setSample(res.sample)
+      setGsPreviewId(null)
+      setLlmSemPreviewId(null)
+      setTarget(null)
+      setFocusSource(null)
+      setSaliency([])
+      setPendingEdge(null)
+      setAddSrc(null)
+      setStatus(res.message || `已清空 L${corpusLine} 显示标注（续训文件未改）`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const duplicateToContinue = async () => {
     if (!sample || selectedIdx == null) return
     const nCont = sample.n_continue_edges ?? 0
@@ -1032,6 +1054,23 @@ export default function App() {
                         </>
                       )}
                     </div>
+                  </div>
+                )}
+
+                {corpusMode && (
+                  <div className="card">
+                    <h3>清空当前标注</h3>
+                    <p className="hint" style={{ marginBottom: 8 }}>
+                      只清掉本页显示的边，不删除续训 JSONL 里已有行。之后再添加 / 接受标注会在文件末尾追加一条新记录。
+                    </p>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={busy || gsBusy || llmSemBusy}
+                      onClick={() => void clearCorpusAnnotations()}
+                    >
+                      一键清空当前标注
+                    </button>
                   </div>
                 )}
 

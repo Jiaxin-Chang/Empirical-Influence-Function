@@ -2,7 +2,55 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 DEFAULT_SYSTEM = "You are a helpful assistant."
+
+
+def _as_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def extract_prompt_response(row: dict[str, Any]) -> tuple[str, str]:
+    """Best-effort prompt/completion from raw corpus / ChatML / FIM rows."""
+    prompt = (
+        _as_text(row.get("prompt"))
+        or _as_text(row.get("input"))
+        or _as_text(row.get("instruction"))
+        or _as_text(row.get("user"))
+    )
+    response = (
+        _as_text(row.get("response"))
+        or _as_text(row.get("output"))
+        or _as_text(row.get("completion"))
+        or _as_text(row.get("target"))
+        or _as_text(row.get("fim_completion"))
+        or _as_text(row.get("gold"))
+        or _as_text(row.get("answer"))
+        or _as_text(row.get("canonical_solution"))
+        or _as_text(row.get("mid"))
+        or _as_text(row.get("code"))
+    )
+    # Compact rows store token ids in ``label``; only use it when it is text.
+    if not response:
+        response = _as_text(row.get("label"))
+    resp_list = row.get("responses")
+    if not response and isinstance(resp_list, list) and resp_list:
+        response = _as_text(resp_list[0])
+
+    for msg in row.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "")
+        content = _as_text(msg.get("content"))
+        if not prompt and role == "user":
+            prompt = content
+        if not response and role == "assistant":
+            response = content
+
+    return prompt, response
 
 
 def encode_prompt_response(

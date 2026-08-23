@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -154,6 +154,8 @@ _gs_preview_cache: dict[str, dict[str, Any]] = {}
 _GS_PREVIEW_CACHE_MAX = 32
 _GS_PREVIEW_TTL_SEC = 3600
 _llm_sem_preview_cache: dict[str, dict[str, Any]] = {}
+# Corpus lines whose display was cleared: skip continue overlay; next persist appends.
+_corpus_skip_overlay: set[int] = set()
 
 
 def _disk_saliency_path(idx: int) -> Path | None:
@@ -472,7 +474,7 @@ def _compose_display_obj(
     return merged
 
 
-def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
+def _upsert_continue(source_idx: int, obj: dict[str, Any], *, force_insert: bool = False) -> dict[str, Any]:
     """Write edited sample into the continue subset (insert or replace by key)."""
     global _continue_offsets
     path = _ensure_continue_path()
@@ -487,12 +489,13 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
             obj["source_train_path"] = str(_data_path)
     keys = _sample_keys(obj, source_idx)
     existing: int | None = None
-    for k in keys:
-        if k in _continue_key_to_idx:
-            existing = _continue_key_to_idx[k]
-            break
+    if not force_insert:
+        for k in keys:
+            if k in _continue_key_to_idx:
+                existing = _continue_key_to_idx[k]
+                break
 
-    if existing is None:
+    if existing is None or force_insert:
         _continue_offsets = _append_jsonl_line(path, obj)
         cont_idx = max(0, len(_continue_offsets) - 2)
         action = "inserted"
@@ -598,14 +601,24 @@ def _write_continue_payload(
     corpus_line: int | None = None,
 ) -> dict[str, Any]:
     """Persist continue row: attention_edges = continue-only; viz_* = display."""
+    force_insert = False
+    uid_override = None
+    if corpus_line is not None and int(corpus_line) in _corpus_skip_overlay:
+        force_insert = True
+        base_uid = str(source.get("uid") or source.get("task_id") or f"corpus_line_{corpus_line}")
+        uid_override = f"{base_uid}::new{uuid.uuid4().hex[:8]}"
     obj = _build_continue_row(
         source_idx,
         source,
         viz_edges=viz_edges,
         continue_edges=continue_edges,
         corpus_line=corpus_line,
+        uid_override=uid_override,
     )
-    return _upsert_continue(source_idx, obj)
+    persist = _upsert_continue(source_idx, obj, force_insert=force_insert)
+    if force_insert and corpus_line is not None:
+        _corpus_skip_overlay.discard(int(corpus_line))
+    return persist
 
 
 def _current_viz_and_continue(idx: int) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -665,15 +678,9 @@ def _read_corpus_raw_row(line: int, *, corpus_path: str | None = None) -> dict[s
 
 
 def _encode_corpus_row(line: int, raw_row: dict[str, Any]) -> dict[str, Any]:
-    from server.corpus_encode import encode_prompt_response
+    from server.corpus_encode import encode_prompt_response, extract_prompt_response
 
-    prompt = str(raw_row.get("prompt") or raw_row.get("input") or "")
-    response = str(
-        raw_row.get("response")
-        or raw_row.get("label")
-        or raw_row.get("output")
-        or ""
-    )
+    prompt, response = extract_prompt_response(raw_row)
     if not prompt.strip():
         raise HTTPException(400, f"corpus line {line} missing prompt/input text")
     input_ids, labels = encode_prompt_response(_get_tokenizer(), prompt, response)
@@ -701,6 +708,9 @@ def _effective_corpus_sample(line: int, *, corpus_path: str | None = None) -> tu
     raw_row = _read_corpus_raw_row(line, corpus_path=corpus_path)
     source = _encode_corpus_row(line, raw_row)
     key, cont_idx = _lookup_continue(-1, source)
+    if int(line) in _corpus_skip_overlay:
+        obj = _compose_display_obj(source, None, from_continue=False)
+        return obj, False, key
     if cont_idx is None:
         obj = _compose_display_obj(source, None, from_continue=False)
         return obj, False, key
@@ -718,7 +728,7 @@ def _current_viz_and_continue_corpus(
     source = _encode_corpus_row(line, raw_row)
     key, cont_idx = _lookup_continue(-1, source)
     del key
-    if cont_idx is None:
+    if int(line) in _corpus_skip_overlay or cont_idx is None:
         return source, [], []
     overlay = _read_continue_by_idx(cont_idx)
     viz, cont = _viz_and_continue_from_overlay(source, overlay)
@@ -947,6 +957,9 @@ class LlmSemanticAnnotateBody(BaseModel):
     max_sources_per_token: int | None = Field(None, ge=1, le=15)
     max_answer_tokens: int | None = Field(None, ge=1, le=256)
 
+    class Config:
+        extra = "ignore"
+
 
 def _duplicate_continue_rows(
     source: dict[str, Any],
@@ -1097,6 +1110,33 @@ def get_corpus_sample(line: int, corpusPath: str = ""):
     with _state_lock:
         obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
     return _sample_detail_from_obj(line, obj, from_continue=from_continue, key=key)
+
+
+@app.post("/api/corpus/sample/{line}/clear-display")
+def clear_corpus_display(line: int, corpusPath: str = ""):
+    """Clear on-screen edges only. Does not delete existing continue JSONL rows.
+
+    The next add/accept for this line appends a new continue row on top of the file.
+    """
+    override = corpusPath.strip() or None
+    with _state_lock:
+        _corpus_skip_overlay.add(int(line))
+        for cache in (_gs_preview_cache, _llm_sem_preview_cache):
+            dead = [pid for pid, ent in cache.items() if int(ent.get("line", -1)) == int(line)]
+            for pid in dead:
+                cache.pop(pid, None)
+        obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
+        sample = _sample_detail_from_obj(-1, obj, from_continue=from_continue, key=key)
+    print(
+        f"[corpus] clear-display line={line} (continue JSONL unchanged; next persist appends)",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "sample": sample,
+        "n_continue_edges": 0,
+        "message": "已清空当前显示标注；续训文件未改。之后新增的边会追加一条新记录。",
+    }
 
 
 @app.post("/api/corpus/sample/{line}/edges/delete")
@@ -1595,28 +1635,44 @@ def _build_llm_semantic_annotated_source(
 
 
 @app.post("/api/corpus/sample/{line}/llm-semantic-annotate/preview")
-def llm_semantic_annotate_preview(line: int, body: LlmSemanticAnnotateBody, corpusPath: str = ""):
+def llm_semantic_annotate_preview(
+    line: int,
+    body: LlmSemanticAnnotateBody | None = None,
+    corpusPath: str = Query(""),
+):
     """Per-token LLM attention-routing annotation; preview only."""
     override = corpusPath.strip() or None
+    payload = body or LlmSemanticAnnotateBody()
+    from server.corpus_encode import extract_prompt_response
     from server.llm_semantic_annotate import annotate_corpus_row_semantic
 
     with _state_lock:
         raw_row = _read_corpus_raw_row(line, corpus_path=override)
         source_enc = _encode_corpus_row(line, raw_row)
         key, _ = _lookup_continue(-1, source_enc)
-        try:
-            annotated = annotate_corpus_row_semantic(
-                raw_row,
-                _get_tokenizer(),
-                max_sources_per_token=body.max_sources_per_token,
-                max_answer_tokens=body.max_answer_tokens,
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        except Exception as exc:
-            print(f"[llm-semantic] FAIL corpus line={line}: {exc}", flush=True)
-            raise HTTPException(502, f"LLM semantic annotate failed: {exc}") from exc
+        tokenizer = _get_tokenizer()
+    prompt, response = extract_prompt_response(raw_row)
+    print(
+        f"[llm-semantic] preview start line={line} "
+        f"prompt_chars={len(prompt)} response_chars={len(response)} "
+        f"keys={sorted(str(k) for k in raw_row.keys())[:24]}",
+        flush=True,
+    )
+    try:
+        annotated = annotate_corpus_row_semantic(
+            raw_row,
+            tokenizer,
+            max_sources_per_token=payload.max_sources_per_token,
+            max_answer_tokens=payload.max_answer_tokens,
+        )
+    except ValueError as exc:
+        print(f"[llm-semantic] FAIL corpus line={line}: {exc}", flush=True)
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        print(f"[llm-semantic] FAIL corpus line={line}: {exc}", flush=True)
+        raise HTTPException(502, f"LLM semantic annotate failed: {exc}") from exc
 
+    with _state_lock:
         annotated_source = _build_llm_semantic_annotated_source(line, raw_row, annotated)
         preview_id = uuid.uuid4().hex
         _prune_llm_sem_preview_cache()

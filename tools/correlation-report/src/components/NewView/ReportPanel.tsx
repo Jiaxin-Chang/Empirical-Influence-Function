@@ -2429,9 +2429,9 @@ export function ReportPanel({
     const [interventionSteps, setInterventionSteps] = useState(0);
     const [pairInterveneLr, setPairInterveneLr] = useState(DEFAULT_PAIR_INTERVENE_LR);
     const [pairInterveneLrInput, setPairInterveneLrInput] = useState(String(DEFAULT_PAIR_INTERVENE_LR));
-    const [continueStepsInput, setContinueStepsInput] = useState('20');
+    const [continueEpochsInput, setContinueEpochsInput] = useState('2');
     const [continueLrInput, setContinueLrInput] = useState('2e-5');
-    const [continueStepsDefault, setContinueStepsDefault] = useState(20);
+    const [continueEpochsDefault, setContinueEpochsDefault] = useState(2);
     const [continueLrDefault, setContinueLrDefault] = useState('2e-5');
     const [continueStartAdapterPath, setContinueStartAdapterPath] = useState<string | null>(null);
     const [continueBusy, setContinueBusy] = useState(false);
@@ -2597,7 +2597,7 @@ export function ReportPanel({
         } satisfies TtavLaunchPrefs));
     }, [ttavUrl, ttavContentPathTemplate, eifBundleCacheTemplate, ttavVisMethod, ttavVisId, eifApiUrl, visualizerMode]);
 
-    // Sync Continue train steps/lr defaults from eif_api.env (EIF_CONTINUE_MAX_STEPS).
+    // Sync Continue train epochs/lr defaults from eif_api.env (EIF_CONTINUE_EPOCHS).
     useEffect(() => {
         let cancelled = false;
         void (async () => {
@@ -2613,6 +2613,7 @@ export function ReportPanel({
                 const data = await resp.json() as {
                     status?: string;
                     defaults?: {
+                        max_epochs?: number;
                         max_steps?: number;
                         learning_rate?: number;
                         adapter_path?: string;
@@ -2623,11 +2624,13 @@ export function ReportPanel({
                 if (typeof data.defaults.adapter_path === 'string' && data.defaults.adapter_path.trim()) {
                     setContinueStartAdapterPath(data.defaults.adapter_path.trim());
                 }
-                const steps = Number(data.defaults.max_steps);
-                if (Number.isFinite(steps) && steps >= 1) {
-                    const s = String(Math.floor(steps));
-                    setContinueStepsDefault(Math.floor(steps));
-                    setContinueStepsInput(prev => (prev === '50' || prev === '20' ? s : prev));
+                const epochs = Number(data.defaults.max_epochs ?? data.defaults.max_steps);
+                if (Number.isFinite(epochs) && epochs >= 1) {
+                    const s = String(Math.floor(epochs));
+                    setContinueEpochsDefault(Math.floor(epochs));
+                    setContinueEpochsInput(prev => (
+                        prev === '50' || prev === '20' || prev === '2' ? s : prev
+                    ));
                 }
                 const lr = Number(data.defaults.learning_rate);
                 if (Number.isFinite(lr) && lr > 0) {
@@ -4178,9 +4181,9 @@ export function ReportPanel({
             setTtavLaunchError('无法从当前 report 路径判断 CE/saliency adapter（需要 ce/*.json 或 saliency/*.json）');
             return;
         }
-        const maxSteps = Math.max(
+        const maxEpochs = Math.max(
             1,
-            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+            Math.floor(Number(continueEpochsInput)) || continueEpochsDefault || 2,
         );
         const learningRate = Number(continueLrInput);
         if (!Number.isFinite(learningRate) || learningRate <= 0) {
@@ -4201,7 +4204,7 @@ export function ReportPanel({
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         mode: 'train',
-                        maxSteps,
+                        maxEpochs,
                         learningRate,
                         lossMode: 'ce_saliency',
                         evalBefore: false,
@@ -4263,9 +4266,9 @@ export function ReportPanel({
         })();
     }, [
         importedReportActive,
-        continueStepsInput,
+        continueEpochsInput,
         continueLrInput,
-        continueStepsDefault,
+        continueEpochsDefault,
         eifApiUrl,
         continueCurrentTestPayload,
         continueAdapterFamily,
@@ -4281,9 +4284,9 @@ export function ReportPanel({
             setTtavLaunchError('无法从当前 report 路径判断 CE/saliency adapter（需要 ce/*.json 或 saliency/*.json）');
             return;
         }
-        const maxSteps = Math.max(
+        const maxEpochs = Math.max(
             1,
-            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+            Math.floor(Number(continueEpochsInput)) || continueEpochsDefault || 2,
         );
         const learningRate = Number(continueLrInput);
         if (!Number.isFinite(learningRate) || learningRate <= 0) {
@@ -4304,7 +4307,7 @@ export function ReportPanel({
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         mode: 'train',
-                        maxSteps,
+                        maxEpochs,
                         learningRate,
                         lossMode: 'ce_only',
                         evalBefore: false,
@@ -4366,9 +4369,9 @@ export function ReportPanel({
         })();
     }, [
         importedReportActive,
-        continueStepsInput,
+        continueEpochsInput,
         continueLrInput,
-        continueStepsDefault,
+        continueEpochsDefault,
         eifApiUrl,
         continueCurrentTestPayload,
         continueAdapterFamily,
@@ -5272,14 +5275,14 @@ export function ReportPanel({
                                     }}>
                                         <span style={{ fontWeight: 700 }}>Continue train</span>
                                         <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                                            steps
+                                            轮次
                                             <input
                                                 type="number"
                                                 min={1}
-                                                value={continueStepsInput}
+                                                value={continueEpochsInput}
                                                 disabled={continueBusy}
-                                                onChange={(e) => setContinueStepsInput(e.target.value)}
-                                                title={`Default from EIF_CONTINUE_MAX_STEPS (eif_api.env): ${continueStepsDefault}`}
+                                                onChange={(e) => setContinueEpochsInput(e.target.value)}
+                                                title={`每个 epoch 打乱后过一遍续训小集。Default from EIF_CONTINUE_EPOCHS: ${continueEpochsDefault}`}
                                                 style={{
                                                     width: 56,
                                                     padding: '2px 6px',
@@ -5309,7 +5312,7 @@ export function ReportPanel({
                                             />
                                         </label>
                                         <span style={{ color: '#94a3b8', fontSize: 11 }} title={continueStartAdapterPath || undefined}>
-                                            当前 steps {continueStepsInput} · default {continueStepsDefault}
+                                            当前 {continueEpochsInput} 轮 · default {continueEpochsDefault}
                                             {' · 起点 '}
                                             {continueAdapterFamily === 'ce'
                                                 ? 'CE adapter'

@@ -80,6 +80,14 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
     try {
       const body = await res.json()
       detail = body.detail || JSON.stringify(body)
+      if (Array.isArray(detail)) {
+        detail = detail
+          .map((item: { loc?: unknown; msg?: string }) => {
+            const loc = Array.isArray(item.loc) ? item.loc.join('.') : ''
+            return `${loc} ${item.msg || JSON.stringify(item)}`.trim()
+          })
+          .join('; ')
+      }
     } catch {
       /* ignore */
     }
@@ -314,6 +322,17 @@ export const api = {
     }>(`/api/corpus/sample/${line}/llm-semantic-annotate/reject${corpusQuery(opts?.corpusPath)}`, {
       method: 'POST',
       body: JSON.stringify({ preview_id: previewId }),
+    }),
+
+  clearCorpusDisplay: (line: number, opts?: { corpusPath?: string | null }) =>
+    jsonFetch<{
+      ok: boolean
+      sample: SampleDetail
+      message?: string
+      n_continue_edges?: number
+    }>(`/api/corpus/sample/${line}/clear-display${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
 
   deleteEdge: (idx: number, edge: Edge) =>

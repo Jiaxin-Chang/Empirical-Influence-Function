@@ -21,7 +21,7 @@ from server.auto_annotate import (
     _is_junk_surface,
     _surface,
 )
-from server.corpus_encode import encode_prompt_response
+from server.corpus_encode import encode_prompt_response, extract_prompt_response
 
 FIM_PRE = "<PRE>"
 FIM_SUF = "<SUF>"
@@ -311,17 +311,15 @@ def annotate_corpus_row_semantic(
     max_sources_per_token: int | None = None,
     max_answer_tokens: int | None = None,
 ) -> dict[str, Any]:
-    prompt = str(raw_row.get("prompt") or raw_row.get("input") or "")
-    response = str(
-        raw_row.get("response")
-        or raw_row.get("label")
-        or raw_row.get("output")
-        or ""
-    )
+    prompt, response = extract_prompt_response(raw_row)
     if not prompt.strip():
-        raise ValueError("corpus row missing prompt")
+        raise ValueError("corpus row missing prompt/input text")
     if not response.strip():
-        raise ValueError("corpus row missing response/label")
+        raise ValueError(
+            "corpus row missing completion text "
+            "(expected string fields: response / output / completion / target, "
+            "or messages[].assistant). Token-id `label` lists are not used."
+        )
 
     language = str(raw_row.get("language") or "go")
     max_src = default_max_sources_per_token() if max_sources_per_token is None else max(
