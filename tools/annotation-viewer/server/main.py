@@ -509,15 +509,17 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_continue_payload(
+def _build_continue_row(
     source_idx: int,
     source: dict[str, Any],
     *,
     viz_edges: list[dict[str, Any]],
     continue_edges: list[dict[str, Any]],
     corpus_line: int | None = None,
+    uid_override: str | None = None,
+    duplicate_of: str | None = None,
 ) -> dict[str, Any]:
-    """Persist continue row: attention_edges = continue-only; viz_* = display."""
+    """Build a continue JSONL row (not persisted)."""
     obj = dict(source)
     obj.pop("_continue_edge_count", None)
     obj.pop("_from_continue", None)
@@ -525,6 +527,11 @@ def _write_continue_payload(
         obj["source_corpus_line"] = int(corpus_line)
         if _corpus_path is not None:
             obj["source_corpus_path"] = str(_corpus_path)
+    if uid_override:
+        obj["uid"] = uid_override
+        obj["raw_id"] = uid_override
+    if duplicate_of:
+        obj["duplicate_of"] = duplicate_of
     viz_n = [_normalize_edge(e) for e in viz_edges]
     cont_n = [
         _normalize_edge(e)
@@ -553,6 +560,44 @@ def _write_continue_payload(
     if isinstance(meta, dict):
         meta["continue_attention_edges"] = len(cont_n)
         meta["viz_attention_edges"] = len(viz_n)
+    return obj
+
+
+def _append_continue_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Append one or more rows to continue JSONL (always insert, never upsert)."""
+    global _continue_offsets
+    if not rows:
+        raise HTTPException(400, "no rows to append")
+    path = _ensure_continue_path()
+    for obj in rows:
+        _continue_offsets = _append_jsonl_line(path, obj)
+    _rebuild_continue_index()
+    _saliency_cache.clear()
+    return {
+        "ok": True,
+        "action": "appended",
+        "n_appended": len(rows),
+        "continue_path": str(path),
+        "n_continue": max(0, len(_continue_offsets) - 1),
+    }
+
+
+def _write_continue_payload(
+    source_idx: int,
+    source: dict[str, Any],
+    *,
+    viz_edges: list[dict[str, Any]],
+    continue_edges: list[dict[str, Any]],
+    corpus_line: int | None = None,
+) -> dict[str, Any]:
+    """Persist continue row: attention_edges = continue-only; viz_* = display."""
+    obj = _build_continue_row(
+        source_idx,
+        source,
+        viz_edges=viz_edges,
+        continue_edges=continue_edges,
+        corpus_line=corpus_line,
+    )
     return _upsert_continue(source_idx, obj)
 
 
@@ -873,6 +918,49 @@ class BumpWeightBody(BaseModel):
     delta: float = Field(1.0, description="add this to weight (use -1 to decrease)")
 
 
+class DuplicateContinueBody(BaseModel):
+    copies: int = Field(
+        1,
+        ge=1,
+        le=32,
+        description="number of additional identical rows to append to continue JSONL",
+    )
+
+
+def _duplicate_continue_rows(
+    source: dict[str, Any],
+    viz: list[dict[str, Any]],
+    cont: list[dict[str, Any]],
+    *,
+    copies: int,
+    source_idx: int,
+    corpus_line: int | None = None,
+) -> dict[str, Any]:
+    if not cont:
+        raise HTTPException(
+            400,
+            "no continue-train edges yet — add at least one edge before duplicating",
+        )
+    import uuid
+
+    base_uid = str(source.get("uid") or source.get("task_id") or f"sample_{source_idx}")
+    rows: list[dict[str, Any]] = []
+    for _ in range(int(copies)):
+        uid = f"{base_uid}::dup{uuid.uuid4().hex[:10]}"
+        rows.append(
+            _build_continue_row(
+                source_idx,
+                source,
+                viz_edges=viz,
+                continue_edges=cont,
+                corpus_line=corpus_line,
+                uid_override=uid,
+                duplicate_of=base_uid,
+            )
+        )
+    return _append_continue_rows(rows)
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -1157,6 +1245,35 @@ def get_corpus_saliency(line: int, target: int, top_k: int = 6, corpusPath: str 
     scored.sort(key=lambda x: x[1], reverse=True)
     top = [{"src": i, "score": sc} for i, sc in scored[: max(1, min(top_k, 20))]]
     return {"target": target, "top": top, "available": True, "cached": False, "source": "model"}
+
+
+@app.post("/api/sample/{idx}/continue-duplicate")
+def duplicate_train_continue(idx: int, body: DuplicateContinueBody):
+    if _data_path is None:
+        raise HTTPException(400, "No data file open.")
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue(idx)
+        persist = _duplicate_continue_rows(
+            source, viz, cont, copies=body.copies, source_idx=idx,
+        )
+    return {
+        **persist,
+        "n_continue_edges": len(cont),
+    }
+
+
+@app.post("/api/corpus/sample/{line}/continue-duplicate")
+def duplicate_corpus_continue(line: int, body: DuplicateContinueBody, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        persist = _duplicate_continue_rows(
+            source, viz, cont, copies=body.copies, source_idx=-1, corpus_line=line,
+        )
+    return {
+        **persist,
+        "n_continue_edges": len(cont),
+    }
 
 
 @app.get("/api/sample/{idx}/saliency/{target}")

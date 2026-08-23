@@ -187,6 +187,34 @@ export const api = {
       body: JSON.stringify(edge),
     }),
 
+  duplicateContinue: (idx: number, copies: number) =>
+    jsonFetch<{
+      ok: boolean
+      n_appended?: number
+      n_continue?: number
+      continue_path?: string
+      n_continue_edges?: number
+    }>(`/api/sample/${idx}/continue-duplicate`, {
+      method: 'POST',
+      body: JSON.stringify({ copies }),
+    }),
+
+  duplicateCorpusContinue: (
+    line: number,
+    copies: number,
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      n_appended?: number
+      n_continue?: number
+      continue_path?: string
+      n_continue_edges?: number
+    }>(`/api/corpus/sample/${line}/continue-duplicate${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify({ copies }),
+    }),
+
   deleteEdge: (idx: number, edge: Edge) =>
     jsonFetch<{
       ok: boolean

@@ -51,6 +51,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [listOffset, setListOffset] = useState(0)
   const [jumpIdx, setJumpIdx] = useState('0')
+  const [duplicateCopies, setDuplicateCopies] = useState(2)
   const [queryMode, setQueryMode] = useState('manual')
   /** Probe/test focus surfaces from correlation-report deep link. */
   const [probeSrcToken, setProbeSrcToken] = useState('')
@@ -493,6 +494,38 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sample, selectedIdx, focusSource, target])
 
+  const duplicateToContinue = async () => {
+    if (!sample || selectedIdx == null) return
+    const nCont = sample.n_continue_edges ?? 0
+    if (nCont <= 0) {
+      setError('请先添加至少一条续训边，再复制到续训小集')
+      return
+    }
+    const copies = Math.max(1, Math.min(32, Math.floor(duplicateCopies) || 1))
+    setBusy(true)
+    setError('')
+    try {
+      const res = corpusMode && corpusLine != null
+        ? await api.duplicateCorpusContinue(corpusLine, copies, corpusOpts)
+        : await api.duplicateContinue(selectedIdx, copies)
+      const h = await api.health()
+      setNContinue(h.n_continue ?? 0)
+      setContinuePath(h.continue_path)
+      if (!corpusMode) {
+        await refreshList(query, 0, false)
+      }
+      setStatus(
+        `已追加 ${res.n_appended ?? copies} 条相同样本到续训小集` +
+          `（续训边 ${res.n_continue_edges ?? nCont} 条/样本` +
+          ` · 小集共 ${h.n_continue ?? res.n_continue ?? '?'} 条）`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const underlineStyle = (subtypes: string[]): CSSProperties | undefined => {
     if (!subtypes.length) return undefined
     // CSS can only show one underline color; prefer first, tooltip lists all.
@@ -759,6 +792,42 @@ export default function App() {
               </div>
 
               <div className="sideActions">
+                {continuePath && (
+                  <div className="card">
+                    <h3>续训小集 · 复制样本</h3>
+                    <p className="hint" style={{ marginBottom: 8 }}>
+                      将当前样本（含已保存的续训边）再追加若干条相同记录，用于小集过采样。
+                      {typeof sample.n_continue_edges === 'number' && sample.n_continue_edges > 0
+                        ? ` 当前续训边 ${sample.n_continue_edges} 条。`
+                        : ' 需先添加至少一条续训边。'}
+                    </p>
+                    <div className="addRow">
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        额外副本
+                        <input
+                          type="number"
+                          min={1}
+                          max={32}
+                          value={duplicateCopies}
+                          onChange={ev => setDuplicateCopies(Number(ev.target.value))}
+                          style={{ width: 72 }}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        disabled={
+                          busy
+                          || (sample.n_continue_edges ?? 0) <= 0
+                        }
+                        title="在续训 JSONL 末尾追加 N 条与当前样本相同的 compact 行（新 uid）"
+                        onClick={() => void duplicateToContinue()}
+                      >
+                        追加到续训文件
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {target != null && (
                   <div className="card">
                     <h3>

@@ -5144,7 +5144,7 @@ export function ReportPanel({
                                         {llmTrainResult?.analysis && llmTrainExprsOnly && (
                                             <>
                                                 <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
-                                                    点击表达式 → 在大语料上检索；点击命中行 → 打开手动标注页（无预标注，边写入续训小集）
+                                                    点击表达式 → 在大语料上检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
                                                 </div>
                                                 {(llmTrainResult.analysis.corpus_search_expressions ?? []).length === 0 ? (
                                                     <div style={{ color: '#b45309' }}>
