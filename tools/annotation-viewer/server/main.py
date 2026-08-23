@@ -90,8 +90,20 @@ def _default_continue_path() -> Path | None:
     return _resolve_env_path(raw)
 
 
+def _default_corpus_path() -> Path | None:
+    raw = (
+        os.environ.get("EIF_LLM_TRAIN_CORPUS")
+        or os.environ.get("EIF_TRAIN_CORPUS")
+        or ""
+    ).strip()
+    if not raw:
+        return None
+    return _resolve_env_path(raw)
+
+
 DEFAULT_DATA = _default_data_path()
 DEFAULT_CONTINUE = _default_continue_path()
+DEFAULT_CORPUS = _default_corpus_path()
 # Tokenizer/decode: use base model path (no separate ANNOTATION_TOKENIZER).
 _TOKENIZER_RAW = (os.environ.get("EIF_BASE_MODEL_PATH") or "").strip()
 DEFAULT_TOKENIZER = Path(_TOKENIZER_RAW).expanduser() if _TOKENIZER_RAW else Path()
@@ -124,6 +136,8 @@ _offsets: list[int] = []  # byte offset of each non-empty line; last sentinel = 
 _continue_path: Path | None = None
 _continue_offsets: list[int] = []
 _continue_key_to_idx: dict[str, int] = {}
+_corpus_path: Path | None = None
+_corpus_offsets: list[int] | None = None
 _tokenizer = None
 _tokenizer_path: str | None = None
 _model = None
@@ -210,6 +224,17 @@ def _sample_keys(obj: dict[str, Any], source_idx: int | None = None) -> list[str
     raw_id = obj.get("raw_id")
     if isinstance(raw_id, str) and raw_id.strip():
         keys.append(f"raw_id:{raw_id.strip()}")
+    corpus_line = obj.get("source_corpus_line")
+    if corpus_line is not None:
+        try:
+            cl = int(corpus_line)
+            if cl >= 0:
+                keys.append(f"corpus_line:{cl}")
+        except (TypeError, ValueError):
+            pass
+    task_id = obj.get("task_id")
+    if isinstance(task_id, str) and task_id.strip():
+        keys.append(f"task_id:{task_id.strip()}")
     stamped = obj.get("source_train_index")
     if isinstance(stamped, int) and stamped >= 0:
         keys.append(f"source_idx:{stamped}")
@@ -445,9 +470,14 @@ def _upsert_continue(source_idx: int, obj: dict[str, Any]) -> dict[str, Any]:
     global _continue_offsets
     path = _ensure_continue_path()
     obj = dict(obj)
-    obj["source_train_index"] = int(source_idx)
-    if _data_path is not None:
-        obj["source_train_path"] = str(_data_path)
+    if obj.get("source_corpus_line") is not None:
+        obj.pop("source_train_index", None)
+        if _corpus_path is not None and not obj.get("source_corpus_path"):
+            obj["source_corpus_path"] = str(_corpus_path)
+    else:
+        obj["source_train_index"] = int(source_idx)
+        if _data_path is not None:
+            obj["source_train_path"] = str(_data_path)
     keys = _sample_keys(obj, source_idx)
     existing: int | None = None
     for k in keys:
@@ -485,11 +515,16 @@ def _write_continue_payload(
     *,
     viz_edges: list[dict[str, Any]],
     continue_edges: list[dict[str, Any]],
+    corpus_line: int | None = None,
 ) -> dict[str, Any]:
     """Persist continue row: attention_edges = continue-only; viz_* = display."""
     obj = dict(source)
     obj.pop("_continue_edge_count", None)
     obj.pop("_from_continue", None)
+    if corpus_line is not None:
+        obj["source_corpus_line"] = int(corpus_line)
+        if _corpus_path is not None:
+            obj["source_corpus_path"] = str(_corpus_path)
     viz_n = [_normalize_edge(e) for e in viz_edges]
     cont_n = [
         _normalize_edge(e)
@@ -532,6 +567,186 @@ def _current_viz_and_continue(idx: int) -> tuple[dict[str, Any], list[dict[str, 
     overlay = _read_continue_by_idx(cont_idx)
     viz, cont = _viz_and_continue_from_overlay(source, overlay)
     return source, viz, cont
+
+
+def _resolve_corpus_path(override: str | None = None) -> Path:
+    global _corpus_path, _corpus_offsets
+    if override:
+        path = Path(override).expanduser().resolve()
+    elif _corpus_path is not None:
+        path = _corpus_path
+    else:
+        path = DEFAULT_CORPUS
+    if path is None or not path.is_file():
+        raise HTTPException(
+            400,
+            "No LLM train corpus configured. Set EIF_LLM_TRAIN_CORPUS in eif_api.env.",
+        )
+    if _corpus_path != path:
+        _corpus_path = path
+        _corpus_offsets = None
+    return path
+
+
+def _ensure_corpus_offsets() -> list[int]:
+    global _corpus_offsets
+    path = _resolve_corpus_path()
+    if _corpus_offsets is None:
+        print(f"[corpus] building line index for {path} …", flush=True)
+        _corpus_offsets = _build_offsets(path)
+        print(f"[corpus] indexed {max(0, len(_corpus_offsets) - 1)} lines", flush=True)
+    return _corpus_offsets
+
+
+def _read_corpus_raw_row(line: int, *, corpus_path: str | None = None) -> dict[str, Any]:
+    path = _resolve_corpus_path(corpus_path)
+    offsets = _ensure_corpus_offsets()
+    if line < 0 or line >= len(offsets) - 1:
+        raise HTTPException(404, f"corpus line {line} out of range (n={len(offsets) - 1})")
+    with path.open("rb") as f:
+        f.seek(offsets[line])
+        raw = f.readline()
+    row = json.loads(raw.decode("utf-8"))
+    if not isinstance(row, dict):
+        raise HTTPException(500, f"corpus line {line} is not a JSON object")
+    return row
+
+
+def _encode_corpus_row(line: int, raw_row: dict[str, Any]) -> dict[str, Any]:
+    from server.corpus_encode import encode_prompt_response
+
+    prompt = str(raw_row.get("prompt") or raw_row.get("input") or "")
+    response = str(
+        raw_row.get("response")
+        or raw_row.get("label")
+        or raw_row.get("output")
+        or ""
+    )
+    if not prompt.strip():
+        raise HTTPException(400, f"corpus line {line} missing prompt/input text")
+    input_ids, labels = encode_prompt_response(_get_tokenizer(), prompt, response)
+    task_id = str(raw_row.get("task_id") or f"line_{line}")
+    return {
+        "input_ids": input_ids,
+        "label": labels,
+        "uid": f"corpus:{task_id}",
+        "task_id": task_id,
+        "raw_id": task_id,
+        "language": str(raw_row.get("language") or "go"),
+        "source_corpus_line": int(line),
+        "source_corpus_path": str(_corpus_path) if _corpus_path else "",
+        "attention_edges": [],
+        "annotation_meta": {
+            "corpus": True,
+            "unannotated_source": True,
+            "prompt_chars": len(prompt),
+            "response_chars": len(response),
+        },
+    }
+
+
+def _effective_corpus_sample(line: int, *, corpus_path: str | None = None) -> tuple[dict[str, Any], bool, str]:
+    raw_row = _read_corpus_raw_row(line, corpus_path=corpus_path)
+    source = _encode_corpus_row(line, raw_row)
+    key, cont_idx = _lookup_continue(-1, source)
+    if cont_idx is None:
+        obj = _compose_display_obj(source, None, from_continue=False)
+        return obj, False, key
+    overlay = _read_continue_by_idx(cont_idx)
+    obj = _compose_display_obj(source, overlay, from_continue=True)
+    return obj, True, key
+
+
+def _current_viz_and_continue_corpus(
+    line: int,
+    *,
+    corpus_path: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    raw_row = _read_corpus_raw_row(line, corpus_path=corpus_path)
+    source = _encode_corpus_row(line, raw_row)
+    key, cont_idx = _lookup_continue(-1, source)
+    del key
+    if cont_idx is None:
+        return source, [], []
+    overlay = _read_continue_by_idx(cont_idx)
+    viz, cont = _viz_and_continue_from_overlay(source, overlay)
+    return source, viz, cont
+
+
+def _write_continue_corpus_payload(
+    line: int,
+    source: dict[str, Any],
+    *,
+    viz_edges: list[dict[str, Any]],
+    continue_edges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _write_continue_payload(
+        -1,
+        source,
+        viz_edges=viz_edges,
+        continue_edges=continue_edges,
+        corpus_line=line,
+    )
+
+
+def _sample_detail_from_obj(
+    idx: int,
+    obj: dict[str, Any],
+    *,
+    from_continue: bool,
+    key: str,
+) -> dict[str, Any]:
+    input_ids = [int(x) for x in (obj.get("input_ids") or [])]
+    labels = [int(x) for x in (obj.get("label") or obj.get("labels") or [])]
+    tokens = _surface_tokens_from_obj(obj, input_ids)
+
+    edges = []
+    n_continue_edges = 0
+    for e in obj.get("attention_edges") or []:
+        if not isinstance(e, dict):
+            continue
+        try:
+            w = float(e.get("weight", 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        if w <= 0:
+            w = 1.0
+        contrib = str(e.get("contrib") or "source")
+        if contrib in CONTINUE_CONTRIBS:
+            n_continue_edges += 1
+        edges.append(
+            {
+                "src": int(e["src"]),
+                "dst": int(e["dst"]),
+                "subtype": str(e.get("subtype") or ""),
+                "weight": w,
+                "contrib": contrib,
+            }
+        )
+    try:
+        n_continue_edges = int(obj.get("_continue_edge_count") or n_continue_edges)
+    except (TypeError, ValueError):
+        pass
+
+    return {
+        "index": idx,
+        "uid": obj.get("uid"),
+        "language": obj.get("language"),
+        "raw_id": obj.get("raw_id"),
+        "tokens": tokens,
+        "input_ids": input_ids,
+        "answer_start": _answer_start(labels),
+        "attention_edges": edges,
+        "n_continue_edges": n_continue_edges,
+        "annotation_meta": obj.get("annotation_meta") or {},
+        "subtypes": SUBTYPES,
+        "in_continue": from_continue,
+        "sample_key": key,
+        "continue_path": str(_continue_path) if _continue_path else None,
+        "corpus_line": obj.get("source_corpus_line"),
+        "corpus_path": obj.get("source_corpus_path"),
+        "corpus_mode": bool((obj.get("annotation_meta") or {}).get("corpus")),
+    }
 
 def _resolve_tokenizer_path() -> str:
     if _tokenizer_path:
@@ -663,12 +878,17 @@ class BumpWeightBody(BaseModel):
 @app.get("/api/health")
 def health():
     tok_path = _resolve_tokenizer_path()
+    corpus_n = 0
+    if _corpus_offsets is not None:
+        corpus_n = max(0, len(_corpus_offsets) - 1)
     return {
         "ok": True,
         "data_path": str(_data_path) if _data_path else None,
         "n_samples": max(0, len(_offsets) - 1) if _offsets else 0,
         "continue_path": str(_continue_path) if _continue_path else None,
         "n_continue": max(0, len(_continue_offsets) - 1) if _continue_offsets else 0,
+        "corpus_path": str(_corpus_path or DEFAULT_CORPUS) if (_corpus_path or DEFAULT_CORPUS) else None,
+        "n_corpus": corpus_n,
         "write_mode": "continue_upsert",
         "subtypes": SUBTYPES,
         "tokenizer_path": tok_path,
@@ -759,55 +979,184 @@ def get_sample(idx: int):
         raise HTTPException(400, "No data file open.")
     with _state_lock:
         obj, from_continue, key = _effective_sample(idx)
-    input_ids = [int(x) for x in (obj.get("input_ids") or [])]
-    labels = [int(x) for x in (obj.get("label") or [])]
-    tokens = _surface_tokens_from_obj(obj, input_ids)
+    return _sample_detail_from_obj(idx, obj, from_continue=from_continue, key=key)
 
-    edges = []
-    n_continue_edges = 0
-    for e in obj.get("attention_edges") or []:
-        if not isinstance(e, dict):
-            continue
-        try:
-            w = float(e.get("weight", 1.0))
-        except (TypeError, ValueError):
-            w = 1.0
-        if w <= 0:
-            w = 1.0
-        contrib = str(e.get("contrib") or "source")
-        if contrib in CONTINUE_CONTRIBS:
-            n_continue_edges += 1
-        edges.append(
-            {
-                "src": int(e["src"]),
-                "dst": int(e["dst"]),
-                "subtype": str(e.get("subtype") or ""),
-                "weight": w,
-                "contrib": contrib,
-            }
+
+@app.get("/api/corpus/sample/{line}")
+def get_corpus_sample(line: int, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    with _state_lock:
+        obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
+    return _sample_detail_from_obj(line, obj, from_continue=from_continue, key=key)
+
+
+@app.post("/api/corpus/sample/{line}/edges/delete")
+def delete_corpus_edge(line: int, body: DeleteEdgeBody, corpusPath: str = ""):
+    if body.subtype not in SUBTYPES:
+        raise HTTPException(400, f"unknown subtype {body.subtype}")
+    override = corpusPath.strip() or None
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        before = len(viz)
+        viz = [
+            e
+            for e in viz
+            if not (
+                int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
+            )
+        ]
+        if len(viz) == before:
+            raise HTTPException(404, "edge not found in attention_edges")
+        cont = [
+            e
+            for e in cont
+            if not (
+                int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
+            )
+        ]
+        persist = _write_continue_corpus_payload(
+            line, source, viz_edges=viz, continue_edges=cont,
         )
-    # Prefer explicit continue count from overlay when present.
-    try:
-        n_continue_edges = int(obj.get("_continue_edge_count") or n_continue_edges)
-    except (TypeError, ValueError):
-        pass
-
     return {
-        "index": idx,
-        "uid": obj.get("uid"),
-        "language": obj.get("language"),
-        "raw_id": obj.get("raw_id"),
-        "tokens": tokens,
-        "input_ids": input_ids,
-        "answer_start": _answer_start(labels),
-        "attention_edges": edges,
-        "n_continue_edges": n_continue_edges,
-        "annotation_meta": obj.get("annotation_meta") or {},
-        "subtypes": SUBTYPES,
-        "in_continue": from_continue,
-        "sample_key": key,
-        "continue_path": str(_continue_path) if _continue_path else None,
+        "ok": True,
+        "n_edges": len(viz),
+        "n_continue_edges": len(cont),
+        **persist,
     }
+
+
+@app.post("/api/corpus/sample/{line}/edges/add")
+def add_corpus_edge(line: int, body: AddEdgeBody, corpusPath: str = ""):
+    if body.subtype not in SUBTYPES:
+        raise HTTPException(400, f"unknown subtype {body.subtype}; choose from {SUBTYPES}")
+    if body.src == body.dst:
+        raise HTTPException(400, "src and dst must differ")
+    override = corpusPath.strip() or None
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        n = len(source.get("input_ids") or [])
+        if not (0 <= body.src < n and 0 <= body.dst < n):
+            raise HTTPException(400, f"src/dst out of range 0..{n-1}")
+        for e in viz:
+            if (
+                int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
+            ):
+                raise HTTPException(409, "edge already exists")
+        edge = _normalize_edge(
+            {
+                "src": body.src,
+                "dst": body.dst,
+                "subtype": body.subtype,
+                "source": body.source,
+                "weight": body.weight,
+            },
+            contrib="user_add",
+        )
+        viz = list(viz) + [edge]
+        cont = list(cont) + [edge]
+        persist = _write_continue_corpus_payload(
+            line, source, viz_edges=viz, continue_edges=cont,
+        )
+    return {
+        "ok": True,
+        "n_edges": len(viz),
+        "n_continue_edges": len(cont),
+        "edge": edge,
+        **persist,
+    }
+
+
+@app.post("/api/corpus/sample/{line}/edges/bump-weight")
+def bump_corpus_edge_weight(line: int, body: BumpWeightBody, corpusPath: str = ""):
+    if body.subtype not in SUBTYPES:
+        raise HTTPException(400, f"unknown subtype {body.subtype}; choose from {SUBTYPES}")
+    delta = float(body.delta)
+    if delta == 0:
+        raise HTTPException(400, "delta must be non-zero")
+    override = corpusPath.strip() or None
+    with _state_lock:
+        source, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
+        found = None
+        for e in viz:
+            if (
+                int(e.get("src", -1)) == body.src
+                and int(e.get("dst", -1)) == body.dst
+                and str(e.get("subtype", "")) == body.subtype
+            ):
+                found = e
+                break
+        if found is None:
+            raise HTTPException(404, "edge not found — add it first, then bump weight")
+        old_w = float(found.get("weight", 1.0))
+        new_w = max(1.0, old_w + delta)
+        bumped = _normalize_edge(found, contrib="user_bump", weight=new_w)
+        viz_out: list[dict[str, Any]] = []
+        for e in viz:
+            viz_out.append(bumped if _edge_key(e) == _edge_key(found) else e)
+        cont_out: list[dict[str, Any]] = []
+        in_cont = False
+        for e in cont:
+            if _edge_key(e) == _edge_key(found):
+                cont_out.append(bumped)
+                in_cont = True
+            else:
+                cont_out.append(e)
+        if not in_cont:
+            cont_out.append(bumped)
+        persist = _write_continue_corpus_payload(
+            line, source, viz_edges=viz_out, continue_edges=cont_out,
+        )
+    return {
+        "ok": True,
+        "n_edges": len(viz_out),
+        "n_continue_edges": len(cont_out),
+        "edge": bumped,
+        "old_weight": old_w,
+        "new_weight": new_w,
+        **persist,
+    }
+
+
+@app.get("/api/corpus/sample/{line}/saliency/{target}")
+def get_corpus_saliency(line: int, target: int, top_k: int = 6, corpusPath: str = ""):
+    override = corpusPath.strip() or None
+    with _state_lock:
+        raw_row = _read_corpus_raw_row(line, corpus_path=override)
+        source = _encode_corpus_row(line, raw_row)
+    input_ids = [int(x) for x in (source.get("input_ids") or [])]
+    if target <= 0 or target >= len(input_ids):
+        raise HTTPException(400, f"target {target} out of range")
+    if not _model_path:
+        return {
+            "target": target,
+            "top": [],
+            "available": False,
+            "message": "No live model for saliency on corpus samples.",
+        }
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    import torch
+    from loss import compute_alti_saliency_vector  # type: ignore
+
+    model = _ensure_model()
+    device = next(model.parameters()).device
+    ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+    attn = torch.ones_like(ids)
+    batch = {"input_ids": ids, "attention_mask": attn}
+    sal = compute_alti_saliency_vector(model, batch, target)
+    scored = [
+        (i, float(s))
+        for i, s in enumerate(sal)
+        if i < target and float(s) > 0
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = [{"src": i, "score": sc} for i, sc in scored[: max(1, min(top_k, 20))]]
+    return {"target": target, "top": top, "available": True, "cached": False, "source": "model"}
 
 
 @app.get("/api/sample/{idx}/saliency/{target}")
@@ -1362,7 +1711,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     global _data_path, _offsets, _continue_path, _continue_offsets, _continue_key_to_idx
-    global _model_path, _tokenizer_path, _saliency_cache_dir
+    global _model_path, _tokenizer_path, _saliency_cache_dir, _corpus_path
     print(f"Source data (.env/CLI): {args.data}", flush=True)
     data = Path(args.data).expanduser().resolve()
     if not data.exists():
@@ -1399,6 +1748,15 @@ def main(argv: list[str] | None = None) -> None:
         print(
             "[WARN] No --continue-data / ANNOTATION_CONTINUE_TRAIN_DATA. "
             "Browse works; add/delete will refuse until configured.",
+            flush=True,
+        )
+
+    if DEFAULT_CORPUS and DEFAULT_CORPUS.is_file():
+        _corpus_path = DEFAULT_CORPUS
+        print(f"LLM train corpus: {_corpus_path} (line index on first open)", flush=True)
+    else:
+        print(
+            "[WARN] No EIF_LLM_TRAIN_CORPUS — corpus manual-annotation mode unavailable.",
             flush=True,
         )
 

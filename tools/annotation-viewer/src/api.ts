@@ -56,9 +56,16 @@ export type SampleDetail = {
   in_continue?: boolean
   sample_key?: string
   continue_path?: string | null
+  corpus_line?: number | null
+  corpus_path?: string | null
+  corpus_mode?: boolean
 }
 
 export type SaliencyHit = { src: number; score: number }
+
+function corpusQuery(path?: string | null): string {
+  return path?.trim() ? `?corpusPath=${encodeURIComponent(path.trim())}` : ''
+}
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -89,6 +96,8 @@ export const api = {
       n_samples: number
       continue_path: string | null
       n_continue: number
+      corpus_path?: string | null
+      n_corpus?: number
       write_mode: string
       subtypes: string[]
       saliency_available: boolean
@@ -107,6 +116,9 @@ export const api = {
 
   getSample: (idx: number) => jsonFetch<SampleDetail>(`/api/sample/${idx}`),
 
+  getCorpusSample: (line: number, opts?: { corpusPath?: string | null }) =>
+    jsonFetch<SampleDetail>(`/api/corpus/sample/${line}${corpusQuery(opts?.corpusPath)}`),
+
   saliency: (idx: number, target: number, topK = 6) =>
     jsonFetch<{
       target: number
@@ -114,6 +126,66 @@ export const api = {
       available?: boolean
       message?: string
     }>(`/api/sample/${idx}/saliency/${target}?top_k=${topK}`),
+
+  corpusSaliency: (line: number, target: number, topK = 6, opts?: { corpusPath?: string | null }) => {
+    const q = new URLSearchParams({ top_k: String(topK) })
+    if (opts?.corpusPath?.trim()) q.set('corpusPath', opts.corpusPath.trim())
+    return jsonFetch<{
+      target: number
+      top: SaliencyHit[]
+      available?: boolean
+      message?: string
+    }>(`/api/corpus/sample/${line}/saliency/${target}?${q.toString()}`)
+  },
+
+  deleteCorpusEdge: (line: number, edge: Edge, opts?: { corpusPath?: string | null }) =>
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+    }>(`/api/corpus/sample/${line}/edges/delete${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify(edge),
+    }),
+
+  addCorpusEdge: (
+    line: number,
+    edge: Edge & { source?: string; weight?: number },
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+      edge?: Edge
+    }>(`/api/corpus/sample/${line}/edges/add${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify(edge),
+    }),
+
+  bumpCorpusWeight: (
+    line: number,
+    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & { delta?: number },
+    opts?: { corpusPath?: string | null },
+  ) =>
+    jsonFetch<{
+      ok: boolean
+      n_edges: number
+      n_continue_edges?: number
+      action?: string
+      continue_path?: string
+      n_continue?: number
+      edge?: Edge
+      old_weight?: number
+      new_weight?: number
+    }>(`/api/corpus/sample/${line}/edges/bump-weight${corpusQuery(opts?.corpusPath)}`, {
+      method: 'POST',
+      body: JSON.stringify(edge),
+    }),
 
   deleteEdge: (idx: number, edge: Edge) =>
     jsonFetch<{

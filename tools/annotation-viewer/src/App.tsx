@@ -28,6 +28,13 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [list, setList] = useState<SampleSummary[]>([])
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
+  const [corpusLine, setCorpusLine] = useState<number | null>(null)
+  const [corpusPath, setCorpusPath] = useState<string | null>(null)
+  const corpusMode = corpusLine != null
+  const corpusOpts = useMemo(
+    () => (corpusPath?.trim() ? { corpusPath: corpusPath.trim() } : undefined),
+    [corpusPath],
+  )
   const [sample, setSample] = useState<SampleDetail | null>(null)
   const [target, setTarget] = useState<number | null>(null)
   /** Deep-link / viz-only focus source (yellow). Not an annotation edit. */
@@ -92,6 +99,8 @@ export default function App() {
   ) => {
     setBusy(true)
     setError('')
+    setCorpusLine(null)
+    setCorpusPath(null)
     try {
       const detail = await api.getSample(idx)
       setSelectedIdx(idx)
@@ -124,6 +133,40 @@ export default function App() {
         ? ' · 已在续训小集（展示覆盖后的标注）'
         : ' · 源集只读（编辑会写入续训小集）'
       setStatus(`样本 #${idx} · ${detail.uid}${edgeNote}${srcNote}${contNote}`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const loadCorpusSample = useCallback(async (
+    line: number,
+    path?: string | null,
+    initialTarget?: number | null,
+  ) => {
+    setBusy(true)
+    setError('')
+    try {
+      const detail = await api.getCorpusSample(line, path ? { corpusPath: path } : undefined)
+      setCorpusLine(line)
+      setCorpusPath(path?.trim() || detail.corpus_path || null)
+      setSelectedIdx(line)
+      setSample(detail)
+      setTarget(initialTarget ?? null)
+      setFocusSource(null)
+      setSaliency([])
+      setSaliencyMsg('')
+      setPendingEdge(null)
+      setAddSrc(null)
+      setJumpIdx(String(line))
+      const contNote = detail.in_continue
+        ? ' · 已在续训小集'
+        : ' · 无预标注（手动添加的边会写入续训小集）'
+      setStatus(
+        `大语料 L${line} · ${detail.uid}${contNote}` +
+          (detail.attention_edges.length ? ` · ${detail.attention_edges.length} 条边` : ''),
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -185,6 +228,21 @@ export default function App() {
             }
           }
           const auto = (params.get('autoAnnotate') || '').trim() === '1'
+          const corpusLineRaw = params.get('corpusLine')
+          const corpusPathRaw = (params.get('corpusPath') || '').trim()
+          if (corpusLineRaw != null && corpusLineRaw !== '') {
+            const cl = Number(corpusLineRaw)
+            if (Number.isInteger(cl) && cl >= 0) {
+              await loadCorpusSample(
+                cl,
+                corpusPathRaw || null,
+                targetRaw != null && targetRaw !== '' && Number.isInteger(Number(targetRaw))
+                  ? Number(targetRaw)
+                  : null,
+              )
+              return
+            }
+          }
           if (sampleRaw != null && sampleRaw !== '') {
             const sampleIdx = Number(sampleRaw)
             const targetIdx =
@@ -214,7 +272,7 @@ export default function App() {
         setError('无法连接后端。请先启动: python -m server.main')
       }
     })()
-  }, [refreshList, loadSample])
+  }, [refreshList, loadSample, loadCorpusSample])
 
   // Only edges whose dst is the selected target (inspect mode).
   const relatedEdges = useMemo(() => {
@@ -252,13 +310,19 @@ export default function App() {
       setBusy(true)
       setError('')
       try {
-        const added = await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
+        const added = corpusMode && corpusLine != null
+          ? await api.addCorpusEdge(corpusLine, { src: addSrc, dst: i, subtype: addSubtype }, corpusOpts)
+          : await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
         setAddSrc(null)
         const h = await api.health()
         setNContinue(h.n_continue ?? 0)
         setContinuePath(h.continue_path)
-        await loadSample(selectedIdx, i)
-        await refreshList(query, 0, false)
+        if (corpusMode && corpusLine != null) {
+          await loadCorpusSample(corpusLine, corpusPath, i)
+        } else {
+          await loadSample(selectedIdx, i)
+          await refreshList(query, 0, false)
+        }
         const nEdges = typeof added?.n_edges === 'number' ? added.n_edges : undefined
         setStatus(
           `已添加 ${addSubtype}: ${addSrc} → ${i} → 续训小集` +
@@ -279,7 +343,9 @@ export default function App() {
     setSaliency([])
     setSaliencyMsg('')
     try {
-      const res = await api.saliency(selectedIdx, i, 6)
+      const res = corpusMode && corpusLine != null
+        ? await api.corpusSaliency(corpusLine, i, 6, corpusOpts)
+        : await api.saliency(selectedIdx, i, 6)
       if (res.available === false) {
         setSaliencyMsg(res.message || 'Saliency 未启用（启动时加 --model）')
       } else {
@@ -305,13 +371,21 @@ export default function App() {
     setBusy(true)
     setError('')
     try {
-      await api.deleteEdge(selectedIdx, edge)
+      if (corpusMode && corpusLine != null) {
+        await api.deleteCorpusEdge(corpusLine, edge, corpusOpts)
+      } else {
+        await api.deleteEdge(selectedIdx, edge)
+      }
       setPendingEdge(null)
       const h = await api.health()
       setNContinue(h.n_continue ?? 0)
       setContinuePath(h.continue_path)
-      await loadSample(selectedIdx)
-      await refreshList(query, 0, false)
+      if (corpusMode && corpusLine != null) {
+        await loadCorpusSample(corpusLine, corpusPath)
+      } else {
+        await loadSample(selectedIdx)
+        await refreshList(query, 0, false)
+      }
       setTarget(edge.dst)
       setStatus(
         `已删除 ${edge.subtype}: ${edge.src} → ${edge.dst} → 续训小集` +
@@ -329,17 +403,28 @@ export default function App() {
     setBusy(true)
     setError('')
     try {
-      const res = await api.bumpWeight(selectedIdx, {
-        src: edge.src,
-        dst: edge.dst,
-        subtype: edge.subtype,
-        delta,
-      })
+      const res = corpusMode && corpusLine != null
+        ? await api.bumpCorpusWeight(corpusLine, {
+            src: edge.src,
+            dst: edge.dst,
+            subtype: edge.subtype,
+            delta,
+          }, corpusOpts)
+        : await api.bumpWeight(selectedIdx, {
+            src: edge.src,
+            dst: edge.dst,
+            subtype: edge.subtype,
+            delta,
+          })
       const h = await api.health()
       setNContinue(h.n_continue ?? 0)
       setContinuePath(h.continue_path)
-      await loadSample(selectedIdx, edge.dst)
-      await refreshList(query, 0, false)
+      if (corpusMode && corpusLine != null) {
+        await loadCorpusSample(corpusLine, corpusPath, edge.dst)
+      } else {
+        await loadSample(selectedIdx, edge.dst)
+        await refreshList(query, 0, false)
+      }
       const nw = res.new_weight ?? res.edge?.weight
       setStatus(
         `权重 ${edge.subtype} ${edge.src}→${edge.dst}: ${res.old_weight ?? '?'} → ${nw ?? '?'}` +
@@ -425,8 +510,14 @@ export default function App() {
       <header className="header">
         <h1>Train Annotation Viewer</h1>
         <p>
-          浏览源 train JSONL（只读）。可视化显示完整标注；续训小集只写入
-          <strong> 用户新增 / 加权 / LLM 自动标注</strong> 的边（不复制旧标注）。
+          {corpusMode
+            ? '大语料手动标注：该样本无预标注，添加/删除的边写入续训小集。'
+            : (
+              <>
+                浏览源 train JSONL（只读）。可视化显示完整标注；续训小集只写入
+                <strong> 用户新增 / 加权 / LLM 自动标注</strong> 的边（不复制旧标注）。
+              </>
+            )}
         </p>
       </header>
 
@@ -500,6 +591,7 @@ export default function App() {
       )}
 
       <div className="layout">
+        {!corpusMode && (
         <aside className="panel">
           <h2>
             训练样本
@@ -544,10 +636,13 @@ export default function App() {
             </button>
           </div>
         </aside>
+        )}
 
         <main className="panel">
           {!sample ? (
-            <p className="hint">选择左侧一条训练数据开始查看。</p>
+            <p className="hint">
+              {corpusMode ? '正在加载大语料样本…' : '选择左侧一条训练数据开始查看。'}
+            </p>
           ) : (
             <>
               <div className="modeBar">
@@ -678,7 +773,7 @@ export default function App() {
                         </span>
                       ) : null}
                     </h3>
-                    {focusSource != null && (
+                    {focusSource != null && !corpusMode && (
                       <div className="addRow" style={{ marginBottom: 8 }}>
                         <button
                           type="button"

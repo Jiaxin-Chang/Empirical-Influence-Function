@@ -625,6 +625,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/llm-train-retrieve":
             self._handle_llm_train_retrieve()
             return
+        if parsed.path == "/api/llm-corpus-search":
+            self._handle_llm_corpus_search()
+            return
         if parsed.path != "/api/prepare-ttav-bundle":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -1540,6 +1543,67 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
         self._send_json(200, result)
+
+    def _handle_llm_corpus_search(self):
+        """Evaluate one boolean expression against EIF_LLM_TRAIN_CORPUS."""
+        _hydrate_eif_env()
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        expression = str(req.get("expression") or "").strip()
+        if not expression:
+            self._send_json(400, {"status": "error", "message": "expression is required"})
+            return
+
+        corpus_path = str(req.get("corpusPath") or "").strip() or None
+        try:
+            top_k = int(req.get("topK", 15) or 15)
+        except (TypeError, ValueError):
+            top_k = 15
+        max_scan = req.get("maxCorpusScan")
+        try:
+            max_scan_i = int(max_scan) if max_scan is not None else None
+        except (TypeError, ValueError):
+            max_scan_i = None
+
+        try:
+            from src.llm_train_retrieval import search_corpus_jsonl
+
+            corpus = corpus_path or (
+                (os.environ.get("EIF_LLM_TRAIN_CORPUS") or os.environ.get("EIF_TRAIN_CORPUS") or "").strip()
+            )
+            if not corpus:
+                self._send_json(400, {
+                    "status": "error",
+                    "message": "No corpus path (set EIF_LLM_TRAIN_CORPUS or pass corpusPath)",
+                })
+                return
+            hits = search_corpus_jsonl(
+                corpus,
+                expression,
+                top_k=top_k,
+                max_scan=max_scan_i,
+            )
+        except Exception as exc:
+            print(f"[llm-corpus-search] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+
+        self._send_json(200, {
+            "status": "success",
+            "expression": expression,
+            "corpus_path": corpus,
+            "hits": hits,
+            "n_hits": len(hits),
+        })
 
     def _handle_prepare_train_probe(self):
         content_length = int(self.headers.get("Content-Length", "0"))

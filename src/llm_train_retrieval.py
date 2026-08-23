@@ -15,6 +15,102 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+_IM_START_RE = re.compile(r"<\|im_start\|>", re.IGNORECASE)
+_IM_END_RE = re.compile(r"<\|redacted_im_end\|>", re.IGNORECASE)
+_THINKING_RE = re.compile(
+    r"<\s*redacted_thinking\s*>.*?</\s*redacted_thinking\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_USER_BLOCK_RE = re.compile(
+    r"<\|im_start\|>\s*user\s*\n(.*?)<\|redacted_im_end\|>",
+    re.DOTALL | re.IGNORECASE,
+)
+_TASK_START_MARKERS = (
+    "This is a go programming task",
+    "### Given Task:",
+    "Below is the package path:",
+    "And here is the function you are asked to complete:",
+)
+
+
+def _strip_thinking_blocks(text: str) -> str:
+    out = _THINKING_RE.sub("", text or "")
+    # Unclosed thinking at start
+    out = re.sub(
+        r"^\s*<\s*redacted_thinking\s*>[\s\S]*$",
+        "",
+        out,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
+def extract_fim_problem_surface(raw: str) -> str:
+    """Strip ChatML / assistant wrappers; keep only the FIM task body (题面)."""
+    text = (raw or "").replace("\r\n", "\n")
+    text = _strip_thinking_blocks(text)
+
+    user_blocks = [m.group(1).strip() for m in _USER_BLOCK_RE.finditer(text)]
+    if user_blocks:
+        body = user_blocks[-1]
+    else:
+        body = text
+        body = _IM_START_RE.sub("", body)
+        body = _IM_END_RE.sub("", body)
+        body = re.sub(
+            r"^\s*(system|user|assistant)\s*\n+",
+            "",
+            body,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+    for cut in (
+        "### Response:",
+        "<|im_start|>assistant",
+        "\n<|im_start|>assistant",
+    ):
+        idx = body.find(cut)
+        if idx >= 0:
+            body = body[:idx]
+
+    body = re.sub(r"\n/no_think\s*$", "", body.strip(), flags=re.IGNORECASE)
+
+    # Prefer task section if present inside a longer blob.
+    for marker in _TASK_START_MARKERS:
+        pos = body.find(marker)
+        if pos >= 0:
+            body = body[pos:]
+            break
+
+    return body.strip()
+
+
+def clean_gold_mid_completion(raw: str) -> str:
+    """Gold = <MID> fill only; strip thinking / ChatML noise."""
+    text = _strip_thinking_blocks(raw or "")
+    text = _IM_START_RE.sub("", text)
+    text = _IM_END_RE.sub("", text)
+    text = re.sub(r"^\s*(assistant|user|system)\s*\n+", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def prepare_llm_train_query(fim_prompt: str, gold_completion: str) -> dict[str, str]:
+    raw_prompt = (fim_prompt or "").strip()
+    raw_gold = (gold_completion or "").strip()
+    surface = extract_fim_problem_surface(raw_prompt)
+    gold = clean_gold_mid_completion(raw_gold)
+    if not surface:
+        surface = raw_prompt
+    if not gold:
+        gold = raw_gold
+    return {
+        "fim_problem_surface": surface,
+        "gold_mid_completion": gold,
+        "raw_fim_prompt": raw_prompt,
+        "raw_gold_completion": raw_gold,
+    }
+
 
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
@@ -96,12 +192,17 @@ def build_llm_train_retrieve_messages(
     example_expression: str | None = None,
 ) -> list[dict[str, str]]:
     """Assemble system + user messages for train-sample need analysis."""
+    prepared = prepare_llm_train_query(fim_prompt, gold_completion)
+    problem = prepared["fim_problem_surface"]
+    gold = prepared["gold_mid_completion"]
     example_expr = example_expression or (
         '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
     )
     system = (
-        "你是 Go 代码补全与 saliency 训练数据专家。"
-        "用户给出一条 FIM（Fill-in-the-Middle）测试题及其 gold 补全（<MID> 处应填内容）。"
+        "你是 Go 代码补全与 saliency 训练数据专家。\n"
+        "用户会给出一条 **Go FIM 测试题**（Fill-in-the-Middle，中间缺失处标记为 <MID>）"
+        "及其 gold 补全（仅 <MID> 处应填写的代码片段）。\n"
+        "注意：题面已去除 ChatML 对话包装（不是 system/user/assistant 聊天消息）。\n"
         "你的任务是判断：模型要稳定生成该 gold，需要从哪些**训练样本**中学习，"
         "尤其是哪些 **attention_edges 标注**（source→target 的代码关联，如 defuse/call/return/api 等）。\n\n"
         "请输出**严格 JSON**（不要 markdown 包裹），字段：\n"
@@ -128,13 +229,13 @@ def build_llm_train_retrieve_messages(
         "请给出 2-5 条 expression，从宽到窄，覆盖 gold 所需的不同代码/错误处理模式。"
     )
     user = (
-        "下面是一道 FIM 测试题（含 <PRE>/<SUF>/<MID> 标记）及其 gold 补全。\n"
-        "请分析：要答对 gold，训练集里应有哪些类型的样本与标注？\n"
-        "并给出可在大规模 Go 训练 JSONL（每行 prompt+response）上检索的布尔表达式。\n\n"
-        "=== FIM PROMPT ===\n"
-        f"{fim_prompt.strip()}\n\n"
-        "=== GOLD (<MID> 处正确答案) ===\n"
-        f"{gold_completion.strip()}\n"
+        "【题目类型】Go 代码 FIM 补全测试题（非对话；已去除 ChatML 包装）\n\n"
+        "【题面】\n"
+        f"{problem}\n\n"
+        "【Gold】<MID> 处应填写的正确代码：\n"
+        f"{gold}\n\n"
+        "请分析：要答对上述 gold，训练集里应有哪些类型的样本与 attention_edges 标注？\n"
+        "并给出可在大规模 Go 训练 JSONL（每行 prompt+response）上检索的布尔表达式。"
     )
     return [
         {"role": "system", "content": system},
@@ -291,7 +392,11 @@ def call_llm_train_retrieve(
     extra = _extra_body()
     if extra:
         kwargs["extra_body"] = extra
-    print(f"[llm-train] model={model_name} prompt_chars={len(fim_prompt)} gold_chars={len(gold_completion)}", flush=True)
+    print(
+        f"[llm-train] model={model_name} surface_chars={len(fim_prompt)} "
+        f"gold_chars={len(gold_completion)}",
+        flush=True,
+    )
     resp = client.chat.completions.create(**kwargs)
     raw = (resp.choices[0].message.content or "").strip()
     parsed = _parse_json_object(raw)
@@ -318,9 +423,13 @@ def retrieve_llm_train_samples(
     if not (gold_completion or "").strip():
         raise ValueError("gold_completion is required")
 
+    prepared = prepare_llm_train_query(fim_prompt, gold_completion)
+    problem = prepared["fim_problem_surface"]
+    gold = prepared["gold_mid_completion"]
+
     llm_out = call_llm_train_retrieve(
-        fim_prompt=fim_prompt,
-        gold_completion=gold_completion,
+        fim_prompt=problem,
+        gold_completion=gold,
     )
     analysis = llm_out.get("analysis") or {}
     exprs = analysis.get("corpus_search_expressions") or []
@@ -365,9 +474,13 @@ def retrieve_llm_train_samples(
         "status": "success",
         "query": {
             "fim_prompt_chars": len(fim_prompt),
+            "fim_surface_chars": len(prepared["fim_problem_surface"]),
             "gold_completion_chars": len(gold_completion),
-            "gold_preview": gold_completion[:400],
+            "gold_preview": prepared["gold_mid_completion"][:400],
+            "fim_surface_preview": prepared["fim_problem_surface"][:600],
+            "stripped_chatml": prepared["fim_problem_surface"] != prepared["raw_fim_prompt"],
         },
+        "prepared": prepared,
         "llm": llm_out,
         "analysis": analysis,
         "search_results": search_results,

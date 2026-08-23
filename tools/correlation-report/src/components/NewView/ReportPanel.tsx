@@ -2431,6 +2431,10 @@ export function ReportPanel({
     const [llmTrainResult, setLlmTrainResult] = useState<LlmTrainRetrieveResult | null>(null);
     const [llmTrainPanelOpen, setLlmTrainPanelOpen] = useState(false);
     const [llmTrainExprsOnly, setLlmTrainExprsOnly] = useState(false);
+    const [llmTrainActiveExprIdx, setLlmTrainActiveExprIdx] = useState<number | null>(null);
+    const [llmTrainExprHits, setLlmTrainExprHits] = useState<Record<number, LlmTrainSearchHit[]>>({});
+    const [llmTrainExprSearchBusy, setLlmTrainExprSearchBusy] = useState(false);
+    const [llmTrainExprSearchError, setLlmTrainExprSearchError] = useState<string | null>(null);
     const enterManualPairMode = useCallback(() => {
         setAttrMode('manual');
         setSelectedTokIdx(null);
@@ -3805,6 +3809,9 @@ export function ReportPanel({
         setLlmTrainError(null);
         setLlmTrainPanelOpen(true);
         setLlmTrainExprsOnly(exprsOnly);
+        setLlmTrainActiveExprIdx(null);
+        setLlmTrainExprHits({});
+        setLlmTrainExprSearchError(null);
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/llm-train-retrieve'), {
@@ -3845,6 +3852,65 @@ export function ReportPanel({
         goldResponseTokens,
         eifApiUrl,
     ]);
+
+    const fetchLlmCorpusSearch = useCallback((exprIdx: number, expression: string) => {
+        if (importedReportActive || !expression.trim()) return;
+        setLlmTrainActiveExprIdx(exprIdx);
+        setLlmTrainExprSearchBusy(true);
+        setLlmTrainExprSearchError(null);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/llm-corpus-search'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        expression: expression.trim(),
+                        corpusPath: llmTrainResult?.corpus_path || undefined,
+                        topK: 15,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: { status?: string; hits?: LlmTrainSearchHit[]; message?: string } = {};
+                if (raw.trim()) {
+                    parsed = JSON.parse(raw) as typeof parsed;
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Corpus search failed (HTTP ${resp.status})`,
+                    );
+                }
+                setLlmTrainExprHits(prev => ({
+                    ...prev,
+                    [exprIdx]: parsed.hits ?? [],
+                }));
+            } catch (error) {
+                setLlmTrainExprSearchError(
+                    error instanceof Error ? error.message : 'Corpus search failed',
+                );
+            } finally {
+                setLlmTrainExprSearchBusy(false);
+            }
+        })();
+    }, [importedReportActive, eifApiUrl, llmTrainResult?.corpus_path]);
+
+    const handleOpenCorpusAnnotationViewer = useCallback((hit: LlmTrainSearchHit) => {
+        if (hit.line == null || hit.line < 0) return;
+        const base = (
+            import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
+        )?.trim() || 'http://127.0.0.1:5174';
+        const url = new URL(base);
+        url.searchParams.set('corpusLine', String(hit.line));
+        const corpusPath = llmTrainResult?.corpus_path?.trim();
+        if (corpusPath) {
+            url.searchParams.set('corpusPath', corpusPath);
+        }
+        if (hit.task_id) {
+            url.searchParams.set('taskId', hit.task_id);
+        }
+        window.open(url.toString(), '_blank', 'noopener,noreferrer');
+    }, [llmTrainResult?.corpus_path]);
 
     const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {
         if (!report || !selectedMeta || importedReportActive) return;
@@ -5077,24 +5143,49 @@ export function ReportPanel({
                                         )}
                                         {llmTrainResult?.analysis && llmTrainExprsOnly && (
                                             <>
+                                                <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
+                                                    点击表达式 → 在大语料上检索；点击命中行 → 打开手动标注页（无预标注，边写入续训小集）
+                                                </div>
                                                 {(llmTrainResult.analysis.corpus_search_expressions ?? []).length === 0 ? (
                                                     <div style={{ color: '#b45309' }}>
                                                         模型未返回 corpus_search_expressions（可看下方 raw）
                                                     </div>
                                                 ) : (
-                                                    (llmTrainResult.analysis.corpus_search_expressions ?? []).map((sr, idx) => (
+                                                    (llmTrainResult.analysis.corpus_search_expressions ?? []).map((sr, idx) => {
+                                                        const isActive = llmTrainActiveExprIdx === idx;
+                                                        const hits = llmTrainExprHits[idx] ?? [];
+                                                        return (
                                                         <div
                                                             key={`dbg-${sr.name ?? 'expr'}-${idx}`}
+                                                            role="button"
+                                                            tabIndex={0}
+                                                            onClick={() => {
+                                                                if (sr.expression?.trim()) {
+                                                                    fetchLlmCorpusSearch(idx, sr.expression);
+                                                                }
+                                                            }}
+                                                            onKeyDown={ev => {
+                                                                if ((ev.key === 'Enter' || ev.key === ' ') && sr.expression?.trim()) {
+                                                                    ev.preventDefault();
+                                                                    fetchLlmCorpusSearch(idx, sr.expression);
+                                                                }
+                                                            }}
                                                             style={{
                                                                 marginTop: idx > 0 ? 10 : 0,
                                                                 padding: '8px 10px',
                                                                 borderRadius: 6,
-                                                                background: '#fff',
-                                                                border: '1px solid #fde68a',
+                                                                background: isActive ? '#fffbeb' : '#fff',
+                                                                border: isActive ? '2px solid #f59e0b' : '1px solid #fde68a',
+                                                                cursor: sr.expression?.trim() ? 'pointer' : 'default',
                                                             }}
+                                                            title="点击检索大语料"
                                                         >
                                                             <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 4 }}>
                                                                 {idx + 1}. {sr.name || `expr${idx + 1}`}
+                                                                {isActive && llmTrainExprSearchBusy ? ' · 检索中…' : ''}
+                                                                {isActive && !llmTrainExprSearchBusy && hits.length > 0
+                                                                    ? ` · ${hits.length} 命中`
+                                                                    : ''}
                                                             </div>
                                                             <pre style={{
                                                                 margin: 0,
@@ -5111,8 +5202,57 @@ export function ReportPanel({
                                                                     {sr.why}
                                                                 </div>
                                                             )}
+                                                            {isActive && llmTrainExprSearchError && (
+                                                                <div style={{ marginTop: 6, fontSize: 11, color: '#b91c1c' }}>
+                                                                    {llmTrainExprSearchError}
+                                                                </div>
+                                                            )}
+                                                            {isActive && !llmTrainExprSearchBusy && hits.length > 0 && (
+                                                                <div style={{ marginTop: 8, borderTop: '1px dashed #fde68a', paddingTop: 6 }}>
+                                                                    <div style={{ fontSize: 11, fontWeight: 700, color: '#075985', marginBottom: 4 }}>
+                                                                        检索结果（点击行 → 手动标注）
+                                                                    </div>
+                                                                    {hits.map(h => (
+                                                                        <div
+                                                                            key={`dbg-hit-${h.line}-${h.task_id}`}
+                                                                            role="button"
+                                                                            tabIndex={0}
+                                                                            onClick={ev => {
+                                                                                ev.stopPropagation();
+                                                                                handleOpenCorpusAnnotationViewer(h);
+                                                                            }}
+                                                                            onKeyDown={ev => {
+                                                                                if (ev.key === 'Enter' || ev.key === ' ') {
+                                                                                    ev.preventDefault();
+                                                                                    ev.stopPropagation();
+                                                                                    handleOpenCorpusAnnotationViewer(h);
+                                                                                }
+                                                                            }}
+                                                                            style={{
+                                                                                marginLeft: 4,
+                                                                                marginBottom: 4,
+                                                                                padding: '4px 6px',
+                                                                                borderRadius: 4,
+                                                                                background: '#f0f9ff',
+                                                                                border: '1px solid #bae6fd',
+                                                                                cursor: 'pointer',
+                                                                                fontSize: 11,
+                                                                            }}
+                                                                        >
+                                                                            L{h.line}
+                                                                            {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                            {h.response_preview
+                                                                                ? ` · ${h.response_preview.slice(0, 100)}`
+                                                                                : h.prompt_preview
+                                                                                    ? ` · ${h.prompt_preview.slice(0, 100)}`
+                                                                                    : ''}
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
                                                         </div>
-                                                    ))
+                                                        );
+                                                    })
                                                 )}
                                                 {llmTrainResult.llm?.model && (
                                                     <div style={{ marginTop: 8, fontSize: 10, color: '#94a3b8' }}>
