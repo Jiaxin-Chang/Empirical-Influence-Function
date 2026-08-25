@@ -4140,7 +4140,6 @@ export function ReportPanel({
             || decodeTokens(goldResponseTokens).join('')
         );
         const region = String(hit.match_region || '');
-        const needsRewrite = region === 'context' || region === 'cross';
 
         void (async () => {
             const url = new URL(base);
@@ -4151,7 +4150,12 @@ export function ReportPanel({
             if (hit.task_id) {
                 url.searchParams.set('taskId', hit.task_id);
             }
-            if (needsRewrite && goldCompletion.trim()) {
+
+            // Always try MID rewrite when we have test gold: teach gold-like
+            // span as the new MID (even if match_region was mislabeled "gold"
+            // due to a trivial response hit like "}").
+            let rewriteNote = '';
+            if (goldCompletion.trim()) {
                 try {
                     const prepResp = await fetch(`${base.replace(/\/$/, '')}/api/corpus/mid-rewrite-prep`, {
                         method: 'POST',
@@ -4168,6 +4172,9 @@ export function ReportPanel({
                         rewrite_id?: string;
                         applied?: boolean;
                         mode?: string;
+                        reason?: string;
+                        dig_preview?: string;
+                        dig_locus?: string;
                         message?: string;
                     } = {};
                     if (prepRaw.trim()) {
@@ -4178,19 +4185,45 @@ export function ReportPanel({
                         }
                     }
                     if (!prepResp.ok || !prep.rewrite_id) {
-                        console.warn(
-                            '[mid-rewrite-prep] failed',
-                            prepResp.status,
-                            prep.message || prepRaw.slice(0, 200),
-                        );
+                        rewriteNote =
+                            `MID改写准备失败 (HTTP ${prepResp.status}). ` +
+                            '将打开原样本。请确认 annotation-viewer 后端已启动。';
+                        console.warn('[mid-rewrite-prep] failed', prepResp.status, prepRaw.slice(0, 240));
                     } else if (prep.applied) {
                         url.searchParams.set('rewriteId', prep.rewrite_id);
+                        rewriteNote =
+                            `已改写 MID (${prep.mode || ''}` +
+                            `${prep.dig_locus ? `@${prep.dig_locus}` : ''}): ` +
+                            `${(prep.dig_preview || '').slice(0, 80)}`;
+                    } else if (
+                        prep.reason === 'train_mid_already_is_gold'
+                        || region === 'gold'
+                    ) {
+                        rewriteNote = '训练 MID 已是 gold 目标，保持原样本。';
+                    } else {
+                        rewriteNote =
+                            `未能挖空改写 (${prep.reason || prep.mode || 'unchanged'})，打开原样本。` +
+                            '常见原因：test gold 与语料 before/after 空白不一致且无法对齐。';
+                        console.warn('[mid-rewrite-prep] not applied', prep);
                     }
                 } catch (err) {
+                    rewriteNote =
+                        'MID改写请求失败（跨域/服务未开），打开原样本。';
                     console.warn('[mid-rewrite-prep] error', err);
                 }
             }
+
+            if (rewriteNote) {
+                // Brief status for the operator; don't block open.
+                console.info('[corpus-open]', rewriteNote);
+            }
             window.open(url.toString(), '_blank', 'noopener,noreferrer');
+            if (rewriteNote && !url.searchParams.get('rewriteId')) {
+                // Surface failure when we expected a rewrite for context hits.
+                if (region === 'context' || region === 'cross' || region === '') {
+                    window.alert(rewriteNote);
+                }
+            }
         })();
     }, [
         llmTrainResult?.corpus_path,

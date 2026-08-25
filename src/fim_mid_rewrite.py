@@ -479,8 +479,30 @@ def _locus_at(doc: str, pos: int) -> str:
     return "other"
 
 
+def ws_flex_find(hay: str, needle: str) -> tuple[int, int] | None:
+    """Find ``needle`` in ``hay`` allowing tab/space/newline run differences.
+
+    Returns ``[start, end)`` into ``hay`` (original characters), or None.
+    """
+    parts = [p for p in re.split(r"\s+", (needle or "").strip()) if p]
+    if not parts or not hay:
+        return None
+    # Prefer longer matches: require all tokens in order with flexible whitespace.
+    pat = r"\s+".join(re.escape(p) for p in parts)
+    try:
+        m = re.search(pat, hay)
+    except re.error:
+        return None
+    if not m:
+        return None
+    return m.start(), m.end()
+
+
 def _choose_in_hay(hay: str, test_gold: str, expression: str) -> tuple[str, str]:
-    """Return ``(dig_text, mode)`` from one haystack, or empty."""
+    """Return ``(dig_text, mode)`` from one haystack, or empty.
+
+    ``dig_text`` is always a verbatim slice of ``hay`` (preserves tabs).
+    """
     gold = (test_gold or "").strip("\n")
     hay = hay or ""
     if not hay.strip():
@@ -489,11 +511,51 @@ def _choose_in_hay(hay: str, test_gold: str, expression: str) -> tuple[str, str]
     if gold and gold in hay:
         return gold, "exact_test_gold"
 
+    if gold:
+        span = ws_flex_find(hay, gold)
+        if span is not None:
+            a, b = span
+            # Prefer snapping to whole lines when the match ate most of the gold.
+            a2, b2 = _snap_to_lines(hay, a, b)
+            dig = hay[a2:b2].strip("\n")
+            if dig.strip():
+                return dig, "ws_exact_test_gold"
+
     min_lcs = max(12, min(40, int(0.35 * len(gold)))) if gold else 12
     if gold:
+        lines = [ln for ln in gold.splitlines() if ln.strip()]
+        best_dig = ""
+        best_mode = ""
+        for i in range(len(lines)):
+            for j in range(len(lines), i, -1):
+                block = "\n".join(lines[i:j])
+                if len(re.sub(r"\s+", "", block)) < min_lcs:
+                    break
+                span = ws_flex_find(hay, block)
+                if span is None:
+                    continue
+                a, b = _snap_to_lines(hay, span[0], span[1])
+                dig = hay[a:b].strip("\n")
+                if len(dig) > len(best_dig):
+                    best_dig = dig
+                    best_mode = "ws_lcs_test_gold"
+                break
+        if best_dig:
+            return best_dig, best_mode
+
+        # Character LCS fallback (verbatim substring of gold that appears in hay).
         lcs = longest_needle_substr_in_hay(gold, hay, min_len=min_lcs)
         if lcs:
             return lcs, "lcs_test_gold"
+        # Also try whitespace-flex on the longest gold line.
+        long_line = max(lines, key=len) if lines else ""
+        if long_line and len(long_line.strip()) >= 12:
+            span = ws_flex_find(hay, long_line)
+            if span is not None:
+                a, b = _snap_to_lines(hay, span[0], span[1])
+                dig = hay[a:b].strip("\n")
+                if dig.strip():
+                    return dig, "ws_line_test_gold"
 
     cover = _expression_cover_span(hay, expression)
     if cover is not None:
@@ -545,6 +607,15 @@ def rewrite_fim_mid(
     """
     prompt = prompt or ""
     old_mid = response or ""
+    try:
+        from llm_train_retrieval import clean_gold_mid_completion
+    except ImportError:  # pragma: no cover
+        try:
+            from src.llm_train_retrieval import clean_gold_mid_completion
+        except ImportError:
+            clean_gold_mid_completion = lambda s: (s or "").strip()  # type: ignore
+    test_gold = clean_gold_mid_completion(test_gold or "")
+
     base: dict[str, Any] = {
         "prompt": prompt,
         "response": old_mid,
@@ -556,6 +627,20 @@ def rewrite_fim_mid(
     if not has_fim_markers(prompt):
         base["reason"] = "no_fim_markers"
         return base
+
+    # Train MID already is the teaching target → keep original sample.
+    if test_gold.strip():
+        if test_gold in old_mid or (
+            old_mid.strip() and old_mid.strip() in test_gold and len(old_mid.strip()) >= 12
+        ):
+            base["reason"] = "train_mid_already_is_gold"
+            return base
+        mid_hit = ws_flex_find(old_mid, test_gold)
+        if mid_hit is not None:
+            covered = mid_hit[1] - mid_hit[0]
+            if covered >= max(12, int(0.8 * len(re.sub(r"\s+", "", test_gold)))):
+                base["reason"] = "train_mid_already_is_gold"
+                return base
 
     span = find_fim_span(prompt)
     # Full user text with the original hole filled and markers removed.
