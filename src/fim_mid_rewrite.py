@@ -128,29 +128,275 @@ def find_enclosing_go_func(
     return None
 
 
-def build_relocated_fim(
-    doc: str,
-    dig_start: int,
-    dig_end: int,
-    *,
-    clamp: tuple[int, int] | None = None,
-) -> tuple[str, str, str, str]:
-    """Build prompt with FIM hole at dig; PRE/SUF span the enclosing function when possible.
+FENCE_BODY_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_ENSURE_HEADER = "Ensure that only missing"
 
-    Returns ``(new_prompt, new_prefix, new_suffix, geometry)`` where geometry is
-    ``func`` (PRE=func→MID, SUF=MID→func_end) or ``point`` (empty PRE body).
-    """
-    dig = doc[dig_start:dig_end]
-    func = find_enclosing_go_func(doc, dig_start, dig_end, clamp=clamp)
-    if func is not None:
-        fs, fe = func
-        new_prefix = doc[fs:dig_start]
-        new_suffix = doc[dig_end:fe]
-        new_prompt = doc[:fs] + PRE + new_prefix + SUF + new_suffix + MID + doc[fe:]
-        return new_prompt, new_prefix, new_suffix, "func"
-    # Fallback: point hole (everything left of dig is outside PRE).
-    new_prompt = doc[:dig_start] + PRE + SUF + doc[dig_end:] + MID
-    return new_prompt, "", doc[dig_end:], "point"
+
+def _section_header_span(prompt: str, header: str) -> tuple[int, int] | None:
+    """Return ``[header_start, section_end)`` until the next major header."""
+    idx = prompt.find(header)
+    if idx < 0:
+        return None
+    stops = (BEFORE_HEADER, AFTER_HEADER, FUNCTION_HEADER, _ENSURE_HEADER)
+    end = len(prompt)
+    for h in stops:
+        if h == header:
+            continue
+        j = prompt.find(h, idx + len(header))
+        if j >= 0:
+            end = min(end, j)
+    return idx, end
+
+
+def _extract_fence_body(section_text: str) -> str:
+    m = FENCE_BODY_RE.search(section_text or "")
+    if not m:
+        return ""
+    return m.group(1).rstrip("\n")
+
+
+def _replace_fence_body(section_text: str, new_body: str) -> str:
+    """Replace the first markdown fence body; create a go fence if missing."""
+    body = (new_body or "").rstrip("\n") + "\n"
+    m = FENCE_BODY_RE.search(section_text or "")
+    if not m:
+        base = (section_text or "").rstrip()
+        return f"{base}\n```go\n{body}```\n"
+    return section_text[: m.start(1)] + body + section_text[m.end(1) :]
+
+
+def _join_code_blocks(*parts: str) -> str:
+    chunks = [p.strip("\n") for p in parts if p and p.strip()]
+    return "\n".join(chunks)
+
+
+def _dig_in_func_source(
+    func_src: str,
+    dig: str,
+) -> tuple[str, str] | None:
+    """Split ``func_src`` into (prefix, suffix) around dig; prefer ws-flex."""
+    if not func_src or not dig:
+        return None
+    if dig in func_src:
+        i = func_src.find(dig)
+        return func_src[:i], func_src[i + len(dig) :]
+    span = ws_flex_find(func_src, dig)
+    if span is None:
+        return None
+    a, b = span
+    return func_src[:a], func_src[b:]
+
+
+def _make_fim_fence_body(prefix: str, suffix: str) -> str:
+    # Keep a newline after PRE content when non-empty for readability.
+    return f"{PRE}{prefix}{SUF}{suffix}{MID}"
+
+
+def build_relocated_fim_in_function_section(
+    prompt: str,
+    *,
+    dig: str,
+    old_mid: str,
+) -> dict[str, Any] | None:
+    """Only move PRE/SUF inside the original FIM function (before/after untouched)."""
+    span = find_fim_span(prompt)
+    filled_fn = span.prefix + old_mid + span.suffix
+    # Locate dig inside the filled function body.
+    if dig in filled_fn:
+        pos = filled_fn.find(dig)
+    else:
+        hit = ws_flex_find(filled_fn, dig)
+        if hit is None:
+            return None
+        pos = hit[0]
+        dig = filled_fn[hit[0] : hit[1]]
+    dig_end = pos + len(dig)
+    if dig == old_mid and pos == len(span.prefix):
+        return None
+    new_prefix = filled_fn[:pos]
+    new_suffix = filled_fn[dig_end:]
+    new_fim = _make_fim_fence_body(new_prefix, new_suffix)
+    func_span = _section_header_span(prompt, FUNCTION_HEADER)
+    if func_span is None:
+        return None
+    fs, fe = func_span
+    func_sec = prompt[fs:fe]
+    new_func_sec = _replace_fence_body(func_sec, new_fim)
+    new_prompt = prompt[:fs] + new_func_sec + prompt[fe:]
+    return {
+        "prompt": new_prompt,
+        "response": dig,
+        "new_prefix": new_prefix,
+        "new_suffix": new_suffix,
+        "fim_geometry": "func_inplace",
+    }
+
+
+def rewrite_sections_for_before_hit(
+    prompt: str,
+    *,
+    dig: str,
+    old_mid: str,
+) -> dict[str, Any] | None:
+    """Promote the hit function from before → new FIM problem; push remainder + old fn to after."""
+    span = find_fim_span(prompt)
+    orig_completed = span.prefix + old_mid + span.suffix
+
+    before_span = _section_header_span(prompt, BEFORE_HEADER)
+    after_span = _section_header_span(prompt, AFTER_HEADER)
+    func_span = _section_header_span(prompt, FUNCTION_HEADER)
+    if before_span is None or func_span is None:
+        return None
+
+    before_sec = prompt[before_span[0] : before_span[1]]
+    after_sec = prompt[after_span[0] : after_span[1]] if after_span else f"\n{AFTER_HEADER}\n```go\n\n```\n"
+    func_sec = prompt[func_span[0] : func_span[1]]
+
+    before_code = _extract_fence_body(before_sec)
+    after_code = _extract_fence_body(after_sec)
+
+    # Resolve dig position inside before fence body.
+    if dig in before_code:
+        dig_pos = before_code.find(dig)
+        dig_end = dig_pos + len(dig)
+    else:
+        hit = ws_flex_find(before_code, dig)
+        if hit is None:
+            return None
+        dig_pos, dig_end = hit
+        dig = before_code[dig_pos:dig_end]
+
+    func = find_enclosing_go_func(before_code, dig_pos, dig_end)
+    if func is None:
+        return None
+    fs, fe = func
+    hit_fn = before_code[fs:fe]
+    split = _dig_in_func_source(hit_fn, dig)
+    if split is None:
+        return None
+    new_prefix, new_suffix = split
+
+    new_before = before_code[:fs].rstrip("\n")
+    remainder_after_hit = before_code[fe:].lstrip("\n")
+    new_after = _join_code_blocks(remainder_after_hit, orig_completed, after_code)
+    new_fim = _make_fim_fence_body(new_prefix, new_suffix)
+
+    new_before_sec = _replace_fence_body(before_sec, new_before)
+    new_after_sec = _replace_fence_body(after_sec, new_after)
+    new_func_sec = _replace_fence_body(func_sec, new_fim)
+
+    # Stitch in original section order (indices from original prompt).
+    replacements: list[tuple[int, int, str]] = [
+        (before_span[0], before_span[1], new_before_sec),
+    ]
+    if after_span is not None:
+        replacements.append((after_span[0], after_span[1], new_after_sec))
+    else:
+        # Insert a new after section just before the function header.
+        replacements.append((func_span[0], func_span[0], new_after_sec))
+    replacements.append((func_span[0], func_span[1], new_func_sec))
+    replacements.sort(key=lambda x: x[0])
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, text in replacements:
+        if start < cursor:
+            # Overlap from inserted after — skip already-written region.
+            continue
+        parts.append(prompt[cursor:start])
+        parts.append(text)
+        cursor = end
+    parts.append(prompt[cursor:])
+    return {
+        "prompt": "".join(parts),
+        "response": dig,
+        "new_prefix": new_prefix,
+        "new_suffix": new_suffix,
+        "fim_geometry": "promote_before_to_fim",
+    }
+
+
+def rewrite_sections_for_after_hit(
+    prompt: str,
+    *,
+    dig: str,
+    old_mid: str,
+) -> dict[str, Any] | None:
+    """Promote the hit function from after → new FIM; push prior funcs + old fn into before."""
+    span = find_fim_span(prompt)
+    orig_completed = span.prefix + old_mid + span.suffix
+
+    before_span = _section_header_span(prompt, BEFORE_HEADER)
+    after_span = _section_header_span(prompt, AFTER_HEADER)
+    func_span = _section_header_span(prompt, FUNCTION_HEADER)
+    if after_span is None or func_span is None:
+        return None
+
+    before_sec = (
+        prompt[before_span[0] : before_span[1]]
+        if before_span
+        else f"\n{BEFORE_HEADER}\n```go\n\n```\n"
+    )
+    after_sec = prompt[after_span[0] : after_span[1]]
+    func_sec = prompt[func_span[0] : func_span[1]]
+
+    before_code = _extract_fence_body(before_sec)
+    after_code = _extract_fence_body(after_sec)
+
+    if dig in after_code:
+        dig_pos = after_code.find(dig)
+        dig_end = dig_pos + len(dig)
+    else:
+        hit = ws_flex_find(after_code, dig)
+        if hit is None:
+            return None
+        dig_pos, dig_end = hit
+        dig = after_code[dig_pos:dig_end]
+
+    func = find_enclosing_go_func(after_code, dig_pos, dig_end)
+    if func is None:
+        return None
+    fs, fe = func
+    hit_fn = after_code[fs:fe]
+    split = _dig_in_func_source(hit_fn, dig)
+    if split is None:
+        return None
+    new_prefix, new_suffix = split
+
+    prior_in_after = after_code[:fs].rstrip("\n")
+    new_before = _join_code_blocks(before_code, orig_completed, prior_in_after)
+    new_after = after_code[fe:].lstrip("\n")
+    new_fim = _make_fim_fence_body(new_prefix, new_suffix)
+
+    new_before_sec = _replace_fence_body(before_sec, new_before)
+    new_after_sec = _replace_fence_body(after_sec, new_after)
+    new_func_sec = _replace_fence_body(func_sec, new_fim)
+
+    replacements: list[tuple[int, int, str]] = []
+    if before_span is not None:
+        replacements.append((before_span[0], before_span[1], new_before_sec))
+    else:
+        replacements.append((after_span[0], after_span[0], new_before_sec))
+    replacements.append((after_span[0], after_span[1], new_after_sec))
+    replacements.append((func_span[0], func_span[1], new_func_sec))
+    replacements.sort(key=lambda x: x[0])
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, text in replacements:
+        if start < cursor:
+            continue
+        parts.append(prompt[cursor:start])
+        parts.append(text)
+        cursor = end
+    parts.append(prompt[cursor:])
+    return {
+        "prompt": "".join(parts),
+        "response": dig,
+        "new_prefix": new_prefix,
+        "new_suffix": new_suffix,
+        "fim_geometry": "promote_after_to_fim",
+    }
 
 
 @dataclass(frozen=True)
@@ -667,8 +913,12 @@ def rewrite_fim_mid(
     sections = _section_ranges(doc)
     if mode.endswith("_before") and "before" in sections:
         prefer_range = sections["before"]
+        locus = "before"
     elif mode.endswith("_after") and "after" in sections:
         prefer_range = sections["after"]
+        locus = "after"
+    else:
+        locus = "function"
 
     pos = -1
     if prefer_range is not None:
@@ -677,6 +927,11 @@ def rewrite_fim_mid(
         rel = local.find(dig)
         if rel >= 0:
             pos = a + rel
+        else:
+            hit = ws_flex_find(local, dig)
+            if hit is not None:
+                pos = a + hit[0]
+                dig = local[hit[0] : hit[1]]
     if pos < 0:
         pos = _find_preferring_context(
             doc, dig, mid_start=old_mid_start, mid_end=old_mid_end,
@@ -685,35 +940,46 @@ def rewrite_fim_mid(
         base["reason"] = "dig_not_found_in_filled"
         return base
 
-    # Relocate FIM hole to dig. Prefer PRE/SUF = enclosing Go function
-    # (func start → MID, MID → func end), especially for before/after snippets.
     if dig == old_mid and pos == old_mid_start:
         base["reason"] = "same_as_original_mid"
         return base
 
-    dig_end = pos + len(dig)
-    clamp = prefer_range
-    # When dig is in the main function section, still prefer enclosing-func geometry.
-    if clamp is None and "function" in sections:
-        clamp = sections["function"]
+    # Resolve locus from position if mode didn't say before/after.
+    if locus == "function":
+        locus = _locus_at(doc, pos)
 
-    new_prompt, new_prefix, new_suffix, geometry = build_relocated_fim(
-        doc, pos, dig_end, clamp=clamp,
-    )
-    locus = _locus_at(doc, pos)
-    dig_hash = hashlib.sha1(dig.encode("utf-8")).hexdigest()[:10]
+    rebuilt: dict[str, Any] | None = None
+    if locus == "before":
+        rebuilt = rewrite_sections_for_before_hit(
+            prompt, dig=dig, old_mid=old_mid,
+        )
+    elif locus == "after":
+        rebuilt = rewrite_sections_for_after_hit(
+            prompt, dig=dig, old_mid=old_mid,
+        )
+    else:
+        rebuilt = build_relocated_fim_in_function_section(
+            prompt, dig=dig, old_mid=old_mid,
+        )
+
+    if not rebuilt:
+        base["reason"] = "section_rewrite_failed"
+        return base
+
+    dig_out = str(rebuilt["response"])
+    dig_hash = hashlib.sha1(dig_out.encode("utf-8")).hexdigest()[:10]
     return {
-        "prompt": new_prompt,
-        "response": dig,
+        "prompt": rebuilt["prompt"],
+        "response": dig_out,
         "mode": mode,
         "dig_locus": locus,
-        "fim_geometry": geometry,
-        "dig_text": dig,
+        "fim_geometry": rebuilt.get("fim_geometry"),
+        "dig_text": dig_out,
         "old_mid": old_mid,
-        "new_prefix_preview": new_prefix[:120],
-        "new_suffix_preview": new_suffix[:80],
+        "new_prefix_preview": str(rebuilt.get("new_prefix") or "")[:120],
+        "new_suffix_preview": str(rebuilt.get("new_suffix") or "")[:80],
         "dig_hash": dig_hash,
         "reason": "ok",
         "dig_start_in_filled": pos,
-        "dig_end_in_filled": dig_end,
+        "dig_end_in_filled": pos + len(dig),
     }
