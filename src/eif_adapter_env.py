@@ -4,6 +4,8 @@ Reports live under::
 
     correlation_matching_results/ce/*.json
     correlation_matching_results/saliency/*.json
+    correlation_matching_results/raw_ce/*.jsonl   # live CE LoRA
+    correlation_matching_results/raw_sa/*.jsonl   # live saliency LoRA
 
 Env (see ``eif_api.env.example``)::
 
@@ -23,6 +25,7 @@ from typing import Any, Literal
 ReportFamily = Literal["ce", "saliency", "unknown"]
 
 _FAMILY_DIRS = ("ce", "saliency")
+_RAW_FAMILY_DIRS = ("raw_ce", "raw_sa", "raw")
 
 
 def normalize_report_relpath(report_file_name: str) -> str:
@@ -53,16 +56,16 @@ def infer_report_family(
     if not rel:
         return "unknown"
     top = rel.split("/", 1)[0].lower()
-    if top == "ce":
+    if top in ("ce", "raw_ce"):
         return "ce"
-    if top == "saliency":
+    if top in ("saliency", "raw_sa"):
         return "saliency"
 
     # Legacy flat filenames: guess from stem tags.
     low = rel.lower()
     if "ce_only" in low or "/ce/" in f"/{low}" or low.startswith("ce_"):
         return "ce"
-    if "saliency" in low or "cesal" in low:
+    if "saliency" in low or "cesal" in low or "/raw_sa/" in f"/{low}":
         return "saliency"
     return "unknown"
 
@@ -76,7 +79,7 @@ def resolve_report_json_path(corr_results_dir: Path, report_file_name: str) -> P
     if len(parts) == 1:
         # Legacy: flat file in corr root.
         cand = (corr_results_dir / parts[0]).resolve()
-    elif len(parts) == 2 and parts[0].lower() in (*_FAMILY_DIRS, "raw"):
+    elif len(parts) == 2 and parts[0].lower() in (*_FAMILY_DIRS, *_RAW_FAMILY_DIRS):
         cand = (corr_results_dir / parts[0].lower() / parts[1]).resolve()
     else:
         return None

@@ -336,6 +336,11 @@ function stemFromSource(sourceName: string): string {
     return lastPart.replace(/\.json$/i, '') || 'uploaded-report';
 }
 
+function isRawEvalPath(fileName: string | undefined | null): boolean {
+    const p = (fileName || '').replace(/\\/g, '/');
+    return p.startsWith('raw_ce/') || p.startsWith('raw_sa/') || p.startsWith('raw/');
+}
+
 function buildImportedMeta(report: AllTokensReport, sourceName: string): AllTokensExperimentMeta {
     const stem = stemFromSource(sourceName);
     const testIndex = report.experiment_meta.test_sample_index;
@@ -1226,7 +1231,7 @@ function CodeTokenStream({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
-    clickScope?: 'analyzed' | 'prompt' | 'all';
+    clickScope?: 'analyzed' | 'prompt' | 'response' | 'all';
     linkedTokenIndex?: number | null;
     onTokenHover?: (idx: number | null) => void;
     compact?: boolean;
@@ -1253,6 +1258,7 @@ function CodeTokenStream({
                     const clickable = Boolean(onTokenClick) && (
                         clickScope === 'all'
                         || (clickScope === 'prompt' && !isResponse)
+                        || (clickScope === 'response' && isResponse)
                         || (clickScope === 'analyzed' && isAnalyzed)
                     );
                     return (
@@ -1303,7 +1309,7 @@ function OutputComparePanel({
     selectedTargetIndex?: number;
     analyzedIndices?: Set<number>;
     onTokenClick?: (idx: number) => void;
-    modelClickScope?: 'analyzed' | 'prompt' | 'all';
+    modelClickScope?: 'analyzed' | 'prompt' | 'response' | 'all';
     goldSelectedLocalIndex?: number | null;
     goldHighlightSourceIndices?: Set<number>;
     onGoldTokenClick?: (localIdx: number) => void;
@@ -2349,11 +2355,11 @@ function inferContinueAdapterFamily(
     if (stamped === 'saliency' || stamped === 'ce_saliency') return 'saliency';
     const rel = String(fileName || '').replace(/\\/g, '/').replace(/^\.\//, '');
     const top = rel.split('/')[0]?.toLowerCase() || '';
-    if (top === 'ce') return 'ce';
-    if (top === 'saliency') return 'saliency';
+    if (top === 'ce' || top === 'raw_ce') return 'ce';
+    if (top === 'saliency' || top === 'raw_sa') return 'saliency';
     const low = rel.toLowerCase();
-    if (low.includes('ce_only') || low.startsWith('ce_')) return 'ce';
-    if (low.includes('saliency') || low.includes('cesal')) return 'saliency';
+    if (low.includes('ce_only') || low.startsWith('ce_') || low.includes('raw_ce')) return 'ce';
+    if (low.includes('saliency') || low.includes('cesal') || low.includes('raw_sa')) return 'saliency';
     return 'unknown';
 }
 
@@ -2384,7 +2390,7 @@ export function ReportPanel({
 }: ReportPanelProps) {
     const importedReportActive = meta.fileName.startsWith('uploaded:') || meta.label.includes('(uploaded)');
     const rawEvalActive = Boolean(report.experiment_meta.raw_eval)
-        || meta.fileName.replace(/\\/g, '/').startsWith('raw/');
+        || isRawEvalPath(meta.fileName);
     const selectedMeta = meta;
 
     // Selected output token (by absolute sequence index)
@@ -2566,11 +2572,12 @@ export function ReportPanel({
     const moveOriginRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
     const inlineVisualizerRef = useRef<HTMLDivElement | null>(null);
 
-    const familyPrefix = meta.fileName.startsWith('ce/')
+    const rawPath = meta.fileName.replace(/\\/g, '/');
+    const familyPrefix = meta.fileName.startsWith('ce/') || rawPath.startsWith('raw_ce/')
         ? '[ce] '
-        : meta.fileName.startsWith('saliency/')
+        : meta.fileName.startsWith('saliency/') || rawPath.startsWith('raw_sa/')
             ? '[saliency] '
-            : (rawEvalActive || meta.fileName.replace(/\\/g, '/').startsWith('raw/')
+            : (rawEvalActive || isRawEvalPath(meta.fileName)
                 ? '[raw] '
                 : '');
     const continueAdapterFamily = inferContinueAdapterFamily(meta.fileName, report);
@@ -2766,10 +2773,18 @@ export function ReportPanel({
     ]);
     const modelTokens = livePredictOverride?.tokens ?? reportModelTokens;
     // Gold panel shows the answer only — same slice used by Markdown export.
-    const goldResponseTokens = useMemo(
-        () => (correctTokens.length > promptLen ? correctTokens.slice(promptLen) : correctTokens),
-        [correctTokens, promptLen],
-    );
+    // Always slice when the gold sequence includes the shared prompt prefix.
+    // (Legacy answer-only reports: length <= promptLen → keep as-is.)
+    const goldResponseTokens = useMemo(() => {
+        if (correctTokens.length > promptLen) return correctTokens.slice(promptLen);
+        if (rawEvalActive) {
+            // Raw reports always use prompt+answer; empty slice means encode bug.
+            const rawLabel = report.test_sample_baseline.raw_label;
+            if (rawLabel && rawLabel.length > 0) return [rawLabel];
+            return [];
+        }
+        return correctTokens;
+    }, [correctTokens, promptLen, rawEvalActive, report]);
     const continueCurrentTestPayload = useMemo(() => {
         if (!report) return null;
         const taskId = report.experiment_meta.task_id;
@@ -4950,7 +4965,9 @@ export function ReportPanel({
                 <span className={styles.modelBannerMeta}>
                     test#{report.experiment_meta.test_sample_index}
                     {report.experiment_meta.task_id ? ` · ${report.experiment_meta.task_id}` : ''}
-                    {` · ${report.per_token_results.length} tokens`}
+                    {rawEvalActive
+                        ? ` · ${Math.max(0, modelTokens.length - promptLen)} answer tokens`
+                        : ` · ${report.per_token_results.length} tokens`}
                 </span>
             </div>
 
@@ -4972,7 +4989,11 @@ export function ReportPanel({
                                 }
                                 selectedTargetIndex={attrMode === 'predict' ? (selectedTokIdx ?? undefined) : undefined}
                                 analyzedIndices={analyzedIndices}
-                                modelClickScope={attrMode === 'manual' ? 'prompt' : 'analyzed'}
+                                modelClickScope={
+                                    attrMode === 'manual'
+                                        ? 'prompt'
+                                        : (rawEvalActive ? 'response' : 'analyzed')
+                                }
                                 onTokenClick={idx => {
                                     if (attrMode === 'manual') {
                                         handleManualSourceClick(idx);

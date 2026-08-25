@@ -186,6 +186,7 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
     from src.eif_adapter_env import (
         adapter_path_for_family,
         base_model_path_from_env,
+        env_adapter_path_for_family,
         infer_report_family,
     )
 
@@ -195,7 +196,12 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
         str(meta.get("report_file") or meta.get("fileName") or ""),
         report,
     )
-    env_model = adapter_path_for_family(family).strip()
+    # Raw CE/SA folders must pin the env LoRA even if a continue-train override
+    # is active (otherwise raw_ce could silently use a saliency continue adapter).
+    if meta.get("raw_eval"):
+        env_model = env_adapter_path_for_family(family).strip()
+    else:
+        env_model = adapter_path_for_family(family).strip()
     report_model = str(meta.get("model_path") or meta.get("adapter_path") or "").strip()
 
     if env_model and not _is_placeholder_path(env_model):

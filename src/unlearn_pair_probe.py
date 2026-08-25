@@ -94,6 +94,7 @@ def _resolve_paths(
     from src.eif_adapter_env import (
         adapter_path_for_family,
         base_model_path_from_env,
+        env_adapter_path_for_family,
         infer_report_family,
     )
 
@@ -102,7 +103,10 @@ def _resolve_paths(
         str(meta.get("report_file") or meta.get("fileName") or ""),
         report,
     )
-    family_adapter = adapter_path_for_family(family)
+    if meta.get("raw_eval"):
+        family_adapter = env_adapter_path_for_family(family)
+    else:
+        family_adapter = adapter_path_for_family(family)
     resolved_model = (
         str(model_path or "").strip()
         or family_adapter

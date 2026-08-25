@@ -1070,16 +1070,22 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if path is None:
             self._send_json(404, {"status": "error", "message": f"raw jsonl not found: {file_name}"})
             return
+        # Preserve caller folder (raw_ce / raw_sa); fall back from resolved path.
+        rel = file_name.replace("\\", "/").lstrip("/")
+        if "/" not in rel:
+            parent = path.parent.name.lower()
+            rel = f"{parent}/{path.name}"
         rows = list_raw_jsonl_rows(path)
         self._send_json(200, {
             "status": "success",
-            "fileName": f"raw/{path.name}",
+            "fileName": rel,
             "rows": rows,
         })
 
     def _handle_raw_eval_sample(self):
         from src.raw_eval_report import (
             build_raw_eval_report,
+            family_from_raw_relpath,
             read_raw_jsonl_row,
             resolve_raw_jsonl,
         )
@@ -1103,17 +1109,32 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if line_no < 1:
             self._send_json(400, {"status": "error", "message": "line (>=1) is required"})
             return
+        rel = file_name.replace("\\", "/").lstrip("/")
+        if "/" not in rel:
+            rel = f"{path.parent.name.lower()}/{path.name}"
+        family = family_from_raw_relpath(rel)
         try:
             row = read_raw_jsonl_row(path, line_no)
             report = build_raw_eval_report(
                 row,
-                file_name=f"raw/{path.name}",
+                file_name=rel,
                 line_no=line_no,
+                report_family=family,
             )
         except Exception as exc:
             print(f"[raw-eval] sample failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
+        baseline = report.get("test_sample_baseline") or {}
+        pl = int(baseline.get("prompt_len") or 0)
+        n_pred = len(baseline.get("full_token_ids") or [])
+        n_gold = len(baseline.get("correct_full_token_ids") or [])
+        meta = report.get("experiment_meta") or {}
+        print(
+            f"[raw-eval] {rel}:L{line_no} family={meta.get('report_family')} "
+            f"prompt_len={pl} predict_answer={n_pred - pl} gold_answer={n_gold - pl}",
+            flush=True,
+        )
         self._send_json(200, {"status": "success", "report": report})
 
     def _handle_gold_saliency(self):

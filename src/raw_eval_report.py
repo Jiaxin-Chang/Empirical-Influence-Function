@@ -1,58 +1,99 @@
-"""Build a synthetic all-tokens report from a raw eval JSONL row (prompt/label/predict)."""
+"""Build a synthetic all-tokens report from a raw eval JSONL row (prompt/label/predict).
+
+Layout under ``correlation_matching_results``::
+
+    raw_ce/*.jsonl   → report_family=ce        → EIF_ADAPTER_PATH_CE
+    raw_sa/*.jsonl   → report_family=saliency   → EIF_ADAPTER_PATH_SALIENCY
+
+Legacy ``raw/`` is still listed (family unknown / must set meta) but new data
+should go in ``raw_ce`` / ``raw_sa``.
+"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.eif_adapter_env import base_model_path_from_env, env_adapter_path_for_family
 
-RAW_DIR_NAME = "raw"
+RawFamily = Literal["ce", "saliency"]
+
+# folder name → adapter family
+RAW_FAMILY_DIRS: dict[str, RawFamily] = {
+    "raw_ce": "ce",
+    "raw_sa": "saliency",
+}
+# Legacy unscoped folder (prefer migrating files into raw_ce / raw_sa).
+RAW_LEGACY_DIR = "raw"
+ALL_RAW_DIRS: tuple[str, ...] = ("raw_ce", "raw_sa", RAW_LEGACY_DIR)
+
+
+def family_from_raw_relpath(file_name: str) -> RawFamily | None:
+    """Return ce/saliency from ``raw_ce/foo.jsonl`` / ``raw_sa/foo.jsonl``."""
+    rel = (file_name or "").strip().replace("\\", "/").lstrip("/")
+    top = rel.split("/", 1)[0].lower() if rel else ""
+    return RAW_FAMILY_DIRS.get(top)
 
 
 def resolve_raw_jsonl(corr_results_dir: Path, file_name: str) -> Path | None:
-    """Resolve ``raw/foo.jsonl`` or ``foo.jsonl`` under correlation_matching_results/raw."""
+    """Resolve ``raw_ce/foo.jsonl``, ``raw_sa/foo.jsonl``, or legacy ``raw/foo.jsonl``."""
     rel = (file_name or "").strip().replace("\\", "/").lstrip("/")
     if not rel or ".." in rel.split("/"):
         return None
     parts = [p for p in rel.split("/") if p]
-    if not parts:
+    if len(parts) == 1:
+        # Bare filename: search raw_ce → raw_sa → raw
+        name = parts[0]
+        if not name.lower().endswith(".jsonl"):
+            return None
+        for folder in ALL_RAW_DIRS:
+            cand = (corr_results_dir / folder / name).resolve()
+            try:
+                cand.relative_to((corr_results_dir / folder).resolve())
+            except ValueError:
+                continue
+            if cand.is_file():
+                return cand
         return None
-    if parts[0].lower() == RAW_DIR_NAME:
-        parts = parts[1:]
-    if len(parts) != 1:
+    if len(parts) != 2:
         return None
-    name = parts[0]
+    folder, name = parts[0].lower(), parts[1]
+    if folder not in ALL_RAW_DIRS:
+        return None
     if not name.lower().endswith(".jsonl"):
         return None
-    cand = (corr_results_dir / RAW_DIR_NAME / name).resolve()
+    cand = (corr_results_dir / folder / name).resolve()
     try:
-        cand.relative_to((corr_results_dir / RAW_DIR_NAME).resolve())
+        cand.relative_to((corr_results_dir / folder).resolve())
     except ValueError:
         return None
     return cand if cand.is_file() else None
 
 
 def list_raw_jsonl_files(corr_results_dir: Path) -> list[dict[str, Any]]:
-    raw_dir = corr_results_dir / RAW_DIR_NAME
-    if not raw_dir.is_dir():
-        return []
     out: list[dict[str, Any]] = []
-    for path in sorted(raw_dir.glob("*.jsonl")):
-        n = 0
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.strip():
-                        n += 1
-        except OSError:
+    for folder, family in RAW_FAMILY_DIRS.items():
+        raw_dir = corr_results_dir / folder
+        if not raw_dir.is_dir():
             continue
-        out.append({
-            "fileName": f"{RAW_DIR_NAME}/{path.name}",
-            "label": path.stem,
-            "nRows": n,
-        })
+        for path in sorted(raw_dir.glob("*.jsonl")):
+            n = 0
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            n += 1
+            except OSError:
+                continue
+            tag = "CE" if family == "ce" else "SA"
+            out.append({
+                "fileName": f"{folder}/{path.name}",
+                "label": f"[{tag}] {path.stem}",
+                "nRows": n,
+                "folder": folder,
+                "reportFamily": family,
+            })
     return out
 
 
@@ -110,19 +151,36 @@ def _load_tokenizer():
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
 
-def _encode_prompt_completion(tokenizer, prompt: str, completion: str) -> tuple[list[str], list[int], int]:
-    from src.continue_train_eval import _render_eval_prompt
+def _surfaces_for_ids(tokenizer, ids: list[int]) -> list[str]:
+    """Per-id display strings. Never merge across ids (see raw encode note)."""
     from src.export_real_ttav_bundle import token_surfaces_for_display
 
-    rendered = _render_eval_prompt(tokenizer, prompt)
-    prompt_ids = [int(x) for x in tokenizer.encode(rendered, add_special_tokens=False)]
-    comp = completion or ""
-    comp_ids = [int(x) for x in tokenizer.encode(comp, add_special_tokens=False)] if comp else []
-    ids = prompt_ids + comp_ids
+    if not ids:
+        return []
+    # Region-local merge is OK (fixes U+FFFD chips) and cannot swallow the answer
+    # into the prompt, because prompt/answer are surfaced in separate calls.
     tokens = token_surfaces_for_display(tokenizer, ids)
     if len(tokens) != len(ids):
         tokens = [tokenizer.decode([i], skip_special_tokens=False) for i in ids]
-    return tokens, ids, len(prompt_ids)
+    return tokens
+
+
+def _encode_prompt_once(tokenizer, prompt: str) -> tuple[list[str], list[int]]:
+    from src.continue_train_eval import _render_eval_prompt
+
+    rendered = _render_eval_prompt(tokenizer, prompt)
+    prompt_ids = [int(x) for x in tokenizer.encode(rendered, add_special_tokens=False)]
+    if not prompt_ids:
+        raise ValueError("raw prompt encoded to empty token ids")
+    return _surfaces_for_ids(tokenizer, prompt_ids), prompt_ids
+
+
+def _encode_completion(tokenizer, completion: str) -> tuple[list[str], list[int]]:
+    comp = completion or ""
+    if not comp:
+        return [], []
+    comp_ids = [int(x) for x in tokenizer.encode(comp, add_special_tokens=False)]
+    return _surfaces_for_ids(tokenizer, comp_ids), comp_ids
 
 
 def build_raw_eval_report(
@@ -131,6 +189,7 @@ def build_raw_eval_report(
     file_name: str,
     line_no: int,
     tokenizer=None,
+    report_family: RawFamily | None = None,
 ) -> dict[str, Any]:
     prompt = str(row.get("prompt") or row.get("input") or "")
     label = str(row.get("label") or row.get("response") or row.get("gold") or "")
@@ -144,28 +203,50 @@ def build_raw_eval_report(
     if not label.strip():
         label = predict
 
+    rel = (file_name or "").strip().replace("\\", "/").lstrip("/")
+    family = report_family or family_from_raw_relpath(rel)
+    if family is None:
+        raise ValueError(
+            f"raw file must live under raw_ce/ or raw_sa/ (got {rel!r}). "
+            "Move the JSONL out of legacy raw/."
+        )
+    if not rel.startswith(("raw_ce/", "raw_sa/")):
+        rel = f"{'raw_ce' if family == 'ce' else 'raw_sa'}/{Path(rel).name}"
+
     tok = tokenizer or _load_tokenizer()
-    pred_tokens, pred_ids, prompt_len = _encode_prompt_completion(tok, prompt, predict)
-    gold_tokens, gold_ids, gold_prompt_len = _encode_prompt_completion(tok, prompt, label)
-    if gold_prompt_len != prompt_len:
-        # Same prompt string should encode identically; if not, keep predict prompt_len
-        # and re-slice gold (rare tokenizer non-determinism).
-        prompt_len = min(prompt_len, gold_prompt_len, len(pred_ids) - 1, len(gold_ids) - 1)
-        pred_tokens = pred_tokens[:prompt_len] + pred_tokens[prompt_len:]
-        gold_tokens = gold_tokens[:prompt_len] + gold_tokens[prompt_len:]
+    # Shared prompt ids so Model/Gold share the same prompt_len boundary.
+    # Critical: surface prompt and completion SEPARATELY. Running
+    # token_surfaces_for_display on the full sequence lets a trailing U+FFFD
+    # byte-fallback merge swallow the entire answer into the last prompt chip;
+    # answer indices become "" → UI shows text that is not clickable, and Gold
+    # looks empty while still rendering a GOLD header.
+    prompt_tokens, prompt_ids = _encode_prompt_once(tok, prompt)
+    prompt_len = len(prompt_ids)
+    pred_ans_tokens, pred_ans_ids = _encode_completion(tok, predict)
+    gold_ans_tokens, gold_ans_ids = _encode_completion(tok, label)
+    if not pred_ans_ids and predict.strip():
+        raise ValueError("raw predict encoded to empty token ids")
+    if not gold_ans_ids and label.strip():
+        raise ValueError("raw label encoded to empty token ids")
+
+    pred_tokens = prompt_tokens + pred_ans_tokens
+    pred_ids = prompt_ids + pred_ans_ids
+    gold_tokens = prompt_tokens + gold_ans_tokens
+    gold_ids = prompt_ids + gold_ans_ids
 
     task_id = str(row.get("task_id") or f"row_{line_no}")
-    rel = file_name if str(file_name).replace("\\", "/").startswith("raw/") else f"raw/{Path(file_name).name}"
+    n_answer = len(pred_ans_ids)
+    family_tag = "ce" if family == "ce" else "sa"
     return {
         "experiment_meta": {
             "test_sample_index": int(line_no),
             "mode": "all_tokens",
-            "tokens_analyzed": 0,
+            "tokens_analyzed": int(n_answer),
             "task_id": task_id,
             "report_file": rel,
-            "report_family": "saliency",
+            "report_family": family,
             "raw_eval": True,
-            "model_name": Path(rel).stem,
+            "model_name": f"{Path(rel).stem}[{family_tag}]",
         },
         "test_sample_baseline": {
             "full_tokens": pred_tokens,

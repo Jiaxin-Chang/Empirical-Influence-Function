@@ -25,6 +25,8 @@ interface RawEvalFile {
     fileName: string;
     label: string;
     nRows: number;
+    folder?: string;
+    reportFamily?: 'ce' | 'saliency' | null;
 }
 
 interface RawEvalRow {
@@ -220,15 +222,17 @@ export function NewView({ metas }: Props) {
             }
             const data = normalizeAllTokensReport(parsed.report);
             const taskId = data.experiment_meta.task_id || `line_${rawLine}`;
+            const family = data.experiment_meta.report_family;
+            const familyTag = family === 'ce' ? 'CE' : family === 'saliency' ? 'SA' : 'raw';
             const meta: AllTokensExperimentMeta = {
                 taskId,
-                label: `[raw] ${rawFile.replace(/^raw\//, '')} · L${rawLine}`,
+                label: `[${familyTag}] ${rawFile} · L${rawLine}`,
                 fileName: rawFile,
             };
             setSlot({
                 report: data,
                 meta,
-                status: `Raw eval · ${taskId} · predict/gold tokens ready (live saliency)`,
+                status: `Raw ${familyTag} · ${taskId} · LoRA=${family || '?'} · live saliency/probs`,
                 error: null,
             });
         } catch (error) {
@@ -260,8 +264,6 @@ export function NewView({ metas }: Props) {
         })();
     }, [activatePayload]);
 
-    const selectedRow = rawRows.find(r => String(r.line) === rawLine) ?? null;
-
     return (
         <div className={styles.root}>
             <div className={styles.slotImportCard}>
@@ -271,7 +273,7 @@ export function NewView({ metas }: Props) {
                         <div className={styles.slotImportDesc}>
                             {slot.report
                                 ? modelLabelFrom(slot.report, slot.meta, 'loaded')
-                                : 'Import JSON、选预处理报告，或打开 correlation_matching_results/raw 下的评测 JSONL'}
+                                : 'Import JSON、选预处理报告，或打开 correlation_matching_results/raw_ce|raw_sa 下的评测 JSONL'}
                         </div>
                     </div>
                     {slot.report && (
@@ -282,7 +284,7 @@ export function NewView({ metas }: Props) {
                 </div>
 
                 <div className={styles.rawEvalBar}>
-                    <div className={styles.rawEvalTitle}>Raw 评测 JSONL</div>
+                    <div className={styles.rawEvalTitle}>Raw 评测 JSONL（raw_ce=CE LoRA · raw_sa=Saliency LoRA）</div>
                     <div className={styles.rawEvalControls}>
                         <label className={styles.rawEvalLabel}>
                             文件
@@ -291,7 +293,7 @@ export function NewView({ metas }: Props) {
                                 disabled={rawBusy || rawFiles.length === 0}
                                 onChange={e => setRawFile(e.target.value)}
                             >
-                                {rawFiles.length === 0 && <option value="">（无 raw/*.jsonl）</option>}
+                                {rawFiles.length === 0 && <option value="">（无 raw_ce|raw_sa/*.jsonl）</option>}
                                 {rawFiles.map(f => (
                                     <option key={f.fileName} value={f.fileName}>
                                         {f.label} · {f.nRows} rows
@@ -323,12 +325,6 @@ export function NewView({ metas }: Props) {
                             {rawBusy ? '打开中…' : '打开样本'}
                         </button>
                     </div>
-                    {selectedRow && (
-                        <div className={styles.rawEvalPreview}>
-                            <div><strong>predict</strong> {selectedRow.predict_preview || '—'}</div>
-                            <div><strong>gold</strong> {selectedRow.label_preview || '—'}</div>
-                        </div>
-                    )}
                     {rawError && <div className={styles.importError}>{rawError}</div>}
                 </div>
 
