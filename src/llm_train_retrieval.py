@@ -2,12 +2,12 @@
 
 Two-stage analysis (no attention-edge / annotation design):
   1) summarize the gold <MID> completion's code pattern
-  2) describe ideal train-sample traits and emit boolean corpus search expressions
+  2) describe ideal train-sample traits and emit dual boolean expressions
+     (gold_expr on response + context_expr on prompt); retrieval requires both.
 
 Uses OpenAI-compatible API from repo-root ``eif_api.env``.
 The server evaluates expressions and returns matching rows.
 """
-
 from __future__ import annotations
 
 import json
@@ -194,12 +194,15 @@ def build_llm_train_retrieve_messages(
     gold_completion: str,
     example_expression: str | None = None,
 ) -> list[dict[str, str]]:
-    """Assemble system + user messages: pattern summary then corpus search."""
+    """Assemble system + user messages: pattern summary then dual corpus search."""
     prepared = prepare_llm_train_query(fim_prompt, gold_completion)
     problem = prepared["fim_problem_surface"]
     gold = prepared["gold_mid_completion"]
-    example_expr = example_expression or (
-        '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
+    example_gold = example_expression or (
+        '("if err :=" OR "if err !=") AND "err != nil" AND "return" AND "Wrap(err"'
+    )
+    example_ctx = (
+        '"func (" AND ("HandleEvent" OR "Execute") AND ("transdsl" OR "TransactionInfo")'
     )
     system = (
         "你是 Go 代码补全训练数据检索助手。\n"
@@ -211,8 +214,9 @@ def build_llm_train_retrieve_messages(
         "请分两段思考，并输出**严格 JSON**（不要 markdown 包裹）：\n"
         "第一段：概括这条 FIM 的 gold 回答是什么样的代码格式/模式。\n"
         "第二段：为了让模型学会这种模式，理想训练样本应具备哪些特征；"
-        "并据此给出 2-5 条布尔检索式，从宽到窄，用于在大规模 Go 训练 JSONL"
-        "（每行 prompt+response）里找出同类样本。\n\n"
+        "并据此给出 2-5 组检索式，从宽到窄。"
+        "每组必须同时约束 **gold（补全）** 与 **context（题面/前后文）**，"
+        "检索时两边都要命中才会入选。\n\n"
         "JSON 字段：\n"
         "{\n"
         '  "gold_pattern_summary": "概括 gold 的代码格式与模式（中文，2-5句）",\n'
@@ -220,17 +224,25 @@ def build_llm_train_retrieve_messages(
         '  "corpus_search_expressions": [\n'
         "    {\n"
         '      "name": "简短英文名",\n'
-        '      "expression": "布尔子串表达式",\n'
-        '      "why": "这条式子对应哪种代码模式、宽还是窄"\n'
+        '      "gold_expr": "只描述 <MID>/response 补全形态的布尔子串式",\n'
+        '      "context_expr": "只描述题面/前后文场景的布尔子串式",\n'
+        '      "why": "为何这对表达式能同时约束题型与补全内容、宽还是窄"\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "corpus_search_expressions 的 expression 语法：\n"
+        "表达式语法（gold_expr / context_expr 相同）：\n"
         '- 字面量用双引号，如 "err != nil {"\n'
         '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
         '- AND 连接必须同时出现，如 A AND B AND C\n'
-        f"- 示例：{example_expr}\n"
-        "必须给出 2-5 条 expression，按从宽到窄排序；只检索代码文本模式，不要检索标注字段。"
+        f"- gold_expr 示例（只谈补全）：{example_gold}\n"
+        f"- context_expr 示例（只谈场景）：{example_ctx}\n"
+        "硬性规则：\n"
+        "- gold_expr 必须能在训练行的 response/label（补全）里单独命中；"
+        "不要把只出现在上下文里的符号写进 gold_expr。\n"
+        "- context_expr 必须能在训练行的 prompt/input（题面）里单独命中；"
+        "可用包路径、receiver、邻近 API、FIM 前后片段特征等。\n"
+        "- 禁止只用一个 expression 字段；必须同时给出 gold_expr 与 context_expr。\n"
+        "- 给出 2-5 组，按从宽到窄排序。"
     )
     user = (
         "【题目类型】Go 代码 FIM 补全测试题（非对话；已去除 ChatML 包装）\n\n"
@@ -241,8 +253,8 @@ def build_llm_train_retrieve_messages(
         "请按两段回答：\n"
         "1）这条 gold 是什么样的代码格式/模式？\n"
         "2）为了训练模型学会该模式，理想训练样本应有哪些特征？"
-        "给出 2-5 条从宽到窄的布尔表达式，用于在训练集里找同类代码样本。"
-        "不要讨论标注。"
+        "给出 2-5 组从宽到窄的检索式，每组都要有 gold_expr（约束补全）"
+        "和 context_expr（约束题面场景）。不要讨论标注。"
     )
     return [
         {"role": "system", "content": system},
@@ -274,27 +286,105 @@ def eval_boolean_expression(text: str, expression: str) -> bool:
     return all(_eval_or_term(text, p.strip()) for p in parts if p.strip())
 
 
-def _sample_haystack(row: dict[str, Any]) -> str:
-    chunks: list[str] = []
+def _row_context_text(row: dict[str, Any]) -> str:
     for key in ("prompt", "input", "query"):
         v = row.get(key)
         if isinstance(v, str) and v:
-            chunks.append(v)
-            break
+            return v
+    return ""
+
+
+def _row_gold_text(row: dict[str, Any]) -> str:
     for key in ("response", "label", "output", "gold"):
         v = row.get(key)
         if isinstance(v, str) and v:
-            chunks.append(v)
-            break
+            return v
+    return ""
+
+
+def _sample_haystack(row: dict[str, Any]) -> str:
+    """Legacy combined haystack (context + gold). Prefer dual-field match."""
+    chunks = [c for c in (_row_context_text(row), _row_gold_text(row)) if c]
     if not chunks and isinstance(row.get("input_ids"), list):
         chunks.append(f"compact_n_tokens={len(row['input_ids'])}")
     return "\n".join(chunks)
 
 
+def normalize_dual_expr_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize one corpus_search_expressions entry to gold_expr + context_expr.
+
+    Legacy single ``expression`` is treated as gold_expr only (context empty →
+    that side is skipped so old LLM replies still searchable, but new prompts
+    require both).
+    """
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or "expr").strip() or "expr"
+    why = str(item.get("why") or "").strip()
+    gold_expr = str(
+        item.get("gold_expr")
+        or item.get("gold_expression")
+        or item.get("expression")
+        or ""
+    ).strip()
+    context_expr = str(
+        item.get("context_expr")
+        or item.get("context_expression")
+        or ""
+    ).strip()
+    if not gold_expr and not context_expr:
+        return None
+    return {
+        "name": name,
+        "gold_expr": gold_expr,
+        "context_expr": context_expr,
+        # Keep a combined display string for older UI snippets.
+        "expression": (
+            f"[gold] {gold_expr}"
+            + (f"  AND  [context] {context_expr}" if context_expr else "")
+        ).strip(),
+        "why": why,
+    }
+
+
+def row_matches_dual_expr(
+    row: dict[str, Any],
+    *,
+    gold_expr: str = "",
+    context_expr: str = "",
+    legacy_expression: str = "",
+) -> bool:
+    """Match gold on response/label and context on prompt/input.
+
+    If only ``legacy_expression`` is set (no dual fields), fall back to the
+    old combined haystack behavior.
+    """
+    gold_expr = (gold_expr or "").strip()
+    context_expr = (context_expr or "").strip()
+    legacy_expression = (legacy_expression or "").strip()
+
+    if gold_expr or context_expr:
+        if gold_expr:
+            gold_text = _row_gold_text(row)
+            if not gold_text or not eval_boolean_expression(gold_text, gold_expr):
+                return False
+        if context_expr:
+            ctx_text = _row_context_text(row)
+            if not ctx_text or not eval_boolean_expression(ctx_text, context_expr):
+                return False
+        return bool(gold_expr or context_expr)
+
+    if legacy_expression:
+        return eval_boolean_expression(_sample_haystack(row), legacy_expression)
+    return False
+
+
 def search_corpus_jsonl(
     corpus_path: str,
-    expression: str,
+    expression: str = "",
     *,
+    gold_expr: str = "",
+    context_expr: str = "",
     top_k: int = 20,
     max_scan: int | None = None,
     stats: dict[str, Any] | None = None,
@@ -320,15 +410,20 @@ def search_corpus_jsonl(
                 continue
             if not isinstance(row, dict):
                 continue
-            hay = _sample_haystack(row)
-            if not eval_boolean_expression(hay, expression):
+            if not row_matches_dual_expr(
+                row,
+                gold_expr=gold_expr,
+                context_expr=context_expr,
+                legacy_expression=expression,
+            ):
                 continue
-            resp = row.get("response") or row.get("label") or row.get("output") or ""
+            ctx = _row_context_text(row)
+            resp = _row_gold_text(row)
             hits.append({
                 "line": line_idx,
                 "task_id": row.get("task_id"),
-                "prompt_preview": (hay[:280] + "…") if len(hay) > 280 else hay,
-                "response_preview": (str(resp)[:200] + "…") if len(str(resp)) > 200 else str(resp),
+                "prompt_preview": (ctx[:280] + "…") if len(ctx) > 280 else ctx,
+                "response_preview": (resp[:200] + "…") if len(resp) > 200 else resp,
             })
             if len(hits) >= top_k:
                 stop_reason = "top_k"
@@ -338,12 +433,19 @@ def search_corpus_jsonl(
         stats["stop_reason"] = stop_reason
         stats["top_k"] = top_k
         stats["cached"] = False
+        stats["mode"] = (
+            "dual"
+            if (gold_expr or "").strip() or (context_expr or "").strip()
+            else "legacy"
+        )
     return hits
 
 
 def search_local_train_bank(
-    expression: str,
+    expression: str = "",
     *,
+    gold_expr: str = "",
+    context_expr: str = "",
     top_k: int = 20,
 ) -> list[dict[str, Any]]:
     """Search compact ``EIF_TRAIN_DATA`` rows (smoke bank) by line index."""
@@ -362,12 +464,15 @@ def search_local_train_bank(
                 continue
             edges = row.get("attention_edges") or row.get("edges") or []
             n_edges = len(edges) if isinstance(edges, list) else 0
-            # Decode compact rows via tokenizer-free placeholder: search by ids length only
-            # if no text — caller usually uses large chat corpus for text search.
             hay = _sample_haystack(row)
             if not hay.strip() and isinstance(row.get("input_ids"), list):
                 continue
-            if not eval_boolean_expression(hay, expression):
+            if not row_matches_dual_expr(
+                row,
+                gold_expr=gold_expr,
+                context_expr=context_expr,
+                legacy_expression=expression,
+            ):
                 continue
             subtypes: set[str] = set()
             if isinstance(edges, list):
@@ -418,6 +523,17 @@ def call_llm_train_retrieve(
     resp = client.chat.completions.create(**kwargs)
     raw = (resp.choices[0].message.content or "").strip()
     parsed = _parse_json_object(raw)
+    # Normalize dual expressions in-place for downstream + UI.
+    raw_exprs = parsed.get("corpus_search_expressions")
+    if isinstance(raw_exprs, list):
+        normalized: list[dict[str, Any]] = []
+        for item in raw_exprs:
+            if not isinstance(item, dict):
+                continue
+            n = normalize_dual_expr_item(item)
+            if n:
+                normalized.append(n)
+        parsed["corpus_search_expressions"] = normalized
     return {
         "model": model_name,
         "raw": raw,
@@ -456,19 +572,25 @@ def retrieve_llm_train_samples(
 
     corpus = corpus_path or _env("EIF_LLM_TRAIN_CORPUS") or _env("EIF_TRAIN_CORPUS") or ""
     search_results: list[dict[str, Any]] = []
-    local_bank_results: list[dict[str, Any]] = []
 
     for item in exprs:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "expr")
+        gold_expr = str(item.get("gold_expr") or "").strip()
+        context_expr = str(item.get("context_expr") or "").strip()
         expression = str(item.get("expression") or "").strip()
         why = str(item.get("why") or "")
-        if not expression:
+        if not gold_expr and not context_expr and not expression:
             continue
         entry: dict[str, Any] = {
             "name": name,
-            "expression": expression,
+            "gold_expr": gold_expr,
+            "context_expr": context_expr,
+            "expression": expression or (
+                f"[gold] {gold_expr}"
+                + (f"  AND  [context] {context_expr}" if context_expr else "")
+            ),
             "why": why,
             "corpus_hits": [],
             "local_bank_hits": [],
@@ -477,7 +599,9 @@ def retrieve_llm_train_samples(
             try:
                 entry["corpus_hits"] = search_corpus_jsonl(
                     corpus,
-                    expression,
+                    expression="" if (gold_expr or context_expr) else expression,
+                    gold_expr=gold_expr,
+                    context_expr=context_expr,
                     top_k=top_k,
                     max_scan=max_corpus_scan,
                 )
@@ -485,7 +609,12 @@ def retrieve_llm_train_samples(
             except Exception as exc:
                 entry["corpus_error"] = str(exc)
         if search_local_bank:
-            entry["local_bank_hits"] = search_local_train_bank(expression, top_k=top_k)
+            entry["local_bank_hits"] = search_local_train_bank(
+                expression="" if (gold_expr or context_expr) else expression,
+                gold_expr=gold_expr,
+                context_expr=context_expr,
+                top_k=top_k,
+            )
         search_results.append(entry)
 
     return {

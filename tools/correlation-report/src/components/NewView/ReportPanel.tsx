@@ -204,6 +204,8 @@ interface LlmTrainSearchHit {
 interface LlmTrainSearchExprResult {
     name?: string;
     expression?: string;
+    gold_expr?: string;
+    context_expr?: string;
     why?: string;
     corpus_hits?: LlmTrainSearchHit[];
     local_bank_hits?: LlmTrainSearchHit[];
@@ -213,6 +215,8 @@ interface LlmTrainSearchExprResult {
 interface LlmTrainExprItem {
     name?: string;
     expression?: string;
+    gold_expr?: string;
+    context_expr?: string;
     why?: string;
 }
 
@@ -2509,6 +2513,7 @@ export function ReportPanel({
         scanned_lines?: number;
         stop_reason?: string;
         elapsed_ms?: number;
+        mode?: string;
     }>>({});
     const enterManualPairMode = useCallback(() => {
         setAttrMode('manual');
@@ -4065,21 +4070,34 @@ export function ReportPanel({
         eifApiUrl,
     ]);
 
-    const fetchLlmCorpusSearch = useCallback((exprIdx: number, expression: string) => {
-        if (importedReportActive || !expression.trim()) return;
+    const fetchLlmCorpusSearch = useCallback((
+        exprIdx: number,
+        opts: { goldExpr?: string; contextExpr?: string; expression?: string },
+    ) => {
+        if (importedReportActive) return;
+        const goldExpr = (opts.goldExpr || '').trim();
+        const contextExpr = (opts.contextExpr || '').trim();
+        const expression = (opts.expression || '').trim();
+        if (!goldExpr && !contextExpr && !expression) return;
         setLlmTrainActiveExprIdx(exprIdx);
         setLlmTrainExprSearchBusy(true);
         setLlmTrainExprSearchError(null);
         void (async () => {
             try {
+                const body: Record<string, unknown> = {
+                    corpusPath: llmTrainResult?.corpus_path || undefined,
+                    topK: 15,
+                };
+                if (goldExpr || contextExpr) {
+                    body.goldExpr = goldExpr || undefined;
+                    body.contextExpr = contextExpr || undefined;
+                } else {
+                    body.expression = expression;
+                }
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/llm-corpus-search'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        expression: expression.trim(),
-                        corpusPath: llmTrainResult?.corpus_path || undefined,
-                        topK: 15,
-                    }),
+                    body: JSON.stringify(body),
                 });
                 const raw = await resp.text();
                 let parsed: {
@@ -4091,6 +4109,7 @@ export function ReportPanel({
                         stop_reason?: string;
                         elapsed_ms?: number;
                         cached?: boolean;
+                        mode?: string;
                     };
                 } = {};
                 if (raw.trim()) {
@@ -5258,7 +5277,7 @@ export function ReportPanel({
                                                     <span className={styles.corrSourceTok}>
                                                         {(decodeToken(c.source_token).trim() || '·')}
                                                         <span className={styles.corrArrow}>→</span>
-                                                        {decodeToken(c.target_token || selectedResult.target_token).trim() || '·'}
+                                                        {decodeToken(c.target_token || selectedResult?.target_token || modelTokens[selectedTokIdx ?? -1] || '').trim() || '·'}
                                                     </span>
                                                 </div>
                                                 <div className={styles.corrBtnRight}>
@@ -5705,7 +5724,7 @@ export function ReportPanel({
                                         <div style={{ fontWeight: 800, marginBottom: 6, color: '#0369a1' }}>
                                             {llmTrainExprsOnly
                                                 ? 'LLM 表达式（调试 · 未检索语料）'
-                                                : 'LLM 拉训练样本（gold 模式 → 布尔检索）'}
+                                                : 'LLM 拉训练样本（gold∩context 双表达式）'}
                                         </div>
                                         {llmTrainBusy && (
                                             <div style={{ color: '#0284c7' }}>
@@ -5734,7 +5753,7 @@ export function ReportPanel({
                                                     </div>
                                                 ) : null}
                                                 <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
-                                                    点击表达式 → 在大语料上检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
+                                                    点击表达式组 → gold∩context 双约束检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
                                                 </div>
                                                 {(llmTrainResult.analysis.corpus_search_expressions ?? []).length === 0 ? (
                                                     <div style={{ color: '#b45309' }}>
@@ -5744,20 +5763,29 @@ export function ReportPanel({
                                                     (llmTrainResult.analysis.corpus_search_expressions ?? []).map((sr, idx) => {
                                                         const isActive = llmTrainActiveExprIdx === idx;
                                                         const hits = llmTrainExprHits[idx] ?? [];
+                                                        const canSearch = Boolean(
+                                                            sr.gold_expr?.trim()
+                                                            || sr.context_expr?.trim()
+                                                            || sr.expression?.trim()
+                                                        );
+                                                        const runSearch = () => {
+                                                            if (!canSearch) return;
+                                                            fetchLlmCorpusSearch(idx, {
+                                                                goldExpr: sr.gold_expr,
+                                                                contextExpr: sr.context_expr,
+                                                                expression: sr.expression,
+                                                            });
+                                                        };
                                                         return (
                                                         <div
                                                             key={`dbg-${sr.name ?? 'expr'}-${idx}`}
                                                             role="button"
                                                             tabIndex={0}
-                                                            onClick={() => {
-                                                                if (sr.expression?.trim()) {
-                                                                    fetchLlmCorpusSearch(idx, sr.expression);
-                                                                }
-                                                            }}
+                                                            onClick={runSearch}
                                                             onKeyDown={ev => {
-                                                                if ((ev.key === 'Enter' || ev.key === ' ') && sr.expression?.trim()) {
+                                                                if ((ev.key === 'Enter' || ev.key === ' ') && canSearch) {
                                                                     ev.preventDefault();
-                                                                    fetchLlmCorpusSearch(idx, sr.expression);
+                                                                    runSearch();
                                                                 }
                                                             }}
                                                             style={{
@@ -5766,9 +5794,9 @@ export function ReportPanel({
                                                                 borderRadius: 6,
                                                                 background: isActive ? '#fffbeb' : '#fff',
                                                                 border: isActive ? '2px solid #f59e0b' : '1px solid #fde68a',
-                                                                cursor: sr.expression?.trim() ? 'pointer' : 'default',
+                                                                cursor: canSearch ? 'pointer' : 'default',
                                                             }}
-                                                            title="点击检索大语料"
+                                                            title="点击检索大语料（gold ∩ context）"
                                                         >
                                                             <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 4 }}>
                                                                 {idx + 1}. {sr.name || `expr${idx + 1}`}
@@ -5777,16 +5805,27 @@ export function ReportPanel({
                                                                     ? ` · ${hits.length} 命中`
                                                                     : ''}
                                                             </div>
-                                                            <pre style={{
-                                                                margin: 0,
-                                                                fontSize: 11,
-                                                                whiteSpace: 'pre-wrap',
-                                                                wordBreak: 'break-all',
-                                                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                                                                color: '#1e3a8a',
-                                                            }}>
-                                                                {sr.expression || '—'}
-                                                            </pre>
+                                                            {(sr.gold_expr || sr.context_expr) ? (
+                                                                <div style={{ fontSize: 11, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                                                                    <div style={{ color: '#166534', marginBottom: 2 }}>
+                                                                        <strong>gold</strong> {sr.gold_expr || '—'}
+                                                                    </div>
+                                                                    <div style={{ color: '#1e3a8a' }}>
+                                                                        <strong>context</strong> {sr.context_expr || '—'}
+                                                                    </div>
+                                                                </div>
+                                                            ) : (
+                                                                <pre style={{
+                                                                    margin: 0,
+                                                                    fontSize: 11,
+                                                                    whiteSpace: 'pre-wrap',
+                                                                    wordBreak: 'break-all',
+                                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                                    color: '#1e3a8a',
+                                                                }}>
+                                                                    {sr.expression || '—'}
+                                                                </pre>
+                                                            )}
                                                             {sr.why && (
                                                                 <div style={{ fontSize: 11, color: '#78716c', marginTop: 4 }}>
                                                                     {sr.why}
@@ -5810,6 +5849,9 @@ export function ReportPanel({
                                                                                 : ''}
                                                                             {llmTrainExprSearchStats[idx].elapsed_ms != null
                                                                                 ? ` · ${llmTrainExprSearchStats[idx].elapsed_ms}ms`
+                                                                                : ''}
+                                                                            {llmTrainExprSearchStats[idx].mode
+                                                                                ? ` · ${llmTrainExprSearchStats[idx].mode}`
                                                                                 : ''}
                                                                             · 无 cache
                                                                         </div>
@@ -5909,9 +5951,20 @@ export function ReportPanel({
                                                         <div style={{ fontWeight: 700, color: '#075985' }}>
                                                             {sr.name || `expr${idx + 1}`}
                                                         </div>
-                                                        <code style={{ fontSize: 11, wordBreak: 'break-all' }}>
-                                                            {sr.expression}
-                                                        </code>
+                                                            {sr.gold_expr || sr.context_expr ? (
+                                                                <div style={{ fontSize: 11, marginTop: 2, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                                                                    <div style={{ color: '#166534' }}>
+                                                                        <strong>gold</strong> {sr.gold_expr || '—'}
+                                                                    </div>
+                                                                    <div style={{ color: '#1e3a8a' }}>
+                                                                        <strong>context</strong> {sr.context_expr || '—'}
+                                                                    </div>
+                                                                </div>
+                                                            ) : (
+                                                                <code style={{ fontSize: 11, wordBreak: 'break-all' }}>
+                                                                    {sr.expression}
+                                                                </code>
+                                                            )}
                                                         {sr.why && (
                                                             <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
                                                                 {sr.why}

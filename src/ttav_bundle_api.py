@@ -1691,8 +1691,15 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             return
 
         expression = str(req.get("expression") or "").strip()
-        if not expression:
-            self._send_json(400, {"status": "error", "message": "expression is required"})
+        gold_expr = str(req.get("goldExpr") or req.get("gold_expr") or "").strip()
+        context_expr = str(
+            req.get("contextExpr") or req.get("context_expr") or ""
+        ).strip()
+        if not expression and not gold_expr and not context_expr:
+            self._send_json(400, {
+                "status": "error",
+                "message": "goldExpr+contextExpr (or legacy expression) is required",
+            })
             return
 
         corpus_path = str(req.get("corpusPath") or "").strip() or None
@@ -1723,7 +1730,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             t0 = time.perf_counter()
             hits = search_corpus_jsonl(
                 corpus,
-                expression,
+                expression="" if (gold_expr or context_expr) else expression,
+                gold_expr=gold_expr,
+                context_expr=context_expr,
                 top_k=top_k,
                 max_scan=max_scan_i,
                 stats=search_stats,
@@ -1736,7 +1745,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, {
             "status": "success",
-            "expression": expression,
+            "expression": expression or None,
+            "gold_expr": gold_expr or None,
+            "context_expr": context_expr or None,
             "corpus_path": corpus,
             "hits": hits,
             "n_hits": len(hits),
