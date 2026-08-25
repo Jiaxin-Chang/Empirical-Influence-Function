@@ -234,6 +234,7 @@ def build_llm_train_retrieve_messages(
         '- 字面量用双引号，如 "err != nil {"\n'
         '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
         '- AND 连接必须同时出现，如 A AND B AND C\n'
+        "- 不要给整条 AND 链再包一层最外层括号；括号只用于 OR 分组。\n"
         f"- gold_expr 示例（只谈补全）：{example_gold}\n"
         f"- context_expr 示例（只谈场景）：{example_ctx}\n"
         "硬性规则：\n"
@@ -262,29 +263,106 @@ def build_llm_train_retrieve_messages(
     ]
 
 
+def _strip_outer_parens(expr: str) -> str:
+    """Strip layers of balanced wrapping parentheses (ignoring parens inside quotes)."""
+    t = (expr or "").strip()
+    while t.startswith("(") and t.endswith(")"):
+        depth = 0
+        in_str = False
+        balanced = True
+        for i, ch in enumerate(t):
+            if ch == '"' and (i == 0 or t[i - 1] != "\\"):
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(t) - 1:
+                    balanced = False
+                    break
+                if depth < 0:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        t = t[1:-1].strip()
+    return t
+
+
+def _split_top_level(expr: str, op: str) -> list[str]:
+    """Split on `` AND `` / `` OR `` only outside parentheses and string literals."""
+    t = (expr or "").strip()
+    if not t:
+        return []
+    op_re = re.compile(rf"\s+{re.escape(op)}\s+", re.IGNORECASE)
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    start = 0
+    i = 0
+    while i < len(t):
+        ch = t[i]
+        if ch == '"' and (i == 0 or t[i - 1] != "\\"):
+            in_str = not in_str
+            i += 1
+            continue
+        if in_str:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            m = op_re.match(t, i)
+            if m:
+                parts.append(t[start:i].strip())
+                i = m.end()
+                start = i
+                continue
+        i += 1
+    parts.append(t[start:].strip())
+    return [p for p in parts if p]
+
+
 def _eval_literal(text: str, lit: str) -> bool:
     s = lit.strip().strip('"').strip("'")
     return bool(s) and s in text
 
 
 def _eval_or_term(text: str, term: str) -> bool:
-    t = term.strip()
-    if t.startswith("(") and t.endswith(")"):
-        t = t[1:-1].strip()
-    if re.search(r"\s+OR\s+", t, re.IGNORECASE):
-        parts = re.split(r"\s+OR\s+", t, flags=re.IGNORECASE)
-        return any(_eval_or_term(text, p) for p in parts)
+    t = _strip_outer_parens(term)
+    # Parenthesized AND-group: recurse as full expression.
+    and_parts = _split_top_level(t, "AND")
+    if len(and_parts) > 1:
+        return all(_eval_or_term(text, p) for p in and_parts)
+    or_parts = _split_top_level(t, "OR")
+    if len(or_parts) > 1:
+        return any(_eval_or_term(text, p) for p in or_parts)
     return _eval_literal(text, t)
 
 
 def eval_boolean_expression(text: str, expression: str) -> bool:
-    """Evaluate ``(A OR B) AND C`` style substring expression."""
-    expr = (expression or "").strip()
+    """Evaluate ``(A OR B) AND C`` style substring expression.
+
+    Supports an outer wrapping ``(...)`` around the whole AND-chain (common in
+    LLM outputs). AND/OR / parentheses inside ``"..."`` literals are ignored
+    for structure (so ``"func ("`` does not break parsing).
+    """
+    expr = _strip_outer_parens(expression or "")
     if not expr:
         return False
-    parts = re.split(r"\s+AND\s+", expr, flags=re.IGNORECASE)
-    return all(_eval_or_term(text, p.strip()) for p in parts if p.strip())
-
+    parts = _split_top_level(expr, "AND")
+    if not parts:
+        return False
+    return all(_eval_or_term(text, p) for p in parts)
 
 def _row_context_text(row: dict[str, Any]) -> str:
     for key in ("prompt", "input", "query"):
