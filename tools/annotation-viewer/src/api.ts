@@ -124,8 +124,35 @@ export const api = {
 
   getSample: (idx: number) => jsonFetch<SampleDetail>(`/api/sample/${idx}`),
 
-  getCorpusSample: (line: number, opts?: { corpusPath?: string | null }) =>
-    jsonFetch<SampleDetail>(`/api/corpus/sample/${line}${corpusQuery(opts?.corpusPath)}`),
+  getCorpusSample: (
+    line: number,
+    opts?: { corpusPath?: string | null; rewriteId?: string | null },
+  ) => {
+    const q = new URLSearchParams()
+    if (opts?.corpusPath?.trim()) q.set('corpusPath', opts.corpusPath.trim())
+    if (opts?.rewriteId?.trim()) q.set('rewriteId', opts.rewriteId.trim())
+    const qs = q.toString()
+    return jsonFetch<SampleDetail>(`/api/corpus/sample/${line}${qs ? `?${qs}` : ''}`)
+  },
+
+  prepCorpusMidRewrite: (body: {
+    line: number
+    corpusPath?: string
+    testGold: string
+    expression?: string
+  }) =>
+    jsonFetch<{
+      ok: boolean
+      rewrite_id: string
+      mode?: string
+      reason?: string
+      dig_preview?: string
+      old_mid_preview?: string
+      applied?: boolean
+    }>('/api/corpus/mid-rewrite-prep', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   saliency: (idx: number, target: number, topK = 6) =>
     jsonFetch<{

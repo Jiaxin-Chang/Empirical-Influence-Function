@@ -439,9 +439,17 @@ def search_corpus_jsonl(
                 continue
             ctx = _row_context_text(row)
             resp = _row_gold_text(row)
+            # Prefer gold: if response matches, keep original MID (no rewrite).
+            if eval_boolean_expression(resp, expr):
+                match_region = "gold"
+            elif eval_boolean_expression(ctx, expr):
+                match_region = "context"
+            else:
+                match_region = "cross"
             hits.append({
                 "line": line_idx,
                 "task_id": row.get("task_id"),
+                "match_region": match_region,
                 "prompt_preview": (ctx[:280] + "…") if len(ctx) > 280 else ctx,
                 "response_preview": (resp[:200] + "…") if len(resp) > 200 else resp,
             })

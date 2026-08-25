@@ -199,6 +199,7 @@ interface LlmTrainSearchHit {
     prompt_preview?: string;
     response_preview?: string;
     preview?: string;
+    match_region?: 'gold' | 'context' | 'cross' | string;
 }
 
 interface LlmTrainSearchExprResult {
@@ -4125,22 +4126,77 @@ export function ReportPanel({
         })();
     }, [importedReportActive, eifApiUrl, llmTrainResult?.corpus_path]);
 
-    const handleOpenCorpusAnnotationViewer = useCallback((hit: LlmTrainSearchHit) => {
+    const handleOpenCorpusAnnotationViewer = useCallback((
+        hit: LlmTrainSearchHit,
+        expression?: string,
+    ) => {
         if (hit.line == null || hit.line < 0) return;
         const base = (
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
         )?.trim() || 'http://127.0.0.1:5174';
-        const url = new URL(base);
-        url.searchParams.set('corpusLine', String(hit.line));
         const corpusPath = llmTrainResult?.corpus_path?.trim();
-        if (corpusPath) {
-            url.searchParams.set('corpusPath', corpusPath);
-        }
-        if (hit.task_id) {
-            url.searchParams.set('taskId', hit.task_id);
-        }
-        window.open(url.toString(), '_blank', 'noopener,noreferrer');
-    }, [llmTrainResult?.corpus_path]);
+        const goldCompletion = (
+            report.test_sample_baseline.raw_label
+            || decodeTokens(goldResponseTokens).join('')
+        );
+        const region = String(hit.match_region || '');
+        const needsRewrite = region === 'context' || region === 'cross';
+
+        void (async () => {
+            const url = new URL(base);
+            url.searchParams.set('corpusLine', String(hit.line));
+            if (corpusPath) {
+                url.searchParams.set('corpusPath', corpusPath);
+            }
+            if (hit.task_id) {
+                url.searchParams.set('taskId', hit.task_id);
+            }
+            if (needsRewrite && goldCompletion.trim()) {
+                try {
+                    const prepResp = await fetch(`${base.replace(/\/$/, '')}/api/corpus/mid-rewrite-prep`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            line: hit.line,
+                            corpusPath: corpusPath || '',
+                            testGold: goldCompletion,
+                            expression: (expression || '').trim(),
+                        }),
+                    });
+                    const prepRaw = await prepResp.text();
+                    let prep: {
+                        rewrite_id?: string;
+                        applied?: boolean;
+                        mode?: string;
+                        message?: string;
+                    } = {};
+                    if (prepRaw.trim()) {
+                        try {
+                            prep = JSON.parse(prepRaw) as typeof prep;
+                        } catch {
+                            /* ignore */
+                        }
+                    }
+                    if (!prepResp.ok || !prep.rewrite_id) {
+                        console.warn(
+                            '[mid-rewrite-prep] failed',
+                            prepResp.status,
+                            prep.message || prepRaw.slice(0, 200),
+                        );
+                    } else if (prep.applied) {
+                        url.searchParams.set('rewriteId', prep.rewrite_id);
+                    }
+                } catch (err) {
+                    console.warn('[mid-rewrite-prep] error', err);
+                }
+            }
+            window.open(url.toString(), '_blank', 'noopener,noreferrer');
+        })();
+    }, [
+        llmTrainResult?.corpus_path,
+        report.test_sample_baseline.raw_label,
+        goldResponseTokens,
+    ]);
 
     const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {
         if (!report || !selectedMeta || importedReportActive) return;
@@ -5826,13 +5882,19 @@ export function ReportPanel({
                                                                             tabIndex={0}
                                                                             onClick={ev => {
                                                                                 ev.stopPropagation();
-                                                                                handleOpenCorpusAnnotationViewer(h);
+                                                                                handleOpenCorpusAnnotationViewer(
+                                                                                    h,
+                                                                                    sr.expression,
+                                                                                );
                                                                             }}
                                                                             onKeyDown={ev => {
                                                                                 if (ev.key === 'Enter' || ev.key === ' ') {
                                                                                     ev.preventDefault();
                                                                                     ev.stopPropagation();
-                                                                                    handleOpenCorpusAnnotationViewer(h);
+                                                                                    handleOpenCorpusAnnotationViewer(
+                                                                                        h,
+                                                                                        sr.expression,
+                                                                                    );
                                                                                 }
                                                                             }}
                                                                             style={{
@@ -5840,14 +5902,30 @@ export function ReportPanel({
                                                                                 marginBottom: 4,
                                                                                 padding: '4px 6px',
                                                                                 borderRadius: 4,
-                                                                                background: '#f0f9ff',
-                                                                                border: '1px solid #bae6fd',
+                                                                                background:
+                                                                                    h.match_region === 'context'
+                                                                                        || h.match_region === 'cross'
+                                                                                        ? '#fff7ed'
+                                                                                        : '#f0f9ff',
+                                                                                border: `1px solid ${
+                                                                                    h.match_region === 'context'
+                                                                                        || h.match_region === 'cross'
+                                                                                        ? '#fdba74'
+                                                                                        : '#bae6fd'
+                                                                                }`,
                                                                                 cursor: 'pointer',
                                                                                 fontSize: 11,
                                                                             }}
                                                                         >
                                                                             L{h.line}
                                                                             {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                            {h.match_region === 'gold'
+                                                                                ? ' · gold命中'
+                                                                                : h.match_region === 'context'
+                                                                                    ? ' · context→改写MID'
+                                                                                    : h.match_region === 'cross'
+                                                                                        ? ' · 跨段→尝试改写'
+                                                                                        : ''}
                                                                             {h.response_preview
                                                                                 ? ` · ${h.response_preview.slice(0, 100)}`
                                                                                 : h.prompt_preview
@@ -5930,10 +6008,46 @@ export function ReportPanel({
                                                         {(sr.corpus_hits?.length ?? 0) > 0 && (
                                                             <div style={{ marginTop: 4, fontSize: 11 }}>
                                                                 <strong>大语料命中 {sr.corpus_hits?.length}：</strong>
-                                                                {(sr.corpus_hits ?? []).slice(0, 5).map(h => (
-                                                                    <div key={`c-${h.line}-${h.task_id}`} style={{ marginLeft: 8 }}>
+                                                                {(sr.corpus_hits ?? []).slice(0, 8).map(h => (
+                                                                    <div
+                                                                        key={`c-${h.line}-${h.task_id}`}
+                                                                        role="button"
+                                                                        tabIndex={0}
+                                                                        onClick={() => handleOpenCorpusAnnotationViewer(
+                                                                            h,
+                                                                            sr.expression,
+                                                                        )}
+                                                                        onKeyDown={ev => {
+                                                                            if (ev.key === 'Enter' || ev.key === ' ') {
+                                                                                ev.preventDefault();
+                                                                                handleOpenCorpusAnnotationViewer(
+                                                                                    h,
+                                                                                    sr.expression,
+                                                                                );
+                                                                            }
+                                                                        }}
+                                                                        style={{
+                                                                            marginLeft: 8,
+                                                                            marginTop: 2,
+                                                                            padding: '2px 4px',
+                                                                            borderRadius: 3,
+                                                                            cursor: 'pointer',
+                                                                            background:
+                                                                                h.match_region === 'context'
+                                                                                    || h.match_region === 'cross'
+                                                                                    ? '#fff7ed'
+                                                                                    : '#f8fafc',
+                                                                        }}
+                                                                    >
                                                                         L{h.line}
                                                                         {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                        {h.match_region === 'gold'
+                                                                            ? ' · gold'
+                                                                            : h.match_region === 'context'
+                                                                                ? ' · ctx→MID'
+                                                                                : h.match_region === 'cross'
+                                                                                    ? ' · cross→MID'
+                                                                                    : ''}
                                                                         {h.response_preview
                                                                             ? ` · ${h.response_preview.slice(0, 80)}`
                                                                             : ''}

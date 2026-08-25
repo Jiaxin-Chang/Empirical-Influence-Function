@@ -150,11 +150,15 @@ export default function App() {
     line: number,
     path?: string | null,
     initialTarget?: number | null,
+    rewriteId?: string | null,
   ) => {
     setBusy(true)
     setError('')
     try {
-      const detail = await api.getCorpusSample(line, path ? { corpusPath: path } : undefined)
+      const detail = await api.getCorpusSample(line, {
+        corpusPath: path || undefined,
+        rewriteId: rewriteId || undefined,
+      })
       setCorpusLine(line)
       setCorpusPath(path?.trim() || detail.corpus_path || null)
       setSelectedIdx(line)
@@ -171,8 +175,15 @@ export default function App() {
       const contNote = detail.in_continue
         ? ' · 已在续训小集'
         : ' · 无预标注（手动添加的边会写入续训小集）'
+      const rw = detail.annotation_meta as Record<string, unknown> | undefined
+      const rwNote =
+        rw?.mid_rewrite
+          ? ` · MID改写(${String(rw.mid_rewrite_mode || '')}${
+              rw.mid_rewrite_locus ? `@${String(rw.mid_rewrite_locus)}` : ''
+            })`
+          : ''
       setStatus(
-        `大语料 L${line} · ${detail.uid}${contNote}` +
+        `大语料 L${line} · ${detail.uid}${contNote}${rwNote}` +
           (detail.attention_edges.length ? ` · ${detail.attention_edges.length} 条边` : ''),
       )
     } catch (e) {
@@ -238,6 +249,7 @@ export default function App() {
           const auto = (params.get('autoAnnotate') || '').trim() === '1'
           const corpusLineRaw = params.get('corpusLine')
           const corpusPathRaw = (params.get('corpusPath') || '').trim()
+          const rewriteIdRaw = (params.get('rewriteId') || '').trim()
           if (corpusLineRaw != null && corpusLineRaw !== '') {
             const cl = Number(corpusLineRaw)
             if (Number.isInteger(cl) && cl >= 0) {
@@ -247,6 +259,7 @@ export default function App() {
                 targetRaw != null && targetRaw !== '' && Number.isInteger(Number(targetRaw))
                   ? Number(targetRaw)
                   : null,
+                rewriteIdRaw || null,
               )
               return
             }

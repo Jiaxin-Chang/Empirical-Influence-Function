@@ -156,6 +156,11 @@ _GS_PREVIEW_TTL_SEC = 3600
 _llm_sem_preview_cache: dict[str, dict[str, Any]] = {}
 # Corpus lines whose display was cleared: skip continue overlay; next persist appends.
 _corpus_skip_overlay: set[int] = set()
+# Context-hit → re-hollow MID: prep cache (cross-origin from correlation-report) +
+# line binding so subsequent encode/edge ops keep the rewritten prompt/response.
+_corpus_mid_rewrite_prep: dict[str, dict[str, Any]] = {}
+_CORPUS_MID_REWRITE_PREP_MAX = 64
+_corpus_mid_rewrite_by_line: dict[str, dict[str, Any]] = {}
 
 
 def _disk_saliency_path(idx: int) -> Path | None:
@@ -677,36 +682,119 @@ def _read_corpus_raw_row(line: int, *, corpus_path: str | None = None) -> dict[s
     return row
 
 
-def _encode_corpus_row(line: int, raw_row: dict[str, Any]) -> dict[str, Any]:
+def _mid_rewrite_line_key(line: int, *, corpus_path: str | None = None) -> str:
+    path = _resolve_corpus_path(corpus_path)
+    return f"{path.resolve()}::{int(line)}"
+
+
+def _bind_corpus_mid_rewrite(
+    line: int,
+    rewrite: dict[str, Any],
+    *,
+    corpus_path: str | None = None,
+) -> None:
+    key = _mid_rewrite_line_key(line, corpus_path=corpus_path)
+    _corpus_mid_rewrite_by_line[key] = dict(rewrite)
+
+
+def _get_bound_corpus_mid_rewrite(
+    line: int,
+    *,
+    corpus_path: str | None = None,
+) -> dict[str, Any] | None:
+    return _corpus_mid_rewrite_by_line.get(_mid_rewrite_line_key(line, corpus_path=corpus_path))
+
+
+def _compute_corpus_mid_rewrite(
+    prompt: str,
+    response: str,
+    *,
+    test_gold: str,
+    expression: str = "",
+) -> dict[str, Any]:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from fim_mid_rewrite import rewrite_fim_mid  # type: ignore
+
+    return rewrite_fim_mid(
+        prompt,
+        response,
+        test_gold=test_gold,
+        expression=expression or "",
+    )
+
+
+def _raw_row_with_bound_mid_rewrite(
+    line: int,
+    raw_row: dict[str, Any],
+    *,
+    corpus_path: str | None = None,
+) -> dict[str, Any]:
+    """Overlay rewritten prompt/response onto a corpus raw row when bound."""
+    bound = _get_bound_corpus_mid_rewrite(line, corpus_path=corpus_path)
+    if not bound or not bound.get("mode") or bound.get("mode") == "unchanged":
+        return raw_row
+    out = dict(raw_row)
+    out["prompt"] = str(bound.get("prompt") or "")
+    out["response"] = str(bound.get("response") or "")
+    return out
+
+
+def _encode_corpus_row(
+    line: int,
+    raw_row: dict[str, Any],
+    *,
+    corpus_path: str | None = None,
+) -> dict[str, Any]:
     from server.corpus_encode import encode_prompt_response, extract_prompt_response
 
     prompt, response = extract_prompt_response(raw_row)
     if not prompt.strip():
         raise HTTPException(400, f"corpus line {line} missing prompt/input text")
+    rewrite_meta: dict[str, Any] | None = None
+    bound = _get_bound_corpus_mid_rewrite(line, corpus_path=corpus_path)
+    if bound and bound.get("mode") and bound.get("mode") != "unchanged":
+        prompt = str(bound.get("prompt") or prompt)
+        response = str(bound.get("response") or response)
+        rewrite_meta = {
+            "mid_rewrite": True,
+            "mid_rewrite_mode": bound.get("mode"),
+            "mid_rewrite_locus": bound.get("dig_locus"),
+            "mid_rewrite_geometry": bound.get("fim_geometry"),
+            "mid_rewrite_reason": bound.get("reason"),
+            "mid_rewrite_dig_preview": (str(bound.get("dig_text") or "")[:160]),
+            "mid_rewrite_old_mid_preview": (str(bound.get("old_mid") or "")[:120]),
+            "mid_rewrite_hash": bound.get("dig_hash"),
+        }
     input_ids, labels = encode_prompt_response(_get_tokenizer(), prompt, response)
     task_id = str(raw_row.get("task_id") or f"line_{line}")
+    uid = f"corpus:{task_id}"
+    if rewrite_meta and rewrite_meta.get("mid_rewrite_hash"):
+        uid = f"{uid}:midrw:{rewrite_meta['mid_rewrite_hash']}"
+    meta: dict[str, Any] = {
+        "corpus": True,
+        "unannotated_source": True,
+        "prompt_chars": len(prompt),
+        "response_chars": len(response),
+    }
+    if rewrite_meta:
+        meta.update(rewrite_meta)
     return {
         "input_ids": input_ids,
         "label": labels,
-        "uid": f"corpus:{task_id}",
+        "uid": uid,
         "task_id": task_id,
         "raw_id": task_id,
         "language": str(raw_row.get("language") or "go"),
         "source_corpus_line": int(line),
         "source_corpus_path": str(_corpus_path) if _corpus_path else "",
         "attention_edges": [],
-        "annotation_meta": {
-            "corpus": True,
-            "unannotated_source": True,
-            "prompt_chars": len(prompt),
-            "response_chars": len(response),
-        },
+        "annotation_meta": meta,
     }
 
 
 def _effective_corpus_sample(line: int, *, corpus_path: str | None = None) -> tuple[dict[str, Any], bool, str]:
     raw_row = _read_corpus_raw_row(line, corpus_path=corpus_path)
-    source = _encode_corpus_row(line, raw_row)
+    source = _encode_corpus_row(line, raw_row, corpus_path=corpus_path)
     key, cont_idx = _lookup_continue(-1, source)
     if int(line) in _corpus_skip_overlay:
         obj = _compose_display_obj(source, None, from_continue=False)
@@ -725,7 +813,7 @@ def _current_viz_and_continue_corpus(
     corpus_path: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     raw_row = _read_corpus_raw_row(line, corpus_path=corpus_path)
-    source = _encode_corpus_row(line, raw_row)
+    source = _encode_corpus_row(line, raw_row, corpus_path=corpus_path)
     key, cont_idx = _lookup_continue(-1, source)
     del key
     if int(line) in _corpus_skip_overlay or cont_idx is None:
@@ -1105,11 +1193,83 @@ def get_sample(idx: int):
 
 
 @app.get("/api/corpus/sample/{line}")
-def get_corpus_sample(line: int, corpusPath: str = ""):
+def get_corpus_sample(
+    line: int,
+    corpusPath: str = "",
+    rewriteId: str = "",
+):
     override = corpusPath.strip() or None
+    rid = (rewriteId or "").strip()
     with _state_lock:
+        if rid:
+            prep = _corpus_mid_rewrite_prep.get(rid)
+            if not prep:
+                raise HTTPException(404, "mid-rewrite prep not found or expired")
+            if int(prep.get("line", -1)) != int(line):
+                raise HTTPException(400, "rewriteId line mismatch")
+            prep_path = str(prep.get("corpus_path") or "").strip()
+            if override and prep_path and prep_path != override:
+                raise HTTPException(400, "rewriteId corpus path mismatch")
+            if not override and prep_path:
+                override = prep_path
+            _bind_corpus_mid_rewrite(
+                line,
+                prep["rewrite"],
+                corpus_path=override,
+            )
         obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
     return _sample_detail_from_obj(line, obj, from_continue=from_continue, key=key)
+
+
+class CorpusMidRewritePrepBody(BaseModel):
+    line: int
+    corpusPath: str = ""
+    testGold: str
+    expression: str = ""
+
+
+@app.post("/api/corpus/mid-rewrite-prep")
+def corpus_mid_rewrite_prep(body: CorpusMidRewritePrepBody):
+    """Precompute context→MID re-hollow for a corpus line (cross-origin open)."""
+    override = (body.corpusPath or "").strip() or None
+    test_gold = body.testGold or ""
+    expression = (body.expression or "").strip()
+    if not test_gold.strip() and not expression:
+        raise HTTPException(400, "testGold or expression required")
+    with _state_lock:
+        raw_row = _read_corpus_raw_row(int(body.line), corpus_path=override)
+        from server.corpus_encode import extract_prompt_response
+
+        prompt, response = extract_prompt_response(raw_row)
+        rewrite = _compute_corpus_mid_rewrite(
+            prompt,
+            response,
+            test_gold=test_gold,
+            expression=expression,
+        )
+        rewrite_id = uuid.uuid4().hex
+        while len(_corpus_mid_rewrite_prep) >= _CORPUS_MID_REWRITE_PREP_MAX:
+            _corpus_mid_rewrite_prep.pop(next(iter(_corpus_mid_rewrite_prep)))
+        _corpus_mid_rewrite_prep[rewrite_id] = {
+            "rewrite_id": rewrite_id,
+            "line": int(body.line),
+            "corpus_path": override or (str(_corpus_path) if _corpus_path else ""),
+            "rewrite": rewrite,
+            "created_at": time.time(),
+        }
+        # Bind immediately so a subsequent open without rewriteId still works
+        # if the same viewer process loads the line.
+        if rewrite.get("mode") and rewrite.get("mode") != "unchanged":
+            _bind_corpus_mid_rewrite(int(body.line), rewrite, corpus_path=override)
+    return {
+        "ok": True,
+        "rewrite_id": rewrite_id,
+        "mode": rewrite.get("mode"),
+        "reason": rewrite.get("reason"),
+        "dig_preview": (str(rewrite.get("dig_text") or "")[:200]),
+        "old_mid_preview": (str(rewrite.get("old_mid") or "")[:120]),
+        "applied": bool(rewrite.get("mode") and rewrite.get("mode") != "unchanged"),
+    }
 
 
 @app.post("/api/corpus/sample/{line}/clear-display")
@@ -1277,7 +1437,7 @@ def get_corpus_saliency(line: int, target: int, top_k: int = 6, corpusPath: str 
     override = corpusPath.strip() or None
     with _state_lock:
         raw_row = _read_corpus_raw_row(line, corpus_path=override)
-        source = _encode_corpus_row(line, raw_row)
+        source = _encode_corpus_row(line, raw_row, corpus_path=override)
     input_ids = [int(x) for x in (source.get("input_ids") or [])]
     if target <= 0 or target >= len(input_ids):
         raise HTTPException(400, f"target {target} out of range")
@@ -1379,8 +1539,9 @@ def _build_graphsignal_annotated_source(
     annotated: dict[str, Any],
     *,
     use_llm: bool,
+    corpus_path: str | None = None,
 ) -> dict[str, Any]:
-    base = _encode_corpus_row(line, raw_row)
+    base = _encode_corpus_row(line, raw_row, corpus_path=corpus_path)
     base["input_ids"] = [int(x) for x in (annotated.get("input_ids") or [])]
     base["label"] = [int(x) for x in (annotated.get("label") or [])]
     raw_edges = annotated.get("attention_edges") or []
@@ -1424,8 +1585,12 @@ def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpu
 
     use_llm = default_use_llm() if body.use_llm is None else bool(body.use_llm)
     with _state_lock:
-        raw_row = _read_corpus_raw_row(line, corpus_path=override)
-        source_enc = _encode_corpus_row(line, raw_row)
+        raw_row = _raw_row_with_bound_mid_rewrite(
+            line,
+            _read_corpus_raw_row(line, corpus_path=override),
+            corpus_path=override,
+        )
+        source_enc = _encode_corpus_row(line, raw_row, corpus_path=override)
         key, _ = _lookup_continue(-1, source_enc)
         try:
             annotated = annotate_corpus_row(
@@ -1443,7 +1608,7 @@ def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpu
             raise HTTPException(502, f"GraphSignal annotate failed: {exc}") from exc
 
         annotated_source = _build_graphsignal_annotated_source(
-            line, raw_row, annotated, use_llm=use_llm,
+            line, raw_row, annotated, use_llm=use_llm, corpus_path=override,
         )
         preview_id = uuid.uuid4().hex
         _prune_gs_preview_cache()
@@ -1496,7 +1661,11 @@ def graphsignal_annotate_accept(line: int, body: GraphsignalPreviewActionBody, c
         annotated_source = dict(entry["annotated_source"])
         new_llm = _graphsignal_llm_edges(entry.get("raw_edges") or [])
 
-        source_enc = _encode_corpus_row(line, _read_corpus_raw_row(line, corpus_path=override))
+        source_enc = _encode_corpus_row(
+            line,
+            _read_corpus_raw_row(line, corpus_path=override),
+            corpus_path=override,
+        )
         _, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
         cont_keep = [
             e for e in cont
@@ -1603,8 +1772,10 @@ def _build_llm_semantic_annotated_source(
     line: int,
     raw_row: dict[str, Any],
     annotated: dict[str, Any],
+    *,
+    corpus_path: str | None = None,
 ) -> dict[str, Any]:
-    base = _encode_corpus_row(line, raw_row)
+    base = _encode_corpus_row(line, raw_row, corpus_path=corpus_path)
     base["input_ids"] = [int(x) for x in (annotated.get("input_ids") or [])]
     base["label"] = [int(x) for x in (annotated.get("label") or [])]
     raw_edges = annotated.get("attention_edges") or []
@@ -1647,8 +1818,12 @@ def llm_semantic_annotate_preview(
     from server.llm_semantic_annotate import annotate_corpus_row_semantic
 
     with _state_lock:
-        raw_row = _read_corpus_raw_row(line, corpus_path=override)
-        source_enc = _encode_corpus_row(line, raw_row)
+        raw_row = _raw_row_with_bound_mid_rewrite(
+            line,
+            _read_corpus_raw_row(line, corpus_path=override),
+            corpus_path=override,
+        )
+        source_enc = _encode_corpus_row(line, raw_row, corpus_path=override)
         key, _ = _lookup_continue(-1, source_enc)
         tokenizer = _get_tokenizer()
     prompt, response = extract_prompt_response(raw_row)
@@ -1673,7 +1848,9 @@ def llm_semantic_annotate_preview(
         raise HTTPException(502, f"LLM semantic annotate failed: {exc}") from exc
 
     with _state_lock:
-        annotated_source = _build_llm_semantic_annotated_source(line, raw_row, annotated)
+        annotated_source = _build_llm_semantic_annotated_source(
+            line, raw_row, annotated, corpus_path=override,
+        )
         preview_id = uuid.uuid4().hex
         _prune_llm_sem_preview_cache()
         _llm_sem_preview_cache[preview_id] = {
@@ -1729,7 +1906,11 @@ def llm_semantic_annotate_accept(line: int, body: GraphsignalPreviewActionBody, 
         annotated_source = dict(entry["annotated_source"])
         new_llm = _llm_semantic_llm_edges(entry.get("raw_edges") or [])
 
-        source_enc = _encode_corpus_row(line, _read_corpus_raw_row(line, corpus_path=override))
+        source_enc = _encode_corpus_row(
+            line,
+            _read_corpus_raw_row(line, corpus_path=override),
+            corpus_path=override,
+        )
         _, viz, cont = _current_viz_and_continue_corpus(line, corpus_path=override)
         cont_keep = [
             e for e in cont
