@@ -5724,7 +5724,7 @@ export function ReportPanel({
                                         <div style={{ fontWeight: 800, marginBottom: 6, color: '#0369a1' }}>
                                             {llmTrainExprsOnly
                                                 ? 'LLM 表达式（调试 · 未检索语料）'
-                                                : 'LLM 拉训练样本（gold∩context 双表达式）'}
+                                                : 'LLM 拉训练样本（暂只按 gold 检索）'}
                                         </div>
                                         {llmTrainBusy && (
                                             <div style={{ color: '#0284c7' }}>
@@ -5753,7 +5753,7 @@ export function ReportPanel({
                                                     </div>
                                                 ) : null}
                                                 <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
-                                                    点击表达式组 → gold∩context 双约束检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
+                                                    点击表达式组 → 暂只按 gold 检索（context 仅展示、不参与过滤；每条最多 15 个候选）；点击命中行 → 打开手动标注页
                                                 </div>
                                                 {(llmTrainResult.analysis.corpus_search_expressions ?? []).length === 0 ? (
                                                     <div style={{ color: '#b45309' }}>

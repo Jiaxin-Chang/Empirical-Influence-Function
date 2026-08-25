@@ -3,12 +3,13 @@
 Two-stage analysis (no attention-edge / annotation design):
   1) summarize the gold <MID> completion's code pattern
   2) describe ideal train-sample traits and emit dual boolean expressions
-     (gold_expr on response + context_expr on prompt); retrieval requires both.
+     (gold_expr on response + context_expr on prompt).
+
+Retrieval currently applies **gold_expr only** (``MATCH_CONTEXT_EXPR=False``);
+flip that flag to require both again.
 
 Uses OpenAI-compatible API from repo-root ``eif_api.env``.
-The server evaluates expressions and returns matching rows.
-"""
-from __future__ import annotations
+"""from __future__ import annotations
 
 import json
 import os
@@ -17,6 +18,10 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# TEMP: corpus search uses gold_expr only; context_expr is still shown / generated
+# by the LLM but not applied as a filter. Flip to True to restore dual matching.
+MATCH_CONTEXT_EXPR = False
 
 _IM_START_RE = re.compile(r"<\|im_start\|>", re.IGNORECASE)
 _IM_END_RE = re.compile(r"<\|redacted_im_end\|>", re.IGNORECASE)
@@ -432,13 +437,15 @@ def row_matches_dual_expr(
     context_expr: str = "",
     legacy_expression: str = "",
 ) -> bool:
-    """Match gold on response/label and context on prompt/input.
+    """Match gold on response/label; optionally also context on prompt/input.
 
     If only ``legacy_expression`` is set (no dual fields), fall back to the
     old combined haystack behavior.
+
+    When ``MATCH_CONTEXT_EXPR`` is False (temporary), ``context_expr`` is ignored.
     """
     gold_expr = (gold_expr or "").strip()
-    context_expr = (context_expr or "").strip()
+    context_expr = (context_expr or "").strip() if MATCH_CONTEXT_EXPR else ""
     legacy_expression = (legacy_expression or "").strip()
 
     if gold_expr or context_expr:
@@ -513,8 +520,12 @@ def search_corpus_jsonl(
         stats["cached"] = False
         stats["mode"] = (
             "dual"
-            if (gold_expr or "").strip() or (context_expr or "").strip()
-            else "legacy"
+            if MATCH_CONTEXT_EXPR and ((gold_expr or "").strip() or (context_expr or "").strip())
+            else (
+                "gold_only"
+                if (gold_expr or "").strip() or (context_expr or "").strip()
+                else "legacy"
+            )
         )
     return hits
 
