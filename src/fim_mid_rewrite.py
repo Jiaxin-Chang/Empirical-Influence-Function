@@ -188,8 +188,33 @@ def _dig_in_func_source(
 
 
 def _make_fim_fence_body(prefix: str, suffix: str) -> str:
-    # Keep a newline after PRE content when non-empty for readability.
-    return f"{PRE}{prefix}{SUF}{suffix}{MID}"
+    """Format FIM hole like::
+
+        <PRE>func ... {
+        <SUF>
+        <MID>
+
+    or with a non-empty suffix::
+
+        <PRE>func ... {
+        ...prefix...
+        <SUF>
+        ...suffix...
+        <MID>
+    """
+    p = (prefix or "").rstrip(" \t")
+    if p and not p.endswith("\n"):
+        p += "\n"
+    s = (suffix or "").rstrip(" \t")
+    # Drop a lone indent that would sit between ``{`` and ``<SUF>``.
+    if s.strip() == "":
+        return f"{PRE}{p}{SUF}\n{MID}"
+    s = s.lstrip(" \t")
+    if not s.startswith("\n"):
+        s = "\n" + s
+    if not s.endswith("\n"):
+        s += "\n"
+    return f"{PRE}{p}{SUF}{s}{MID}"
 
 
 def build_relocated_fim_in_function_section(
