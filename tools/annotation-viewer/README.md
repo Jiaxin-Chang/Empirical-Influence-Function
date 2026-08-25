@@ -18,7 +18,7 @@ EIF_BASE_MODEL_PATH=/path/to/Qwen3-8B
 ```bash
 cd tools/annotation-viewer
 python -m server.main   # 自动读 ../../eif_api.env
-pnpm dev                # 固定 http://127.0.0.1:5174 ；占用则直接失败
+pnpm dev                # 固定 http://127.0.0.1:5275 ；占用则直接失败
 ```
 
-Deep link：`http://127.0.0.1:5174/?sample=N&target=<idx>&source=<idx>`
+Deep link：`http://127.0.0.1:5275/?sample=N&target=<idx>&source=<idx>`

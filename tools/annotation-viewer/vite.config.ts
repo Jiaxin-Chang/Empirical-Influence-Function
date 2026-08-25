@@ -1,8 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 
-/** Fixed port for annotation-viewer. Fail if busy — do not silently bump to 5175+. */
-const ANNOTATION_VIEWER_PORT = 5174
+/** Fixed port for annotation-viewer. Fail if busy — do not silently bump. */
+const ANNOTATION_VIEWER_PORT = 5275
 
 export default defineConfig({
   plugins: [react()],

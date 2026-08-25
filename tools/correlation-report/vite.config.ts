@@ -459,7 +459,7 @@ const EIF_API_PROXY = {
 }
 
 // Pin a dedicated port so this app never collides with TTAV's vite (5173)
-// or annotation-viewer (5174). strictPort: fail if busy — never auto-bump.
+// or annotation-viewer (5275). strictPort: fail if busy — never auto-bump.
 const EIF_REPORT_PORT = 5273
 
 export default defineConfig({

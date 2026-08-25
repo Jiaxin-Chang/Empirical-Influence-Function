@@ -865,7 +865,10 @@ function loadTtavLaunchPrefs(): TtavLaunchPrefs {
         if (!raw) throw new Error('missing prefs');
         const parsed = JSON.parse(raw) as Partial<TtavLaunchPrefs>;
 
-        const legacyUrl = parsed.ttavUrl?.includes('localhost:5174');
+        const legacyUrl = parsed.ttavUrl?.includes('localhost:5174')
+            || parsed.ttavUrl?.includes('localhost:5275')
+            || parsed.ttavUrl?.includes('127.0.0.1:5174')
+            || parsed.ttavUrl?.includes('127.0.0.1:5275');
         const legacyMethod = parsed.visMethod?.trim().toUpperCase() === 'UMAP';
         const legacyPath = parsed.contentPathTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/');
         const legacyEifCachePath = parsed.eifBundleCacheTemplate?.includes('/root/project/time-travelling-visualizer/data/eif_bundles/')
@@ -3365,7 +3368,7 @@ export function ReportPanel({
     const handleOpenAnnotationViewer = (pair: CorrelationPair, opts?: { autoAnnotate?: boolean }) => {
         const base = (
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
-        )?.trim() || 'http://127.0.0.1:5174';
+        )?.trim() || 'http://127.0.0.1:5275';
         void (async () => {
             const url = new URL(base);
             url.searchParams.set('sample', String(pair.train_sample_id));
@@ -4133,7 +4136,7 @@ export function ReportPanel({
         if (hit.line == null || hit.line < 0) return;
         const base = (
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
-        )?.trim() || 'http://127.0.0.1:5174';
+        )?.trim() || 'http://127.0.0.1:5275';
         const corpusPath = llmTrainResult?.corpus_path?.trim();
         const goldCompletion = (
             report.test_sample_baseline.raw_label
@@ -4207,8 +4210,9 @@ export function ReportPanel({
                         console.warn('[mid-rewrite-prep] not applied', prep);
                     }
                 } catch (err) {
+                    const errMsg = err instanceof Error ? err.message : String(err);
                     rewriteNote =
-                        'MID改写请求失败（跨域/服务未开），打开原样本。';
+                        `MID改写请求失败（连不上 ${base}/api，多半是 annotation-viewer 未在该端口启动）: ${errMsg}。打开原样本。`;
                     console.warn('[mid-rewrite-prep] error', err);
                 }
             }
