@@ -107,6 +107,18 @@ interface UnlearnPairResult {
 
 /** Default normalized LoRA step size for Learn/Unlearn (||Δθ||₂ = η). */
 const DEFAULT_PAIR_INTERVENE_LR = 0.05;
+const LIVE_SALIENCY_TOP_K = 6;
+
+function asIntArray(value: unknown): number[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const out: number[] = [];
+    for (const x of value) {
+        const n = Number(x);
+        if (!Number.isFinite(n)) return undefined;
+        out.push(Math.trunc(n));
+    }
+    return out;
+}
 
 interface NextTokenProbRow {
     token: string;
@@ -210,9 +222,7 @@ interface LlmTrainRetrieveResult {
         gold_pattern_summary?: string;
         reasoning?: string;
         required_code_patterns?: string[];
-        required_annotation_subtypes?: string[];
         ideal_train_sample_traits?: string[];
-        negative_traits?: string[];
         corpus_search_expressions?: LlmTrainExprItem[];
     };
     search_results?: LlmTrainSearchExprResult[];
@@ -246,6 +256,9 @@ export interface AllTokensReport {
         model_path?: string | null;
         base_model_path?: string | null;
         task_id?: string;
+        report_file?: string;
+        report_family?: string;
+        raw_eval?: boolean;
     };
     test_sample_baseline: {
         full_tokens: string[];
@@ -255,6 +268,9 @@ export interface AllTokensReport {
         full_tokens_display?: string[];
         correct_full_tokens_display?: string[];
         prompt_len: number;
+        raw_prompt?: string;
+        raw_label?: string;
+        raw_predict?: string;
     };
     per_token_results: PerTokenResult[];
     train_sample_details: Record<string, TrainSampleDetail>;
@@ -391,11 +407,21 @@ export function normalizeAllTokensReport(report: AllTokensReport): AllTokensRepo
             model_path: asString(report.experiment_meta.model_path) ?? undefined,
             base_model_path: asString((report.experiment_meta as { base_model_path?: unknown }).base_model_path) ?? undefined,
             task_id: asString(report.experiment_meta.task_id) ?? undefined,
+            report_file: asString((report.experiment_meta as { report_file?: unknown }).report_file) ?? undefined,
+            report_family: asString((report.experiment_meta as { report_family?: unknown }).report_family) ?? undefined,
+            raw_eval: Boolean((report.experiment_meta as { raw_eval?: unknown }).raw_eval),
         },
         test_sample_baseline: {
             full_tokens: fullTokens,
             correct_full_tokens: correctTokens,
+            full_token_ids: asIntArray(baseline.full_token_ids) ?? undefined,
+            correct_full_token_ids: asIntArray(baseline.correct_full_token_ids) ?? undefined,
+            full_tokens_display: asStringArray(baseline.full_tokens_display) ?? undefined,
+            correct_full_tokens_display: asStringArray(baseline.correct_full_tokens_display) ?? undefined,
             prompt_len: promptLen,
+            raw_prompt: asString((baseline as { raw_prompt?: unknown }).raw_prompt) ?? undefined,
+            raw_label: asString((baseline as { raw_label?: unknown }).raw_label) ?? undefined,
+            raw_predict: asString((baseline as { raw_predict?: unknown }).raw_predict) ?? undefined,
         },
         per_token_results: perTokenResults,
         train_sample_details: isRecord(report.train_sample_details)
@@ -2357,6 +2383,8 @@ export function ReportPanel({
     compact = false,
 }: ReportPanelProps) {
     const importedReportActive = meta.fileName.startsWith('uploaded:') || meta.label.includes('(uploaded)');
+    const rawEvalActive = Boolean(report.experiment_meta.raw_eval)
+        || meta.fileName.replace(/\\/g, '/').startsWith('raw/');
     const selectedMeta = meta;
 
     // Selected output token (by absolute sequence index)
@@ -2441,9 +2469,12 @@ export function ReportPanel({
         task_id?: string;
         label?: string;
         predict?: string;
+        predict_tokens?: string[];
+        predict_token_ids?: number[];
         line_hit_pre?: number;
         line_hit_rec?: number;
     } | null>(null);
+    const [livePredictViewActive, setLivePredictViewActive] = useState(false);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
     /** After continue-train: live predict top-k overlay (null = use report JSON). */
@@ -2539,7 +2570,9 @@ export function ReportPanel({
         ? '[ce] '
         : meta.fileName.startsWith('saliency/')
             ? '[saliency] '
-            : '';
+            : (rawEvalActive || meta.fileName.replace(/\\/g, '/').startsWith('raw/')
+                ? '[raw] '
+                : '');
     const continueAdapterFamily = inferContinueAdapterFamily(meta.fileName, report);
     const rawLabel = modelLabel
         || report.experiment_meta.model_name
@@ -2547,6 +2580,7 @@ export function ReportPanel({
         || 'model';
     const displayModelLabel = (
         familyPrefix && !String(rawLabel).startsWith('[ce]') && !String(rawLabel).startsWith('[saliency]')
+            && !String(rawLabel).startsWith('[raw]')
             ? `${familyPrefix}${rawLabel}`
             : rawLabel
     );
@@ -2660,7 +2694,7 @@ export function ReportPanel({
     }, [report]);
 
     useEffect(() => {
-        if (importedReportActive || !selectedMeta) return;
+        if (importedReportActive || rawEvalActive || !selectedMeta) return;
         const baseline = report.test_sample_baseline;
         const haveFull = (baseline.full_tokens_display?.length ?? 0) === baseline.full_tokens.length;
         const goldRaw = baseline.correct_full_tokens ?? [];
@@ -2693,9 +2727,9 @@ export function ReportPanel({
             }
         })();
         return () => { cancelled = true; };
-    }, [report, selectedMeta, importedReportActive, eifApiUrl]);
+    }, [report, selectedMeta, importedReportActive, rawEvalActive, eifApiUrl]);
 
-    const modelTokens = useMemo(
+    const reportModelTokens = useMemo(
         () => pickDisplayTokens(report.test_sample_baseline.full_tokens, fullTokensDisplay),
         [report, fullTokensDisplay],
     );
@@ -2707,6 +2741,30 @@ export function ReportPanel({
         [report, correctTokensDisplay],
     );
     const promptLen     = report?.test_sample_baseline.prompt_len ?? 0;
+    const continuePredictTokens = continueCurrentTestOutput?.predict_tokens;
+    const continuePredictIds = continueCurrentTestOutput?.predict_token_ids;
+    const livePredictOverride = useMemo(() => {
+        if (!livePredictViewActive) return null;
+        const predTok = continuePredictTokens;
+        const predIds = continuePredictIds;
+        const promptIds = report.test_sample_baseline.full_token_ids;
+        if (!predTok?.length || !predIds?.length || predTok.length !== predIds.length) return null;
+        if (!promptIds?.length || promptIds.length < promptLen) return null;
+        const promptIdPrefix = promptIds.slice(0, promptLen).map(n => Number(n));
+        if (promptIdPrefix.some(n => !Number.isFinite(n))) return null;
+        return {
+            tokens: [...reportModelTokens.slice(0, promptLen), ...predTok],
+            ids: [...promptIdPrefix.map(n => Math.trunc(n)), ...predIds],
+        };
+    }, [
+        livePredictViewActive,
+        continuePredictTokens,
+        continuePredictIds,
+        report,
+        promptLen,
+        reportModelTokens,
+    ]);
+    const modelTokens = livePredictOverride?.tokens ?? reportModelTokens;
     // Gold panel shows the answer only — same slice used by Markdown export.
     const goldResponseTokens = useMemo(
         () => (correctTokens.length > promptLen ? correctTokens.slice(promptLen) : correctTokens),
@@ -2721,6 +2779,35 @@ export function ReportPanel({
         return { taskId, prompt, label };
     }, [report, correctTokens, promptLen, goldResponseTokens]);
     const selectedSampleId = inferSampleIdFromMeta(selectedMeta, report);
+
+    const handleContinuePredictTokenClick = useCallback((localIdx: number) => {
+        if (importedReportActive) return;
+        const predTok = continueCurrentTestOutput?.predict_tokens;
+        const predIds = continueCurrentTestOutput?.predict_token_ids;
+        if (!predTok?.length || !predIds?.length || predTok.length !== predIds.length) return;
+        const promptIds = report.test_sample_baseline.full_token_ids;
+        if (!promptIds?.length || promptIds.length < promptLen) {
+            setTtavLaunchError('当前 report 缺少 full_token_ids，无法把续训输出接到 test 页。');
+            return;
+        }
+        const abs = promptLen + localIdx;
+        if (!(abs > 0)) return;
+        setLivePredictViewActive(true);
+        setAttrMode('predict');
+        clearGoldLive();
+        clearManualPair();
+        setSelectedTokIdx(abs);
+        setSelectedTestCorrIdx(null);
+    }, [
+        importedReportActive,
+        continueCurrentTestOutput?.predict_tokens,
+        continueCurrentTestOutput?.predict_token_ids,
+        promptLen,
+        report,
+        clearGoldLive,
+        clearManualPair,
+        setSelectedTokIdx,
+    ]);
 
     // Keep the floating plot aligned with the model/output section.
     // ResizeObserver fires once on observe, so it supplies the initial
@@ -2766,6 +2853,8 @@ export function ReportPanel({
         setInlineBundle(null);
         setInlineBundleError(null);
         setHoverTarget(null);
+        setLivePredictViewActive(false);
+        setContinueCurrentTestOutput(null);
         setAttrMode('predict');
         clearGoldLive();
         clearManualPair();
@@ -2779,7 +2868,24 @@ export function ReportPanel({
     }, [report]);
 
     // Indices of analyzed output tokens (those with per_token_results)
-    const analyzedIndices = useMemo(() => new Set(perTokenMap.keys()), [perTokenMap]);
+    const analyzedIndices = useMemo(() => {
+        if (livePredictOverride) {
+            const idxs = new Set<number>();
+            for (let i = promptLen; i < livePredictOverride.tokens.length; i++) idxs.add(i);
+            return idxs;
+        }
+        // Raw eval has no precomputed per_token_results — every response token is clickable.
+        if (rawEvalActive || perTokenMap.size === 0) {
+            const idxs = new Set<number>();
+            for (let i = promptLen; i < modelTokens.length; i++) idxs.add(i);
+            return idxs;
+        }
+        return new Set(perTokenMap.keys());
+    }, [livePredictOverride, promptLen, perTokenMap, rawEvalActive, modelTokens.length]);
+
+    const reportApiPayload = useMemo(() => (
+        rawEvalActive ? { report } : {}
+    ), [rawEvalActive, report]);
 
     const selectedResult = selectedTokIdx !== null ? perTokenMap.get(selectedTokIdx) ?? null : null;
 
@@ -3001,6 +3107,8 @@ export function ReportPanel({
                     body: JSON.stringify({
                         reportFileName: selectedMeta.fileName,
                         targetIndex: absIdx,
+                        topK: LIVE_SALIENCY_TOP_K,
+                        ...reportApiPayload,
                     }),
                 });
                 const raw = await resp.text();
@@ -3036,6 +3144,7 @@ export function ReportPanel({
     }, [
         importedReportActive, promptLen, eifApiUrl, selectedMeta.fileName,
         clearGoldLive, clearManualPair, setSelectedTokIdx, attrMode, goldResponseTokens,
+        reportApiPayload,
     ]);
 
     const handleManualSourceClick = useCallback((idx: number) => {
@@ -3075,6 +3184,7 @@ export function ReportPanel({
                         reportFileName: selectedMeta.fileName,
                         sourceIndex: next,
                         targetIndex: absTarget,
+                        ...reportApiPayload,
                     }),
                 });
                 const raw = await resp.text();
@@ -3111,7 +3221,7 @@ export function ReportPanel({
                 setGoldBusy(false);
             }
         })();
-    }, [goldLocalIdx, goldSelectedCorrIdx, promptLen, eifApiUrl, selectedMeta.fileName]);
+    }, [goldLocalIdx, goldSelectedCorrIdx, promptLen, eifApiUrl, selectedMeta.fileName, reportApiPayload]);
 
     // 指定 pair: once source+target are set, run the same gold Stage3 gradient retrieve.
     useEffect(() => {
@@ -3140,6 +3250,7 @@ export function ReportPanel({
                         reportFileName: selectedMeta.fileName,
                         sourceIndex: manualSourceIdx,
                         targetIndex: manualTargetAbsIdx,
+                        ...reportApiPayload,
                     }),
                 });
                 const raw = await resp.text();
@@ -3183,7 +3294,7 @@ export function ReportPanel({
         return () => { cancelled = true; };
     }, [
         attrMode, manualSourceIdx, manualTargetAbsIdx,
-        importedReportActive, eifApiUrl, selectedMeta.fileName,
+        importedReportActive, eifApiUrl, selectedMeta.fileName, reportApiPayload,
     ]);
 
     // Load a prepared bundle into the in-page plot. All three entry points route
@@ -3328,6 +3439,12 @@ export function ReportPanel({
                         // Prefer eif_api.env (same as gold live); do not force report checkpoint.
                         modelPath: null,
                         baseModelPath: null,
+                        ...reportApiPayload,
+                        ...(mode === 'predict' && livePredictOverride ? {
+                            fullTokens: livePredictOverride.tokens,
+                            fullTokenIds: livePredictOverride.ids,
+                            promptLen,
+                        } : {}),
                     }),
                 });
                 const rawText = await resp.text();
@@ -3357,7 +3474,7 @@ export function ReportPanel({
                 setTokenProbBusy(false);
             }
         })();
-    }, [report, selectedMeta, importedReportActive, eifApiUrl, probViewFamily]);
+    }, [report, selectedMeta, importedReportActive, eifApiUrl, probViewFamily, livePredictOverride, promptLen, reportApiPayload]);
 
     useEffect(() => {
         if (importedReportActive) return;
@@ -3439,6 +3556,7 @@ export function ReportPanel({
                         compareFamily: probViewFamily,
                         gainedTokenId: tokenProbResult?.flip?.gainedTokenId,
                         lostTokenId: tokenProbResult?.flip?.lostTokenId,
+                        ...reportApiPayload,
                     }),
                 });
                 const rawText = await resp.text();
@@ -3485,7 +3603,7 @@ export function ReportPanel({
     }, [
         report, selectedMeta, importedReportActive, eifApiUrl,
         tokenProbFocus, probViewFamily, tokenProbResult?.flip?.gainedTokenId,
-        tokenProbResult?.flip?.lostTokenId,
+        tokenProbResult?.flip?.lostTokenId, reportApiPayload,
     ]);
 
     useEffect(() => {
@@ -3529,8 +3647,14 @@ export function ReportPanel({
                 reportFileName: selectedMeta.fileName,
                 mode: opts.mode,
                 targetIndex: opts.targetIndex,
-                topK: opts.topK ?? 4,
+                topK: opts.topK ?? LIVE_SALIENCY_TOP_K,
                 ...(opts.sourceIndex != null ? { sourceIndex: opts.sourceIndex } : {}),
+                ...reportApiPayload,
+                ...(opts.mode === 'predict' && livePredictOverride ? {
+                    fullTokens: livePredictOverride.tokens,
+                    fullTokenIds: livePredictOverride.ids,
+                    promptLen,
+                } : {}),
             }),
         });
         const raw = await resp.text();
@@ -3548,7 +3672,7 @@ export function ReportPanel({
             );
         }
         return parsed;
-    }, [eifApiUrl, selectedMeta]);
+    }, [eifApiUrl, selectedMeta, livePredictOverride, promptLen, reportApiPayload]);
 
     /** Refresh predict/gold top-k and 指定-pair edge saliency after continue / recover. */
     const refreshSaliencyPanels = useCallback(async (opts?: {
@@ -3574,7 +3698,7 @@ export function ReportPanel({
                     const parsed = await fetchLiveSaliency({
                         mode: 'predict',
                         targetIndex: focus.selectedTokIdx,
-                        topK: 4,
+                        topK: LIVE_SALIENCY_TOP_K,
                     });
                     const top = Array.isArray(parsed.topCorrelations)
                         ? parsed.topCorrelations as TestCorrelation[]
@@ -3597,7 +3721,7 @@ export function ReportPanel({
                 const parsed = await fetchLiveSaliency({
                     mode: 'gold',
                     targetIndex: abs,
-                    topK: 4,
+                        topK: LIVE_SALIENCY_TOP_K,
                 });
                 const top = Array.isArray(parsed.topCorrelations)
                     ? parsed.topCorrelations as TestCorrelation[]
@@ -3624,7 +3748,7 @@ export function ReportPanel({
                     mode: 'gold',
                     targetIndex: focus.manualTargetAbsIdx,
                     sourceIndex: focus.manualSourceIdx,
-                    topK: 4,
+                        topK: LIVE_SALIENCY_TOP_K,
                 });
                 const score = typeof parsed.edgeSaliency === 'number' ? parsed.edgeSaliency : null;
                 setManualEdgeSaliency(score);
@@ -3638,11 +3762,11 @@ export function ReportPanel({
         }
     }, [importedReportActive, selectedMeta, fetchLiveSaliency]);
 
-    // While continued adapter is active, keep predict panel on live scores when target changes.
+    // Live predict saliency: continued adapter OR raw eval (no precomputed report edges).
     useEffect(() => {
         if (importedReportActive) return;
         if (attrMode !== 'predict' || selectedTokIdx == null || selectedTokIdx <= 0) return;
-        if (!continueAdapterActive) {
+        if (!continueAdapterActive && !rawEvalActive && !livePredictOverride) {
             setPredictLiveTop(null);
             return;
         }
@@ -3653,7 +3777,7 @@ export function ReportPanel({
                 const parsed = await fetchLiveSaliency({
                     mode: 'predict',
                     targetIndex: selectedTokIdx,
-                    topK: 4,
+                    topK: LIVE_SALIENCY_TOP_K,
                 });
                 if (cancelled) return;
                 const top = Array.isArray(parsed.topCorrelations)
@@ -3670,7 +3794,7 @@ export function ReportPanel({
         })();
         return () => { cancelled = true; };
     }, [
-        attrMode, selectedTokIdx, continueAdapterActive,
+        attrMode, selectedTokIdx, continueAdapterActive, rawEvalActive, livePredictOverride,
         importedReportActive, fetchLiveSaliency,
     ]);
 
@@ -3692,7 +3816,7 @@ export function ReportPanel({
                     mode: 'gold',
                     targetIndex: manualTargetAbsIdx,
                     sourceIndex: manualSourceIdx,
-                    topK: 4,
+                        topK: LIVE_SALIENCY_TOP_K,
                 });
                 if (cancelled) return;
                 const score = typeof parsed.edgeSaliency === 'number' ? parsed.edgeSaliency : null;
@@ -3863,8 +3987,14 @@ export function ReportPanel({
     const fetchLlmTrainRetrieve = useCallback((opts?: { exprsOnly?: boolean }) => {
         if (importedReportActive) return;
         const exprsOnly = Boolean(opts?.exprsOnly);
-        const fimPrompt = decodeTokens(correctTokens.slice(0, promptLen)).join('');
-        const goldCompletion = decodeTokens(goldResponseTokens).join('');
+        const fimPrompt = (
+            report.test_sample_baseline.raw_prompt
+            || decodeTokens(correctTokens.slice(0, promptLen)).join('')
+        );
+        const goldCompletion = (
+            report.test_sample_baseline.raw_label
+            || decodeTokens(goldResponseTokens).join('')
+        );
         if (!fimPrompt.trim() || !goldCompletion.trim()) {
             setLlmTrainError('缺少 FIM prompt 或 gold completion');
             return;
@@ -3912,6 +4042,8 @@ export function ReportPanel({
         })();
     }, [
         importedReportActive,
+        report.test_sample_baseline.raw_prompt,
+        report.test_sample_baseline.raw_label,
         correctTokens,
         promptLen,
         goldResponseTokens,
@@ -4193,6 +4325,7 @@ export function ReportPanel({
         setContinueBusy(true);
         setContinueResultSummary(null);
         setContinueCurrentTestOutput(null);
+        setLivePredictViewActive(false);
         setTtavLaunchError(null);
         setTtavLaunchStatus(
             `续训小集 → 当前 test greedy 生成…（起点 ${continueAdapterFamily === 'ce' ? 'EIF_ADAPTER_PATH_CE' : 'EIF_ADAPTER_PATH_SALIENCY'}）`,
@@ -4237,10 +4370,17 @@ export function ReportPanel({
                     const fmt = (v: unknown) =>
                         typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
                     if (typeof cur.predict === 'string' && cur.predict.trim()) {
+                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
+                        const predIds = asIntArray(cur.predict_token_ids);
+                        const aligned = Boolean(
+                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
+                        );
                         setContinueCurrentTestOutput({
                             task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
                             label: typeof cur.label === 'string' ? cur.label : undefined,
                             predict: cur.predict,
+                            predict_tokens: aligned ? predTok : undefined,
+                            predict_token_ids: aligned ? predIds : undefined,
                             line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
                             line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
                         });
@@ -4296,6 +4436,7 @@ export function ReportPanel({
         setContinueBusy(true);
         setContinueResultSummary(null);
         setContinueCurrentTestOutput(null);
+        setLivePredictViewActive(false);
         setTtavLaunchError(null);
         setTtavLaunchStatus(
             `纯 CE 续训小集 → 当前 test greedy 生成…（起点 ${continueAdapterFamily === 'ce' ? 'EIF_ADAPTER_PATH_CE' : 'EIF_ADAPTER_PATH_SALIENCY'}）`,
@@ -4340,10 +4481,17 @@ export function ReportPanel({
                     const fmt = (v: unknown) =>
                         typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
                     if (typeof cur.predict === 'string' && cur.predict.trim()) {
+                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
+                        const predIds = asIntArray(cur.predict_token_ids);
+                        const aligned = Boolean(
+                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
+                        );
                         setContinueCurrentTestOutput({
                             task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
                             label: typeof cur.label === 'string' ? cur.label : undefined,
                             predict: cur.predict,
+                            predict_tokens: aligned ? predTok : undefined,
+                            predict_token_ids: aligned ? predIds : undefined,
                             line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
                             line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
                         });
@@ -4478,6 +4626,8 @@ export function ReportPanel({
                     );
                 }
                 setContinueAdapterActive(false);
+                setLivePredictViewActive(false);
+                setContinueCurrentTestOutput(null);
                 setActiveInterventionPairId(null);
                 setActiveInterventionDirection(null);
                 setInterventionSteps(0);
@@ -5044,25 +5194,35 @@ export function ReportPanel({
                                 </div>
                             )}
 
-                            {attrMode === 'predict' && selectedResult && (
+                            {attrMode === 'predict' && selectedTokIdx != null && (selectedResult || livePredictOverride || rawEvalActive) && (
                                 <div className={styles.correlationList}>
                                     <div className={styles.correlationListTitle}>
-                                        Top Correlations for "{decodeToken(selectedResult.target_token).trim()}" @ idx {selectedResult.target_token_index}
+                                        Top Correlations for "{decodeToken(
+                                            selectedResult?.target_token
+                                            ?? modelTokens[selectedTokIdx]
+                                            ?? ''
+                                        ).trim()}" @ idx {selectedTokIdx}
                                         {predictLiveBusy ? ' …' : ''}
                                         {predictLiveTop
-                                            ? (continueAdapterActive ? ' · live(续训)' : ' · live')
-                                            : ' · report'}
+                                            ? (rawEvalActive
+                                                ? ' · live(raw)'
+                                                : (continueAdapterActive ? ' · live(续训)' : ' · live'))
+                                            : (livePredictOverride ? ' · live(续训输出)' : ' · report')}
                                     </div>
                                     <div className={styles.correlationListHint}>
-                                        Click one source→target edge to load its Top-10 training matches on the right.
-                                        {' '}续训后切到 live 分数；Recover 后回到报告原版。
+                                        {rawEvalActive
+                                            ? 'Raw 评测：无预处理 saliency；点击 Model/Gold token 后当场计算 top 6。'
+                                            : 'Click one source→target edge to load its Top-10 training matches on the right.'}
+                                        {!rawEvalActive && ' 续训输出点击后按续训 adapter 重算 top '}
+                                        {!rawEvalActive && LIVE_SALIENCY_TOP_K}
+                                        {!rawEvalActive && '；Recover 后回到报告原版。'}
                                     </div>
                                     <div className={styles.correlationListItems}>
-                                        {(predictLiveTop ?? selectedResult.top_correlations).slice(0, 4).map(c => (
+                                        {(predictLiveTop ?? selectedResult?.top_correlations ?? []).slice(0, LIVE_SALIENCY_TOP_K).map(c => (
                                             <button
                                                 key={c.source_token_index}
                                                 type="button"
-                                                title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(c.target_token || selectedResult.target_token).trim()} for train retrieval`}
+                                                title={`Select ${decodeToken(c.source_token).trim() || '·'} → ${decodeToken(c.target_token || selectedResult?.target_token || modelTokens[selectedTokIdx] || '').trim()} for train retrieval`}
                                                 className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
                                                 onClick={() => {
                                                     setDegradePairs([]);
@@ -5149,7 +5309,7 @@ export function ReportPanel({
                                             type="button"
                                             disabled={llmTrainBusy || importedReportActive}
                                             onClick={() => fetchLlmTrainRetrieve()}
-                                            title="对当前整条测试 FIM + gold，调用 eif_api.env 的 OpenAPI，分析需要哪些训练样本/标注，并在语料上检索布尔表达式"
+                                            title="对当前整条测试 FIM + gold：概括 gold 代码模式，再给出从宽到窄的语料检索表达式（本阶段不涉及标注）"
                                             style={{
                                                 border: '1px solid #0ea5e9',
                                                 background: llmTrainBusy ? '#e0f2fe' : '#f0f9ff',
@@ -5161,7 +5321,7 @@ export function ReportPanel({
                                                 cursor: llmTrainBusy ? 'wait' : 'pointer',
                                             }}
                                         >
-                                            {llmTrainBusy && !llmTrainExprsOnly ? 'LLM 分析中…' : 'LLM 训练样本归因'}
+                                            {llmTrainBusy && !llmTrainExprsOnly ? 'LLM 分析中…' : 'LLM 拉训练样本'}
                                         </button>
                                         <button
                                             type="button"
@@ -5429,7 +5589,38 @@ export function ReportPanel({
                                                     {continueCurrentTestOutput.task_id
                                                         ? ` · ${continueCurrentTestOutput.task_id}`
                                                         : ''}
+                                                    {livePredictViewActive ? ' · 已接到 test 页' : ' · 点击 token 查看 saliency'}
                                                 </summary>
+                                                {(continueCurrentTestOutput.predict_tokens?.length ?? 0) > 0 ? (
+                                                    <div
+                                                        style={{
+                                                            marginTop: 6,
+                                                            padding: 8,
+                                                            background: '#f0fdf4',
+                                                            border: '1px solid #bbf7d0',
+                                                            borderRadius: 6,
+                                                            maxHeight: 220,
+                                                            overflow: 'auto',
+                                                        }}
+                                                    >
+                                                        <CodeTokenStream
+                                                            tokens={continueCurrentTestOutput.predict_tokens ?? []}
+                                                            promptLen={0}
+                                                            responseTone="model"
+                                                            selectedTargetIndex={
+                                                                livePredictViewActive && selectedTokIdx != null && selectedTokIdx >= promptLen
+                                                                    ? selectedTokIdx - promptLen
+                                                                    : undefined
+                                                            }
+                                                            analyzedIndices={new Set(
+                                                                (continueCurrentTestOutput.predict_tokens ?? []).map((_, i) => i),
+                                                            )}
+                                                            onTokenClick={handleContinuePredictTokenClick}
+                                                            clickScope="analyzed"
+                                                            compact
+                                                        />
+                                                    </div>
+                                                ) : (
                                                 <pre style={{
                                                     marginTop: 6,
                                                     padding: 8,
@@ -5445,6 +5636,7 @@ export function ReportPanel({
                                                 }}>
                                                     {continueCurrentTestOutput.predict}
                                                 </pre>
+                                                )}
                                                 {continueCurrentTestOutput.label && (
                                                     <details style={{ marginTop: 4 }}>
                                                         <summary style={{ cursor: 'pointer', fontSize: 10, color: '#64748b' }}>
@@ -5492,7 +5684,7 @@ export function ReportPanel({
                                         <div style={{ fontWeight: 800, marginBottom: 6, color: '#0369a1' }}>
                                             {llmTrainExprsOnly
                                                 ? 'LLM 表达式（调试 · 未检索语料）'
-                                                : 'LLM 训练样本归因（整条 test · OpenAPI）'}
+                                                : 'LLM 拉训练样本（gold 模式 → 布尔检索）'}
                                         </div>
                                         {llmTrainBusy && (
                                             <div style={{ color: '#0284c7' }}>
@@ -5504,6 +5696,22 @@ export function ReportPanel({
                                         )}
                                         {llmTrainResult?.analysis && llmTrainExprsOnly && (
                                             <>
+                                                {llmTrainResult.analysis.gold_pattern_summary && (
+                                                    <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
+                                                        <strong>Gold 模式：</strong>
+                                                        {llmTrainResult.analysis.gold_pattern_summary}
+                                                    </div>
+                                                )}
+                                                {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
+                                                    <div style={{ marginBottom: 8 }}>
+                                                        <strong>理想训练样本：</strong>
+                                                        <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
+                                                            {llmTrainResult.analysis.ideal_train_sample_traits.map((t, i) => (
+                                                                <li key={`trait-${i}`}>{t}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                ) : null}
                                                 <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
                                                     点击表达式 → 在大语料上检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
                                                 </div>
@@ -5653,20 +5861,19 @@ export function ReportPanel({
                                         {llmTrainResult?.analysis && !llmTrainExprsOnly && (
                                             <>
                                                 {llmTrainResult.analysis.gold_pattern_summary && (
-                                                    <div style={{ marginBottom: 6 }}>
-                                                        <strong>模式：</strong>
+                                                    <div style={{ marginBottom: 6, lineHeight: 1.45 }}>
+                                                        <strong>Gold 模式：</strong>
                                                         {llmTrainResult.analysis.gold_pattern_summary}
                                                     </div>
                                                 )}
-                                                {llmTrainResult.analysis.reasoning && (
-                                                    <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
-                                                        {llmTrainResult.analysis.reasoning}
-                                                    </div>
-                                                )}
-                                                {llmTrainResult.analysis.required_annotation_subtypes?.length ? (
-                                                    <div style={{ marginBottom: 6 }}>
-                                                        <strong>建议标注 subtype：</strong>
-                                                        {llmTrainResult.analysis.required_annotation_subtypes.join(', ')}
+                                                {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
+                                                    <div style={{ marginBottom: 8 }}>
+                                                        <strong>理想训练样本：</strong>
+                                                        <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
+                                                            {llmTrainResult.analysis.ideal_train_sample_traits.map((t, i) => (
+                                                                <li key={`full-trait-${i}`}>{t}</li>
+                                                            ))}
+                                                        </ul>
                                                     </div>
                                                 ) : null}
                                                 {(llmTrainResult.search_results ?? []).map((sr, idx) => (

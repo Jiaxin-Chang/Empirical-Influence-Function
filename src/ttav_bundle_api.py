@@ -574,6 +574,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/continue-adapter-status":
             self._send_json(200, {"status": "success", **get_active_adapter_status()})
             return
+        if parsed.path == "/api/raw-eval-files":
+            self._handle_raw_eval_files()
+            return
+        if parsed.path == "/api/raw-eval-rows":
+            self._handle_raw_eval_rows()
+            return
         if parsed.path == "/api/continue-train-eval-defaults":
             qs = parse_qs(parsed.query)
             report_file = (qs.get("reportFileName") or [""])[0].strip() or None
@@ -600,6 +606,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/raw-eval-sample":
+            self._handle_raw_eval_sample()
+            return
         if parsed.path == "/api/continue-train-eval":
             self._handle_continue_train_eval()
             return
@@ -1006,6 +1015,13 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         from src.eif_adapter_env import resolve_report_json_path, stamp_report_family
 
         report_file_name = str(req.get("reportFileName", "")).strip()
+        inline = req.get("report")
+        if isinstance(inline, dict) and isinstance(inline.get("test_sample_baseline"), dict):
+            report = inline
+            stamp_report_family(report, report_file_name or str(
+                (report.get("experiment_meta") or {}).get("report_file") or ""
+            ))
+            return report, None
         if not report_file_name:
             return None, "reportFileName is required"
         report_json_path = resolve_report_json_path(CORR_RESULTS_DIR, report_file_name)
@@ -1020,6 +1036,11 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     report_json_path = alt
         if report_json_path is None or not report_json_path.exists():
             return None, f"Report JSON not found: {report_file_name}"
+        if report_json_path.suffix.lower() == ".jsonl":
+            return None, (
+                f"Refusing to load JSONL as a correlation report: {report_file_name}. "
+                "Open a raw sample via /api/raw-eval-sample (inline report)."
+            )
         try:
             report = json.loads(report_json_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -1031,6 +1052,69 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             flush=True,
         )
         return report, None
+
+    def _handle_raw_eval_files(self):
+        from src.raw_eval_report import list_raw_jsonl_files
+
+        self._send_json(200, {
+            "status": "success",
+            "files": list_raw_jsonl_files(CORR_RESULTS_DIR),
+        })
+
+    def _handle_raw_eval_rows(self):
+        from src.raw_eval_report import list_raw_jsonl_rows, resolve_raw_jsonl
+
+        qs = parse_qs(urlparse(self.path).query)
+        file_name = (qs.get("file") or qs.get("fileName") or [""])[0].strip()
+        path = resolve_raw_jsonl(CORR_RESULTS_DIR, file_name)
+        if path is None:
+            self._send_json(404, {"status": "error", "message": f"raw jsonl not found: {file_name}"})
+            return
+        rows = list_raw_jsonl_rows(path)
+        self._send_json(200, {
+            "status": "success",
+            "fileName": f"raw/{path.name}",
+            "rows": rows,
+        })
+
+    def _handle_raw_eval_sample(self):
+        from src.raw_eval_report import (
+            build_raw_eval_report,
+            read_raw_jsonl_row,
+            resolve_raw_jsonl,
+        )
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        file_name = str(req.get("fileName") or req.get("file") or "").strip()
+        try:
+            line_no = int(req.get("line") or req.get("lineNo") or 0)
+        except (TypeError, ValueError):
+            line_no = 0
+        path = resolve_raw_jsonl(CORR_RESULTS_DIR, file_name)
+        if path is None:
+            self._send_json(404, {"status": "error", "message": f"raw jsonl not found: {file_name}"})
+            return
+        if line_no < 1:
+            self._send_json(400, {"status": "error", "message": "line (>=1) is required"})
+            return
+        try:
+            row = read_raw_jsonl_row(path, line_no)
+            report = build_raw_eval_report(
+                row,
+                file_name=f"raw/{path.name}",
+                line_no=line_no,
+            )
+        except Exception as exc:
+            print(f"[raw-eval] sample failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, {"status": "success", "report": report})
 
     def _handle_gold_saliency(self):
         """Stage1: teacher-force gold → top-k saliency sources for one gold target."""
@@ -1059,6 +1143,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         top_k = req.get("topK")
         mode = str(req.get("mode", "gold") or "gold").strip().lower()
         source_index = req.get("sourceIndex")
+        full_tokens = req.get("fullTokens")
+        full_token_ids = req.get("fullTokenIds")
+        prompt_len_override = req.get("promptLen")
         print(
             f"[live-saliency] mode={mode} targetIndex={target_index}"
             + (f" sourceIndex={source_index}" if source_index is not None else ""),
@@ -1072,6 +1159,10 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     top_k=int(top_k) if top_k is not None else None,
                     mode=mode,
                     source_index=int(source_index) if source_index is not None else None,
+                    full_tokens=full_tokens if isinstance(full_tokens, list) else None,
+                    full_token_ids=full_token_ids if isinstance(full_token_ids, list) else None,
+                    prompt_len_override=int(prompt_len_override)
+                    if prompt_len_override is not None else None,
                 )
         except Exception as exc:
             print(f"[live-saliency] failed: {exc}", flush=True)
@@ -1385,6 +1476,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         view_family = str(req.get("viewFamily") or req.get("view_family") or "live").strip()
         gained_token_id = req.get("gainedTokenId")
         lost_token_id = req.get("lostTokenId")
+        full_tokens = req.get("fullTokens")
+        full_token_ids = req.get("fullTokenIds")
+        prompt_len_override = req.get("promptLen")
 
         print(
             f"[probs] mode={mode} targetIndex={target_index} topK={top_k} view={view_family}",
@@ -1402,6 +1496,10 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     view_family=view_family,
                     gained_token_id=int(gained_token_id) if gained_token_id is not None else None,
                     lost_token_id=int(lost_token_id) if lost_token_id is not None else None,
+                    full_tokens=full_tokens if isinstance(full_tokens, list) else None,
+                    full_token_ids=full_token_ids if isinstance(full_token_ids, list) else None,
+                    prompt_len_override=int(prompt_len_override)
+                    if prompt_len_override is not None else None,
                 )
         except Exception as exc:
             print(f"[probs] failed: {exc}", flush=True)

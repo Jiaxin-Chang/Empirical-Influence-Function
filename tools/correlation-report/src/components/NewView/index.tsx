@@ -21,6 +21,19 @@ interface SlotState {
     error: string | null;
 }
 
+interface RawEvalFile {
+    fileName: string;
+    label: string;
+    nRows: number;
+}
+
+interface RawEvalRow {
+    line: number;
+    task_id: string;
+    predict_preview?: string;
+    label_preview?: string;
+}
+
 function emptySlot(): SlotState {
     return { report: null, meta: null, status: null, error: null };
 }
@@ -31,9 +44,20 @@ function modelLabelFrom(report: AllTokensReport | null, meta: AllTokensExperimen
         || fallback;
 }
 
+function defaultEifApiOrigin(): string {
+    if (typeof window === 'undefined') return 'http://127.0.0.1:8766';
+    return window.location.origin;
+}
+
 export function NewView({ metas }: Props) {
     const [slot, setSlot] = useState<SlotState>(() => emptySlot());
     const [dragging, setDragging] = useState(false);
+    const [rawFiles, setRawFiles] = useState<RawEvalFile[]>([]);
+    const [rawFile, setRawFile] = useState('');
+    const [rawRows, setRawRows] = useState<RawEvalRow[]>([]);
+    const [rawLine, setRawLine] = useState('');
+    const [rawBusy, setRawBusy] = useState(false);
+    const [rawError, setRawError] = useState<string | null>(null);
 
     const activatePayload = useCallback((payload: unknown, sourceName: string) => {
         try {
@@ -112,6 +136,110 @@ export function NewView({ metas }: Props) {
         }
     }, [activatePayload]);
 
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const resp = await fetch(`${defaultEifApiOrigin()}/api/raw-eval-files`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json() as { status?: string; files?: RawEvalFile[] };
+                if (cancelled || data.status !== 'success') return;
+                const files = Array.isArray(data.files) ? data.files : [];
+                setRawFiles(files);
+                if (files.length > 0) {
+                    setRawFile(prev => prev || files[0].fileName);
+                }
+            } catch (error) {
+                if (!cancelled) {
+                    setRawError(error instanceof Error ? error.message : 'Failed to list raw eval files');
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
+        if (!rawFile) {
+            setRawRows([]);
+            setRawLine('');
+            return;
+        }
+        let cancelled = false;
+        setRawBusy(true);
+        setRawError(null);
+        void (async () => {
+            try {
+                const url = new URL(`${defaultEifApiOrigin()}/api/raw-eval-rows`);
+                url.searchParams.set('file', rawFile);
+                const resp = await fetch(url.toString());
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json() as { status?: string; rows?: RawEvalRow[]; message?: string };
+                if (cancelled) return;
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Failed to load raw rows');
+                }
+                const rows = Array.isArray(data.rows) ? data.rows : [];
+                setRawRows(rows);
+                setRawLine(rows[0] ? String(rows[0].line) : '');
+            } catch (error) {
+                if (!cancelled) {
+                    setRawRows([]);
+                    setRawLine('');
+                    setRawError(error instanceof Error ? error.message : 'Failed to load raw rows');
+                }
+            } finally {
+                if (!cancelled) setRawBusy(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [rawFile]);
+
+    const loadRawSample = useCallback(async () => {
+        if (!rawFile || !rawLine) return;
+        setRawBusy(true);
+        setRawError(null);
+        setSlot({
+            report: null,
+            meta: null,
+            status: `Tokenizing ${rawFile} line ${rawLine}…`,
+            error: null,
+        });
+        try {
+            const resp = await fetch(`${defaultEifApiOrigin()}/api/raw-eval-sample`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileName: rawFile, line: Number(rawLine) }),
+            });
+            const rawText = await resp.text();
+            let parsed: { status?: string; report?: AllTokensReport; message?: string } = {};
+            if (rawText.trim()) {
+                parsed = JSON.parse(rawText) as typeof parsed;
+            }
+            if (!resp.ok || parsed.status !== 'success' || !parsed.report) {
+                throw new Error(parsed.message || `Raw sample failed (HTTP ${resp.status})`);
+            }
+            const data = normalizeAllTokensReport(parsed.report);
+            const taskId = data.experiment_meta.task_id || `line_${rawLine}`;
+            const meta: AllTokensExperimentMeta = {
+                taskId,
+                label: `[raw] ${rawFile.replace(/^raw\//, '')} · L${rawLine}`,
+                fileName: rawFile,
+            };
+            setSlot({
+                report: data,
+                meta,
+                status: `Raw eval · ${taskId} · predict/gold tokens ready (live saliency)`,
+                error: null,
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to load raw sample';
+            setRawError(message);
+            setSlot({ report: null, meta: null, status: null, error: message });
+        } finally {
+            setRawBusy(false);
+        }
+    }, [rawFile, rawLine]);
+
     // Optional URL query: ?reportUrl=...
     useEffect(() => {
         if (typeof window === 'undefined') return;
@@ -132,6 +260,8 @@ export function NewView({ metas }: Props) {
         })();
     }, [activatePayload]);
 
+    const selectedRow = rawRows.find(r => String(r.line) === rawLine) ?? null;
+
     return (
         <div className={styles.root}>
             <div className={styles.slotImportCard}>
@@ -141,7 +271,7 @@ export function NewView({ metas }: Props) {
                         <div className={styles.slotImportDesc}>
                             {slot.report
                                 ? modelLabelFrom(slot.report, slot.meta, 'loaded')
-                                : 'Import JSON or pick a bundled experiment'}
+                                : 'Import JSON、选预处理报告，或打开 correlation_matching_results/raw 下的评测 JSONL'}
                         </div>
                     </div>
                     {slot.report && (
@@ -149,6 +279,57 @@ export function NewView({ metas }: Props) {
                             Clear
                         </button>
                     )}
+                </div>
+
+                <div className={styles.rawEvalBar}>
+                    <div className={styles.rawEvalTitle}>Raw 评测 JSONL</div>
+                    <div className={styles.rawEvalControls}>
+                        <label className={styles.rawEvalLabel}>
+                            文件
+                            <select
+                                value={rawFile}
+                                disabled={rawBusy || rawFiles.length === 0}
+                                onChange={e => setRawFile(e.target.value)}
+                            >
+                                {rawFiles.length === 0 && <option value="">（无 raw/*.jsonl）</option>}
+                                {rawFiles.map(f => (
+                                    <option key={f.fileName} value={f.fileName}>
+                                        {f.label} · {f.nRows} rows
+                                    </option>
+                                ))}
+                            </select>
+                        </label>
+                        <label className={styles.rawEvalLabel}>
+                            样本
+                            <select
+                                value={rawLine}
+                                disabled={rawBusy || rawRows.length === 0}
+                                onChange={e => setRawLine(e.target.value)}
+                            >
+                                {rawRows.length === 0 && <option value="">—</option>}
+                                {rawRows.map(r => (
+                                    <option key={r.line} value={String(r.line)}>
+                                        L{r.line} · {r.task_id}
+                                    </option>
+                                ))}
+                            </select>
+                        </label>
+                        <button
+                            type="button"
+                            className={styles.rawEvalOpenBtn}
+                            disabled={rawBusy || !rawFile || !rawLine}
+                            onClick={() => void loadRawSample()}
+                        >
+                            {rawBusy ? '打开中…' : '打开样本'}
+                        </button>
+                    </div>
+                    {selectedRow && (
+                        <div className={styles.rawEvalPreview}>
+                            <div><strong>predict</strong> {selectedRow.predict_preview || '—'}</div>
+                            <div><strong>gold</strong> {selectedRow.label_preview || '—'}</div>
+                        </div>
+                    )}
+                    {rawError && <div className={styles.importError}>{rawError}</div>}
                 </div>
 
                 <label
@@ -198,7 +379,7 @@ export function NewView({ metas }: Props) {
 
             {!slot.report && (
                 <div className={styles.emptyState}>
-                    Import or select a correlation report to begin.
+                    Import or select a correlation report / raw eval sample to begin.
                 </div>
             )}
 

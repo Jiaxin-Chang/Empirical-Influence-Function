@@ -76,7 +76,7 @@ def resolve_report_json_path(corr_results_dir: Path, report_file_name: str) -> P
     if len(parts) == 1:
         # Legacy: flat file in corr root.
         cand = (corr_results_dir / parts[0]).resolve()
-    elif len(parts) == 2 and parts[0].lower() in _FAMILY_DIRS:
+    elif len(parts) == 2 and parts[0].lower() in (*_FAMILY_DIRS, "raw"):
         cand = (corr_results_dir / parts[0].lower() / parts[1]).resolve()
     else:
         return None

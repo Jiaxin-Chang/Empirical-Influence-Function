@@ -1239,6 +1239,9 @@ def compute_next_token_probs(
     view_family: str | None = None,
     gained_token_id: int | None = None,
     lost_token_id: int | None = None,
+    full_tokens: list[str] | None = None,
+    full_token_ids: list[int] | None = None,
+    prompt_len_override: int | None = None,
 ) -> dict[str, Any]:
     """Top-k next-token distribution that produces ``tokens[target_index]``.
 
@@ -1258,12 +1261,26 @@ def compute_next_token_probs(
         raise ValueError(f"mode must be 'predict' or 'gold', got {mode!r}")
 
     baseline = report.get("test_sample_baseline") or {}
-    if mode_norm == "gold":
+    override = None
+    if mode_norm == "predict" and isinstance(full_tokens, list) and isinstance(full_token_ids, list):
+        from src.gold_live_attribution import _predict_sequence_override
+        override = _predict_sequence_override(
+            full_tokens,
+            full_token_ids,
+            prompt_len_override,
+            int(baseline.get("prompt_len") or 0),
+        )
+    if override is not None:
+        tokens, ids, _pl = override
+        stored_ids = ids
+    elif mode_norm == "gold":
         tokens = list(baseline.get("correct_full_tokens") or [])
         stored_ids = baseline.get("correct_full_token_ids")
+        ids = None
     else:
         tokens = list(baseline.get("full_tokens") or [])
         stored_ids = baseline.get("full_token_ids")
+        ids = None
     if not tokens:
         raise ValueError(f"Report missing tokens for mode={mode_norm}.")
 

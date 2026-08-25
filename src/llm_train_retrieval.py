@@ -1,8 +1,11 @@
-"""LLM-based train-sample retrieval for a whole test FIM (not saliency-pair attribution).
+"""LLM-based train-sample retrieval for a whole test FIM.
 
-Uses OpenAI-compatible API from repo-root ``eif_api.env`` (same as auto-annotate).
-The model proposes boolean substring search expressions over a training corpus;
-the server evaluates them and returns matching rows.
+Two-stage analysis (no attention-edge / annotation design):
+  1) summarize the gold <MID> completion's code pattern
+  2) describe ideal train-sample traits and emit boolean corpus search expressions
+
+Uses OpenAI-compatible API from repo-root ``eif_api.env``.
+The server evaluates expressions and returns matching rows.
 """
 
 from __future__ import annotations
@@ -191,7 +194,7 @@ def build_llm_train_retrieve_messages(
     gold_completion: str,
     example_expression: str | None = None,
 ) -> list[dict[str, str]]:
-    """Assemble system + user messages for train-sample need analysis."""
+    """Assemble system + user messages: pattern summary then corpus search."""
     prepared = prepare_llm_train_query(fim_prompt, gold_completion)
     problem = prepared["fim_problem_surface"]
     gold = prepared["gold_mid_completion"]
@@ -199,34 +202,35 @@ def build_llm_train_retrieve_messages(
         '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
     )
     system = (
-        "你是 Go 代码补全与 saliency 训练数据专家。\n"
+        "你是 Go 代码补全训练数据检索助手。\n"
         "用户会给出一条 **Go FIM 测试题**（Fill-in-the-Middle，中间缺失处标记为 <MID>）"
         "及其 gold 补全（仅 <MID> 处应填写的代码片段）。\n"
-        "注意：题面已去除 ChatML 对话包装（不是 system/user/assistant 聊天消息）。\n"
-        "你的任务是判断：模型要稳定生成该 gold，需要从哪些**训练样本**中学习，"
-        "尤其是哪些 **attention_edges 标注**（source→target 的代码关联，如 defuse/call/return/api 等）。\n\n"
-        "请输出**严格 JSON**（不要 markdown 包裹），字段：\n"
+        "题面已去除 ChatML 对话包装（不是 system/user/assistant 聊天消息）。\n"
+        "本阶段只做「相关代码模式 → 检索训练样本」，不要设计、不要提及 "
+        "attention_edges、标注、saliency、subtype 或 source→target 边。\n\n"
+        "请分两段思考，并输出**严格 JSON**（不要 markdown 包裹）：\n"
+        "第一段：概括这条 FIM 的 gold 回答是什么样的代码格式/模式。\n"
+        "第二段：为了让模型学会这种模式，理想训练样本应具备哪些特征；"
+        "并据此给出 2-5 条布尔检索式，从宽到窄，用于在大规模 Go 训练 JSONL"
+        "（每行 prompt+response）里找出同类样本。\n\n"
+        "JSON 字段：\n"
         "{\n"
-        '  "gold_pattern_summary": "一句话概括 gold 的代码模式",\n'
-        '  "reasoning": "为什么需要这些训练样本/标注（中文，3-8句）",\n'
-        '  "required_code_patterns": ["模式1", "模式2"],\n'
-        '  "required_annotation_subtypes": ["defuse", "call", ...],\n'
+        '  "gold_pattern_summary": "概括 gold 的代码格式与模式（中文，2-5句）",\n'
+        '  "ideal_train_sample_traits": ["理想训练样本特征1", "特征2"],\n'
         '  "corpus_search_expressions": [\n'
         "    {\n"
         '      "name": "简短英文名",\n'
         '      "expression": "布尔子串表达式",\n'
-        '      "why": "为何用此式在训练语料中检索"\n'
+        '      "why": "这条式子对应哪种代码模式、宽还是窄"\n'
         "    }\n"
-        "  ],\n"
-        '  "ideal_train_sample_traits": ["理想训练样本应具备的特征"],\n'
-        '  "negative_traits": ["应避免的噪声样本特征"]\n'
+        "  ]\n"
         "}\n\n"
         "corpus_search_expressions 的 expression 语法：\n"
         '- 字面量用双引号，如 "err != nil {"\n'
         '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
         '- AND 连接必须同时出现，如 A AND B AND C\n'
         f"- 示例：{example_expr}\n"
-        "请给出 2-5 条 expression，从宽到窄，覆盖 gold 所需的不同代码/错误处理模式。"
+        "必须给出 2-5 条 expression，按从宽到窄排序；只检索代码文本模式，不要检索标注字段。"
     )
     user = (
         "【题目类型】Go 代码 FIM 补全测试题（非对话；已去除 ChatML 包装）\n\n"
@@ -234,8 +238,11 @@ def build_llm_train_retrieve_messages(
         f"{problem}\n\n"
         "【Gold】<MID> 处应填写的正确代码：\n"
         f"{gold}\n\n"
-        "请分析：要答对上述 gold，训练集里应有哪些类型的样本与 attention_edges 标注？\n"
-        "并给出可在大规模 Go 训练 JSONL（每行 prompt+response）上检索的布尔表达式。"
+        "请按两段回答：\n"
+        "1）这条 gold 是什么样的代码格式/模式？\n"
+        "2）为了训练模型学会该模式，理想训练样本应有哪些特征？"
+        "给出 2-5 条从宽到窄的布尔表达式，用于在训练集里找同类代码样本。"
+        "不要讨论标注。"
     )
     return [
         {"role": "system", "content": system},

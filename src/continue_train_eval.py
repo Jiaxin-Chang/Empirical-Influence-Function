@@ -765,8 +765,14 @@ def generate_one(tokenizer, model, prompt: str, max_new_tokens: int) -> dict[str
     text_out = tokenizer.decode(gen, skip_special_tokens=True)
     predict, removed = remove_leading_thinking(text_out)
     finish_reason = "stop" if generated_list and generated_list[-1] in eos_ids else "length"
+    pred_ids = tokenizer.encode(predict, add_special_tokens=False) if predict else []
+    pred_tokens = [
+        tokenizer.decode([int(i)], skip_special_tokens=False) for i in pred_ids
+    ]
     row = {
         "predict": predict,
+        "predict_token_ids": [int(i) for i in pred_ids],
+        "predict_tokens": pred_tokens,
         "finish_reason": finish_reason,
         "prompt_tokens": prompt_tokens,
         "generated_tokens": len(generated_list),
@@ -1398,6 +1404,8 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
                 "prompt": cur["prompt"],
                 "label": cur["label"],
                 "predict": gen["predict"],
+                "predict_token_ids": gen.get("predict_token_ids") or [],
+                "predict_tokens": gen.get("predict_tokens") or [],
                 "line_hit_pre": round(pre, 4),
                 "line_hit_rec": round(rec, 4),
                 "finish_reason": gen.get("finish_reason"),

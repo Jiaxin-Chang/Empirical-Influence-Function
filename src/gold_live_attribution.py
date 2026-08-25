@@ -553,6 +553,27 @@ def _completion_tokens_and_ids(
     return tokens, ids, prompt_len
 
 
+def _predict_sequence_override(
+    tokens: Any,
+    ids: Any,
+    prompt_len: Any,
+    fallback_prompt_len: int,
+) -> tuple[list[str], list[int], int] | None:
+    if not isinstance(tokens, list) or not isinstance(ids, list):
+        return None
+    if len(tokens) != len(ids) or len(ids) < 2:
+        return None
+    try:
+        id_list = [int(x) for x in ids]
+        tok_list = [str(x) for x in tokens]
+        pl = int(prompt_len) if prompt_len is not None else int(fallback_prompt_len)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= pl < len(id_list)):
+        return None
+    return tok_list, id_list, pl
+
+
 def gold_saliency_top_k(
     report: dict[str, Any],
     *,
@@ -560,6 +581,9 @@ def gold_saliency_top_k(
     top_k: int | None = None,
     mode: str = "gold",
     source_index: int | None = None,
+    full_tokens: list[str] | None = None,
+    full_token_ids: list[int] | None = None,
+    prompt_len_override: int | None = None,
 ) -> dict[str, Any]:
     """Stage 1: top-k saliency sources for one target (gold or predict completion).
 
@@ -577,7 +601,18 @@ def gold_saliency_top_k(
     ensure_peft_lora_dtype(model, torch.bfloat16)
     k = max(1, int(top_k if top_k is not None else _env_int("EIF_GOLD_TOP_SALIENCY", 4)))
 
-    tokens, ids, prompt_len = _completion_tokens_and_ids(report, tokenizer, mode=mode_norm)
+    baseline = report.get("test_sample_baseline") or {}
+    fallback_pl = int(baseline.get("prompt_len") or 0)
+    override = None
+    override = _predict_sequence_override(
+        full_tokens, full_token_ids, prompt_len_override, fallback_pl,
+    )
+    if override is not None:
+        tokens, ids, prompt_len = override
+    else:
+        tokens, ids, prompt_len = _completion_tokens_and_ids(
+            report, tokenizer, mode=mode_norm,
+        )
     if not (prompt_len <= target_index < len(ids)):
         raise ValueError(
             f"{mode_norm} target_index={target_index} out of range "
