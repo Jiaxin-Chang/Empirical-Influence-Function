@@ -869,6 +869,10 @@ def _choose_in_hay(hay: str, test_gold: str, expression: str) -> tuple[str, str]
         a, b = _snap_to_lines(hay, cover[0], cover[1])
         dig = hay[a:b].strip("\n")
         if dig.strip():
+            # Ignore expression hits on struct fields / bare func prototypes (no body).
+            if find_enclosing_go_func(hay, a, b) is None:
+                if not (gold and (gold in hay or ws_flex_find(hay, gold))):
+                    return "", "unchanged"
             return dig, "expression_cover"
 
     return "", "unchanged"
@@ -880,21 +884,42 @@ def choose_dig_text(
     test_gold: str,
     expression: str,
 ) -> tuple[str, str]:
-    """Prefer before → after → full doc (old MID already filled into context)."""
+    """Search only inside before / after / function code fences (not struct blocks)."""
     sections = _section_ranges(doc)
-    # Hits in before/after are the common failure mode this rewrite targets.
-    for name in ("before", "after"):
+    for name in ("before", "after", "function"):
         if name not in sections:
             continue
         a, b = sections[name]
         dig, mode = _choose_in_hay(doc[a:b], test_gold, expression)
         if dig:
             return dig, f"{mode}_{name}"
-
-    dig, mode = _choose_in_hay(doc, test_gold, expression)
-    if dig:
-        return dig, mode
     return "", "unchanged"
+
+
+def _locate_dig_in_doc_section(
+    doc: str,
+    section: str,
+    dig: str,
+    *,
+    test_gold: str = "",
+) -> tuple[int, str] | None:
+    """Return ``(pos, verbatim_dig)`` for a dig string inside one fenced section."""
+    sections = _section_ranges(doc)
+    if section not in sections:
+        return None
+    a, b = sections[section]
+    local = doc[a:b]
+    if dig in local:
+        rel = local.find(dig)
+        return a + rel, dig
+    hit = ws_flex_find(local, dig)
+    if hit is not None:
+        return a + hit[0], local[hit[0] : hit[1]]
+    if test_gold:
+        hit = ws_flex_find(local, test_gold)
+        if hit is not None:
+            return a + hit[0], local[hit[0] : hit[1]]
+    return None
 
 
 def rewrite_fim_mid(
@@ -968,21 +993,34 @@ def rewrite_fim_mid(
     )
     if not dig or mode == "unchanged":
         base["reason"] = "no_dig_span"
+        base["detail"] = (
+            "test gold / 检索表达式在 train 的 before·after·待补全函数 三个代码块中"
+            "都找不到可挖空的完整片段（常见于 gold 只存在于 test、train 仅有同名符号）。"
+        )
         return base
 
     prefer_range: tuple[int, int] | None = None
     sections = _section_ranges(doc)
-    if mode.endswith("_before") and "before" in sections:
-        prefer_range = sections["before"]
-        locus = "before"
-    elif mode.endswith("_after") and "after" in sections:
-        prefer_range = sections["after"]
-        locus = "after"
+    section_from_mode = (
+        "before" if mode.endswith("_before")
+        else "after" if mode.endswith("_after")
+        else "function" if mode.endswith("_function")
+        else ""
+    )
+    if section_from_mode and section_from_mode in sections:
+        prefer_range = sections[section_from_mode]
+        locus = section_from_mode
     else:
         locus = "function"
 
     pos = -1
-    if prefer_range is not None:
+    if section_from_mode:
+        located = _locate_dig_in_doc_section(
+            doc, section_from_mode, dig, test_gold=test_gold,
+        )
+        if located is not None:
+            pos, dig = located
+    elif prefer_range is not None:
         a, b = prefer_range
         local = doc[a:b]
         rel = local.find(dig)
@@ -993,12 +1031,13 @@ def rewrite_fim_mid(
             if hit is not None:
                 pos = a + hit[0]
                 dig = local[hit[0] : hit[1]]
-    if pos < 0 and prefer_range is None:
+    if pos < 0 and section_from_mode == "function":
         pos = _find_preferring_context(
             doc, dig, mid_start=old_mid_start, mid_end=old_mid_end,
         )
     if pos < 0:
         base["reason"] = "dig_not_found_in_filled"
+        base["detail"] = f"mode={mode} but dig not relocatable in section {section_from_mode or locus}"
         return base
 
     if dig == old_mid and pos == old_mid_start:

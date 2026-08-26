@@ -4209,9 +4209,9 @@ export function ReportPanel({
                         const reason = prep.reason || prep.mode || 'unchanged';
                         const hint =
                             reason === 'section_rewrite_failed'
-                                ? '（已找到候选片段，但无法把它提升成合法 FIM 题面，例如 dig 不在完整 Go 函数体内）'
+                                ? '（已找到候选片段，但无法把它提升成合法 FIM 题面；常见：gold 只在 test 有、train 仅有 NotificationType 等符号命中 struct/函数声明）'
                                 : reason === 'no_dig_span'
-                                    ? '（test gold / 表达式在语料 before·after·原函数中对不齐）'
+                                    ? (prep.detail || '（test gold / 表达式在 train 三个代码块中对不齐）')
                                     : '';
                         rewriteNote =
                             `未能挖空改写 (${reason}${detail ? `: ${detail}` : ''})，打开原样本。` +
