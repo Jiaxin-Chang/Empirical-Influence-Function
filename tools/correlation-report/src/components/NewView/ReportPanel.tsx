@@ -4176,6 +4176,7 @@ export function ReportPanel({
                         applied?: boolean;
                         mode?: string;
                         reason?: string;
+                        detail?: string;
                         dig_preview?: string;
                         dig_locus?: string;
                         message?: string;
@@ -4204,9 +4205,17 @@ export function ReportPanel({
                     ) {
                         rewriteNote = '训练 MID 已是 gold 目标，保持原样本。';
                     } else {
+                        const detail = prep.detail;
+                        const reason = prep.reason || prep.mode || 'unchanged';
+                        const hint =
+                            reason === 'section_rewrite_failed'
+                                ? '（已找到候选片段，但无法把它提升成合法 FIM 题面，例如 dig 不在完整 Go 函数体内）'
+                                : reason === 'no_dig_span'
+                                    ? '（test gold / 表达式在语料 before·after·原函数中对不齐）'
+                                    : '';
                         rewriteNote =
-                            `未能挖空改写 (${prep.reason || prep.mode || 'unchanged'})，打开原样本。` +
-                            '常见原因：test gold 与语料 before/after 空白不一致且无法对齐。';
+                            `未能挖空改写 (${reason}${detail ? `: ${detail}` : ''})，打开原样本。` +
+                            hint;
                         console.warn('[mid-rewrite-prep] not applied', prep);
                     }
                 } catch (err) {

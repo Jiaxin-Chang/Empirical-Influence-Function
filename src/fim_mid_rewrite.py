@@ -79,6 +79,29 @@ def _match_brace_block_end(text: str, open_idx: int) -> int:
     return -1
 
 
+def _find_go_func_body_brace(text: str, func_start: int, limit: int) -> int:
+    """Index of the function-body ``{`` (not ``interface{}`` etc. in the signature)."""
+    i = func_start
+    n = min(len(text), limit)
+    paren_depth = 0
+    while i < n:
+        skipped = _skip_string_or_comment(text, i)
+        if skipped is not None:
+            i = skipped
+            continue
+        ch = text[i]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif ch == "{" and paren_depth == 0:
+            return i
+        elif ch == "\n" and i > func_start and _FUNC_LINE_RE.match(text, i + 1):
+            break
+        i += 1
+    return -1
+
+
 def find_enclosing_go_func(
     text: str,
     dig_start: int,
@@ -103,21 +126,7 @@ def find_enclosing_go_func(
     region = text[lo:dig_start]
     starts = [lo + m.start() for m in _FUNC_LINE_RE.finditer(region)]
     for func_start in reversed(starts):
-        # Opening brace of the function body (first '{' after signature).
-        brace = -1
-        i = func_start
-        while i < hi:
-            skipped = _skip_string_or_comment(text, i)
-            if skipped is not None:
-                i = skipped
-                continue
-            if text[i] == "{":
-                brace = i
-                break
-            # Don't walk into a later top-level func.
-            if i > func_start and _FUNC_LINE_RE.match(text, i):
-                break
-            i += 1
+        brace = _find_go_func_body_brace(text, func_start, hi)
         if brace < 0:
             continue
         func_end = _match_brace_block_end(text, brace)
@@ -262,7 +271,7 @@ def rewrite_sections_for_before_hit(
     *,
     dig: str,
     old_mid: str,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str]:
     """Promote the hit function from before → new FIM problem; push remainder + old fn to after."""
     span = find_fim_span(prompt)
     orig_completed = span.prefix + old_mid + span.suffix
@@ -271,7 +280,7 @@ def rewrite_sections_for_before_hit(
     after_span = _section_header_span(prompt, AFTER_HEADER)
     func_span = _section_header_span(prompt, FUNCTION_HEADER)
     if before_span is None or func_span is None:
-        return None
+        return None, "missing_before_or_function_header"
 
     before_sec = prompt[before_span[0] : before_span[1]]
     after_sec = prompt[after_span[0] : after_span[1]] if after_span else f"\n{AFTER_HEADER}\n```go\n\n```\n"
@@ -279,26 +288,40 @@ def rewrite_sections_for_before_hit(
 
     before_code = _extract_fence_body(before_sec)
     after_code = _extract_fence_body(after_sec)
+    if not before_code.strip():
+        return None, "empty_before_fence"
 
     # Resolve dig position inside before fence body.
+    dig_pos = -1
+    dig_end = -1
     if dig in before_code:
         dig_pos = before_code.find(dig)
         dig_end = dig_pos + len(dig)
     else:
         hit = ws_flex_find(before_code, dig)
-        if hit is None:
-            return None
-        dig_pos, dig_end = hit
-        dig = before_code[dig_pos:dig_end]
+        if hit is not None:
+            dig_pos, dig_end = hit
+            dig = before_code[dig_pos:dig_end]
+    if dig_pos < 0:
+        return None, "dig_not_in_before_fence"
 
     func = find_enclosing_go_func(before_code, dig_pos, dig_end)
     if func is None:
-        return None
+        # Dig may span past one function or sit on a blank line — anchor at dig start.
+        func = find_enclosing_go_func(before_code, dig_pos, dig_pos + 1)
+    if func is None:
+        return None, "no_enclosing_go_func_in_before"
     fs, fe = func
+    # Clamp dig into the enclosing function (gold/LCS may overrun the closing brace).
+    dig_pos = max(dig_pos, fs)
+    dig_end = min(dig_end, fe)
+    if dig_pos >= dig_end:
+        return None, "dig_empty_after_clamp_in_before"
+    dig = before_code[dig_pos:dig_end]
     hit_fn = before_code[fs:fe]
     split = _dig_in_func_source(hit_fn, dig)
     if split is None:
-        return None
+        return None, "dig_split_failed_in_before_func"
     new_prefix, new_suffix = split
 
     new_before = before_code[:fs].rstrip("\n")
@@ -338,7 +361,7 @@ def rewrite_sections_for_before_hit(
         "new_prefix": new_prefix,
         "new_suffix": new_suffix,
         "fim_geometry": "promote_before_to_fim",
-    }
+    }, "ok"
 
 
 def rewrite_sections_for_after_hit(
@@ -346,7 +369,7 @@ def rewrite_sections_for_after_hit(
     *,
     dig: str,
     old_mid: str,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str]:
     """Promote the hit function from after → new FIM; push prior funcs + old fn into before."""
     span = find_fim_span(prompt)
     orig_completed = span.prefix + old_mid + span.suffix
@@ -355,7 +378,7 @@ def rewrite_sections_for_after_hit(
     after_span = _section_header_span(prompt, AFTER_HEADER)
     func_span = _section_header_span(prompt, FUNCTION_HEADER)
     if after_span is None or func_span is None:
-        return None
+        return None, "missing_after_or_function_header"
 
     before_sec = (
         prompt[before_span[0] : before_span[1]]
@@ -367,25 +390,37 @@ def rewrite_sections_for_after_hit(
 
     before_code = _extract_fence_body(before_sec)
     after_code = _extract_fence_body(after_sec)
+    if not after_code.strip():
+        return None, "empty_after_fence"
 
+    dig_pos = -1
+    dig_end = -1
     if dig in after_code:
         dig_pos = after_code.find(dig)
         dig_end = dig_pos + len(dig)
     else:
         hit = ws_flex_find(after_code, dig)
-        if hit is None:
-            return None
-        dig_pos, dig_end = hit
-        dig = after_code[dig_pos:dig_end]
+        if hit is not None:
+            dig_pos, dig_end = hit
+            dig = after_code[dig_pos:dig_end]
+    if dig_pos < 0:
+        return None, "dig_not_in_after_fence"
 
     func = find_enclosing_go_func(after_code, dig_pos, dig_end)
     if func is None:
-        return None
+        func = find_enclosing_go_func(after_code, dig_pos, dig_pos + 1)
+    if func is None:
+        return None, "no_enclosing_go_func_in_after"
     fs, fe = func
+    dig_pos = max(dig_pos, fs)
+    dig_end = min(dig_end, fe)
+    if dig_pos >= dig_end:
+        return None, "dig_empty_after_clamp_in_after"
+    dig = after_code[dig_pos:dig_end]
     hit_fn = after_code[fs:fe]
     split = _dig_in_func_source(hit_fn, dig)
     if split is None:
-        return None
+        return None, "dig_split_failed_in_after_func"
     new_prefix, new_suffix = split
 
     prior_in_after = after_code[:fs].rstrip("\n")
@@ -421,7 +456,7 @@ def rewrite_sections_for_after_hit(
         "new_prefix": new_prefix,
         "new_suffix": new_suffix,
         "fim_geometry": "promote_after_to_fim",
-    }
+    }, "ok"
 
 
 @dataclass(frozen=True)
@@ -780,7 +815,8 @@ def _choose_in_hay(hay: str, test_gold: str, expression: str) -> tuple[str, str]
         return "", "unchanged"
 
     if gold and gold in hay:
-        return gold, "exact_test_gold"
+        i = hay.find(gold)
+        return hay[i : i + len(gold)], "exact_test_gold"
 
     if gold:
         span = ws_flex_find(hay, gold)
@@ -957,7 +993,7 @@ def rewrite_fim_mid(
             if hit is not None:
                 pos = a + hit[0]
                 dig = local[hit[0] : hit[1]]
-    if pos < 0:
+    if pos < 0 and prefer_range is None:
         pos = _find_preferring_context(
             doc, dig, mid_start=old_mid_start, mid_end=old_mid_end,
         )
@@ -973,22 +1009,50 @@ def rewrite_fim_mid(
     if locus == "function":
         locus = _locus_at(doc, pos)
 
+    fail_reasons: list[str] = []
     rebuilt: dict[str, Any] | None = None
+
+    def _try_before() -> bool:
+        nonlocal rebuilt, locus
+        out, why = rewrite_sections_for_before_hit(prompt, dig=dig, old_mid=old_mid)
+        if out:
+            rebuilt = out
+            locus = "before"
+            return True
+        fail_reasons.append(f"before:{why}")
+        return False
+
+    def _try_after() -> bool:
+        nonlocal rebuilt, locus
+        out, why = rewrite_sections_for_after_hit(prompt, dig=dig, old_mid=old_mid)
+        if out:
+            rebuilt = out
+            locus = "after"
+            return True
+        fail_reasons.append(f"after:{why}")
+        return False
+
+    def _try_function() -> bool:
+        nonlocal rebuilt, locus
+        out = build_relocated_fim_in_function_section(prompt, dig=dig, old_mid=old_mid)
+        if out:
+            rebuilt = out
+            locus = "function"
+            return True
+        fail_reasons.append("function:inplace_failed")
+        return False
+
+    # Prefer the detected locus, then fall back so a mis-classified locus still works.
     if locus == "before":
-        rebuilt = rewrite_sections_for_before_hit(
-            prompt, dig=dig, old_mid=old_mid,
-        )
+        _try_before() or _try_after() or _try_function()
     elif locus == "after":
-        rebuilt = rewrite_sections_for_after_hit(
-            prompt, dig=dig, old_mid=old_mid,
-        )
+        _try_after() or _try_before() or _try_function()
     else:
-        rebuilt = build_relocated_fim_in_function_section(
-            prompt, dig=dig, old_mid=old_mid,
-        )
+        _try_function() or _try_before() or _try_after()
 
     if not rebuilt:
         base["reason"] = "section_rewrite_failed"
+        base["detail"] = "; ".join(fail_reasons) if fail_reasons else "unknown"
         return base
 
     dig_out = str(rebuilt["response"])

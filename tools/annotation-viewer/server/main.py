@@ -1270,6 +1270,7 @@ def corpus_mid_rewrite_prep(body: CorpusMidRewritePrepBody):
         "fim_geometry": rewrite.get("fim_geometry"),
         "dig_preview": (str(rewrite.get("dig_text") or "")[:200]),
         "old_mid_preview": (str(rewrite.get("old_mid") or "")[:120]),
+        "detail": rewrite.get("detail") or "",
         "applied": bool(rewrite.get("mode") and rewrite.get("mode") != "unchanged"),
     }
 
