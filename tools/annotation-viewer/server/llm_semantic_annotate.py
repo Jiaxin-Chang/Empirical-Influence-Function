@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
+import threading
 import time
 from typing import Any
 
@@ -27,6 +29,55 @@ FIM_PRE = "<PRE>"
 FIM_SUF = "<SUF>"
 FIM_MID = "<MID>"
 SUBTYPE = "semantic"
+
+_abort_event = threading.Event()
+_sigint_count = 0
+_prev_sigint_handler = None
+
+
+class LlmSemanticCancelled(Exception):
+    """Raised when semantic annotate is aborted (user cancel or server shutdown)."""
+
+
+def request_llm_semantic_abort() -> None:
+    _abort_event.set()
+
+
+def clear_llm_semantic_abort() -> None:
+    _abort_event.clear()
+
+
+def llm_semantic_abort_requested() -> bool:
+    return _abort_event.is_set()
+
+
+def install_llm_semantic_signal_handlers() -> None:
+    """First Ctrl+C requests abort; second forces immediate process exit."""
+    global _prev_sigint_handler
+
+    def _handler(signum, frame):  # noqa: ANN001
+        global _sigint_count
+        request_llm_semantic_abort()
+        _sigint_count += 1
+        if _sigint_count >= 2:
+            print("[llm-semantic] second Ctrl+C — force exit", flush=True)
+            os._exit(130)
+        print(
+            "[llm-semantic] interrupt: stopping after current step "
+            "(Ctrl+C again to force quit)",
+            flush=True,
+        )
+        if callable(_prev_sigint_handler) and _prev_sigint_handler not in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+        ):
+            _prev_sigint_handler(signum, frame)
+
+    try:
+        _prev_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        pass  # not main thread / unsupported platform
 
 
 def _env_int(name: str, default: int) -> int:
@@ -318,6 +369,42 @@ def _call_llm_for_target(
     return sources, raw
 
 
+def _call_llm_for_target_interruptible(
+    messages: list[dict[str, str]],
+    *,
+    dst: int,
+    allowed: set[int],
+    max_sources: int,
+) -> tuple[list[tuple[int, str]], str]:
+    """Run LLM call in a side thread so abort can break multi-minute waits."""
+    if llm_semantic_abort_requested():
+        raise LlmSemanticCancelled("aborted before LLM call")
+
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        try:
+            result["pair"] = _call_llm_for_target(
+                messages,
+                dst=dst,
+                allowed=allowed,
+                max_sources=max_sources,
+            )
+        except BaseException as exc:
+            error["exc"] = exc
+
+    t = threading.Thread(target=_worker, name=f"llm-semantic-dst-{dst}", daemon=True)
+    t.start()
+    while t.is_alive():
+        if llm_semantic_abort_requested():
+            raise LlmSemanticCancelled("aborted during LLM call")
+        t.join(timeout=0.4)
+    if "exc" in error:
+        raise error["exc"]
+    return result["pair"]
+
+
 def annotate_corpus_row_semantic(
     raw_row: dict[str, Any],
     tokenizer: Any,
@@ -356,6 +443,7 @@ def annotate_corpus_row_semantic(
     edge_seen: set[tuple[int, int]] = set()
     llm_calls = 0
 
+    clear_llm_semantic_abort()
     print(
         f"[llm-semantic] start answer_tokens={len(answer_indices)} "
         f"max_sources={max_src} seq_len={n}",
@@ -363,6 +451,8 @@ def annotate_corpus_row_semantic(
     )
 
     for dst in answer_indices:
+        if llm_semantic_abort_requested():
+            raise LlmSemanticCancelled(f"aborted at dst={dst}")
         ctx_idx = _select_context_indices(dst, answer_start)
         allowed = set(ctx_idx)
         messages = _build_per_token_messages(
@@ -376,12 +466,14 @@ def annotate_corpus_row_semantic(
         )
         t0 = time.perf_counter()
         try:
-            sources, _raw = _call_llm_for_target(
+            sources, _raw = _call_llm_for_target_interruptible(
                 messages,
                 dst=dst,
                 allowed=allowed,
                 max_sources=max_src,
             )
+        except LlmSemanticCancelled:
+            raise
         except Exception as exc:
             print(f"[llm-semantic] dst={dst} LLM failed: {exc}", flush=True)
             continue

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react'
 import {
   SUBTYPE_COLORS,
   SUBTYPE_LABELS,
@@ -57,6 +57,7 @@ export default function App() {
   const [gsBusy, setGsBusy] = useState(false)
   const [llmSemPreviewId, setLlmSemPreviewId] = useState<string | null>(null)
   const [llmSemBusy, setLlmSemBusy] = useState(false)
+  const llmSemAbortRef = useRef<AbortController | null>(null)
   const [queryMode, setQueryMode] = useState('manual')
   /** Probe/test focus surfaces from correlation-report deep link. */
   const [probeSrcToken, setProbeSrcToken] = useState('')
@@ -582,10 +583,17 @@ export default function App() {
 
   const runLlmSemanticPreview = async () => {
     if (!corpusMode || corpusLine == null) return
+    llmSemAbortRef.current?.abort()
+    const ac = new AbortController()
+    llmSemAbortRef.current = ac
     setLlmSemBusy(true)
     setError('')
     try {
-      const res = await api.llmSemanticAnnotatePreview(corpusLine, {}, corpusOpts)
+      const res = await api.llmSemanticAnnotatePreview(
+        corpusLine,
+        {},
+        { ...corpusOpts, signal: ac.signal },
+      )
       setSample(res.sample)
       setLlmSemPreviewId(res.preview_id)
       setTarget(null)
@@ -598,9 +606,26 @@ export default function App() {
         + `${res.llm_calls != null ? ` · ${res.llm_calls} 次 LLM 调用` : ''}）· 请接受或拒绝`,
       )
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (ac.signal.aborted) {
+        setStatus('LLM 语义标注已取消')
+      } else {
+        setError(e instanceof Error ? e.message : String(e))
+      }
     } finally {
+      if (llmSemAbortRef.current === ac) {
+        llmSemAbortRef.current = null
+      }
       setLlmSemBusy(false)
+    }
+  }
+
+  const cancelLlmSemanticPreview = async () => {
+    llmSemAbortRef.current?.abort()
+    try {
+      await api.abortLlmSemantic()
+      setStatus('已请求停止 LLM 语义标注…')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -1033,13 +1058,24 @@ export default function App() {
                     </p>
                     <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
                       {!llmSemPreviewId ? (
-                        <button
-                          type="button"
-                          disabled={llmSemBusy || busy || gsBusy || Boolean(gsPreviewId)}
-                          onClick={() => void runLlmSemanticPreview()}
-                        >
-                          {llmSemBusy ? '逐 token 标注中…' : 'LLM 语义标注'}
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            disabled={llmSemBusy || busy || gsBusy || Boolean(gsPreviewId)}
+                            onClick={() => void runLlmSemanticPreview()}
+                          >
+                            {llmSemBusy ? '逐 token 标注中…' : 'LLM 语义标注'}
+                          </button>
+                          {llmSemBusy && (
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={() => void cancelLlmSemanticPreview()}
+                            >
+                              取消标注
+                            </button>
+                          )}
+                        </>
                       ) : (
                         <>
                           <button

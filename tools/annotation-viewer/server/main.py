@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +123,18 @@ SUBTYPES = [
     "api",
 ]
 
-app = FastAPI(title="Train Annotation Viewer")
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    from server.llm_semantic_annotate import install_llm_semantic_signal_handlers
+
+    install_llm_semantic_signal_handlers()
+    yield
+    from server.llm_semantic_annotate import request_llm_semantic_abort
+
+    request_llm_semantic_abort()
+
+
+app = FastAPI(title="Train Annotation Viewer", lifespan=_app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1808,6 +1820,16 @@ def _build_llm_semantic_annotated_source(
     return base
 
 
+@app.post("/api/llm-semantic-abort")
+def llm_semantic_abort():
+    """Request in-flight per-token semantic annotate to stop (also set on Ctrl+C)."""
+    from server.llm_semantic_annotate import request_llm_semantic_abort
+
+    request_llm_semantic_abort()
+    print("[llm-semantic] abort requested via API", flush=True)
+    return {"ok": True, "message": "已请求停止 LLM 语义标注（当前 token 结束后退出）"}
+
+
 @app.post("/api/corpus/sample/{line}/llm-semantic-annotate/preview")
 def llm_semantic_annotate_preview(
     line: int,
@@ -1818,7 +1840,10 @@ def llm_semantic_annotate_preview(
     override = corpusPath.strip() or None
     payload = body or LlmSemanticAnnotateBody()
     from server.corpus_encode import extract_prompt_response
-    from server.llm_semantic_annotate import annotate_corpus_row_semantic
+    from server.llm_semantic_annotate import (
+        LlmSemanticCancelled,
+        annotate_corpus_row_semantic,
+    )
 
     with _state_lock:
         raw_row = _raw_row_with_bound_mid_rewrite(
@@ -1843,6 +1868,13 @@ def llm_semantic_annotate_preview(
             max_sources_per_token=payload.max_sources_per_token,
             max_answer_tokens=payload.max_answer_tokens,
         )
+    except LlmSemanticCancelled as exc:
+        print(f"[llm-semantic] cancelled line={line}: {exc}", flush=True)
+        raise HTTPException(
+            499,
+            "LLM 语义标注已取消（Ctrl+C 或点击取消）。"
+            "若进程仍不退出，请再按一次 Ctrl+C 强制结束。",
+        ) from exc
     except ValueError as exc:
         print(f"[llm-semantic] FAIL corpus line={line}: {exc}", flush=True)
         raise HTTPException(400, str(exc)) from exc
@@ -2618,7 +2650,13 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[WARN] tokenizer not loaded: {exc}", flush=True)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        timeout_graceful_shutdown=2,
+    )
 
 
 if __name__ == "__main__":

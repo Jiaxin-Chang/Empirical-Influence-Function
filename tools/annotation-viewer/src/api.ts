@@ -303,7 +303,7 @@ export const api = {
   llmSemanticAnnotatePreview: (
     line: number,
     body?: { max_sources_per_token?: number; max_answer_tokens?: number },
-    opts?: { corpusPath?: string | null },
+    opts?: { corpusPath?: string | null; signal?: AbortSignal },
   ) =>
     jsonFetch<{
       ok: boolean
@@ -316,6 +316,13 @@ export const api = {
     }>(`/api/corpus/sample/${line}/llm-semantic-annotate/preview${corpusQuery(opts?.corpusPath)}`, {
       method: 'POST',
       body: JSON.stringify(body || {}),
+      signal: opts?.signal,
+    }),
+
+  abortLlmSemantic: () =>
+    jsonFetch<{ ok: boolean; message?: string }>('/api/llm-semantic-abort', {
+      method: 'POST',
+      body: '{}',
     }),
 
   llmSemanticAnnotateAccept: (
