@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ChangeEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import styles from './NewView.module.css';
 import {
     ReportPanel,
@@ -51,6 +51,12 @@ function defaultEifApiOrigin(): string {
     return window.location.origin;
 }
 
+function hasReportUrlQuery(): boolean {
+    if (typeof window === 'undefined') return false;
+    const params = new URLSearchParams(window.location.search);
+    return Boolean(params.get('reportUrl') ?? params.get('report_url') ?? params.get('leftUrl'));
+}
+
 export function NewView({ metas }: Props) {
     const [slot, setSlot] = useState<SlotState>(() => emptySlot());
     const [dragging, setDragging] = useState(false);
@@ -60,6 +66,7 @@ export function NewView({ metas }: Props) {
     const [rawLine, setRawLine] = useState('');
     const [rawBusy, setRawBusy] = useState(false);
     const [rawError, setRawError] = useState<string | null>(null);
+    const loadGenRef = useRef(0);
 
     const activatePayload = useCallback((payload: unknown, sourceName: string) => {
         try {
@@ -138,6 +145,57 @@ export function NewView({ metas }: Props) {
         }
     }, [activatePayload]);
 
+    const loadRawSampleAt = useCallback(async (fileName: string, line: string) => {
+        if (!fileName || !line) return;
+        const gen = ++loadGenRef.current;
+        setRawBusy(true);
+        setRawError(null);
+        setSlot({
+            report: null,
+            meta: null,
+            status: `Tokenizing ${fileName} line ${line}…`,
+            error: null,
+        });
+        try {
+            const resp = await fetch(`${defaultEifApiOrigin()}/api/raw-eval-sample`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileName, line: Number(line) }),
+            });
+            const rawText = await resp.text();
+            let parsed: { status?: string; report?: AllTokensReport; message?: string } = {};
+            if (rawText.trim()) {
+                parsed = JSON.parse(rawText) as typeof parsed;
+            }
+            if (gen !== loadGenRef.current) return;
+            if (!resp.ok || parsed.status !== 'success' || !parsed.report) {
+                throw new Error(parsed.message || `Raw sample failed (HTTP ${resp.status})`);
+            }
+            const data = normalizeAllTokensReport(parsed.report);
+            const taskId = data.experiment_meta.task_id || `line_${line}`;
+            const family = data.experiment_meta.report_family;
+            const familyTag = family === 'ce' ? 'CE' : family === 'saliency' ? 'SA' : 'raw';
+            const meta: AllTokensExperimentMeta = {
+                taskId,
+                label: `[${familyTag}] ${fileName} · L${line}`,
+                fileName,
+            };
+            setSlot({
+                report: data,
+                meta,
+                status: `Raw ${familyTag} · ${taskId} · LoRA=${family || '?'} · live saliency/probs`,
+                error: null,
+            });
+        } catch (error) {
+            if (gen !== loadGenRef.current) return;
+            const message = error instanceof Error ? error.message : 'Failed to load raw sample';
+            setRawError(message);
+            setSlot({ report: null, meta: null, status: null, error: message });
+        } finally {
+            if (gen === loadGenRef.current) setRawBusy(false);
+        }
+    }, []);
+
     useEffect(() => {
         let cancelled = false;
         void (async () => {
@@ -182,67 +240,47 @@ export function NewView({ metas }: Props) {
                 }
                 const rows = Array.isArray(data.rows) ? data.rows : [];
                 setRawRows(rows);
-                setRawLine(rows[0] ? String(rows[0].line) : '');
+                const firstLine = rows[0] ? String(rows[0].line) : '';
+                setRawLine(firstLine);
+                if (cancelled) return;
+                if (firstLine && !hasReportUrlQuery()) {
+                    await loadRawSampleAt(rawFile, firstLine);
+                } else {
+                    setRawBusy(false);
+                }
             } catch (error) {
                 if (!cancelled) {
                     setRawRows([]);
                     setRawLine('');
                     setRawError(error instanceof Error ? error.message : 'Failed to load raw rows');
+                    setRawBusy(false);
                 }
-            } finally {
-                if (!cancelled) setRawBusy(false);
             }
         })();
         return () => { cancelled = true; };
-    }, [rawFile]);
+    }, [rawFile, loadRawSampleAt]);
 
-    const loadRawSample = useCallback(async () => {
-        if (!rawFile || !rawLine) return;
-        setRawBusy(true);
-        setRawError(null);
-        setSlot({
-            report: null,
-            meta: null,
-            status: `Tokenizing ${rawFile} line ${rawLine}…`,
-            error: null,
-        });
-        try {
-            const resp = await fetch(`${defaultEifApiOrigin()}/api/raw-eval-sample`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fileName: rawFile, line: Number(rawLine) }),
-            });
-            const rawText = await resp.text();
-            let parsed: { status?: string; report?: AllTokensReport; message?: string } = {};
-            if (rawText.trim()) {
-                parsed = JSON.parse(rawText) as typeof parsed;
-            }
-            if (!resp.ok || parsed.status !== 'success' || !parsed.report) {
-                throw new Error(parsed.message || `Raw sample failed (HTTP ${resp.status})`);
-            }
-            const data = normalizeAllTokensReport(parsed.report);
-            const taskId = data.experiment_meta.task_id || `line_${rawLine}`;
-            const family = data.experiment_meta.report_family;
-            const familyTag = family === 'ce' ? 'CE' : family === 'saliency' ? 'SA' : 'raw';
-            const meta: AllTokensExperimentMeta = {
-                taskId,
-                label: `[${familyTag}] ${rawFile} · L${rawLine}`,
-                fileName: rawFile,
-            };
-            setSlot({
-                report: data,
-                meta,
-                status: `Raw ${familyTag} · ${taskId} · LoRA=${family || '?'} · live saliency/probs`,
-                error: null,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Failed to load raw sample';
-            setRawError(message);
-            setSlot({ report: null, meta: null, status: null, error: message });
-        } finally {
-            setRawBusy(false);
-        }
-    }, [rawFile, rawLine]);
+    useEffect(() => {
+        const onKeyDown = (ev: KeyboardEvent) => {
+            if (rawBusy) return;
+            if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
+            const tag = (ev.target as HTMLElement | null)?.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+            if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return;
+            ev.preventDefault();
+            if (!rawFile || rawRows.length === 0) return;
+            const idx = rawRows.findIndex(r => String(r.line) === rawLine);
+            const nextIdx = ev.key === 'ArrowDown'
+                ? (idx < 0 ? 0 : idx + 1)
+                : (idx < 0 ? 0 : idx - 1);
+            if (nextIdx < 0 || nextIdx >= rawRows.length) return;
+            const line = String(rawRows[nextIdx].line);
+            setRawLine(line);
+            void loadRawSampleAt(rawFile, line);
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [rawBusy, rawFile, rawLine, rawRows, loadRawSampleAt]);
 
     // Optional URL query: ?reportUrl=...
     useEffect(() => {
@@ -264,6 +302,11 @@ export function NewView({ metas }: Props) {
         })();
     }, [activatePayload]);
 
+    const selectRawLine = (line: string) => {
+        setRawLine(line);
+        void loadRawSampleAt(rawFile, line);
+    };
+
     return (
         <div className={styles.root}>
             <div className={styles.slotImportCard}>
@@ -273,7 +316,7 @@ export function NewView({ metas }: Props) {
                         <div className={styles.slotImportDesc}>
                             {slot.report
                                 ? modelLabelFrom(slot.report, slot.meta, 'loaded')
-                                : 'Import JSON、选预处理报告，或打开 correlation_matching_results/raw_ce|raw_sa 下的评测 JSONL'}
+                                : '打开后默认展示第一条 Raw JSONL 样本，↓ / ↑ 切换'}
                         </div>
                     </div>
                     {slot.report && (
@@ -306,7 +349,7 @@ export function NewView({ metas }: Props) {
                             <select
                                 value={rawLine}
                                 disabled={rawBusy || rawRows.length === 0}
-                                onChange={e => setRawLine(e.target.value)}
+                                onChange={e => selectRawLine(e.target.value)}
                             >
                                 {rawRows.length === 0 && <option value="">—</option>}
                                 {rawRows.map(r => (
@@ -316,57 +359,64 @@ export function NewView({ metas }: Props) {
                                 ))}
                             </select>
                         </label>
-                        <button
-                            type="button"
-                            className={styles.rawEvalOpenBtn}
-                            disabled={rawBusy || !rawFile || !rawLine}
-                            onClick={() => void loadRawSample()}
-                        >
-                            {rawBusy ? '打开中…' : '打开样本'}
-                        </button>
+                        <span className={styles.slotImportDesc}>
+                            {rawBusy ? '打开中…' : '↓ 下一条 · ↑ 上一条'}
+                        </span>
                     </div>
                     {rawError && <div className={styles.importError}>{rawError}</div>}
                 </div>
 
-                <label
-                    className={`${styles.importDropZone} ${dragging ? styles.importDropZoneActive : ''}`}
-                    onDragOver={event => {
-                        event.preventDefault();
-                        setDragging(true);
-                    }}
-                    onDragLeave={() => setDragging(false)}
-                    onDrop={event => {
-                        event.preventDefault();
-                        setDragging(false);
-                        void handleFile(event.dataTransfer.files?.[0]);
-                    }}
-                >
-                    <input
-                        type="file"
-                        accept=".json,application/json"
-                        className={styles.importFileInput}
-                        onChange={(event: ChangeEvent<HTMLInputElement>) => {
-                            void handleFile(event.target.files?.[0]);
-                            event.target.value = '';
-                        }}
-                    />
-                    <span className={styles.importDropMain}>Choose JSON</span>
-                    <span className={styles.importDropSub}>all-token report</span>
-                </label>
-
-                {metas.length > 0 && (
-                    <div className={styles.slotMetaList}>
-                        {metas.map((m, i) => (
-                            <button
-                                key={`${m.fileName}-${i}`}
-                                type="button"
-                                className={`${styles.metaBtn} ${slot.meta?.fileName === m.fileName ? styles.metaBtnActive : ''}`}
-                                onClick={() => void loadMeta(m)}
-                            >
-                                {m.label}
-                            </button>
-                        ))}
-                    </div>
+                {/* 暂时隐藏：JSON 文件导入 + 预处理报告列表 + 打开样本按钮 */}
+                {false && (
+                    <>
+                        <button
+                            type="button"
+                            className={styles.rawEvalOpenBtn}
+                            disabled={rawBusy || !rawFile || !rawLine}
+                            onClick={() => void loadRawSampleAt(rawFile, rawLine)}
+                        >
+                            {rawBusy ? '打开中…' : '打开样本'}
+                        </button>
+                        <label
+                            className={`${styles.importDropZone} ${dragging ? styles.importDropZoneActive : ''}`}
+                            onDragOver={event => {
+                                event.preventDefault();
+                                setDragging(true);
+                            }}
+                            onDragLeave={() => setDragging(false)}
+                            onDrop={event => {
+                                event.preventDefault();
+                                setDragging(false);
+                                void handleFile(event.dataTransfer.files?.[0]);
+                            }}
+                        >
+                            <input
+                                type="file"
+                                accept=".json,application/json"
+                                className={styles.importFileInput}
+                                onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                                    void handleFile(event.target.files?.[0]);
+                                    event.target.value = '';
+                                }}
+                            />
+                            <span className={styles.importDropMain}>Choose JSON</span>
+                            <span className={styles.importDropSub}>all-token report</span>
+                        </label>
+                        {metas.length > 0 && (
+                            <div className={styles.slotMetaList}>
+                                {metas.map((m, i) => (
+                                    <button
+                                        key={`${m.fileName}-${i}`}
+                                        type="button"
+                                        className={`${styles.metaBtn} ${slot.meta?.fileName === m.fileName ? styles.metaBtnActive : ''}`}
+                                        onClick={() => void loadMeta(m)}
+                                    >
+                                        {m.label}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </>
                 )}
 
                 {slot.status && <div className={styles.importStatus}>{slot.status}</div>}
@@ -375,7 +425,7 @@ export function NewView({ metas }: Props) {
 
             {!slot.report && (
                 <div className={styles.emptyState}>
-                    Import or select a correlation report / raw eval sample to begin.
+                    {rawBusy ? '正在加载第一条样本…' : '选择 Raw JSONL 后会自动展示第一条；↓ 切换下一条。'}
                 </div>
             )}
 
