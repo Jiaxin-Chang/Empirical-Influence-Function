@@ -105,8 +105,13 @@ def token_surfaces_for_display(tokenizer, token_ids: list[int]) -> list[str]:
     while i < n:
         j = i + 1
         text = tokenizer.decode(ids[i:j])
-        # Grow until the span no longer needs replacement chars, or no gain.
+        # Grow only across consecutive byte-fallback pieces. A following token
+        # that already decodes cleanly must stay its own chip — otherwise the
+        # merge swallows it, later indices become "" and the UI shows "·".
         while j < n and "\ufffd" in text:
+            nxt_alone = tokenizer.decode([ids[j]])
+            if "\ufffd" not in nxt_alone:
+                break
             nxt = tokenizer.decode(ids[i : j + 1])
             if nxt == text and "\ufffd" in nxt:
                 # No progress (rare) — stop to avoid scanning forever.

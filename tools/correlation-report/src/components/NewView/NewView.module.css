@@ -2,10 +2,10 @@
 .root {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 12px;
     flex: 1;
     min-height: 0;
-    padding: 0 0 48px;
+    padding: 0;
     font-family: inherit;
 }
 
@@ -17,11 +17,11 @@
 /* ── Evaluation toolbar (paper-style chrome) ── */
 .slotImportCard {
     display: grid;
-    gap: 12px;
-    padding: 0 0 14px;
+    gap: 8px;
+    padding: 0 0 10px;
     background: transparent;
     border: none;
-    border-bottom: 1px solid #e5e5e5;
+    border-bottom: 1px solid #e8e6e1;
     border-radius: 0;
     box-shadow: none;
     min-width: 0;
@@ -316,10 +316,10 @@
     min-width: 0;
     min-height: 0;
     height: 100%;
-    border: 1px solid #e5e5e5;
-    border-radius: 2px;
-    padding: 10px 12px 12px;
-    background: #ffffff;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -339,7 +339,7 @@
     height: 100%;
     overflow: hidden;
     padding-bottom: 0;
-    gap: 12px;
+    gap: 0;
 }
 .modelBanner {
     display: flex;
@@ -533,33 +533,43 @@
 
 /* ── Code Panel ── */
 .codePanel {
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
     overflow: hidden;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-    /* Prevent flex-shrink crush when prob chart appears in bottomLeft. */
+    box-shadow: none;
     flex-shrink: 0;
 }
 .codePanelHeader {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    background: #f8fafc;
-    border-bottom: 1px solid #e2e8f0;
+    gap: 10px;
+    padding: 7px 12px;
+    background: #ffffff;
+    border-bottom: 1px solid #e8e6e1;
 }
 .badge {
     font-size: 10px;
-    font-weight: 800;
-    color: #fff;
-    padding: 2px 8px;
-    border-radius: 4px;
-    letter-spacing: 0.05em;
+    font-weight: 700;
+    color: #57534e;
+    padding: 0;
+    border-radius: 0;
+    letter-spacing: 0.08em;
+    background: transparent;
+    text-transform: uppercase;
+}
+.badgeModel {
+    color: #b42318;
 }
 .codePanelLabel {
     font-size: 12px;
-    font-weight: 600;
-    color: #475569;
+    font-weight: 500;
+    color: #78716c;
+}
+.codePanelHeaderActions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
 .outputCompareBody {
     display: flex;
@@ -577,30 +587,34 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 14px;
-    background: #f7f7f5;
+    padding: 5px 12px;
+    background: #fafaf8;
     border-bottom: 1px solid #e8e6e1;
     flex-shrink: 0;
 }
 .outputSectionTitle {
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 700;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
 }
 .outputSectionTitleModel { color: #b42318; }
 .outputSectionTitleGold { color: #15803d; }
+.outputSectionHint {
+    font-size: 11px;
+    color: #a8a29e;
+}
 .codeBlock {
     margin: 0;
-    padding: 14px;
+    padding: 12px 14px;
     background: #ffffff;
     color: #1c1917;
     border: none;
-    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-family: 'IBM Plex Mono', 'Cascadia Code', ui-monospace, monospace;
     font-size: 13px;
     line-height: 1.7;
     overflow-x: auto;
-    max-height: 560px; /* was 420; temporary: show more Model lines */
+    max-height: 560px;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
@@ -661,16 +675,16 @@
    or .token-source-highlight — those already mean "current target" and
    "attribution source", and overloading them would make the picture unreadable. */
 .token-linked {
-    outline: 2px solid #22d3ee;
-    outline-offset: 1px;
-    background: rgba(34, 211, 238, 0.28);
-    border-radius: 3px;
+    outline: 1px solid #1c1917;
+    outline-offset: 0;
+    background: rgba(28, 25, 23, 0.06);
+    border-radius: 2px;
 }
 
 /* ── Bottom Section: Model left, Train right — each scrolls on its own ── */
 .bottomSection {
     display: flex;
-    gap: 20px;
+    gap: 16px;
     align-items: stretch;
     flex: 1;
     min-height: 0;
@@ -687,7 +701,7 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 10px;
     min-width: 0;
     min-height: 0;
     overflow-x: hidden;
@@ -704,6 +718,8 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    display: flex;
+    flex-direction: column;
 }
 
 .panelRootCompact .bottomSection {
@@ -726,35 +742,36 @@
 .correlationList {
     background: #ffffff;
     border-radius: 2px;
-    border: 1px solid #e5e5e5;
-    padding: 16px;
+    border: 1px solid #e8e6e1;
+    padding: 10px 12px 12px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 8px;
     flex-shrink: 0;
 }
 .correlationListTitle {
-    font-size: 11px;
+    font-size: 10px;
     color: #78716c;
     font-weight: 700;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    margin-bottom: 4px;
+    margin: 0;
 }
 .correlationListHint {
     font-size: 11px;
-    color: #2563eb;
+    color: #78716c;
     line-height: 1.35;
-    margin-bottom: 4px;
+    margin: 0;
 }
 .corrArrow {
     margin: 0 6px;
-    color: #78716c;
-    font-weight: 700;
+    color: #a8a29e;
+    font-weight: 600;
 }
 .correlationListItems {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 8px;
+    gap: 6px;
 }
 @media (max-width: 1200px) {
     .correlationListItems { grid-template-columns: 1fr; }
@@ -762,121 +779,134 @@
 
 .corrBtn {
     background: #ffffff;
-    border: 1px solid #e5e5e5;
-    border-radius: 8px;
-    padding: 10px 12px;
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
+    padding: 7px 9px;
     cursor: pointer;
     text-align: left;
-    transition: all 0.15s;
+    transition: background 0.1s, border-color 0.1s;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 8px;
 }
 .corrBtn:hover {
-    background: #f7f7f5;
+    background: #fafaf8;
+    border-color: #d6d3d1;
 }
 .corrBtnActive {
-    border-color: #2563eb;
-    background: rgba(137, 180, 250, 0.15);
+    border-color: #1c1917;
+    background: #f7f7f5;
 }
 
 .corrBtnLeft {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
 }
 .corrBtnRight {
     display: flex;
     flex-direction: column;
     gap: 2px;
     align-items: flex-end;
+    flex-shrink: 0;
 }
 
-.corrLabel, .corrScoreLabel {
+.corrBtnLeft .corrLabel,
+.corrScoreLabel {
     font-size: 9px;
     font-weight: 700;
-    color: #78716c;
+    color: #a8a29e;
     text-transform: uppercase;
+    letter-spacing: 0.04em;
 }
 
 .corrSourceTok {
-    font-family: monospace;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
     font-size: 12px;
-    font-weight: 700;
-    color: #2563eb;
-    background: #eff6ff;
-    padding: 2px 6px;
-    border-radius: 4px;
+    font-weight: 600;
+    color: #1c1917;
+    background: #f7f7f5;
+    padding: 1px 5px;
+    border-radius: 2px;
 }
-.sourceChipSal { color: #78716c; font-size: 10px; }
+.sourceChipSal {
+    color: #78716c;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+}
 
 /* ── Bottom panel ── */
 .bottomPanel {
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
     overflow: hidden;
+    background: #ffffff;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
 }
 .bottomPanelHeader {
-    padding: 14px 18px;
-    background: #f8fafc;
-    border-bottom: 1px solid #e2e8f0;
+    padding: 8px 12px;
+    background: #ffffff;
+    border-bottom: 1px solid #e8e6e1;
     display: flex;
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 12px;
+    gap: 8px;
 }
 .bottomPanelTitle {
-    font-size: 14px;
-    font-weight: 700;
-    color: #1e293b;
+    font-size: 12px;
+    font-weight: 600;
+    color: #1c1917;
     display: flex;
     align-items: center;
     gap: 10px;
 }
+.trainGroupList {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.trainGroup {
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
+    overflow: hidden;
+}
+.trainGroupHeader {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: #fafaf8;
+    cursor: pointer;
+    flex-wrap: wrap;
+    border-bottom: 1px solid transparent;
+    transition: background 0.1s;
+}
+.trainGroupHeader:hover { background: #f3f3f0; }
+.trainGroupId   { font-size: 11px; color: #57534e; font-weight: 700; font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.trainGroupCoarse { font-size: 11px; color: #a8a29e; }
+.trainGroupCount  { font-size: 11px; color: #a8a29e; }
 .pairCount {
     font-size: 11px;
     font-weight: 500;
-    color: #94a3b8;
+    color: #a8a29e;
 }
 .filterRow {
     display: flex;
     align-items: center;
     gap: 8px;
 }
-.filterLabel { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
-.thresholdSlider { width: 140px; accent-color: #6366f1; }
-.thresholdVal { font-size: 13px; font-weight: 700; color: #4338ca; min-width: 40px; }
-
-.trainGroupList {
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-/* ── Train group ── */
-.trainGroup {
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    overflow: hidden;
-}
-.trainGroupHeader {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px;
-    background: #f8fafc;
-    cursor: pointer;
-    flex-wrap: wrap;
-    border-bottom: 1px solid transparent;
-    transition: background 0.1s;
-}
-.trainGroupHeader:hover { background: #f1f5f9; }
-.trainGroupId   { font-size: 11px; color: #818cf8; font-weight: 700; font-family: monospace; }
-.trainGroupCoarse { font-size: 11px; color: #94a3b8; }
-.trainGroupCount  { font-size: 11px; color: #94a3b8; }
+.filterLabel { font-size: 11px; font-weight: 700; color: #78716c; text-transform: uppercase; }
+.thresholdSlider { width: 140px; accent-color: #1c1917; }
+.thresholdVal { font-size: 12px; font-weight: 600; color: #1c1917; min-width: 40px; font-variant-numeric: tabular-nums; }
 
 .trainGroupBody {
     padding: 14px;
@@ -907,33 +937,33 @@
 
 /* ── Pair card ── */
 .pairCard {
-    border: 1px solid #e5e7eb;
-    border-radius: 8px;
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
     overflow: hidden;
     background: #fff;
-    transition: border-color 0.15s;
+    transition: border-color 0.12s;
 }
 .pairCardHeader {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 9px 12px;
+    padding: 7px 10px;
     cursor: pointer;
     flex-wrap: wrap;
-    background: #fafafa;
+    background: #fafaf8;
     transition: background 0.1s;
 }
-.pairCardHeader:hover { background: #f1f5f9; }
+.pairCardHeader:hover { background: #f3f3f0; }
 
-.pairId    { font-size: 10px; font-family: monospace; color: #c4b5fd; }
-.cosSim    { font-weight: 700; font-size: 12px; padding: 2px 9px; border-radius: 10px; flex-shrink: 0; }
-.corrTag   { border: 1px solid; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-family: monospace; flex-shrink: 0; }
+.pairId    { font-size: 10px; font-family: 'IBM Plex Mono', ui-monospace, monospace; color: #a8a29e; }
+.cosSim    { font-weight: 700; font-size: 12px; padding: 1px 7px; border-radius: 2px; flex-shrink: 0; }
+.corrTag   { border: 1px solid; border-radius: 2px; padding: 1px 6px; font-size: 11px; font-family: 'IBM Plex Mono', ui-monospace, monospace; flex-shrink: 0; }
 .corrLabel { opacity: 0.65; }
 .arrow     { opacity: 0.55; }
 .offset    { opacity: 0.5; font-size: 10px; margin-left: 3px; }
-.corrArrow { color: #c4b5fd; font-size: 14px; }
-.trainBadge { font-size: 10px; background: #ede9fe; color: #5b21b6; padding: 2px 7px; border-radius: 4px; font-weight: 700; }
-.expandIcon { color: #94a3b8; font-size: 12px; margin-left: auto; }
+.pairCard .corrArrow { color: #a8a29e; font-size: 13px; }
+.trainBadge { font-size: 10px; background: #f7f7f5; color: #57534e; padding: 1px 6px; border-radius: 2px; font-weight: 700; letter-spacing: 0.04em; }
+.expandIcon { color: #a8a29e; font-size: 11px; margin-left: auto; }
 
 .pairCardBody {
     padding: 10px 12px;
@@ -991,8 +1021,8 @@
 /* Picks between drawing the plot in this page and opening the TTAV web app. */
 .modeSwitch {
     display: inline-flex;
-    border: 1px solid #cbd5e1;
-    border-radius: 999px;
+    border: 1px solid #e8e6e1;
+    border-radius: 2px;
     overflow: hidden;
     background: #fff;
 }
@@ -1171,10 +1201,10 @@
 
 /* ── Next-token probability chart (bottom-left) ── */
 .probPanel {
-    margin-top: 10px;
+    margin-top: 0;
     background: #ffffff;
     border: 1px solid #e8e6e1;
-    border-radius: 8px;
+    border-radius: 2px;
     overflow: hidden;
     flex-shrink: 0;
 }
@@ -1199,13 +1229,13 @@
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 .probRecoverBtn {
-    border: 1px solid #15803d;
-    background: #f0fdf4;
-    color: #15803d;
-    border-radius: 999px;
-    padding: 2px 10px;
+    border: 1px solid #e8e6e1;
+    background: #ffffff;
+    color: #1c1917;
+    border-radius: 2px;
+    padding: 2px 8px;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     cursor: pointer;
 }
 .probRecoverBtn:disabled {
@@ -1242,9 +1272,6 @@
 .probTokClicked {
     color: #854d0e;
     font-weight: 700;
-    background: #fde68a;
-    border-radius: 2px;
-    padding: 0 3px;
 }
 .probPct {
     color: #2563eb;
@@ -1297,13 +1324,13 @@
     flex-shrink: 0;
 }
 .probViewTab {
-    border: 1px solid #d6d3d1;
-    background: #e8e6e1;
+    border: 1px solid #e8e6e1;
+    background: #ffffff;
     color: #78716c;
-    border-radius: 999px;
-    padding: 2px 10px;
+    border-radius: 2px;
+    padding: 2px 8px;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     cursor: pointer;
 }
 .probViewTab:disabled {
@@ -1311,14 +1338,14 @@
     cursor: wait;
 }
 .probViewTabActive {
-    border-color: #6d28d9;
-    background: #e8e6e1;
-    color: #6d28d9;
+    border-color: #1c1917;
+    background: #f7f7f5;
+    color: #1c1917;
 }
 .degradeHint {
     padding: 4px 12px 6px;
     font-size: 11px;
-    color: #6d28d9;
+    color: #57534e;
     border-bottom: 1px solid #e8e6e1;
 }
 .degradeCard {
@@ -1331,7 +1358,7 @@
 }
 .degradeTitle {
     font-weight: 700;
-    color: #6d28d9;
+    color: #1c1917;
     margin-bottom: 4px;
 }
 .degradeFormula {
@@ -1357,13 +1384,13 @@
     margin-bottom: 8px;
 }
 .degradeBtn {
-    border: 1px solid #6d28d9;
+    border: 1px solid #1c1917;
     background: #ffffff;
-    color: #6d28d9;
-    border-radius: 999px;
-    padding: 3px 12px;
+    color: #1c1917;
+    border-radius: 2px;
+    padding: 3px 10px;
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     cursor: pointer;
 }
 .degradeBtn:disabled {
@@ -1376,19 +1403,19 @@
 .degradeProgressMeta {
     font-size: 11px;
     font-weight: 700;
-    color: #6d28d9;
+    color: #1c1917;
     margin-bottom: 4px;
-    font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
 }
 .degradeProgressTrack {
-    height: 8px;
+    height: 6px;
     background: #e8e6e1;
-    border-radius: 999px;
+    border-radius: 1px;
     overflow: hidden;
 }
 .degradeProgressFill {
     height: 100%;
-    background: #6d28d9;
+    background: #1c1917;
     transition: width 0.2s ease;
 }
 .degradeProgressMsg {
@@ -1446,20 +1473,150 @@
 
 /* ── Misc ── */
 .emptyState {
-    padding: 56px 20px 80px;
+    padding: 40px 16px 56px;
     text-align: center;
     color: #7a7368;
     font-family: 'Source Serif 4', Georgia, serif;
-    font-size: 1.05rem;
+    font-size: 1rem;
     font-style: italic;
     line-height: 1.65;
     max-width: 36em;
     margin: 0 auto;
 }
 .emptyState code {
-    background: #f1f5f9;
-    padding: 2px 6px;
-    border-radius: 4px;
+    background: #f7f7f5;
+    padding: 1px 5px;
+    border-radius: 2px;
     font-size: 12px;
-    color: #475569;
+    color: #57534e;
+}
+.panelEmpty {
+    padding: 28px 16px;
+    text-align: left;
+    color: #78716c;
+    font-family: inherit;
+    font-size: 12px;
+    font-style: normal;
+    line-height: 1.55;
+    max-width: none;
+}
+
+.ghostBtn {
+    border: 1px solid #e8e6e1;
+    background: #ffffff;
+    color: #57534e;
+    border-radius: 2px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    line-height: 1.4;
+}
+.ghostBtn:hover:not(:disabled) {
+    border-color: #d6d3d1;
+    color: #1c1917;
+    background: #fafaf8;
+}
+.ghostBtn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.ghostBtnOn {
+    border-color: #1c1917;
+    background: #f7f7f5;
+    color: #1c1917;
+}
+.ghostBtnWait {
+    cursor: wait;
+}
+
+.toolRow {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #57534e;
+    border-bottom: 1px solid #e8e6e1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: #ffffff;
+}
+.toolRowLabel {
+    font-weight: 700;
+    color: #1c1917;
+}
+.toolRowMuted {
+    color: #a8a29e;
+}
+.toolInput {
+    width: 72px;
+    padding: 2px 6px;
+    border-radius: 2px;
+    border: 1px solid #e8e6e1;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    color: #1c1917;
+    background: #fff;
+}
+.toolInput:focus {
+    outline: none;
+    border-color: #1c1917;
+}
+
+.manualPairBar {
+    padding: 6px 0 2px;
+    font-size: 12px;
+    color: #44403c;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+.manualPairHint {
+    font-size: 11px;
+    color: #78716c;
+    line-height: 1.4;
+}
+.manualPairScore {
+    margin-top: 2px;
+    padding: 6px 8px;
+    border: 1px solid #e8e6e1;
+    background: #fafaf8;
+    font-size: 12px;
+    color: #44403c;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.splitStack {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 360px;
+    overflow: hidden;
+}
+.splitPane {
+    flex: 1 1 50%;
+    min-height: 160px;
+    overflow: auto;
+}
+.splitPane + .splitPane {
+    border-top: 1px solid #e8e6e1;
+    background: #fafaf8;
+}
+.splitPaneHead {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 6px 12px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: #ffffff;
+    border-bottom: 1px solid #e8e6e1;
+    color: #57534e;
 }

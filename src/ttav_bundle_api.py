@@ -1220,8 +1220,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             })
             return
         top_trains = req.get("topTrains")
+        mode = str(req.get("mode") or "gold")
+        full_tokens = req.get("fullTokens")
+        full_token_ids = req.get("fullTokenIds")
+        prompt_len_override = req.get("promptLen")
         print(
-            f"[gold] retrieve+stage3 source={source_index} target={target_index}",
+            f"[gold] retrieve+stage3 mode={mode} source={source_index} target={target_index}",
             flush=True,
         )
         try:
@@ -1231,6 +1235,11 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     source_index=source_index,
                     target_index=target_index,
                     top_trains=int(top_trains) if top_trains is not None else None,
+                    mode=mode,
+                    full_tokens=full_tokens if isinstance(full_tokens, list) else None,
+                    full_token_ids=full_token_ids if isinstance(full_token_ids, list) else None,
+                    prompt_len_override=int(prompt_len_override)
+                    if prompt_len_override is not None else None,
                 )
         except Exception as exc:
             print(f"[gold] retrieve/stage3 failed: {exc}", flush=True)

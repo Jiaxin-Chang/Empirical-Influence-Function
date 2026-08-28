@@ -332,13 +332,13 @@ export function NewView({ metas }: Props) {
             <div className={styles.slotImportCard}>
                 <div className={styles.toolbarRow}>
                     <label className={styles.field}>
-                        <span className={styles.fieldLabel}>Corpus</span>
+                        <span className={styles.fieldLabel}>语料</span>
                         <select
                             value={rawFile}
                             disabled={rawBusy || rawFiles.length === 0}
                             onChange={e => setRawFile(e.target.value)}
                         >
-                            {rawFiles.length === 0 && <option value="">No JSONL available</option>}
+                    {rawFiles.length === 0 && <option value="">暂无 JSONL</option>}
                             {rawFiles.map(f => (
                                 <option key={f.fileName} value={f.fileName}>
                                     {f.label} · {f.nRows}
@@ -347,7 +347,7 @@ export function NewView({ metas }: Props) {
                         </select>
                     </label>
                     <label className={`${styles.field} ${styles.fieldGrow}`}>
-                        <span className={styles.fieldLabel}>Sample</span>
+                        <span className={styles.fieldLabel}>样本</span>
                         <select
                             value={rawLine}
                             disabled={rawBusy || rawRows.length === 0}
@@ -381,7 +381,7 @@ export function NewView({ metas }: Props) {
                             ↓
                         </button>
                     </div>
-                    {rawBusy && <span className={styles.loadingNote}>Loading…</span>}
+                    {rawBusy && <span className={styles.loadingNote}>载入中…</span>}
                     {!rawBusy && rawRows.length > 0 && sampleIdx >= 0 && (
                         <span className={styles.counter}>
                             {sampleIdx + 1}
@@ -452,8 +452,8 @@ export function NewView({ metas }: Props) {
             {!slot.report && (
                 <div className={styles.emptyState}>
                     {rawBusy
-                        ? 'Loading the first evaluation sample…'
-                        : 'No sample loaded. Choose a corpus, or press ↓ after the API is available.'}
+                        ? '正在载入第一条评测样本…'
+                        : '尚未载入样本。选择语料后，API 就绪即可用 ↓ 切换。'}
                 </div>
             )}
 

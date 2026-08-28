@@ -29,7 +29,10 @@ from src.NIF import (
     build_train_dataset,
 )
 from src.bank_loss import load_bank_loss_config
-from src.export_real_ttav_bundle import convert_report_tokens_to_ids
+from src.export_real_ttav_bundle import (
+    convert_report_tokens_to_ids,
+    token_surfaces_for_display,
+)
 from src.export_ttav_bundle import infer_sample_id
 from src.intervention_experiment import (
     ALTI_CHUNK_SIZE,
@@ -64,6 +67,37 @@ from src.unlearn_pair_probe import _release_cuda_memory
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _SESSION: dict[str, Any] | None = None
+
+
+def _surface_visible(tok: str) -> bool:
+    s = (
+        str(tok or "")
+        .replace("Ċ", "\n")
+        .replace("Ġ", " ")
+        .replace("ĉ", "\t")
+        .replace("\ufffd", "")
+    )
+    return bool(s.strip())
+
+
+def _anchor_display_index(tokens: list[str], idx: int) -> int:
+    """Map a byte-fallback continuation chip back to the visible merged surface."""
+    if not tokens:
+        return max(0, int(idx))
+    i = max(0, min(int(idx), len(tokens) - 1))
+    while i > 0 and not _surface_visible(tokens[i]):
+        i -= 1
+    return i
+
+
+def _display_surfaces(tokenizer, ids: list[int], fallback: list[str]) -> list[str]:
+    try:
+        disp = token_surfaces_for_display(tokenizer, ids)
+    except Exception:
+        disp = []
+    if len(disp) == len(ids):
+        return [str(x) for x in disp]
+    return [str(x) for x in fallback]
 
 
 def _file_stamp(path: Path) -> tuple[int, int]:
@@ -638,20 +672,44 @@ def gold_saliency_top_k(
         tokenizer,
         batch["input_ids"][0],
         sal_for_rank,
-        k,
+        max(k * 8, 24),
         offset=0,
     )
-    target_tok = tokens[target_index]
-    top = []
-    for rank_i, (idx, score) in enumerate(ranked, start=1):
+    display = _display_surfaces(tokenizer, ids, tokens)
+    target_tok = (
+        display[target_index] if target_index < len(display) else tokens[target_index]
+    )
+    if not _surface_visible(target_tok):
+        target_tok = tokens[target_index]
+    top: list[dict[str, Any]] = []
+    seen_anchor: set[int] = set()
+    for _rank_i, (idx, score) in enumerate(ranked, start=1):
+        idx = int(idx)
+        if idx == int(target_index):
+            continue
+        anchor = _anchor_display_index(display, idx) if idx < len(display) else idx
+        if anchor in seen_anchor:
+            continue
+        surf = display[anchor] if 0 <= anchor < len(display) else ""
+        if not _surface_visible(surf):
+            decoded = tokenizer.decode([int(ids[anchor])]) if 0 <= anchor < len(ids) else ""
+            if not _surface_visible(decoded):
+                continue
+            surf = decoded
+        seen_anchor.add(anchor)
+        # Bind the edge to the visible chip so the UI can highlight a real glyph,
+        # not a zero-width byte-fallback continuation.
         top.append({
-            "source_token_index": int(idx),
-            "source_token": tokens[idx] if idx < len(tokens) else tokenizer.decode([ids[idx]]),
+            "source_token_index": int(anchor),
+            "source_display_index": int(anchor),
+            "source_token": surf,
             "target_token_index": int(target_index),
             "target_token": target_tok,
             "saliency_score": float(score),
-            "saliency_rank": rank_i,
+            "saliency_rank": len(top) + 1,
         })
+        if len(top) >= k:
+            break
 
     edge_sal = None
     edge_src_tok = None
@@ -866,8 +924,12 @@ def gold_retrieve_and_stage3(
     source_index: int,
     target_index: int,
     top_trains: int | None = None,
+    mode: str = "gold",
+    full_tokens: list[str] | None = None,
+    full_token_ids: list[int] | None = None,
+    prompt_len_override: int | None = None,
 ) -> dict[str, Any]:
-    """Stage 2+3 for one gold saliency edge."""
+    """Stage 2+3 for one saliency edge (gold teacher-force or predict completion)."""
     session = _ensure_session(report)
     model = session["model"]
     tokenizer = session["tokenizer"]
@@ -877,7 +939,20 @@ def gold_retrieve_and_stage3(
     # Defensive: shared unlearn/probs paths can leave LoRA in float32.
     ensure_peft_lora_dtype(model, torch.bfloat16)
 
-    tokens, ids, prompt_len = _gold_tokens_and_ids(report, tokenizer)
+    mode_norm = (mode or "gold").strip().lower()
+    if mode_norm not in ("gold", "predict"):
+        raise ValueError(f"mode must be 'gold' or 'predict', got {mode!r}")
+    baseline = report.get("test_sample_baseline") or {}
+    fallback_pl = int(baseline.get("prompt_len") or 0)
+    override = _predict_sequence_override(
+        full_tokens, full_token_ids, prompt_len_override, fallback_pl,
+    )
+    if override is not None:
+        tokens, ids, prompt_len = override
+    else:
+        tokens, ids, prompt_len = _completion_tokens_and_ids(
+            report, tokenizer, mode=mode_norm,
+        )
     if not (0 <= source_index < target_index < len(ids)):
         raise ValueError(
             f"Invalid gold edge source={source_index} target={target_index} len={len(ids)}"
@@ -886,8 +961,14 @@ def gold_retrieve_and_stage3(
         raise ValueError("Gold target must be in the response (index >= prompt_len).")
 
     batch = _batch_from_ids(ids, prompt_len, device)
-    test_src_text = tokens[source_index]
-    test_tgt_text = tokens[target_index]
+    display = _display_surfaces(tokenizer, ids, tokens)
+    src_anchor = _anchor_display_index(display, source_index)
+    test_src_text = display[src_anchor] if src_anchor < len(display) else tokens[source_index]
+    if not _surface_visible(test_src_text):
+        test_src_text = tokens[source_index]
+    test_tgt_text = display[target_index] if target_index < len(display) else tokens[target_index]
+    if not _surface_visible(test_tgt_text):
+        test_tgt_text = tokens[target_index]
 
     # Refresh saliency score for this edge (cheap vs match/probe).
     with torch.no_grad():
@@ -933,7 +1014,7 @@ def gold_retrieve_and_stage3(
     _release_cuda_memory(model, reason="gold_retrieve_done")
     return {
         "status": "success",
-        "mode": "gold",
+        "mode": mode_norm,
         "promptLen": prompt_len,
         "edge": {
             "source_token_index": int(source_index),
