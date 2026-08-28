@@ -123,25 +123,42 @@ def _http_json(
 
 
 def _load_raw_rows(path: Path) -> list[tuple[int, dict[str, Any]]]:
-    """Return ``(1-based line_no, row)`` for JSONL or a JSON list/object."""
+    """Return ``(1-based line_no, row)`` for JSONL or a JSON list/object.
+
+    ``*.jsonl`` is always parsed line-by-line (one JSON object per line).
+    """
     text = path.read_text(encoding="utf-8")
+    # Prefer JSONL for .jsonl even if the first char is '{' (every line is an object).
+    if path.suffix.lower() == ".jsonl" or path.name.lower().endswith(".jsonl"):
+        out: list[tuple[int, dict[str, Any]]] = []
+        for i, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                out.append((i, obj))
+        return out
+
     stripped = text.lstrip()
     if stripped.startswith("["):
         arr = json.loads(text)
         if not isinstance(arr, list):
             raise ValueError(f"{path}: expected JSON array")
-        out: list[tuple[int, dict[str, Any]]] = []
+        out = []
         for i, obj in enumerate(arr, start=1):
             if isinstance(obj, dict):
                 out.append((i, obj))
         return out
-    if stripped.startswith("{") and "\n" not in stripped.rstrip()[-2:]:
-        # Single JSON object file
-        obj = json.loads(text)
+
+    # Single-object .json (no newline between braces as multiple records)
+    non_empty = [ln for ln in text.splitlines() if ln.strip()]
+    if len(non_empty) == 1 and non_empty[0].lstrip().startswith("{"):
+        obj = json.loads(non_empty[0])
         if not isinstance(obj, dict):
             raise ValueError(f"{path}: expected JSON object")
         return [(1, obj)]
 
+    # Fallback: treat as JSONL
     out = []
     for i, line in enumerate(text.splitlines(), start=1):
         if not line.strip():

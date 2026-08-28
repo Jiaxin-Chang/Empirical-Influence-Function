@@ -288,6 +288,8 @@ export default function App() {
                 ;(window as unknown as { __eifAutoAnnotate?: boolean }).__eifAutoAnnotate = true
               }
             }
+          } else if (h.n_samples > 0) {
+            await loadSample(0)
           }
         }
       } catch {
@@ -295,6 +297,34 @@ export default function App() {
       }
     })()
   }, [refreshList, loadSample, loadCorpusSample])
+
+  // ArrowDown / ArrowUp: next / previous JSONL sample (skip when typing in inputs).
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (corpusLine != null) return
+      if (busy || nSamples <= 0) return
+      if (ev.ctrlKey || ev.altKey || ev.metaKey) return
+      const tag = (ev.target as HTMLElement | null)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return
+      ev.preventDefault()
+      const cur = selectedIdx ?? -1
+      const next = ev.key === 'ArrowDown' ? cur + 1 : (cur < 0 ? 0 : cur - 1)
+      if (next < 0 || next >= nSamples) return
+      void (async () => {
+        if (!query && next >= list.length && list.length < nSamples) {
+          await refreshList(query, listOffset + PAGE, true)
+        }
+        await loadSample(next)
+      })()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [busy, corpusLine, nSamples, selectedIdx, list.length, listOffset, query, refreshList, loadSample])
+
+  useEffect(() => {
+    document.querySelector('.sampleItem.active')?.scrollIntoView({ block: 'nearest' })
+  }, [selectedIdx])
 
   // Only edges whose dst is the selected target (inspect mode).
   const relatedEdges = useMemo(() => {
@@ -722,6 +752,10 @@ export default function App() {
     }
   }
 
+  // File-path / jump-open UI is temporarily commented out; keep helpers live for restore.
+  void openData
+  void jumpIdx
+
   const underlineStyle = (subtypes: string[]): CSSProperties | undefined => {
     if (!subtypes.length) return undefined
     // CSS can only show one underline color; prefer first, tooltip lists all.
@@ -752,6 +786,7 @@ export default function App() {
 
       {!corpusMode && (
       <div className="toolbar">
+        {/* 暂时注释：JSON/数据文件路径输入
         <label className="grow">
           数据文件路径
           <input
@@ -763,6 +798,7 @@ export default function App() {
         <button type="button" onClick={openData} disabled={busy}>
           打开 / 刷新
         </button>
+        */}
         {continuePath && (
           <span className="hint" title={continuePath} style={{ maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             续训小集 · {nContinue} 条
@@ -787,6 +823,7 @@ export default function App() {
         >
           搜索
         </button>
+        {/* 暂时注释：跳转 index + 打开样本
         <label>
           跳转 index
           <input
@@ -813,7 +850,9 @@ export default function App() {
         >
           打开
         </button>
+        */}
         <span className="status">{nSamples ? `${nSamples} samples` : ''}</span>
+        <span className="hint">↓ 下一条 · ↑ 上一条</span>
       </div>
       )}
 
@@ -872,7 +911,7 @@ export default function App() {
         <main className="panel">
           {!sample ? (
             <p className="hint">
-              {corpusMode ? '正在加载大语料样本…' : '选择左侧一条训练数据开始查看。'}
+              {corpusMode ? '正在加载大语料样本…' : '正在加载第一条样本…（↓ 切换下一条）'}
             </p>
           ) : (
             <>

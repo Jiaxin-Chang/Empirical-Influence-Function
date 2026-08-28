@@ -1248,24 +1248,27 @@ def corpus_mid_rewrite_prep(body: CorpusMidRewritePrepBody):
     expression = (body.expression or "").strip()
     if not test_gold.strip() and not expression:
         raise HTTPException(400, "testGold or expression required")
+    # Read under lock; heavy rewrite outside so GraphSignal / other APIs aren't blocked.
     with _state_lock:
         raw_row = _read_corpus_raw_row(int(body.line), corpus_path=override)
-        from server.corpus_encode import extract_prompt_response
+        corpus_path_snap = override or (str(_corpus_path) if _corpus_path else "")
+    from server.corpus_encode import extract_prompt_response
 
-        prompt, response = extract_prompt_response(raw_row)
-        rewrite = _compute_corpus_mid_rewrite(
-            prompt,
-            response,
-            test_gold=test_gold,
-            expression=expression,
-        )
-        rewrite_id = uuid.uuid4().hex
+    prompt, response = extract_prompt_response(raw_row)
+    rewrite = _compute_corpus_mid_rewrite(
+        prompt,
+        response,
+        test_gold=test_gold,
+        expression=expression,
+    )
+    rewrite_id = uuid.uuid4().hex
+    with _state_lock:
         while len(_corpus_mid_rewrite_prep) >= _CORPUS_MID_REWRITE_PREP_MAX:
             _corpus_mid_rewrite_prep.pop(next(iter(_corpus_mid_rewrite_prep)))
         _corpus_mid_rewrite_prep[rewrite_id] = {
             "rewrite_id": rewrite_id,
             "line": int(body.line),
-            "corpus_path": override or (str(_corpus_path) if _corpus_path else ""),
+            "corpus_path": corpus_path_snap,
             "rewrite": rewrite,
             "created_at": time.time(),
         }
@@ -1599,6 +1602,9 @@ def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpu
     from server.graphsignal_annotate import annotate_corpus_row, default_use_llm
 
     use_llm = default_use_llm() if body.use_llm is None else bool(body.use_llm)
+    # Snapshot under lock; run heavy annotate OUTSIDE so mid-rewrite-prep / UI
+    # clicks are not blocked for minutes (auto pipeline + manual browse share
+    # this process).
     with _state_lock:
         raw_row = _raw_row_with_bound_mid_rewrite(
             line,
@@ -1607,21 +1613,25 @@ def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpu
         )
         source_enc = _encode_corpus_row(line, raw_row, corpus_path=override)
         key, _ = _lookup_continue(-1, source_enc)
-        try:
-            annotated = annotate_corpus_row(
-                raw_row,
-                _get_tokenizer(),
-                max_teacher_edges=body.max_edges,
-                use_llm=use_llm,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(501, str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        except Exception as exc:
-            print(f"[graphsignal] FAIL corpus line={line}: {exc}", flush=True)
-            raise HTTPException(502, f"GraphSignal annotate failed: {exc}") from exc
+        tokenizer = _get_tokenizer()
+        corpus_path_snap = override or (str(_corpus_path) if _corpus_path else "")
 
+    try:
+        annotated = annotate_corpus_row(
+            raw_row,
+            tokenizer,
+            max_teacher_edges=body.max_edges,
+            use_llm=use_llm,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(501, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        print(f"[graphsignal] FAIL corpus line={line}: {exc}", flush=True)
+        raise HTTPException(502, f"GraphSignal annotate failed: {exc}") from exc
+
+    with _state_lock:
         annotated_source = _build_graphsignal_annotated_source(
             line, raw_row, annotated, use_llm=use_llm, corpus_path=override,
         )
@@ -1630,7 +1640,7 @@ def graphsignal_annotate_preview(line: int, body: GraphsignalAnnotateBody, corpu
         _gs_preview_cache[preview_id] = {
             "preview_id": preview_id,
             "line": int(line),
-            "corpus_path": override or (str(_corpus_path) if _corpus_path else ""),
+            "corpus_path": corpus_path_snap,
             "annotated_source": annotated_source,
             "raw_edges": list(annotated.get("attention_edges") or []),
             "use_llm": use_llm,

@@ -4144,6 +4144,51 @@ export function ReportPanel({
         );
         const region = String(hit.match_region || '');
 
+        // Open synchronously on the click gesture so the UI doesn't feel dead
+        // while mid-rewrite-prep waits (viewer may be busy with GraphSignal).
+        // Do NOT use noopener — we need to navigate this tab after prep.
+        const popup = window.open('about:blank', '_blank');
+        if (popup) {
+            try {
+                popup.document.write(
+                    '<!doctype html><title>MID prep…</title>'
+                    + '<body style="font:14px/1.4 system-ui;padding:24px;color:#334155">'
+                    + '<p>正在准备 MID 改写 / 打开标注页…</p>'
+                    + '<p style="color:#64748b;font-size:12px">若 annotation-viewer 正在跑 GraphSignal，'
+                    + '可能稍等几秒；请勿关闭此标签。</p></body>',
+                );
+                popup.document.close();
+            } catch {
+                /* cross-origin / restricted — still try location later */
+            }
+        }
+
+        const navigate = (href: string, note: string) => {
+            if (note) {
+                // Prefer non-blocking feedback; alert freezes the report UI.
+                console.info('[open-corpus]', note);
+            }
+            if (popup && !popup.closed) {
+                try {
+                    popup.location.href = href;
+                    return;
+                } catch {
+                    /* fall through */
+                }
+            }
+            window.open(href, '_blank', 'noopener,noreferrer');
+            if (note) {
+                window.setTimeout(() => {
+                    try {
+                        // eslint-disable-next-line no-alert
+                        window.alert(note);
+                    } catch {
+                        /* ignore */
+                    }
+                }, 0);
+            }
+        };
+
         void (async () => {
             const url = new URL(base);
             url.searchParams.set('corpusLine', String(hit.line));
@@ -4154,9 +4199,6 @@ export function ReportPanel({
                 url.searchParams.set('taskId', hit.task_id);
             }
 
-            // Always try MID rewrite when we have test gold: teach gold-like
-            // span as the new MID (even if match_region was mislabeled "gold"
-            // due to a trivial response hit like "}").
             let rewriteNote = '';
             if (goldCompletion.trim()) {
                 try {
@@ -4190,15 +4232,15 @@ export function ReportPanel({
                     }
                     if (!prepResp.ok || !prep.rewrite_id) {
                         rewriteNote =
-                            `MID改写准备失败 (HTTP ${prepResp.status}). ` +
-                            '将打开原样本。请确认 annotation-viewer 后端已启动。';
+                            `MID改写准备失败 (HTTP ${prepResp.status}). `
+                            + '将打开原样本。请确认 annotation-viewer 后端已启动。';
                         console.warn('[mid-rewrite-prep] failed', prepResp.status, prepRaw.slice(0, 240));
                     } else if (prep.applied) {
                         url.searchParams.set('rewriteId', prep.rewrite_id);
                         rewriteNote =
-                            `已改写 MID (${prep.mode || ''}` +
-                            `${prep.dig_locus ? `@${prep.dig_locus}` : ''}): ` +
-                            `${(prep.dig_preview || '').slice(0, 80)}`;
+                            `已改写 MID (${prep.mode || ''}`
+                            + `${prep.dig_locus ? `@${prep.dig_locus}` : ''}): `
+                            + `${(prep.dig_preview || '').slice(0, 80)}`;
                     } else if (
                         prep.reason === 'train_mid_already_is_gold'
                         || region === 'gold'
@@ -4214,8 +4256,8 @@ export function ReportPanel({
                                     ? (prep.detail || '（test gold / 表达式在 train 三个代码块中对不齐）')
                                     : '';
                         rewriteNote =
-                            `未能挖空改写 (${reason}${detail ? `: ${detail}` : ''})，打开原样本。` +
-                            hint;
+                            `未能挖空改写 (${reason}${detail ? `: ${detail}` : ''})，打开原样本。`
+                            + hint;
                         console.warn('[mid-rewrite-prep] not applied', prep);
                     }
                 } catch (err) {
@@ -4226,17 +4268,7 @@ export function ReportPanel({
                 }
             }
 
-            if (rewriteNote) {
-                // Brief status for the operator; don't block open.
-                console.info('[corpus-open]', rewriteNote);
-            }
-            window.open(url.toString(), '_blank', 'noopener,noreferrer');
-            if (rewriteNote && !url.searchParams.get('rewriteId')) {
-                // Surface failure when we expected a rewrite for context hits.
-                if (region === 'context' || region === 'cross' || region === '') {
-                    window.alert(rewriteNote);
-                }
-            }
+            navigate(url.toString(), rewriteNote);
         })();
     }, [
         llmTrainResult?.corpus_path,
