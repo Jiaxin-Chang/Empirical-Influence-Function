@@ -946,6 +946,12 @@ function decodeToken(t: string): string {
     return String(t ?? '').replaceAll('Ċ', '\n').replaceAll('Ġ', ' ').replaceAll('ĉ', '  ');
 }
 
+function sameProbToken(a: string | null | undefined, b: string | null | undefined): boolean {
+    if (a == null || b == null) return false;
+    if (a === b) return true;
+    return decodeToken(a) === decodeToken(b);
+}
+
 function decodeTokens(tokens: string[]): string[] {
     return tokens.map(decodeToken);
 }
@@ -1585,6 +1591,9 @@ function NextTokenProbPanel({
     degradeError,
     degradeProgress,
     onRetrieveDegrade,
+    goldToken,
+    modelToken,
+    clickedToken,
 }: {
     result: NextTokenProbResult | null;
     busy?: boolean;
@@ -1599,6 +1608,9 @@ function NextTokenProbPanel({
     degradeError?: string | null;
     degradeProgress?: DegradeProgress | null;
     onRetrieveDegrade?: () => void;
+    goldToken?: string | null;
+    modelToken?: string | null;
+    clickedToken?: string | null;
 }) {
     const rows = result?.top ?? [];
     const maxP = Math.max(...rows.map(r => r.prob), 1e-12);
@@ -1651,11 +1663,6 @@ function NextTokenProbPanel({
                     </span>
                 )}
             </div>
-            {viewFamily === 'live' && onViewFamilyChange && (
-                <div className={styles.degradeHint}>
-                    切 CE / Base 对比同一位置的概率，并打开退化归因
-                </div>
-            )}
             {interventionActive && (
                 <div className={styles.probInterveneBanner}>
                     Active {interventionDirection === 'learn' ? 'Learn' : 'Unlearn'}
@@ -1676,20 +1683,36 @@ function NextTokenProbPanel({
                     const display = decodeToken(row.token).replace(/\n/g, '\\n');
                     const isGained = flip != null && row.tokenId === flip.gainedTokenId;
                     const isLost = flip != null && row.tokenId === flip.lostTokenId;
+                    const isGold = sameProbToken(row.token, goldToken);
+                    const isModel = sameProbToken(row.token, modelToken);
+                    const isClicked = sameProbToken(row.token, clickedToken);
+                    const tokClass = [
+                        styles.probTok,
+                        isGold ? styles.probTokGold : '',
+                        !isGold && isClicked ? styles.probTokClicked : '',
+                        isGained ? styles.probTokGained : '',
+                        isLost ? styles.probTokLost : '',
+                    ].filter(Boolean).join(' ');
+                    const barClass = [
+                        styles.probBarFill,
+                        isGold ? styles.probBarFillGold : '',
+                        !isGold && isClicked ? styles.probBarFillClicked : '',
+                    ].filter(Boolean).join(' ');
                     return (
                         <div key={`${row.tokenId}-${i}`} className={styles.probRow}>
-                            <span className={`${styles.probTok}${row.isActual ? ` ${styles.probTokActual}` : ''}${isGained ? ` ${styles.probTokGained}` : ''}${isLost ? ` ${styles.probTokLost}` : ''}`}>
+                            <span className={tokClass}>
                                 {display || '·'}
                                 {isGained ? ' ↑live' : ''}
                                 {isLost ? ' ↓cmp' : ''}
                             </span>
                             <span className={styles.probPct}>{formatProbPct(row.prob)}</span>
                             <div className={styles.probBarTrack}>
-                                <div
-                                    className={`${styles.probBarFill}${row.isActual ? ` ${styles.probBarFillTop}` : ''}`}
-                                    style={{ width }}
-                                />
+                                <div className={barClass} style={{ width }} />
                             </div>
+                            <span className={styles.probRole}>
+                                {isGold ? <span className={styles.probRoleGold}>gold</span> : null}
+                                {isModel ? <span className={styles.probRoleModel}>model</span> : null}
+                            </span>
                         </div>
                     );
                 })}
@@ -2387,7 +2410,6 @@ export interface ReportPanelProps {
 export function ReportPanel({
     report,
     meta,
-    modelLabel,
     selectedTokIdx: controlledTokIdx,
     onSelectedTokIdxChange,
     compact = false,
@@ -2577,25 +2599,7 @@ export function ReportPanel({
     const moveOriginRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
     const inlineVisualizerRef = useRef<HTMLDivElement | null>(null);
 
-    const rawPath = meta.fileName.replace(/\\/g, '/');
-    const familyPrefix = meta.fileName.startsWith('ce/') || rawPath.startsWith('raw_ce/')
-        ? '[ce] '
-        : meta.fileName.startsWith('saliency/') || rawPath.startsWith('raw_sa/')
-            ? '[saliency] '
-            : (rawEvalActive || isRawEvalPath(meta.fileName)
-                ? '[raw] '
-                : '');
     const continueAdapterFamily = inferContinueAdapterFamily(meta.fileName, report);
-    const rawLabel = modelLabel
-        || report.experiment_meta.model_name
-        || meta.label
-        || 'model';
-    const displayModelLabel = (
-        familyPrefix && !String(rawLabel).startsWith('[ce]') && !String(rawLabel).startsWith('[saliency]')
-            && !String(rawLabel).startsWith('[raw]')
-            ? `${familyPrefix}${rawLabel}`
-            : rawLabel
-    );
 
     // Reset secondary selection when selected token changes
     useEffect(() => {
@@ -5095,18 +5099,6 @@ export function ReportPanel({
 
     return (
         <div className={`${styles.root}${compact ? ` ${styles.panelRootCompact}` : ''}`}>
-            <div className={styles.modelBanner}>
-                <span className={styles.modelBannerLabel}>Model</span>
-                <span className={styles.modelBannerName}>{displayModelLabel}</span>
-                <span className={styles.modelBannerMeta}>
-                    test#{report.experiment_meta.test_sample_index}
-                    {report.experiment_meta.task_id ? ` · ${report.experiment_meta.task_id}` : ''}
-                    {rawEvalActive
-                        ? ` · ${Math.max(0, modelTokens.length - promptLen)} answer tokens`
-                        : ` · ${report.per_token_results.length} tokens`}
-                </span>
-            </div>
-
                     {/* ── Left: Model+Gold · Right: Train matches ── */}
                     <div className={styles.bottomSection}>
                         <div className={styles.bottomLeft} ref={bottomLeftRef}>
@@ -5421,6 +5413,27 @@ export function ReportPanel({
                                 degradeError={degradeError}
                                 degradeProgress={degradeProgress}
                                 onRetrieveDegrade={fetchDegradeRetrieve}
+                                goldToken={
+                                    tokenProbResult?.targetIndex != null && tokenProbResult.targetIndex >= promptLen
+                                        ? goldResponseTokens[tokenProbResult.targetIndex - promptLen] ?? null
+                                        : null
+                                }
+                                modelToken={
+                                    tokenProbResult?.targetIndex != null
+                                        ? modelTokens[tokenProbResult.targetIndex] ?? null
+                                        : null
+                                }
+                                clickedToken={
+                                    attrMode === 'gold' && goldLocalIdx != null
+                                        ? goldResponseTokens[goldLocalIdx] ?? null
+                                        : attrMode === 'manual' && manualTargetAbsIdx != null
+                                            ? goldResponseTokens[manualTargetAbsIdx - promptLen]
+                                                ?? modelTokens[manualTargetAbsIdx]
+                                                ?? null
+                                            : attrMode === 'predict' && selectedTokIdx != null
+                                                ? modelTokens[selectedTokIdx] ?? null
+                                                : tokenProbResult?.actualToken ?? null
+                                }
                             />
 
                         </div>

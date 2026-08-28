@@ -633,7 +633,7 @@
 .token-analyzed-gold:hover { background: rgba(166,227,161,0.18); }
 
 .token-selected {
-    background: #fde68a;
+    background: #fb923c;
     color: #1c1917;
     font-weight: 700;
     border-radius: 3px;
@@ -641,7 +641,7 @@
 }
 
 .token-source-highlight {
-    background: #fef3c7;
+    background: #fde68a;
     color: #1c1917;
     font-weight: 600;
     border-radius: 3px;
@@ -1222,7 +1222,7 @@
 }
 .probRow {
     display: grid;
-    grid-template-columns: minmax(72px, 1fr) 56px minmax(80px, 2.2fr);
+    grid-template-columns: minmax(72px, 1fr) 56px minmax(80px, 2.2fr) auto;
     align-items: center;
     gap: 8px;
     margin: 3px 0;
@@ -1235,9 +1235,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
 }
-.probTokActual {
-    color: #15803d;
+.probTokGold {
+    color: #c2410c;
     font-weight: 700;
+}
+.probTokClicked {
+    color: #854d0e;
+    font-weight: 700;
+    background: #fde68a;
+    border-radius: 2px;
+    padding: 0 3px;
 }
 .probPct {
     color: #2563eb;
@@ -1256,9 +1263,27 @@
     background: #2563eb;
     min-width: 0;
 }
-.probBarFillTop {
-    background: #fab387;
+.probBarFillGold {
+    background: #fb923c;
 }
+.probBarFillClicked {
+    background: #facc15;
+}
+.probRole {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 3.4em;
+}
+.probRoleGold,
+.probRoleModel {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.probRoleGold { color: #c2410c; }
+.probRoleModel { color: #854d0e; }
 .probTokGained {
     color: #b42318;
 }
