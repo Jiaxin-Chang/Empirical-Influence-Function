@@ -2,9 +2,11 @@
 .root {
     display: flex;
     flex-direction: column;
-    gap: 20px;
-    padding: 0 0 60px;
-    font-family: system-ui, -apple-system, sans-serif;
+    gap: 18px;
+    flex: 1;
+    min-height: 0;
+    padding: 0 0 48px;
+    font-family: inherit;
 }
 
 .panelRootCompact {
@@ -12,17 +14,165 @@
     padding-bottom: 24px;
 }
 
-/* ── Import card ── */
+/* ── Evaluation toolbar (paper-style chrome) ── */
 .slotImportCard {
     display: grid;
-    gap: 10px;
-    padding: 14px 16px;
-    background: #ffffff;
-    border: 1px solid #dbe3ef;
-    border-radius: 10px;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+    gap: 12px;
+    padding: 0 0 14px;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #e5e5e5;
+    border-radius: 0;
+    box-shadow: none;
     min-width: 0;
 }
+.toolbarTop {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+}
+.toolbarIdentity {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    min-width: 0;
+}
+.kicker {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #8a8175;
+}
+.toolbarTitle {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 1.02rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: #1c1917;
+}
+.counter {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: #57534e;
+    font-variant-numeric: tabular-nums;
+    padding-bottom: 8px;
+}
+.counterSep {
+    margin: 0 0.2em;
+    color: #a8a29e;
+}
+.kbdHint {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    color: #8a8175;
+    white-space: nowrap;
+}
+.kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.35em;
+    height: 1.35em;
+    padding: 0 0.28em;
+    border: 1px solid #e5e5e5;
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    background: #ffffff;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    color: #44403c;
+}
+.toolbarRow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 10px 12px;
+}
+.field {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+}
+.fieldGrow {
+    flex: 1 1 280px;
+}
+.fieldLabel {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #8a8175;
+}
+.field select {
+    width: 100%;
+    min-width: 200px;
+    max-width: 100%;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid #e5e5e5;
+    border-radius: 2px;
+    background: #ffffff;
+    color: #1c1917;
+    font-family: inherit;
+    font-size: 0.84rem;
+    appearance: auto;
+}
+.field select:focus {
+    outline: none;
+    border-color: #1c1917;
+}
+.field select:disabled {
+    color: #a8a29e;
+    background: #ffffff;
+}
+.stepper {
+    display: inline-flex;
+    border: 1px solid #e5e5e5;
+    border-radius: 2px;
+    overflow: hidden;
+    height: 34px;
+}
+.stepBtn {
+    width: 34px;
+    height: 34px;
+    border: none;
+    border-right: 1px solid #e5e5e5;
+    background: #ffffff;
+    color: #1c1917;
+    font-size: 0.85rem;
+    cursor: pointer;
+    line-height: 1;
+}
+.stepBtn:last-child {
+    border-right: none;
+}
+.stepBtn:hover:not(:disabled) {
+    background: #f3f3f3;
+}
+.stepBtn:disabled {
+    color: #c4bdb3;
+    cursor: not-allowed;
+}
+.loadingNote {
+    font-size: 0.78rem;
+    font-style: italic;
+    color: #8a8175;
+    padding-bottom: 8px;
+}
+.footnoteError {
+    margin: 0;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    color: #7f1d1d;
+}
+
+/* legacy classes kept for temporarily hidden JSON import UI */
 .slotImportHeader {
     display: flex;
     align-items: flex-start;
@@ -152,10 +302,9 @@
 .singleGrid {
     display: grid;
     grid-template-columns: 1fr;
-    /* Fill the viewport under the app header + import card so the two
-       columns can scroll independently instead of scrolling the page. */
-    height: calc(100vh - 210px);
+    flex: 1;
     min-height: 420px;
+    height: auto;
 }
 @media (max-width: 1400px) {
     .dualGrid {
@@ -167,10 +316,10 @@
     min-width: 0;
     min-height: 0;
     height: 100%;
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
+    border: 1px solid #e5e5e5;
+    border-radius: 2px;
     padding: 10px 12px 12px;
-    background: #fff;
+    background: #ffffff;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -422,15 +571,15 @@
     flex-shrink: 0;
 }
 .outputSection + .outputSection {
-    border-top: 1px solid #313244;
+    border-top: 1px solid #e8e6e1;
 }
 .outputSectionHeader {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 8px 14px;
-    background: #181825;
-    border-bottom: 1px solid #313244;
+    background: #f7f7f5;
+    border-bottom: 1px solid #e8e6e1;
     flex-shrink: 0;
 }
 .outputSectionTitle {
@@ -439,13 +588,14 @@
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
-.outputSectionTitleModel { color: #f38ba8; }
-.outputSectionTitleGold { color: #a6e3a1; }
+.outputSectionTitleModel { color: #b42318; }
+.outputSectionTitleGold { color: #15803d; }
 .codeBlock {
     margin: 0;
     padding: 14px;
-    background: #1e1e2e;
-    color: #cdd6f4;
+    background: #ffffff;
+    color: #1c1917;
+    border: none;
     font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
     font-size: 13px;
     line-height: 1.7;
@@ -463,36 +613,36 @@
 /* ── Token states ── */
 .token { border-radius: 3px; transition: background 0.1s; }
 
-.token-normal   { color: #cdd6f4; }
-.token-response { color: #a6e3a1; }
-.token-response-model { color: #f38ba8; }
-.token-response-gold { color: #a6e3a1; }
+.token-normal   { color: #1c1917; }
+.token-response { color: #15803d; }
+.token-response-model { color: #b42318; }
+.token-response-gold { color: #15803d; }
 
 .token-analyzed {
-    color: #f38ba8;
-    border-bottom: 1.5px dashed #89b4fa;
+    color: #b42318;
+    border-bottom: 1.5px dashed #2563eb;
     cursor: pointer;
 }
 .token-analyzed:hover { background: rgba(137,180,250,0.2); }
 
 .token-analyzed-gold {
-    color: #a6e3a1;
-    border-bottom: 1.5px dashed #94e2d5;
+    color: #15803d;
+    border-bottom: 1.5px dashed #0f766e;
     cursor: pointer;
 }
 .token-analyzed-gold:hover { background: rgba(166,227,161,0.18); }
 
 .token-selected {
-    background: #fab387;
-    color: #1e1e2e;
+    background: #fde68a;
+    color: #1c1917;
     font-weight: 700;
     border-radius: 3px;
     cursor: pointer;
 }
 
 .token-source-highlight {
-    background: #f9e2af;
-    color: #1e1e2e;
+    background: #fef3c7;
+    color: #1c1917;
     font-weight: 600;
     border-radius: 3px;
 }
@@ -574,9 +724,9 @@
 
 /* ── Correlations List (Left Pane) ── */
 .correlationList {
-    background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
-    border-radius: 12px;
-    border: 1px solid #45475a;
+    background: #ffffff;
+    border-radius: 2px;
+    border: 1px solid #e5e5e5;
     padding: 16px;
     display: flex;
     flex-direction: column;
@@ -585,20 +735,20 @@
 }
 .correlationListTitle {
     font-size: 11px;
-    color: #a6adc8;
+    color: #78716c;
     font-weight: 700;
     text-transform: uppercase;
     margin-bottom: 4px;
 }
 .correlationListHint {
     font-size: 11px;
-    color: #89b4fa;
+    color: #2563eb;
     line-height: 1.35;
     margin-bottom: 4px;
 }
 .corrArrow {
     margin: 0 6px;
-    color: #a6adc8;
+    color: #78716c;
     font-weight: 700;
 }
 .correlationListItems {
@@ -611,8 +761,8 @@
 }
 
 .corrBtn {
-    background: #313244;
-    border: 1px solid #45475a;
+    background: #ffffff;
+    border: 1px solid #e5e5e5;
     border-radius: 8px;
     padding: 10px 12px;
     cursor: pointer;
@@ -624,10 +774,10 @@
     gap: 8px;
 }
 .corrBtn:hover {
-    background: #45475a;
+    background: #f7f7f5;
 }
 .corrBtnActive {
-    border-color: #89b4fa;
+    border-color: #2563eb;
     background: rgba(137, 180, 250, 0.15);
 }
 
@@ -646,7 +796,7 @@
 .corrLabel, .corrScoreLabel {
     font-size: 9px;
     font-weight: 700;
-    color: #a6adc8;
+    color: #78716c;
     text-transform: uppercase;
 }
 
@@ -654,12 +804,12 @@
     font-family: monospace;
     font-size: 12px;
     font-weight: 700;
-    color: #89b4fa;
-    background: #1e1e2e;
+    color: #2563eb;
+    background: #eff6ff;
     padding: 2px 6px;
     border-radius: 4px;
 }
-.sourceChipSal { color: #a6adc8; font-size: 10px; }
+.sourceChipSal { color: #78716c; font-size: 10px; }
 
 /* ── Bottom panel ── */
 .bottomPanel {
@@ -752,7 +902,7 @@
 .trainSampleViewer {
     border-radius: 8px;
     overflow: hidden;
-    border: 1px solid #313244;
+    border: 1px solid #e8e6e1;
 }
 
 /* ── Pair card ── */
@@ -1022,8 +1172,8 @@
 /* ── Next-token probability chart (bottom-left) ── */
 .probPanel {
     margin-top: 10px;
-    background: #1e1e2e;
-    border: 1px solid #313244;
+    background: #ffffff;
+    border: 1px solid #e8e6e1;
     border-radius: 8px;
     overflow: hidden;
     flex-shrink: 0;
@@ -1033,25 +1183,25 @@
     align-items: center;
     gap: 10px;
     padding: 8px 12px;
-    border-bottom: 1px solid #313244;
-    background: #181825;
+    border-bottom: 1px solid #e8e6e1;
+    background: #f7f7f5;
     flex-wrap: wrap;
 }
 .probPanelTitle {
     font-size: 11px;
-    color: #a6adc8;
+    color: #78716c;
     flex: 1;
     min-width: 0;
 }
 .probPanelMeta {
     font-size: 11px;
-    color: #cdd6f4;
+    color: #1c1917;
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 .probRecoverBtn {
-    border: 1px solid #a6e3a1;
-    background: #1e2a1e;
-    color: #a6e3a1;
+    border: 1px solid #15803d;
+    background: #f0fdf4;
+    color: #15803d;
     border-radius: 999px;
     padding: 2px 10px;
     font-size: 11px;
@@ -1067,7 +1217,7 @@
 }
 .probEmpty {
     font-size: 12px;
-    color: #6c7086;
+    color: #a8a29e;
     padding: 6px 0;
 }
 .probRow {
@@ -1080,40 +1230,40 @@
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 .probTok {
-    color: #cdd6f4;
+    color: #1c1917;
     white-space: pre;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 .probTokActual {
-    color: #a6e3a1;
+    color: #15803d;
     font-weight: 700;
 }
 .probPct {
-    color: #89b4fa;
+    color: #2563eb;
     text-align: right;
     font-variant-numeric: tabular-nums;
 }
 .probBarTrack {
     height: 10px;
-    background: #313244;
+    background: #e8e6e1;
     border-radius: 3px;
     overflow: hidden;
 }
 .probBarFill {
     height: 100%;
     border-radius: 3px;
-    background: #89b4fa;
+    background: #2563eb;
     min-width: 0;
 }
 .probBarFillTop {
     background: #fab387;
 }
 .probTokGained {
-    color: #f38ba8;
+    color: #b42318;
 }
 .probTokLost {
-    color: #89dceb;
+    color: #0e7490;
 }
 .probViewTabs {
     display: flex;
@@ -1122,9 +1272,9 @@
     flex-shrink: 0;
 }
 .probViewTab {
-    border: 1px solid #45475a;
-    background: #313244;
-    color: #a6adc8;
+    border: 1px solid #d6d3d1;
+    background: #e8e6e1;
+    color: #78716c;
     border-radius: 999px;
     padding: 2px 10px;
     font-size: 11px;
@@ -1136,41 +1286,41 @@
     cursor: wait;
 }
 .probViewTabActive {
-    border-color: #cba6f7;
-    background: #313244;
-    color: #cba6f7;
+    border-color: #6d28d9;
+    background: #e8e6e1;
+    color: #6d28d9;
 }
 .degradeHint {
     padding: 4px 12px 6px;
     font-size: 11px;
-    color: #cba6f7;
-    border-bottom: 1px solid #313244;
+    color: #6d28d9;
+    border-bottom: 1px solid #e8e6e1;
 }
 .degradeCard {
     margin: 0 12px 10px;
     padding: 8px 10px 10px;
-    border-top: 1px solid #313244;
-    color: #cdd6f4;
+    border-top: 1px solid #e8e6e1;
+    color: #1c1917;
     font-size: 11px;
     line-height: 1.45;
 }
 .degradeTitle {
     font-weight: 700;
-    color: #cba6f7;
+    color: #6d28d9;
     margin-bottom: 4px;
 }
 .degradeFormula {
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-    color: #a6adc8;
+    color: #78716c;
     margin-bottom: 6px;
 }
 .degradeFlip {
-    color: #f38ba8;
+    color: #b42318;
     font-weight: 700;
     margin-bottom: 6px;
 }
 .degradeNoFlip {
-    color: #a6adc8;
+    color: #78716c;
     margin-bottom: 6px;
 }
 .degradeMetrics {
@@ -1178,13 +1328,13 @@
     flex-wrap: wrap;
     gap: 8px 12px;
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-    color: #89b4fa;
+    color: #2563eb;
     margin-bottom: 8px;
 }
 .degradeBtn {
-    border: 1px solid #cba6f7;
-    background: #1e1e2e;
-    color: #cba6f7;
+    border: 1px solid #6d28d9;
+    background: #ffffff;
+    color: #6d28d9;
     border-radius: 999px;
     padding: 3px 12px;
     font-size: 11px;
@@ -1201,30 +1351,30 @@
 .degradeProgressMeta {
     font-size: 11px;
     font-weight: 700;
-    color: #cba6f7;
+    color: #6d28d9;
     margin-bottom: 4px;
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 .degradeProgressTrack {
     height: 8px;
-    background: #313244;
+    background: #e8e6e1;
     border-radius: 999px;
     overflow: hidden;
 }
 .degradeProgressFill {
     height: 100%;
-    background: #cba6f7;
+    background: #6d28d9;
     transition: width 0.2s ease;
 }
 .degradeProgressMsg {
     margin-top: 4px;
     font-size: 11px;
-    color: #a6adc8;
+    color: #78716c;
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
     word-break: break-all;
 }
 .degradeErr {
-    color: #f38ba8;
+    color: #b42318;
     margin-top: 6px;
 }
 .degradeTrains {
@@ -1234,8 +1384,8 @@
     gap: 6px;
 }
 .degradeTrainRow {
-    background: #181825;
-    border: 1px solid #313244;
+    background: #f7f7f5;
+    border: 1px solid #e8e6e1;
     border-radius: 6px;
     padding: 6px 8px;
 }
@@ -1244,19 +1394,19 @@
     gap: 8px;
     align-items: center;
     font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-    color: #a6adc8;
+    color: #78716c;
     margin-bottom: 2px;
 }
 .degradeTagNew {
-    color: #f38ba8;
+    color: #b42318;
     font-weight: 700;
 }
 .degradeTagWrap {
-    color: #a6e3a1;
+    color: #15803d;
     font-weight: 700;
 }
 .degradeSnippet {
-    color: #cdd6f4;
+    color: #1c1917;
     white-space: pre-wrap;
     word-break: break-word;
 }
@@ -1265,17 +1415,21 @@
     padding: 6px 10px;
     border-radius: 6px;
     font-size: 11px;
-    background: #313244;
-    color: #cdd6f4;
+    background: #e8e6e1;
+    color: #1c1917;
 }
 
 /* ── Misc ── */
 .emptyState {
-    padding: 40px 20px;
+    padding: 56px 20px 80px;
     text-align: center;
-    color: #94a3b8;
-    font-size: 14px;
-    line-height: 1.6;
+    color: #7a7368;
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 1.05rem;
+    font-style: italic;
+    line-height: 1.65;
+    max-width: 36em;
+    margin: 0 auto;
 }
 .emptyState code {
     background: #f1f5f9;

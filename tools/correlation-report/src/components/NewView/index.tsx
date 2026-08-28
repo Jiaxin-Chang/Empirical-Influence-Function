@@ -51,6 +51,13 @@ function defaultEifApiOrigin(): string {
     return window.location.origin;
 }
 
+function friendlyApiError(message: string): string {
+    if (/HTTP 500|Failed to list raw eval files|Failed to load raw rows/i.test(message)) {
+        return 'Evaluation API is unavailable. Start the backend and reload.';
+    }
+    return message;
+}
+
 function hasReportUrlQuery(): boolean {
     if (typeof window === 'undefined') return false;
     const params = new URLSearchParams(window.location.search);
@@ -307,64 +314,86 @@ export function NewView({ metas }: Props) {
         void loadRawSampleAt(rawFile, line);
     };
 
+    const sampleIdx = rawRows.findIndex(r => String(r.line) === rawLine);
+    const canPrev = !rawBusy && sampleIdx > 0;
+    const canNext = !rawBusy && sampleIdx >= 0 && sampleIdx < rawRows.length - 1;
+    const displayError = rawError || slot.error;
+
+    const goDelta = (delta: number) => {
+        if (rawBusy || rawRows.length === 0) return;
+        const idx = sampleIdx < 0 ? 0 : sampleIdx;
+        const nextIdx = idx + delta;
+        if (nextIdx < 0 || nextIdx >= rawRows.length) return;
+        selectRawLine(String(rawRows[nextIdx].line));
+    };
+
     return (
         <div className={styles.root}>
             <div className={styles.slotImportCard}>
-                <div className={styles.slotImportHeader}>
-                    <div>
-                        <div className={styles.slotImportTitle}>Correlation Report</div>
-                        <div className={styles.slotImportDesc}>
-                            {slot.report
-                                ? modelLabelFrom(slot.report, slot.meta, 'loaded')
-                                : '打开后默认展示第一条 Raw JSONL 样本，↓ / ↑ 切换'}
-                        </div>
-                    </div>
-                    {slot.report && (
-                        <button type="button" className={styles.slotClearBtn} onClick={() => setSlot(emptySlot())}>
-                            Clear
+                <div className={styles.toolbarRow}>
+                    <label className={styles.field}>
+                        <span className={styles.fieldLabel}>Corpus</span>
+                        <select
+                            value={rawFile}
+                            disabled={rawBusy || rawFiles.length === 0}
+                            onChange={e => setRawFile(e.target.value)}
+                        >
+                            {rawFiles.length === 0 && <option value="">No JSONL available</option>}
+                            {rawFiles.map(f => (
+                                <option key={f.fileName} value={f.fileName}>
+                                    {f.label} · {f.nRows}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className={`${styles.field} ${styles.fieldGrow}`}>
+                        <span className={styles.fieldLabel}>Sample</span>
+                        <select
+                            value={rawLine}
+                            disabled={rawBusy || rawRows.length === 0}
+                            onChange={e => selectRawLine(e.target.value)}
+                        >
+                            {rawRows.length === 0 && <option value="">—</option>}
+                            {rawRows.map(r => (
+                                <option key={r.line} value={String(r.line)}>
+                                    L{r.line} · {r.task_id}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <div className={styles.stepper}>
+                        <button
+                            type="button"
+                            className={styles.stepBtn}
+                            disabled={!canPrev}
+                            aria-label="Previous sample"
+                            onClick={() => goDelta(-1)}
+                        >
+                            ↑
                         </button>
+                        <button
+                            type="button"
+                            className={styles.stepBtn}
+                            disabled={!canNext}
+                            aria-label="Next sample"
+                            onClick={() => goDelta(1)}
+                        >
+                            ↓
+                        </button>
+                    </div>
+                    {rawBusy && <span className={styles.loadingNote}>Loading…</span>}
+                    {!rawBusy && rawRows.length > 0 && sampleIdx >= 0 && (
+                        <span className={styles.counter}>
+                            {sampleIdx + 1}
+                            <span className={styles.counterSep}>/</span>
+                            {rawRows.length}
+                        </span>
                     )}
                 </div>
 
-                <div className={styles.rawEvalBar}>
-                    <div className={styles.rawEvalTitle}>Raw 评测 JSONL（raw_ce=CE LoRA · raw_sa=Saliency LoRA）</div>
-                    <div className={styles.rawEvalControls}>
-                        <label className={styles.rawEvalLabel}>
-                            文件
-                            <select
-                                value={rawFile}
-                                disabled={rawBusy || rawFiles.length === 0}
-                                onChange={e => setRawFile(e.target.value)}
-                            >
-                                {rawFiles.length === 0 && <option value="">（无 raw_ce|raw_sa/*.jsonl）</option>}
-                                {rawFiles.map(f => (
-                                    <option key={f.fileName} value={f.fileName}>
-                                        {f.label} · {f.nRows} rows
-                                    </option>
-                                ))}
-                            </select>
-                        </label>
-                        <label className={styles.rawEvalLabel}>
-                            样本
-                            <select
-                                value={rawLine}
-                                disabled={rawBusy || rawRows.length === 0}
-                                onChange={e => selectRawLine(e.target.value)}
-                            >
-                                {rawRows.length === 0 && <option value="">—</option>}
-                                {rawRows.map(r => (
-                                    <option key={r.line} value={String(r.line)}>
-                                        L{r.line} · {r.task_id}
-                                    </option>
-                                ))}
-                            </select>
-                        </label>
-                        <span className={styles.slotImportDesc}>
-                            {rawBusy ? '打开中…' : '↓ 下一条 · ↑ 上一条'}
-                        </span>
-                    </div>
-                    {rawError && <div className={styles.importError}>{rawError}</div>}
-                </div>
+                {displayError && (
+                    <p className={styles.footnoteError}>{friendlyApiError(displayError)}</p>
+                )}
 
                 {/* 暂时隐藏：JSON 文件导入 + 预处理报告列表 + 打开样本按钮 */}
                 {false && (
@@ -418,14 +447,13 @@ export function NewView({ metas }: Props) {
                         )}
                     </>
                 )}
-
-                {slot.status && <div className={styles.importStatus}>{slot.status}</div>}
-                {slot.error && <div className={styles.importError}>{slot.error}</div>}
             </div>
 
             {!slot.report && (
                 <div className={styles.emptyState}>
-                    {rawBusy ? '正在加载第一条样本…' : '选择 Raw JSONL 后会自动展示第一条；↓ 切换下一条。'}
+                    {rawBusy
+                        ? 'Loading the first evaluation sample…'
+                        : 'No sample loaded. Choose a corpus, or press ↓ after the API is available.'}
                 </div>
             )}
 

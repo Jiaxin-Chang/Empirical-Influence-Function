@@ -1665,7 +1665,7 @@ function NextTokenProbPanel({
             )}
             <div className={styles.probPanelBody}>
                 {busy && <div className={styles.probEmpty}>Loading next-token distribution…</div>}
-                {!busy && error && <div className={styles.probEmpty} style={{ color: '#f38ba8' }}>{error}</div>}
+                {!busy && error && <div className={styles.probEmpty} style={{ color: '#b42318' }}>{error}</div>}
                 {!busy && !error && rows.length === 0 && (
                     <div className={styles.probEmpty}>
                         Click a Model or Gold answer token to show the next-token distribution.
@@ -1777,7 +1777,7 @@ function NextTokenProbPanel({
                                         <div className={styles.degradeTrainMeta}>
                                             <span>train #{p.train_sample_id}</span>
                                             <span>{src} → {dst}</span>
-                                            <span style={{ color: contrib > 0 ? '#f38ba8' : '#a6adc8' }}>
+                                            <span style={{ color: contrib > 0 ? '#b42318' : '#78716c' }}>
                                                 contrib {contrib >= 0 ? '+' : ''}{contrib.toFixed(4)}
                                             </span>
                                         </div>
