@@ -121,27 +121,62 @@ def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+def _annotate_backend() -> str:
+    raw = _env("ANNOTATE_BACKEND", "").lower()
+    if raw in ("api", "dashscope", "remote", "cloud"):
+        return "api"
+    if raw in ("vllm", "local"):
+        return "vllm"
+    if _env("DASHSCOPE_API_KEY"):
+        return "api"
+    return "vllm"
+
+
 def _build_openai_client():
+    """OpenAI-compatible client for DashScope API or local vLLM."""
     try:
         from openai import OpenAI
     except ImportError as exc:
         raise RuntimeError("pip install openai") from exc
 
-    api_key = (
-        _env("DASHSCOPE_API_KEY")
-        or _env("OPENAI_API_KEY")
-        or _env("ANNOTATE_API_KEY")
-    )
-    if not api_key:
-        raise RuntimeError(
-            "Set DASHSCOPE_API_KEY or OPENAI_API_KEY in eif_api.env"
+    backend = _annotate_backend()
+    kwargs: dict[str, Any] = {}
+    if backend == "api":
+        api_key = (
+            _env("DASHSCOPE_API_KEY")
+            or _env("OPENAI_API_KEY")
+            or _env("ANNOTATE_API_KEY")
         )
-    base_url = (
-        _env("OPENAI_BASE_URL")
-        or _env("ANNOTATE_BASE_URL")
-        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    )
-    return OpenAI(api_key=api_key, base_url=base_url)
+        if not api_key:
+            raise RuntimeError(
+                "ANNOTATE_BACKEND=api requires DASHSCOPE_API_KEY or OPENAI_API_KEY "
+                "in repo-root eif_api.env"
+            )
+        kwargs["api_key"] = api_key
+        kwargs["base_url"] = (
+            _env("OPENAI_BASE_URL")
+            or _env("ANNOTATE_BASE_URL")
+            or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+    else:
+        kwargs["api_key"] = (
+            _env("OPENAI_API_KEY")
+            or _env("ANNOTATE_API_KEY")
+            or "dummy"
+        )
+        kwargs["base_url"] = (
+            _env("OPENAI_BASE_URL")
+            or _env("ANNOTATE_BASE_URL")
+            or "http://127.0.0.1:8000/v1"
+        )
+        try:
+            import httpx
+            kwargs["http_client"] = httpx.Client(
+                transport=httpx.HTTPTransport(proxy=None, verify=True),
+            )
+        except Exception:
+            pass
+    return OpenAI(**kwargs)
 
 
 def _extra_body() -> dict[str, Any]:
