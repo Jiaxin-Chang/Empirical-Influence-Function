@@ -32,10 +32,42 @@ _USER_BLOCK_RE = re.compile(
 )
 _TASK_START_MARKERS = (
     "This is a go programming task",
+    "This is a c/cpp programming task",
+    "This is a cpp programming task",
     "### Given Task:",
     "Below is the package path:",
+    "Here is the file path where the current code is located.",
     "And here is the function you are asked to complete:",
+    "And here is the code snippet you are asked to complete:",
 )
+
+_LANG_PROFILES: dict[str, dict[str, str]] = {
+    "go": {
+        "name": "Go",
+        "example": (
+            '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
+        ),
+    },
+    "cpp": {
+        "name": "C/C++",
+        "example": (
+            '("TEST_F(" OR "EXPECT_EQ(") AND "SCM_" AND "VOS_OK"'
+        ),
+    },
+    "c": {
+        "name": "C/C++",
+        "example": (
+            '("TEST_F(" OR "EXPECT_EQ(") AND "SCM_" AND "VOS_OK"'
+        ),
+    },
+}
+
+
+def _lang_profile(language: str | None) -> dict[str, str]:
+    key = (language or "go").strip().lower().replace("c++", "cpp")
+    if key in ("cplusplus", "cxx"):
+        key = "cpp"
+    return _LANG_PROFILES.get(key, _LANG_PROFILES["go"])
 
 
 def _strip_thinking_blocks(text: str) -> str:
@@ -230,25 +262,27 @@ def build_llm_train_retrieve_messages(
     fim_prompt: str,
     gold_completion: str,
     example_expression: str | None = None,
+    language: str | None = None,
 ) -> list[dict[str, str]]:
     """Assemble system + user messages: pattern summary then corpus search."""
     prepared = prepare_llm_train_query(fim_prompt, gold_completion)
     problem = prepared["fim_problem_surface"]
     gold = prepared["gold_mid_completion"]
-    example_expr = example_expression or (
-        '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
-    )
+    profile = _lang_profile(language)
+    lang_name = profile["name"]
+    example_expr = example_expression or profile["example"]
     system = (
-        "你是 Go 代码补全训练数据检索助手。\n"
-        "用户会给出一条 **Go FIM 测试题**（Fill-in-the-Middle，中间缺失处标记为 <MID>）"
-        "及其 gold 补全（仅 <MID> 处应填写的代码片段）。\n"
+        f"你是 {lang_name} 代码补全训练数据检索助手。\n"
+        f"用户会给出一条 **{lang_name} FIM 测试题**（Fill-in-the-Middle，"
+        "中间缺失处可能标记为 <MID> 或 <FIM>）"
+        "及其 gold 补全（仅挖空处应填写的代码片段）。\n"
         "题面已去除 ChatML 对话包装（不是 system/user/assistant 聊天消息）。\n"
         "本阶段只做「相关代码模式 → 检索训练样本」，不要设计、不要提及 "
         "attention_edges、标注、saliency、subtype 或 source→target 边。\n\n"
         "请分两段思考，并输出**严格 JSON**（不要 markdown 包裹）：\n"
         "第一段：概括这条 FIM 的 gold 回答是什么样的代码格式/模式。\n"
         "第二段：为了让模型学会这种模式，理想训练样本应具备哪些特征；"
-        "并据此给出 2-5 条布尔检索式，从宽到窄，用于在大规模 Go 训练 JSONL"
+        f"并据此给出 2-5 条布尔检索式，从宽到窄，用于在大规模 {lang_name} 训练 JSONL"
         "（每行完整 prompt+response 文本）里找出同类样本。\n\n"
         "JSON 字段：\n"
         "{\n"
@@ -273,10 +307,10 @@ def build_llm_train_retrieve_messages(
         "只检索代码文本模式，不要检索标注字段。"
     )
     user = (
-        "【题目类型】Go 代码 FIM 补全测试题（非对话；已去除 ChatML 包装）\n\n"
+        f"【题目类型】{lang_name} 代码 FIM 补全测试题（非对话；已去除 ChatML 包装）\n\n"
         "【题面】\n"
         f"{problem}\n\n"
-        "【Gold】<MID> 处应填写的正确代码：\n"
+        "【Gold】挖空处应填写的正确代码：\n"
         f"{gold}\n\n"
         "请按两段回答：\n"
         "1）这条 gold 是什么样的代码格式/模式？\n"
@@ -553,6 +587,7 @@ def call_llm_train_retrieve(
     gold_completion: str,
     model: str | None = None,
     max_tokens: int | None = None,
+    language: str | None = None,
 ) -> dict[str, Any]:
     client = _build_openai_client()
     model_name = model or _env("ANNOTATE_MODEL") or _env("LLM_RETRIEVE_MODEL") or "qwen-plus"
@@ -560,6 +595,7 @@ def call_llm_train_retrieve(
     messages = build_llm_train_retrieve_messages(
         fim_prompt=fim_prompt,
         gold_completion=gold_completion,
+        language=language,
     )
     kwargs: dict[str, Any] = {
         "model": model_name,
@@ -605,6 +641,7 @@ def retrieve_llm_train_samples(
     max_corpus_scan: int | None = None,
     run_corpus_search: bool = True,
     search_local_bank: bool = True,
+    language: str | None = None,
 ) -> dict[str, Any]:
     if not (fim_prompt or "").strip():
         raise ValueError("fim_prompt is required")
@@ -618,6 +655,7 @@ def retrieve_llm_train_samples(
     llm_out = call_llm_train_retrieve(
         fim_prompt=problem,
         gold_completion=gold,
+        language=language,
     )
     analysis = llm_out.get("analysis") or {}
     exprs = analysis.get("corpus_search_expressions") or []
