@@ -196,6 +196,8 @@ def _rewrite_train(
     )
     mode = str(out.get("mode") or "unchanged")
     reason = str(out.get("reason") or "")
+    if mode in ("angle_fim_keep", "relocate_angle_fim"):
+        return str(out["prompt"]), str(out["response"]), out
     if mode != "unchanged" and reason == "ok":
         return str(out["prompt"]), str(out["response"]), out
     if reason in ("train_mid_already_is_gold", "same_as_original_mid"):

@@ -30,6 +30,7 @@ from .prompt_sections import (
     build_hole_fill,
     edgeable_filled_view,
     fim_marker_spans_in_user,
+    has_angle_fim,
     has_fim_markers,
     locate_edgeable_spans,
     prepare_row,
@@ -886,7 +887,11 @@ def annotate_row(row: dict[str, Any], tokenizer: Any, max_len: int, max_teacher_
 
     target = str(row.get("target", row.get("fim_completion", "")))
     user_content = get_user_content(row)
-    if not target or not (has_fim_markers(user_content) or MASK_TOKEN in user_content):
+    if not target or not (
+        has_fim_markers(user_content)
+        or has_angle_fim(user_content)
+        or MASK_TOKEN in user_content
+    ):
         return None
     messages = build_messages(row)
     _, enc_input_ids, enc_offsets = encode_chatml(tokenizer, messages)

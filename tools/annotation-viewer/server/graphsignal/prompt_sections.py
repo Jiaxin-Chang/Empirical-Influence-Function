@@ -12,6 +12,7 @@ PRE = "<PRE>"
 SUF = "<SUF>"
 MID = "<MID>"
 MASK = "[MASK]"
+ANGLE_FIM = "<FIM>"
 
 LANG_ALIASES = {
     "go": "Go",
@@ -162,10 +163,23 @@ def has_fim_markers(text: str) -> bool:
         return False
 
 
+def find_angle_fim_index(text: str) -> int:
+    """Hole ``<FIM>`` index (last occurrence; earlier mentions are often instructional)."""
+    return (text or "").rfind(ANGLE_FIM)
+
+
+def has_angle_fim(text: str) -> bool:
+    return find_angle_fim_index(text) >= 0
+
+
+def has_any_hole_marker(text: str) -> bool:
+    return has_fim_markers(text) or has_angle_fim(text) or (MASK in (text or ""))
+
+
 def build_hole_fill(user_content: str, target: str) -> HoleFill:
     """Insert ``target`` into the user hole for annotation tokenization.
 
-    Prefers ``<PRE>/<SUF>/<MID>``; falls back to ``[MASK]``.
+    Prefers ``<PRE>/<SUF>/<MID>``; then single ``<FIM>``; then ``[MASK]``.
     """
     if has_fim_markers(user_content):
         span = find_fim_span(user_content)
@@ -192,6 +206,23 @@ def build_hole_fill(user_content: str, target: str) -> HoleFill:
             mid_end=span.mid_end,
         )
 
+    fim_i = find_angle_fim_index(user_content)
+    if fim_i >= 0:
+        filled = (
+            user_content[:fim_i]
+            + target
+            + user_content[fim_i + len(ANGLE_FIM) :]
+        )
+        return HoleFill(
+            mode="angle_fim",
+            filled=filled,
+            completion_start=fim_i,
+            completion_end=fim_i + len(target),
+            prefix="",
+            suffix="",
+            mask_pos=fim_i,
+        )
+
     marker = "* Incomplete Code:\n"
     marker_pos = user_content.find(marker)
     if marker_pos >= 0:
@@ -202,7 +233,9 @@ def build_hole_fill(user_content: str, target: str) -> HoleFill:
     if mask_pos < 0:
         mask_pos = user_content.rfind(MASK)
     if mask_pos < 0:
-        raise ValueError("user content has neither <PRE>/<SUF>/<MID> nor [MASK]")
+        raise ValueError(
+            "user content has neither <PRE>/<SUF>/<MID>, <FIM>, nor [MASK]"
+        )
     filled = user_content[:mask_pos] + target + user_content[mask_pos + len(MASK) :]
     return HoleFill(
         mode="mask",
@@ -223,15 +256,16 @@ def remap_hole_offset_to_chatml(
     hole: HoleFill,
 ) -> int:
     """Map a char offset in ``hole.filled`` to an offset in the ChatML string."""
-    if hole.mode == "mask":
+    if hole.mode in ("mask", "angle_fim"):
         target_len = hole.completion_end - hole.completion_start
         mask_pos = hole.mask_pos
+        marker_len = len(ANGLE_FIM) if hole.mode == "angle_fim" else len(MASK)
         target_end = mask_pos + target_len
         if offset < mask_pos:
             return user_content_start + offset
         if offset < target_end:
             return assistant_content_start + (offset - mask_pos)
-        shrink = target_len - len(MASK)
+        shrink = target_len - marker_len
         return user_content_start + offset - shrink
 
     # filled: head + prefix + target + suffix + tail
@@ -324,11 +358,19 @@ def prepare_from_raw_prompt(
     language: str | None = None,
     default_language: str = "Go",
 ) -> PreparedPrompt:
-    span = find_fim_span(prompt)
     lang = normalize_language(language or detect_language(prompt, default_language), default_language)
     before_code, after_code = extract_before_after_code(prompt)
     user = build_user_content_from_raw(prompt)
     reference_text = extract_reference_text(user)
+
+    if has_fim_markers(prompt):
+        span = find_fim_span(prompt)
+        prefix, suffix = span.prefix, span.suffix
+    elif has_angle_fim(prompt):
+        prefix, suffix = "", ""
+    else:
+        raise ValueError("prompt missing <PRE>/<SUF>/<MID> or <FIM> hole")
+
     messages = [
         {"role": "system", "content": f"You are a {lang} code completion assistant."},
         {"role": "user", "content": user},
@@ -336,8 +378,8 @@ def prepare_from_raw_prompt(
     ]
     return PreparedPrompt(
         language=lang,
-        prefix=span.prefix,
-        suffix=span.suffix,
+        prefix=prefix,
+        suffix=suffix,
         target=target,
         before_code=before_code,
         after_code=after_code,
@@ -370,6 +412,9 @@ def _enrich_chatml_row(row: dict[str, Any], *, default_language: str = "Go") -> 
             span = find_fim_span(user)
             out.setdefault("prefix", span.prefix)
             out.setdefault("suffix", span.suffix)
+        elif has_angle_fim(user):
+            out.setdefault("prefix", "")
+            out.setdefault("suffix", "")
         else:
             m = INCOMPLETE_CODE_RE.search(user)
             if m and MASK in m.group(1):
@@ -380,19 +425,31 @@ def _enrich_chatml_row(row: dict[str, Any], *, default_language: str = "Go") -> 
     if "uid" not in out and out.get("task_id") is not None:
         out["uid"] = str(out["task_id"])
     out["only_last_turn_loss"] = True
-    out["hole_mode"] = "fim" if has_fim_markers(user) else ("mask" if MASK in user else "unknown")
+    if has_fim_markers(user):
+        out["hole_mode"] = "fim"
+    elif has_angle_fim(user):
+        out["hole_mode"] = "angle_fim"
+    elif MASK in user:
+        out["hole_mode"] = "mask"
+    else:
+        out["hole_mode"] = "unknown"
     return out
 
 
 def prepare_row(row: dict[str, Any], *, default_language: str = "Go") -> dict[str, Any]:
     """Normalize a raw or ChatML row into annotate-ready ChatML + section fields.
 
-    Raw prompts keep ``<PRE>/<SUF>/<MID>`` delimiters in the user message.
+    Raw prompts keep ``<PRE>/<SUF>/<MID>`` or single ``<FIM>`` in the user message.
     Legacy ``[MASK]`` ChatML rows remain supported.
     """
     if row.get("messages"):
         user = str(get_user_content_from_row(row))
-        if has_fim_markers(user) or MASK in user or row.get("prefix") is not None:
+        if (
+            has_fim_markers(user)
+            or has_angle_fim(user)
+            or MASK in user
+            or row.get("prefix") is not None
+        ):
             return _enrich_chatml_row(row, default_language=default_language)
 
     prompt = str(row.get("prompt", ""))
@@ -405,6 +462,12 @@ def prepare_row(row: dict[str, Any], *, default_language: str = "Go") -> dict[st
         language=str(row["language"]) if row.get("language") else None,
         default_language=default_language,
     )
+    if has_fim_markers(prompt):
+        hole_mode = "fim"
+    elif has_angle_fim(prompt):
+        hole_mode = "angle_fim"
+    else:
+        hole_mode = "unknown"
     out = {
         "language": prepared.language,
         "prefix": prepared.prefix,
@@ -415,7 +478,7 @@ def prepare_row(row: dict[str, Any], *, default_language: str = "Go") -> dict[st
         "reference_text": prepared.reference_text,
         "messages": prepared.messages,
         "only_last_turn_loss": True,
-        "hole_mode": "fim",
+        "hole_mode": hole_mode,
     }
     for key in ("task_id", "uid", "source_file", "source_line", "raw_id"):
         if key in row:
@@ -448,6 +511,24 @@ def _find_span(filled: str, text: str, *, prefer_after: int = 0) -> EdgeableSpan
     return EdgeableSpan(kind="", start=idx, end=idx + len(text), text=filled[idx : idx + len(text)])
 
 
+def _fence_span_containing(filled: str, pos: int) -> tuple[int, int] | None:
+    """Return ``[start, end)`` of the ``` fence body that contains ``pos``, if any."""
+    if pos < 0 or pos > len(filled):
+        return None
+    # Find opening fence before pos.
+    open_idx = filled.rfind("```", 0, pos)
+    if open_idx < 0:
+        return None
+    nl = filled.find("\n", open_idx)
+    if nl < 0 or nl >= pos:
+        return None
+    body_start = nl + 1
+    close_idx = filled.find("```", pos)
+    if close_idx < 0:
+        return None
+    return body_start, close_idx
+
+
 def locate_edgeable_spans(
     filled: str,
     *,
@@ -466,10 +547,20 @@ def locate_edgeable_spans(
     if hole is not None:
         func_start = hole.completion_start - len(hole.prefix)
         func_end = hole.completion_end + len(hole.suffix)
-        if hole.mode == "mask":
+        if hole.mode in ("mask", "angle_fim"):
             m = INCOMPLETE_CODE_RE.search(filled)
             if m:
                 func_start, func_end = m.start(1), m.end(1)
+            elif hole.mode == "angle_fim":
+                # Prefer the fenced code block that contains the filled hole.
+                fence = _fence_span_containing(filled, hole.completion_start)
+                if fence is not None:
+                    func_start, func_end = fence
+                else:
+                    # Fallback: local window around the completion.
+                    pad = 800
+                    func_start = max(0, hole.completion_start - pad)
+                    func_end = min(len(filled), hole.completion_end + pad)
         if 0 <= func_start < func_end <= len(filled):
             func_span = EdgeableSpan("function", func_start, func_end, filled[func_start:func_end])
     if func_span is None:
@@ -479,6 +570,11 @@ def locate_edgeable_spans(
         elif has_fim_markers(filled):
             span = find_fim_span(filled)
             func_span = EdgeableSpan("function", span.pre_i, span.mid_end, filled[span.pre_i : span.mid_end])
+        elif has_angle_fim(filled):
+            i = find_angle_fim_index(filled)
+            fence = _fence_span_containing(filled, i)
+            if fence is not None:
+                func_span = EdgeableSpan("function", fence[0], fence[1], filled[fence[0]:fence[1]])
 
     before_span = _find_span(filled, before_code) if before_code else None
     if before_span:

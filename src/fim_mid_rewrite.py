@@ -15,6 +15,13 @@ from typing import Any
 PRE = "<PRE>"
 SUF = "<SUF>"
 MID = "<MID>"
+# Single-hole marker used by C/C++ eval / train JSONL (not PRE/SUF/MID).
+ANGLE_FIM = "<FIM>"
+
+_FENCE_WRAP_RE = re.compile(
+    r"^\s*```[^\n]*\n([\s\S]*?)\n```\s*$",
+    re.MULTILINE,
+)
 
 # Rich Go FIM prompt sections (outside the <PRE>/<SUF>/<MID> hole).
 BEFORE_HEADER = "The code snippets before the function is:"
@@ -495,6 +502,248 @@ def has_fim_markers(prompt: str) -> bool:
         return False
 
 
+def find_angle_fim_index(prompt: str) -> int:
+    """Index of the hole ``<FIM>`` (last occurrence; earlier ones are often instructional)."""
+    return (prompt or "").rfind(ANGLE_FIM)
+
+
+def has_angle_fim(prompt: str) -> bool:
+    return find_angle_fim_index(prompt) >= 0
+
+
+def strip_response_fence(text: str) -> str:
+    """Unwrap a single outer ```lang ... ``` fence from gold/response if present."""
+    t = (text or "").strip()
+    m = _FENCE_WRAP_RE.match(t)
+    if m:
+        return m.group(1).strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        if nl > 0:
+            body = t[nl + 1 :]
+            end = body.rfind("```")
+            if end >= 0:
+                return body[:end].strip()
+    return t
+
+
+def fill_angle_fim(prompt: str, completion: str) -> tuple[str, int]:
+    """Fill the hole ``<FIM>`` with ``completion``. Returns (filled_text, hole_index)."""
+    i = find_angle_fim_index(prompt)
+    if i < 0:
+        raise ValueError("prompt missing <FIM> marker")
+    filled = prompt[:i] + (completion or "") + prompt[i + len(ANGLE_FIM) :]
+    return filled, i
+
+
+def _choose_angle_dig_span(
+    filled: str,
+    *,
+    old_mid_start: int,
+    old_mid_end: int,
+    test_gold: str,
+    expression: str,
+) -> tuple[int, int, str] | None:
+    """Pick a dig span in filled context, preferring hits outside the old hole fill."""
+    candidates: list[tuple[int, int, str]] = []
+
+    if (expression or "").strip() and _eval_boolean_expression(filled, expression):
+        cover = _expression_cover_span(filled, expression)
+        if cover is not None:
+            candidates.append((cover[0], cover[1], "expression_cover"))
+
+    gold = (test_gold or "").strip()
+    if gold:
+        if gold in filled:
+            i = 0
+            while True:
+                j = filled.find(gold, i)
+                if j < 0:
+                    break
+                candidates.append((j, j + len(gold), "gold_exact"))
+                i = j + 1
+        hit = ws_flex_find(filled, gold)
+        if hit is not None:
+            candidates.append((hit[0], hit[1], "gold_flex"))
+
+    if not candidates:
+        return None
+
+    # Prefer spans that are not wholly inside the just-filled old MID.
+    outside = [
+        c for c in candidates
+        if not (c[0] >= old_mid_start and c[1] <= old_mid_end)
+    ]
+    pool = outside or candidates
+
+    def score(c: tuple[int, int, str]) -> tuple[int, int, int]:
+        a, b, kind = c
+        wholly_inside = 1 if (a >= old_mid_start and b <= old_mid_end) else 0
+        kind_rank = 0 if kind.startswith("expression") else 1
+        return (wholly_inside, kind_rank, -(b - a))
+
+    pool.sort(key=score)
+    a, b, kind = pool[0]
+    if b <= a:
+        return None
+    # Don't dig the instructional "<FIM>" mention itself.
+    dig = filled[a:b]
+    if dig.strip() in (ANGLE_FIM, PRE, SUF, MID):
+        return None
+    return a, b, kind
+
+
+def rewrite_angle_fim(
+    prompt: str,
+    response: str,
+    *,
+    test_gold: str,
+    expression: str = "",
+) -> dict[str, Any]:
+    """Keep ``<FIM>`` format.
+
+    - Hit on the hole completion (response): keep sample, annotate as-is.
+    - Hit in context: fill the original hole with old response, move ``<FIM>`` onto
+      the matched span; new response is that dug span.
+    """
+    prompt = prompt or ""
+    old_raw = response or ""
+    try:
+        from llm_train_retrieval import clean_gold_mid_completion
+    except ImportError:  # pragma: no cover
+        try:
+            from src.llm_train_retrieval import clean_gold_mid_completion
+        except ImportError:
+            clean_gold_mid_completion = lambda s: (s or "").strip()  # type: ignore
+
+    old_mid = strip_response_fence(old_raw)
+    gold = strip_response_fence(
+        clean_gold_mid_completion(test_gold or "") or (test_gold or "")
+    )
+    expr = (expression or "").strip()
+
+    base: dict[str, Any] = {
+        "prompt": prompt,
+        "response": old_raw,
+        "mode": "unchanged",
+        "dig_text": "",
+        "old_mid": old_mid,
+        "reason": "",
+        "dig_locus": "angle_fim",
+    }
+    if not has_angle_fim(prompt):
+        base["reason"] = "no_angle_fim"
+        return base
+
+    # --- gold / FIM-completion hit: keep original <FIM> sample ---
+    if expr and _eval_boolean_expression(old_mid, expr):
+        return {
+            **base,
+            "prompt": prompt,
+            "response": old_mid,
+            "mode": "angle_fim_keep",
+            "reason": "ok",
+            "detail": "expression hits FIM completion; keep hole",
+        }
+    if gold.strip():
+        if gold in old_mid or (
+            old_mid.strip() and old_mid.strip() in gold and len(old_mid.strip()) >= 12
+        ):
+            return {
+                **base,
+                "prompt": prompt,
+                "response": old_mid,
+                "mode": "angle_fim_keep",
+                "reason": "train_mid_already_is_gold",
+            }
+        mid_hit = ws_flex_find(old_mid, gold)
+        if mid_hit is not None:
+            covered = mid_hit[1] - mid_hit[0]
+            if covered >= max(12, int(0.8 * len(re.sub(r"\s+", "", gold)))):
+                return {
+                    **base,
+                    "prompt": prompt,
+                    "response": old_mid,
+                    "mode": "angle_fim_keep",
+                    "reason": "train_mid_already_is_gold",
+                }
+
+    # --- context hit: fill old hole, relocate <FIM> onto dig span ---
+    try:
+        filled, hole_i = fill_angle_fim(prompt, old_mid)
+    except ValueError:
+        base["reason"] = "no_angle_fim"
+        return base
+    old_mid_start = hole_i
+    old_mid_end = hole_i + len(old_mid)
+
+    chosen = _choose_angle_dig_span(
+        filled,
+        old_mid_start=old_mid_start,
+        old_mid_end=old_mid_end,
+        test_gold=gold,
+        expression=expr,
+    )
+    if chosen is None:
+        # Expression only matched prompt+response jointly via the hole marker area,
+        # or no diggable span — if expression hits prompt context text at all, try
+        # cover on prompt before fill (excluding the <FIM> token).
+        if expr and _eval_boolean_expression(prompt, expr):
+            # Search in prompt with <FIM> removed (empty), spans after hole shift.
+            prompt_filled_empty, _ = fill_angle_fim(prompt, "")
+            chosen = _choose_angle_dig_span(
+                prompt_filled_empty,
+                old_mid_start=hole_i,
+                old_mid_end=hole_i,
+                test_gold=gold,
+                expression=expr,
+            )
+            if chosen is not None:
+                a, b, kind = chosen
+                # Map empty-fill coordinates: same as filled if dig is before hole;
+                # if dig starts at/after hole, add len(old_mid).
+                if a >= hole_i:
+                    a += len(old_mid)
+                    b += len(old_mid)
+                chosen = (a, b, kind)
+                filled, _ = fill_angle_fim(prompt, old_mid)
+
+    if chosen is None:
+        base["reason"] = "no_dig_span"
+        base["detail"] = (
+            "expression/gold not found as a diggable span in <FIM> train context"
+        )
+        return base
+
+    dig_a, dig_b, dig_kind = chosen
+    # After filling, coordinates must refer to ``filled``.
+    if dig_b > len(filled) or dig_a < 0 or dig_b <= dig_a:
+        base["reason"] = "no_dig_span"
+        base["detail"] = "dig span out of range after fill"
+        return base
+
+    dig_text = filled[dig_a:dig_b]
+    if not dig_text.strip():
+        base["reason"] = "no_dig_span"
+        return base
+
+    new_prompt = filled[:dig_a] + ANGLE_FIM + filled[dig_b:]
+    return {
+        **base,
+        "prompt": new_prompt,
+        "response": dig_text,
+        "mode": "relocate_angle_fim",
+        "reason": "ok",
+        "dig_text": dig_text,
+        "dig_hash": hashlib.sha1(dig_text.encode("utf-8")).hexdigest()[:16],
+        "dig_locus": dig_kind,
+        "detail": (
+            f"filled original <FIM> with old completion; "
+            f"moved <FIM> onto context span ({dig_kind})"
+        ),
+    }
+
+
 def _eval_boolean_expression(text: str, expression: str) -> bool:
     try:
         from llm_train_retrieval import eval_boolean_expression
@@ -956,6 +1205,15 @@ def rewrite_fim_mid(
         "old_mid": old_mid,
         "reason": "",
     }
+    # C/C++ JSONL uses a single <FIM> hole (keep format; relocate on context hits).
+    if has_angle_fim(prompt) and not has_fim_markers(prompt):
+        return rewrite_angle_fim(
+            prompt,
+            old_mid,
+            test_gold=test_gold,
+            expression=expression,
+        )
+
     if not has_fim_markers(prompt):
         base["reason"] = "no_fim_markers"
         return base

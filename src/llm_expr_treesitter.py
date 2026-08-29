@@ -6,8 +6,9 @@ For each test row (``prompt`` + gold in ``label``/``response``; ignore ``predict
   1. Call LLM to summarize gold pattern and emit 2–5 boolean search expressions
      (LLM emits wide→narrow; this script **reverses** to tight→loose by default)
   2. For each expression, scan the train corpus; prefer gold-region hits
-  3. MID-rewrite usable hits (``rewrite_fim_mid`` with expression + gold)
-  4. GraphSignal annotate with **tree-sitter only** (``use_llm=False``)
+  3. Rewrite hits (keep ``<FIM>``): completion-hit → annotate as-is; context-hit →
+     fill old hole, move ``<FIM>`` onto the matched span
+  4. GraphSignal annotate with **tree-sitter only** (fill hole, parse full context)
   5. Write ``input_ids`` / ``label`` / ``attention_edges`` (× copies)
 
 Needs: OpenAI-compatible LLM (vLLM / DashScope via ``eif_api.env``), tokenizer,
@@ -194,13 +195,16 @@ def _rewrite_train(
     )
     mode = str(out.get("mode") or "unchanged")
     reason = str(out.get("reason") or "")
+    # <FIM> path: keep format (keep hole or relocate onto context dig).
+    if mode in ("angle_fim_keep", "relocate_angle_fim"):
+        return str(out["prompt"]), str(out["response"]), out
     if mode != "unchanged" and reason == "ok":
         return str(out["prompt"]), str(out["response"]), out
-    if reason in _MID_OK_WITHOUT_REWRITE:
+    if reason in _MID_OK_WITHOUT_REWRITE or reason in (
+        "train_mid_already_is_gold",
+        "same_as_original_mid",
+    ):
         return prompt, response, out
-    if reason in ("train_mid_already_is_gold", "same_as_original_mid"):
-        return prompt, response, out
-    # gold-region hit with unchanged MID is fine
     raise RuntimeError(f"MID rewrite failed: reason={reason} detail={out.get('detail')}")
 
 
