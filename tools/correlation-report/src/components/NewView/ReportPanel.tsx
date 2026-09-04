@@ -2564,6 +2564,12 @@ export function ReportPanel({
     const [continueStepsDefault, setContinueStepsDefault] = useState(20);
     const [continueLrDefault, setContinueLrDefault] = useState('2e-5');
     const [continueStartAdapterPath, setContinueStartAdapterPath] = useState<string | null>(null);
+    const [retrainEpochsInput, setRetrainEpochsInput] = useState('1');
+    const [retrainStepsInput, setRetrainStepsInput] = useState('');
+    const [retrainLrInput, setRetrainLrInput] = useState('2e-5');
+    const [retrainEpochsDefault, setRetrainEpochsDefault] = useState(1);
+    const [retrainLrDefault, setRetrainLrDefault] = useState('2e-5');
+    const [liveAdapterKind, setLiveAdapterKind] = useState<'continue' | 'retrain' | null>(null);
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
@@ -2774,6 +2780,41 @@ export function ReportPanel({
         })();
         return () => { cancelled = true; };
     }, [eifApiUrl, continueAdapterFamily, meta.fileName]);
+
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/retrain-eval-defaults'));
+                if (!resp.ok || cancelled) return;
+                const data = await resp.json() as {
+                    status?: string;
+                    defaults?: {
+                        num_epochs?: number;
+                        learning_rate?: number;
+                    };
+                };
+                if (data.status !== 'success' || !data.defaults || cancelled) return;
+                const epochs = Number(data.defaults.num_epochs);
+                if (Number.isFinite(epochs) && epochs >= 1) {
+                    const s = String(Math.floor(epochs));
+                    setRetrainEpochsDefault(Math.floor(epochs));
+                    setRetrainEpochsInput(prev => (prev === '1' ? s : prev));
+                }
+                const lr = Number(data.defaults.learning_rate);
+                if (Number.isFinite(lr) && lr > 0) {
+                    const nice = lr === 2e-5
+                        ? '2e-5'
+                        : lr.toExponential().replace(/\.0+e/, 'e').replace(/e\+/, 'e');
+                    setRetrainLrDefault(nice);
+                    setRetrainLrInput(prev => (prev === '2e-5' ? nice : prev));
+                }
+            } catch {
+                // keep local defaults
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [eifApiUrl]);
 
     const [fullTokensDisplay, setFullTokensDisplay] = useState<string[] | null>(
         () => report.test_sample_baseline.full_tokens_display ?? null,
@@ -4601,11 +4642,12 @@ export function ReportPanel({
     const pollContinueJob = useCallback(async (
         jobId: string,
         onComplete: (result: Record<string, unknown>) => void,
+        statusPath = '/api/continue-train-eval-status',
     ) => {
         for (;;) {
             await new Promise(r => setTimeout(r, 2000));
             const stResp = await fetch(
-                `${buildEifApiUrl(eifApiUrl, '/api/continue-train-eval-status')}?jobId=${encodeURIComponent(jobId)}`,
+                `${buildEifApiUrl(eifApiUrl, statusPath)}?jobId=${encodeURIComponent(jobId)}`,
             );
             const stRaw = await stResp.text();
             let st: Record<string, unknown> = {};
@@ -4714,6 +4756,7 @@ export function ReportPanel({
                         setContinueResultSummary('续训完成（未拿到当前 test 生成结果）');
                     }
                     setContinueAdapterActive(true);
+                    setLiveAdapterKind('continue');
                     setTtavLaunchStatus(null);
                     refreshTokenProbs();
                     void refreshSaliencyPanels();
@@ -4825,6 +4868,7 @@ export function ReportPanel({
                         setContinueResultSummary('CE 续训完成（未拿到当前 test 生成结果）');
                     }
                     setContinueAdapterActive(true);
+                    setLiveAdapterKind('continue');
                     setTtavLaunchStatus(null);
                     refreshTokenProbs();
                     void refreshSaliencyPanels();
@@ -4851,11 +4895,124 @@ export function ReportPanel({
         refreshSaliencyPanels,
     ]);
 
+    const handleRetrainEval = useCallback(() => {
+        if (importedReportActive) return;
+        const stepsRaw = retrainStepsInput.trim();
+        const parsedSteps = Number(stepsRaw);
+        const maxSteps = stepsRaw !== '' && Number.isFinite(parsedSteps) && parsedSteps > 0
+            ? Math.max(1, Math.floor(parsedSteps))
+            : undefined;
+        const numEpochs = maxSteps == null
+            ? Math.max(1, Math.floor(Number(retrainEpochsInput)) || retrainEpochsDefault || 1)
+            : undefined;
+        const learningRate = Number(retrainLrInput);
+        if (!Number.isFinite(learningRate) || learningRate <= 0) {
+            setTtavLaunchError('重训 lr 必须是 > 0 的数字（如 2e-5）');
+            return;
+        }
+        setContinueBusy(true);
+        setContinueResultSummary(null);
+        setContinueCurrentTestOutput(null);
+        setLivePredictViewActive(false);
+        setTtavLaunchError(null);
+        const stopHint = maxSteps != null
+            ? `${maxSteps} 步`
+            : `${numEpochs} 轮`;
+        setTtavLaunchStatus(
+            `重训：base + 新 LoRA，EIF_TRAIN_DATA 后拼续训小集，训 ${stopHint} 后对当前 test greedy 生成…`,
+        );
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/retrain-eval'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        maxSteps,
+                        numEpochs,
+                        learningRate,
+                        lossMode: 'ce_saliency',
+                        currentTest: continueCurrentTestPayload ?? undefined,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`Retrain API non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `Retrain failed (HTTP ${resp.status})`,
+                    );
+                }
+                const jobId = String(parsed.jobId || '');
+                if (!jobId) throw new Error('Retrain response missing jobId');
+                setContinueJobId(jobId);
+                await pollContinueJob(jobId, (result) => {
+                    const cur = (result.currentTest || {}) as Record<string, unknown>;
+                    const fmt = (v: unknown) =>
+                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
+                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
+                        const predIds = asIntArray(cur.predict_token_ids);
+                        const aligned = Boolean(
+                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
+                        );
+                        setContinueCurrentTestOutput({
+                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
+                            label: typeof cur.label === 'string' ? cur.label : undefined,
+                            predict: cur.predict,
+                            predict_tokens: aligned ? predTok : undefined,
+                            predict_token_ids: aligned ? predIds : undefined,
+                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
+                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
+                        });
+                        setContinueResultSummary(
+                            `重训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
+                            + ` rec=${fmt(cur.line_hit_rec)}`,
+                        );
+                    } else {
+                        setContinueResultSummary('重训完成（未拿到当前 test 生成结果）');
+                    }
+                    setContinueAdapterActive(true);
+                    setLiveAdapterKind('retrain');
+                    setTtavLaunchStatus(null);
+                    refreshTokenProbs();
+                    void refreshSaliencyPanels();
+                }, '/api/retrain-eval-status');
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Retrain failed';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [
+        importedReportActive,
+        retrainStepsInput,
+        retrainEpochsInput,
+        retrainEpochsDefault,
+        retrainLrInput,
+        eifApiUrl,
+        continueCurrentTestPayload,
+        pollContinueJob,
+        refreshTokenProbs,
+        refreshSaliencyPanels,
+    ]);
+
     const handleContinueLineHitCompare = useCallback(() => {
         if (importedReportActive || !continueAdapterActive) return;
         setContinueBusy(true);
         setTtavLaunchError(null);
-        setTtavLaunchStatus('对比 line_hit：baseline vs 续训 adapter（全测试集）…');
+        setTtavLaunchStatus(
+            `对比 line_hit：baseline vs ${liveAdapterKind === 'retrain' ? '重训' : '续训'} adapter（全测试集）…`,
+        );
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/continue-train-eval'), {
@@ -4917,7 +5074,7 @@ export function ReportPanel({
                 setContinueBusy(false);
             }
         })();
-    }, [importedReportActive, continueAdapterActive, eifApiUrl, pollContinueJob, continueAdapterFamily, meta.fileName]);
+    }, [importedReportActive, continueAdapterActive, liveAdapterKind, eifApiUrl, pollContinueJob, continueAdapterFamily, meta.fileName]);
 
     const handleContinueAdapterRecover = useCallback(() => {
         if (importedReportActive) return;
@@ -4948,6 +5105,7 @@ export function ReportPanel({
                     );
                 }
                 setContinueAdapterActive(false);
+                setLiveAdapterKind(null);
                 setLivePredictViewActive(false);
                 setContinueCurrentTestOutput(null);
                 setActiveInterventionPairId(null);
@@ -5409,7 +5567,9 @@ export function ReportPanel({
                                             )}
                                             <span className={styles.toolRowMuted}>
                                                 {continueAdapterActive
-                                                    ? 'live（续训 adapter）'
+                                                    ? (liveAdapterKind === 'retrain'
+                                                        ? 'live（重训 adapter）'
+                                                        : 'live（续训 adapter）')
                                                     : 'live（env adapter）'}
                                                 {' · recover 后会重算'}
                                             </span>
@@ -5425,7 +5585,9 @@ export function ReportPanel({
                                         {decodeToken(goldResponseTokens[goldLocalIdx] ?? '').trim()}"
                                         {' '}@ idx {promptLen + goldLocalIdx}
                                         {goldBusy ? ' …' : ''}
-                                        {continueAdapterActive ? ' · 续训 adapter' : ''}
+                                        {continueAdapterActive
+                                            ? (liveAdapterKind === 'retrain' ? ' · 重训 adapter' : ' · 续训 adapter')
+                                            : ''}
                                     </div>
                                     <div className={styles.correlationListItems}>
                                         {goldTopCorrelations.map(c => (
@@ -5466,8 +5628,12 @@ export function ReportPanel({
                                         {predictLiveTop
                                             ? (rawEvalActive
                                                 ? ' · live(raw)'
-                                                : (continueAdapterActive ? ' · live(续训)' : ' · live'))
-                                            : (livePredictOverride ? ' · live(续训输出)' : ' · report')}
+                                                : (continueAdapterActive
+                                                    ? (liveAdapterKind === 'retrain' ? ' · live(重训)' : ' · live(续训)')
+                                                    : ' · live'))
+                                            : (livePredictOverride
+                                                ? (liveAdapterKind === 'retrain' ? ' · live(重训输出)' : ' · live(续训输出)')
+                                                : ' · report')}
                                     </div>
                                     <div className={styles.correlationListItems}>
                                         {(predictLiveTop ?? selectedResult?.top_correlations ?? []).slice(0, LIVE_SALIENCY_TOP_K).map(c => (
@@ -5702,7 +5868,7 @@ export function ReportPanel({
                                                 || !continueAdapterActive
                                             }
                                             onClick={handleContinueLineHitCompare}
-                                            title="全 EIF_TEST_DATA line_hit 对比：baseline（cache/原 adapter）vs 续训 adapter"
+                                            title="全 EIF_TEST_DATA line_hit 对比：baseline（cache/原 adapter）vs 当前 live adapter（续训或重训）"
                                             className={styles.ghostBtn}
                                         >
                                             {continueBusy ? '…' : '对比 line_hit'}
@@ -5717,13 +5883,15 @@ export function ReportPanel({
                                                 || !continueAdapterActive
                                             }
                                             onClick={handleContinueAdapterRecover}
-                                            title="清除续训后的 live adapter 覆盖，恢复为 eif_api.env 中的 EIF_ADAPTER_PATH_*，并刷新 token 概率"
+                                            title="清除续训/重训后的 live adapter 覆盖，恢复为 eif_api.env 中的 EIF_ADAPTER_PATH_*，并刷新 token 概率"
                                             className={styles.ghostBtn}
                                         >
                                             {continueRecoverBusy ? 'Recovering…' : 'Recover 原 adapter'}
                                         </button>
                                         {continueAdapterActive && (
-                                            <span className={styles.toolRowMuted}>live=续训 adapter</span>
+                                            <span className={styles.toolRowMuted}>
+                                                {liveAdapterKind === 'retrain' ? 'live=重训 adapter' : 'live=续训 adapter'}
+                                            </span>
                                         )}
                                         {continueJobId && (
                                             <span className={styles.toolRowMuted}>job {continueJobId}</span>
@@ -5736,7 +5904,7 @@ export function ReportPanel({
                                         {continueCurrentTestOutput?.predict && (
                                             <details open style={{ width: '100%', marginTop: 4 }}>
                                                 <summary style={{ cursor: 'pointer', fontSize: 11, color: '#15803d', fontWeight: 700 }}>
-                                                    续训后当前 test 输出
+                                                    {liveAdapterKind === 'retrain' ? '重训后当前 test 输出' : '续训后当前 test 输出'}
                                                     {continueCurrentTestOutput.task_id
                                                         ? ` · ${continueCurrentTestOutput.task_id}`
                                                         : ''}
@@ -5807,6 +5975,65 @@ export function ReportPanel({
                                                 )}
                                             </details>
                                         )}
+                                    </div>
+                                )}
+                                {!importedReportActive && (
+                                    <div className={styles.toolRow}>
+                                        <span className={styles.toolRowLabel}>Retrain</span>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            轮次
+                                            <input
+                                                type="number"
+                                                min={1}
+                                                value={retrainEpochsInput}
+                                                disabled={continueBusy}
+                                                onChange={(e) => setRetrainEpochsInput(e.target.value)}
+                                                title="未填步数时：opt steps = epochs × ceil(n / grad_accum)。grad_accum=4。"
+                                                className={styles.toolInput}
+                                                style={{ width: 48 }}
+                                            />
+                                        </label>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            步数
+                                            <input
+                                                type="number"
+                                                min={1}
+                                                value={retrainStepsInput}
+                                                disabled={continueBusy}
+                                                onChange={(e) => setRetrainStepsInput(e.target.value)}
+                                                title="可选。填了则按 AdamW 更新次数停，忽略轮次。空=按轮次。"
+                                                className={styles.toolInput}
+                                                style={{ width: 56 }}
+                                                placeholder="按轮次"
+                                            />
+                                        </label>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            lr
+                                            <input
+                                                type="text"
+                                                value={retrainLrInput}
+                                                disabled={continueBusy}
+                                                onChange={(e) => setRetrainLrInput(e.target.value)}
+                                                title={`AdamW lr on fresh LoRA. Default ${retrainLrDefault}.`}
+                                                className={styles.toolInput}
+                                                style={{ width: 64 }}
+                                            />
+                                        </label>
+                                        <span className={styles.toolRowMuted}>
+                                            {retrainStepsInput.trim()
+                                                ? `停于 ${retrainStepsInput} 步`
+                                                : `停于 ${retrainEpochsInput || retrainEpochsDefault} 轮`}
+                                            {' · base + LoRA r=16 · train∥continue'}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
+                                            onClick={handleRetrainEval}
+                                            title="从 EIF_BASE_MODEL_PATH 新 LoRA，把 ANNOTATION_CONTINUE_TRAIN_DATA 拼到 EIF_TRAIN_DATA 后 CE+saliency 重训，完成后对当前打开的 test greedy 生成"
+                                            className={`${styles.ghostBtn}${continueBusy ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {continueBusy ? 'Training…' : '重训(CE+saliency)'}
+                                        </button>
                                     </div>
                                 )}
                                 {(ttavLaunchError || ttavLaunchStatus) && (

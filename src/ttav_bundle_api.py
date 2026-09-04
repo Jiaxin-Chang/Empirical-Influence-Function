@@ -39,6 +39,11 @@ from src.continue_train_eval import (
     run_continue_train_and_eval,
     run_continue_line_hit_compare,
 )
+from src.retrain_eval import (
+    build_retrain_config_from_request,
+    default_retrain_paths,
+    run_retrain_and_eval,
+)
 from src.eif_adapter_env import (
     get_active_adapter_status,
     set_active_adapter_override,
@@ -113,10 +118,16 @@ def _set_continue_job(job_id: str, **fields):
         cur.update(fields)
         cur["updatedAt"] = int(time() * 1000)
         CONTINUE_TRAIN_JOBS[job_id] = cur
+    kind = cur.get("kind") or "continue-train"
     print(
-        f"[continue-train][{job_id}] {fields.get('stage', '?')}: {fields.get('message', '')}",
+        f"[{kind}][{job_id}] {cur.get('stage', '?')}: {cur.get('message', '')}",
         flush=True,
     )
+
+
+def _active_train_jobs() -> list[dict]:
+    with CONTINUE_TRAIN_JOBS_LOCK:
+        return [j for j in CONTINUE_TRAIN_JOBS.values() if j.get("active")]
 
 
 def _get_continue_job(job_id: str) -> dict:
@@ -161,6 +172,7 @@ def _run_continue_train_job(job_id: str, req: dict):
                 result = run_continue_train_and_eval(cfg, progress_cb=progress)
         _set_continue_job(
             job_id,
+            kind="continue-train",
             stage="completed",
             message="Continue job finished.",
             active=False,
@@ -170,6 +182,48 @@ def _run_continue_train_job(job_id: str, req: dict):
     except Exception as exc:
         _set_continue_job(
             job_id,
+            kind="continue-train",
+            stage="error",
+            message=str(exc),
+            active=False,
+            error=True,
+        )
+
+
+def _run_retrain_job(job_id: str, req: dict):
+    try:
+        cfg = build_retrain_config_from_request(req)
+
+        def progress(stage: str, message: str, extra: dict | None = None):
+            payload = {
+                "kind": "retrain",
+                "stage": stage,
+                "message": message,
+                "active": stage not in {"completed", "error"},
+                "error": False,
+            }
+            if isinstance(extra, dict):
+                slim = {k: v for k, v in extra.items() if k != "result"}
+                payload["progress"] = slim
+                if "result" in extra:
+                    payload["result"] = extra["result"]
+            _set_continue_job(job_id, **payload)
+
+        with CONTINUE_TRAIN_LOCK:
+            result = run_retrain_and_eval(cfg, progress_cb=progress)
+        _set_continue_job(
+            job_id,
+            kind="retrain",
+            stage="completed",
+            message="Retrain job finished.",
+            active=False,
+            error=False,
+            result=result,
+        )
+    except Exception as exc:
+        _set_continue_job(
+            job_id,
+            kind="retrain",
             stage="error",
             message=str(exc),
             active=False,
@@ -564,7 +618,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/degradation-retrieve-progress":
             self._send_json(200, {"status": "success", **_get_degrade_progress()})
             return
-        if parsed.path == "/api/continue-train-eval-status":
+        if parsed.path in ("/api/continue-train-eval-status", "/api/retrain-eval-status"):
             job_id = parse_qs(parsed.query).get("jobId", [""])[0].strip()
             if not job_id:
                 self._send_json(400, {"status": "error", "message": "jobId is required"})
@@ -592,6 +646,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 ),
             })
             return
+        if parsed.path == "/api/retrain-eval-defaults":
+            self._send_json(200, {
+                "status": "success",
+                "defaults": default_retrain_paths(),
+            })
+            return
         if parsed.path != "/api/prepare-ttav-bundle-status":
             self._send_json(404, {"status": "error", "message": "Not found"})
             return
@@ -611,6 +671,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/continue-train-eval":
             self._handle_continue_train_eval()
+            return
+        if parsed.path == "/api/retrain-eval":
+            self._handle_retrain_eval()
             return
         if parsed.path == "/api/continue-adapter-recover":
             self._handle_continue_adapter_recover()
@@ -824,16 +887,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "message": str(exc)})
             return
 
-        # Reject if another continue-train is already active.
-        with CONTINUE_TRAIN_JOBS_LOCK:
-            active = [
-                j for j in CONTINUE_TRAIN_JOBS.values()
-                if j.get("active")
-            ]
+        # Reject if another continue-train / retrain is already active.
+        active = _active_train_jobs()
         if active:
             self._send_json(409, {
                 "status": "error",
-                "message": f"Another continue-train job is active: {active[0].get('jobId')}",
+                "message": f"Another training job is active: {active[0].get('jobId')}",
                 "jobId": active[0].get("jobId"),
             })
             return
@@ -841,6 +900,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         job_id = uuid.uuid4().hex[:12]
         _set_continue_job(
             job_id,
+            kind="continue-train",
             stage="queued",
             message="Continue-train job queued…",
             active=True,
@@ -882,6 +942,86 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 "learningRate": cfg.learning_rate,
                 "lossMode": cfg.loss_mode,
                 "metrics": ["line_hit_pre", "line_hit_rec"],
+            },
+        })
+
+    def _handle_retrain_eval(self):
+        """Start async retrain from base LoRA on EIF_TRAIN_DATA + continue subset."""
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "EIF_CACHE_ONLY=1 — retrain disabled on this server.",
+            })
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        try:
+            cfg = build_retrain_config_from_request(req)
+        except Exception as exc:
+            self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+
+        active = _active_train_jobs()
+        if active:
+            self._send_json(409, {
+                "status": "error",
+                "message": f"Another training job is active: {active[0].get('jobId')}",
+                "jobId": active[0].get("jobId"),
+            })
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        _set_continue_job(
+            job_id,
+            kind="retrain",
+            stage="queued",
+            message="Retrain job queued…",
+            active=True,
+            error=False,
+            config={
+                "baseModelPath": cfg.base_model_path,
+                "sourceTrainData": cfg.source_train_data,
+                "continueTrainData": cfg.continue_train_data,
+                "testData": cfg.test_data,
+                "outputDir": cfg.output_dir,
+                "maxSteps": cfg.max_steps,
+                "numEpochs": cfg.num_epochs,
+                "learningRate": cfg.learning_rate,
+                "lossMode": cfg.loss_mode,
+                "maxSeqLen": cfg.max_seq_len,
+            },
+        )
+        thread = threading.Thread(
+            target=_run_retrain_job,
+            args=(job_id, req),
+            name=f"retrain-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._send_json(200, {
+            "status": "success",
+            "jobId": job_id,
+            "message": "Retrain job started (EIF_TRAIN_DATA + continue subset, then current-test predict)",
+            "config": {
+                "baseModelPath": cfg.base_model_path,
+                "sourceTrainData": cfg.source_train_data,
+                "continueTrainData": cfg.continue_train_data,
+                "testData": cfg.test_data,
+                "outputDir": cfg.output_dir,
+                "maxSteps": cfg.max_steps,
+                "numEpochs": cfg.num_epochs,
+                "learningRate": cfg.learning_rate,
+                "lossMode": cfg.loss_mode,
+                "maxSeqLen": cfg.max_seq_len,
             },
         })
 
