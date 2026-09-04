@@ -52,7 +52,7 @@ def _load_dotenv(path: Path, *, override: bool = False) -> None:
             continue
         if not override and key in os.environ:
             continue
-            os.environ[key] = value
+        os.environ[key] = value
 
 
 # Prefer repo-root eif_api.env (shared with ttav_bundle_api); local .env is deprecated.
