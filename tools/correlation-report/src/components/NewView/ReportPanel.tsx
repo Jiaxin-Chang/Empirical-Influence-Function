@@ -207,6 +207,7 @@ interface LlmTrainSearchExprResult {
     name?: string;
     expression?: string;
     why?: string;
+    match_in?: string;
     corpus_hits?: LlmTrainSearchHit[];
     local_bank_hits?: LlmTrainSearchHit[];
     corpus_error?: string;
@@ -216,12 +217,15 @@ interface LlmTrainExprItem {
     name?: string;
     expression?: string;
     why?: string;
+    match_in?: 'full' | 'response' | 'prompt' | string;
 }
 
 interface LlmTrainRetrieveResult {
     status?: string;
     analysis?: {
         gold_pattern_summary?: string;
+        hole_relation?: string;
+        sibling_line?: string;
         reasoning?: string;
         required_code_patterns?: string[];
         ideal_train_sample_traits?: string[];
@@ -2731,7 +2735,7 @@ export function ReportPanel({
                 if (meta.fileName) qs.set('reportFileName', meta.fileName);
                 const q = qs.toString();
                 const resp = await fetch(
-                    `${eifApiUrl.replace(/\/$/, '')}/api/continue-train-eval-defaults${q ? `?${q}` : ''}`,
+                    `${buildEifApiUrl(eifApiUrl, '/api/continue-train-eval-defaults')}${q ? `?${q}` : ''}`,
                 );
                 if (!resp.ok || cancelled) return;
                 const data = await resp.json() as {
@@ -4230,7 +4234,8 @@ export function ReportPanel({
         eifApiUrl,
     ]);
 
-    const fetchLlmCorpusSearch = useCallback((exprIdx: number, expression: string) => {
+    const fetchLlmCorpusSearch = useCallback((exprIdx: number, item: LlmTrainExprItem) => {
+        const expression = item.expression || '';
         if (importedReportActive || !expression.trim()) return;
         setLlmTrainActiveExprIdx(exprIdx);
         setLlmTrainExprSearchBusy(true);
@@ -4242,6 +4247,7 @@ export function ReportPanel({
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         expression: expression.trim(),
+                        matchIn: item.match_in || 'full',
                         corpusPath: llmTrainResult?.corpus_path || undefined,
                         topK: 15,
                     }),
@@ -5847,6 +5853,15 @@ export function ReportPanel({
                                                         {llmTrainResult.analysis.gold_pattern_summary}
                                                     </div>
                                                 )}
+                                                {llmTrainResult.analysis.hole_relation && (
+                                                    <div style={{ marginBottom: 6, fontSize: 12, color: '#57534e' }}>
+                                                        <strong>挖空关系：</strong>
+                                                        {llmTrainResult.analysis.hole_relation}
+                                                        {llmTrainResult.analysis.sibling_line
+                                                            ? ` · sibling: ${llmTrainResult.analysis.sibling_line}`
+                                                            : ''}
+                                                    </div>
+                                                )}
                                                 {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
                                                     <div style={{ marginBottom: 8 }}>
                                                         <strong>理想训练样本：</strong>
@@ -5875,13 +5890,13 @@ export function ReportPanel({
                                                             tabIndex={0}
                                                             onClick={() => {
                                                                 if (sr.expression?.trim()) {
-                                                                    fetchLlmCorpusSearch(idx, sr.expression);
+                                                                    fetchLlmCorpusSearch(idx, sr);
                                                                 }
                                                             }}
                                                             onKeyDown={ev => {
                                                                 if ((ev.key === 'Enter' || ev.key === ' ') && sr.expression?.trim()) {
                                                                     ev.preventDefault();
-                                                                    fetchLlmCorpusSearch(idx, sr.expression);
+                                                                    fetchLlmCorpusSearch(idx, sr);
                                                                 }
                                                             }}
                                                             style={{
@@ -5896,6 +5911,7 @@ export function ReportPanel({
                                                         >
                                                             <div style={{ fontWeight: 700, color: '#92400e', marginBottom: 4 }}>
                                                                 {idx + 1}. {sr.name || `expr${idx + 1}`}
+                                                                {sr.match_in && sr.match_in !== 'full' ? ` · ${sr.match_in}` : ''}
                                                                 {isActive && llmTrainExprSearchBusy ? ' · 检索中…' : ''}
                                                                 {isActive && !llmTrainExprSearchBusy && hits.length > 0
                                                                     ? ` · ${hits.length} 命中`
@@ -6038,6 +6054,15 @@ export function ReportPanel({
                                                         {llmTrainResult.analysis.gold_pattern_summary}
                                                     </div>
                                                 )}
+                                                {llmTrainResult.analysis.hole_relation && (
+                                                    <div style={{ marginBottom: 6, fontSize: 12, color: '#57534e' }}>
+                                                        <strong>挖空关系：</strong>
+                                                        {llmTrainResult.analysis.hole_relation}
+                                                        {llmTrainResult.analysis.sibling_line
+                                                            ? ` · sibling: ${llmTrainResult.analysis.sibling_line}`
+                                                            : ''}
+                                                    </div>
+                                                )}
                                                 {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
                                                     <div style={{ marginBottom: 8 }}>
                                                         <strong>理想训练样本：</strong>
@@ -6059,6 +6084,7 @@ export function ReportPanel({
                                                     >
                                                         <div style={{ fontWeight: 700, color: '#075985' }}>
                                                             {sr.name || `expr${idx + 1}`}
+                                                            {sr.match_in && sr.match_in !== 'full' ? ` · ${sr.match_in}` : ''}
                                                         </div>
                                                         <code style={{ fontSize: 11, wordBreak: 'break-all' }}>
                                                             {sr.expression}

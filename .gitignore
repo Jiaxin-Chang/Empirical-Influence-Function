@@ -243,3 +243,6 @@ checkpoint-full
 token_embeddings/
 smoke_train_data.jsonl
 tools/annotation-viewer/human_annot_log.jsonl
+
+# Local train/test dumps and eval predictions at repo root (not nested jsonl).
+/*.jsonl

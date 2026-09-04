@@ -11,24 +11,48 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 
+def _is_decoder_stack(m) -> bool:
+    layers = getattr(m, "layers", None)
+    if layers is None:
+        return False
+    try:
+        if len(layers) == 0:
+            return False
+        layer0 = layers[0]
+    except (TypeError, IndexError):
+        return False
+    return hasattr(layer0, "self_attn") and hasattr(layer0, "input_layernorm")
+
+
 def _unwrap_to_decoder_stack(model):
     """
     Walk through HF / PEFT / DDP wrappers and return the module that owns `.layers` (ecoderLayer list).
     """
     m = model
     # DDP / DeepSpeed wrappers
-    if hasattr(m, "module") and not hasattr(m, "layers"):
+    if hasattr(m, "module") and not _is_decoder_stack(m):
         m = m.module
-    while True:
-        if hasattr(m, "layers"):
+    seen: set[int] = set()
+    while id(m) not in seen:
+        seen.add(id(m))
+        if _is_decoder_stack(m):
             return m
+        if hasattr(m, "get_base_model"):
+            try:
+                base = m.get_base_model()
+            except Exception:
+                base = None
+            if base is not None and base is not m:
+                m = base
+                continue
         if hasattr(m, "model"):
             m = m.model
             continue
         if hasattr(m, "base_model"):
             m = m.base_model
             continue
-        raise RuntimeError(f"Cannot locate decoder layer stack on {type(model).__name__}.")
+        break
+    raise RuntimeError(f"Cannot locate decoder layer stack on {type(model).__name__}.")
 
 
 

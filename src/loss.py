@@ -458,19 +458,9 @@ def _normalize_alti_importance(
 
 def _unwrap_qwen_decoder(model):
     """Return the decoder stack that owns .layers (unwrap Peft if needed)."""
-    m = model
-    if hasattr(m, "get_base_model"):
-        try:
-            m = m.get_base_model()
-        except Exception:
-            pass
-    if hasattr(m, "model") and hasattr(m.model, "layers"):
-        return m.model
-    if hasattr(m, "layers"):
-        return m
-    raise ValueError(
-        f"Expected a Qwen-style model.model.layers stack; got {type(model).__name__}."
-    )
+    from src.saliency_loss import _unwrap_to_decoder_stack
+
+    return _unwrap_to_decoder_stack(model)
 
 
 def _get_lm_head(model):

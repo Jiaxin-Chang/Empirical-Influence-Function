@@ -1,14 +1,192 @@
 import react from '@vitejs/plugin-react-swc'
 import { defineConfig, type Plugin } from 'vite'
-import { readdirSync, existsSync, readFileSync, statSync } from 'fs'
+import { readdirSync, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs'
+import { get as httpGet, type IncomingMessage, type ServerResponse } from 'http'
+import { networkInterfaces } from 'os'
 import { resolve, join } from 'path'
-import type { IncomingMessage, ServerResponse } from 'http'
 
 // ── Repo root where JSON experiment files live ────────────────────────────────
 const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
+const RAW_FAMILY_DIRS: Record<string, 'ce' | 'saliency'> = { raw_ce: 'ce', raw_sa: 'saliency' }
+const ALL_RAW_DIRS = ['raw_ce', 'raw_sa', 'raw'] as const
+const EIF_API_PORT = Number(process.env.EIF_API_PORT || 8766)
+const JSONL_CHUNK = 1024 * 1024
+const JSONL_LINE_CAP = 64 * 1024 * 1024
+
+function countNonEmptyLines(filePath: string): number {
+  const fd = openSync(filePath, 'r')
+  const buf = Buffer.alloc(JSONL_CHUNK)
+  let carry = ''
+  let n = 0
+  try {
+    for (;;) {
+      const read = readSync(fd, buf, 0, buf.length, null)
+      if (read === 0) break
+      carry += buf.toString('utf8', 0, read)
+      let nl = carry.indexOf('\n')
+      while (nl >= 0) {
+        const line = carry.slice(0, nl).replace(/\r$/, '')
+        carry = carry.slice(nl + 1)
+        if (line.trim()) n += 1
+        nl = carry.indexOf('\n')
+      }
+    }
+    if (carry.trim()) n += 1
+  } finally {
+    closeSync(fd)
+  }
+  return n
+}
+
+function listRawJsonlFiles(): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  for (const [folder, family] of Object.entries(RAW_FAMILY_DIRS)) {
+    const dir = join(CORR_RESULTS_DIR, folder)
+    if (!existsSync(dir)) continue
+    const names = readdirSync(dir).filter(f => f.toLowerCase().endsWith('.jsonl')).sort()
+    for (const name of names) {
+      const filePath = join(dir, name)
+      let nRows = 0
+      try {
+        nRows = countNonEmptyLines(filePath)
+      } catch {
+        continue
+      }
+      const tag = family === 'ce' ? 'CE' : 'SA'
+      out.push({
+        fileName: `${folder}/${name}`,
+        label: `[${tag}] ${name.replace(/\.jsonl$/i, '')}`,
+        nRows,
+        folder,
+        reportFamily: family,
+      })
+    }
+  }
+  return out
+}
+
+function resolveRawJsonlPath(fileName: string): string | null {
+  const rel = (fileName || '').replace(/\\/g, '/').replace(/^\/+/, '')
+  if (!rel || rel.split('/').includes('..')) return null
+  const parts = rel.split('/').filter(Boolean)
+  if (parts.length === 1) {
+    const name = parts[0]
+    if (!name.toLowerCase().endsWith('.jsonl')) return null
+    for (const folder of ALL_RAW_DIRS) {
+      const cand = join(CORR_RESULTS_DIR, folder, name)
+      if (existsSync(cand) && statSync(cand).isFile()) return cand
+    }
+    return null
+  }
+  if (parts.length !== 2) return null
+  const folder = parts[0].toLowerCase()
+  const name = parts[1]
+  if (!(ALL_RAW_DIRS as readonly string[]).includes(folder)) return null
+  if (!name.toLowerCase().endsWith('.jsonl')) return null
+  const cand = join(CORR_RESULTS_DIR, folder, name)
+  return existsSync(cand) && statSync(cand).isFile() ? cand : null
+}
+
+function listRawJsonlRows(filePath: string, previewChars = 96): Record<string, unknown>[] {
+  const fd = openSync(filePath, 'r')
+  const buf = Buffer.alloc(JSONL_CHUNK)
+  let carry = ''
+  let lineNo = 0
+  const rows: Record<string, unknown>[] = []
+  const consume = (raw: string) => {
+    lineNo += 1
+    const line = raw.replace(/\r$/, '')
+    if (!line.trim()) return
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>
+      if (!obj || typeof obj !== 'object') return
+      const predict = String(obj.predict ?? obj.output ?? '')
+      const label = String(obj.label ?? obj.response ?? obj.gold ?? '')
+      rows.push({
+        line: lineNo,
+        task_id: String(obj.task_id || `row_${lineNo}`),
+        predict_preview: predict.slice(0, previewChars),
+        label_preview: label.slice(0, previewChars),
+      })
+    } catch {
+      /* skip bad line */
+    }
+  }
+  try {
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null)
+      if (n === 0) break
+      carry += buf.toString('utf8', 0, n)
+      let nl = carry.indexOf('\n')
+      while (nl >= 0) {
+        consume(carry.slice(0, nl))
+        carry = carry.slice(nl + 1)
+        nl = carry.indexOf('\n')
+      }
+      if (carry.length > JSONL_LINE_CAP) {
+        throw new Error(`jsonl line exceeds ${JSONL_LINE_CAP} bytes in ${filePath}`)
+      }
+    }
+    if (carry) consume(carry)
+  } finally {
+    closeSync(fd)
+  }
+  return rows
+}
+
+function probeEifApiServer(host: string, port: number): Promise<string | null> {
+  return new Promise(resolve => {
+    const req = httpGet({ host, port, path: '/api/raw-eval-files', timeout: 1500 }, res => {
+      resolve(String(res.headers.server || ''))
+      res.resume()
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => {
+      req.destroy()
+      resolve(null)
+    })
+  })
+}
+
+function lanIPv4s(): string[] {
+  const out: string[] = []
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family !== 'IPv4' || a.internal) continue
+      if (a.address.startsWith('169.254.')) continue
+      out.push(a.address)
+    }
+  }
+  return out
+}
+
+async function resolveEifApiProxyTarget(): Promise<string> {
+  const loopback = await probeEifApiServer('127.0.0.1', EIF_API_PORT)
+  if (loopback && loopback.includes('EIFTTAVBundleAPI')) {
+    return `http://127.0.0.1:${EIF_API_PORT}`
+  }
+  if (loopback) {
+    console.warn(
+      `[eif-api] 127.0.0.1:${EIF_API_PORT} is "${loopback}", not the local EIF API ` +
+        '(often VS Code / Cursor forwarding this port to a remote uvicorn). ' +
+        'Looking on LAN interfaces…',
+    )
+  }
+  for (const ip of lanIPv4s()) {
+    const server = await probeEifApiServer(ip, EIF_API_PORT)
+    if (server && server.includes('EIFTTAVBundleAPI')) {
+      const target = `http://${ip}:${EIF_API_PORT}`
+      console.warn(`[eif-api] proxying /api → ${target}`)
+      return target
+    }
+  }
+  const fallback = `http://127.0.0.1:${EIF_API_PORT}`
+  console.warn(`[eif-api] no local EIFTTAVBundleAPI on :${EIF_API_PORT}; proxying ${fallback} anyway`)
+  return fallback
+}
 
 /** Lightweight parse of repo-root eif_api.env (no dependency on dotenv). */
 function readEifApiEnv(): Record<string, string> {
@@ -66,6 +244,65 @@ type TrainGtEdges = Record<string, Record<string, number[]>>
 
 let trainGtEdgesCache: { sig: string; payload: string | null } | undefined
 
+/** First N source-train rows used as GT underlines (reports historically use 0..4). */
+const TRAIN_GT_HEAD_LINES = 5
+
+function readJsonlHeadSync(filePath: string, maxLines: number): string[] {
+  const fd = openSync(filePath, 'r')
+  const buf = Buffer.alloc(JSONL_CHUNK)
+  let carry = ''
+  const lines: string[] = []
+  try {
+    while (lines.length < maxLines) {
+      const n = readSync(fd, buf, 0, buf.length, null)
+      if (n === 0) break
+      carry += buf.toString('utf8', 0, n)
+      let nl = carry.indexOf('\n')
+      while (nl >= 0 && lines.length < maxLines) {
+        const line = carry.slice(0, nl).replace(/\r$/, '')
+        carry = carry.slice(nl + 1)
+        if (line) lines.push(line)
+        nl = carry.indexOf('\n')
+      }
+      if (carry.length > JSONL_LINE_CAP) {
+        throw new Error(`jsonl line exceeds ${JSONL_LINE_CAP} bytes in ${filePath}`)
+      }
+    }
+    if (carry.trim() && lines.length < maxLines) {
+      lines.push(carry.replace(/\r$/, ''))
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return lines
+}
+
+function forEachJsonlLineSync(filePath: string, onLine: (line: string) => void): void {
+  const fd = openSync(filePath, 'r')
+  const buf = Buffer.alloc(JSONL_CHUNK)
+  let carry = ''
+  try {
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null)
+      if (n === 0) break
+      carry += buf.toString('utf8', 0, n)
+      let nl = carry.indexOf('\n')
+      while (nl >= 0) {
+        const line = carry.slice(0, nl).replace(/\r$/, '')
+        carry = carry.slice(nl + 1)
+        if (line) onLine(line)
+        nl = carry.indexOf('\n')
+      }
+      if (carry.length > JSONL_LINE_CAP) {
+        throw new Error(`jsonl line exceeds ${JSONL_LINE_CAP} bytes in ${filePath}`)
+      }
+    }
+    if (carry.trim()) onLine(carry.replace(/\r$/, ''))
+  } finally {
+    closeSync(fd)
+  }
+}
+
 function _edgesFromRow(row: {
   attention_edges?: { src?: unknown; dst?: unknown }[]
   qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
@@ -105,10 +342,22 @@ function buildTrainGtEdgesPayload(): string | null {
   if (trainGtEdgesCache?.sig === sig) return trainGtEdgesCache.payload
 
   try {
-    const lines = readFileSync(TRAIN_GT_EDGES_JSONL, 'utf-8').split(/\r?\n/).filter(Boolean)
+    let sizeMb = 0
+    try {
+      sizeMb = statSync(TRAIN_GT_EDGES_JSONL).size / (1024 * 1024)
+    } catch {
+      /* ignore */
+    }
+    if (sizeMb > 64) {
+      console.info(
+        `[train-gt-edges] ${TRAIN_GT_EDGES_JSONL} is ${sizeMb.toFixed(0)}MB — ` +
+          `streaming first ${TRAIN_GT_HEAD_LINES} lines (not readFileSync)`,
+      )
+    }
+    const lines = readJsonlHeadSync(TRAIN_GT_EDGES_JSONL, TRAIN_GT_HEAD_LINES)
     const out: TrainGtEdges = {}
     // First five lines map to train samples 0..4 used by the current reports.
-    for (let i = 0; i < Math.min(5, lines.length); i++) {
+    for (let i = 0; i < Math.min(TRAIN_GT_HEAD_LINES, lines.length); i++) {
       const row = JSON.parse(lines[i]) as {
         attention_edges?: { src?: unknown; dst?: unknown }[]
         qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
@@ -118,9 +367,8 @@ function buildTrainGtEdgesPayload(): string | null {
 
     // Overlay annotation-viewer continue subset (edits never rewrite source JSONL).
     if (existsSync(CONTINUE_GT_EDGES_JSONL)) {
-      const contLines = readFileSync(CONTINUE_GT_EDGES_JSONL, 'utf-8').split(/\r?\n/).filter(Boolean)
       let overlaid = 0
-      for (const line of contLines) {
+      forEachJsonlLineSync(CONTINUE_GT_EDGES_JSONL, line => {
         try {
           const row = JSON.parse(line) as {
             source_train_index?: unknown
@@ -128,13 +376,13 @@ function buildTrainGtEdgesPayload(): string | null {
             qwen_annotations?: { token_i_idx?: unknown; token_j_idx?: unknown }[]
           }
           const idx = typeof row.source_train_index === 'number' ? row.source_train_index : null
-          if (idx === null || idx < 0 || idx > 4) continue
+          if (idx === null || idx < 0 || idx > 4) return
           out[String(idx)] = _edgesFromRow(row)
           overlaid += 1
         } catch {
           /* skip bad line */
         }
-      }
+      })
       console.info(
         `[train-gt-edges] loaded ${Object.keys(out).length} samples from ${TRAIN_GT_EDGES_JSONL}` +
           ` + overlay ${overlaid} from ${CONTINUE_GT_EDGES_JSONL}`,
@@ -312,6 +560,38 @@ function experimentDataPlugin(): Plugin {
   function addMiddleware(server: MiddlewareServer) {
     server.middlewares.use((req, res, next) => {
       const reqUrl = req.url ?? ''
+      const reqPath = reqUrl.split('?')[0]
+      // Serve raw JSONL listing from disk so the corpus dropdown does not
+      // depend on 127.0.0.1:8766 (often stolen by VS Code port-forward).
+      if (reqPath === '/api/raw-eval-files') {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache')
+        res.end(JSON.stringify({ status: 'success', files: listRawJsonlFiles() }))
+        return
+      }
+      if (reqPath === '/api/raw-eval-rows') {
+        const qs = new URL(reqUrl, 'http://vite.local').searchParams
+        const file = (qs.get('file') || qs.get('fileName') || '').trim()
+        const filePath = resolveRawJsonlPath(file)
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache')
+        if (!filePath) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ status: 'error', message: `raw jsonl not found: ${file}` }))
+          return
+        }
+        let rel = file.replace(/\\/g, '/').replace(/^\/+/, '')
+        if (!rel.includes('/')) {
+          const bits = filePath.replace(/\\/g, '/').split('/')
+          rel = `${bits[bits.length - 2]}/${bits[bits.length - 1]}`
+        }
+        res.end(JSON.stringify({
+          status: 'success',
+          fileName: rel,
+          rows: listRawJsonlRows(filePath),
+        }))
+        return
+      }
       if (reqUrl === '/data/index.json') {
         res.setHeader('Content-Type', 'application/json')
         res.setHeader('Cache-Control', 'no-cache')
@@ -447,23 +727,21 @@ function experimentDataPlugin(): Plugin {
   }
 }
 
-// Reverse-proxy /api/* to the EIF bundle API so the frontend can call it
-// same-origin (see getDefaultEifApiUrl). Works for both `vite` (dev) and
-// `vite preview`. In VS Code forwarded-localhost setups this means you only
-// need to forward the vite port — no separate 8766 forward, no port mismatch.
-const EIF_API_PROXY = {
-  '/api': {
-    target: 'http://127.0.0.1:8766',
-    changeOrigin: true,
-  },
-}
-
-// Pin a dedicated port so this app never collides with TTAV's vite (5173)
-// or annotation-viewer (5275). strictPort: fail if busy — never auto-bump.
+// Reverse-proxy remaining /api/* to the EIF bundle API (tokenize / prepare).
+// 127.0.0.1:8766 is often a VS Code forward to a remote uvicorn — probe first.
 const EIF_REPORT_PORT = 5273
 
-export default defineConfig({
-  plugins: [react(), experimentDataPlugin()],
-  server: { port: EIF_REPORT_PORT, strictPort: true, proxy: EIF_API_PROXY },
-  preview: { port: EIF_REPORT_PORT, strictPort: true, proxy: EIF_API_PROXY },
+export default defineConfig(async () => {
+  const eifApiTarget = await resolveEifApiProxyTarget()
+  const proxy = {
+    '/api': {
+      target: eifApiTarget,
+      changeOrigin: true,
+    },
+  }
+  return {
+    plugins: [react(), experimentDataPlugin()],
+    server: { port: EIF_REPORT_PORT, strictPort: true, proxy },
+    preview: { port: EIF_REPORT_PORT, strictPort: true, proxy },
+  }
 })

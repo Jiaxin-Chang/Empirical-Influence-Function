@@ -1186,7 +1186,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     if prompt_len_override is not None else None,
                 )
         except Exception as exc:
+            import traceback
             print(f"[live-saliency] failed: {exc}", flush=True)
+            traceback.print_exc()
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
         self._send_json(200, result)
@@ -1736,6 +1738,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 top_k=top_k,
                 max_scan=max_scan_i,
                 stats=search_stats,
+                match_in=str(req.get("matchIn") or req.get("match_in") or "full"),
             )
             search_stats["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         except Exception as exc:
@@ -2037,6 +2040,31 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         })
 
 
+def _warn_if_loopback_stolen(port: int) -> None:
+    """0.0.0.0 can listen while 127.0.0.1 is already taken (VS Code port-forward)."""
+    from urllib.error import URLError
+    from urllib.request import urlopen
+
+    url = f"http://127.0.0.1:{port}/api/raw-eval-files"
+    try:
+        with urlopen(url, timeout=1.5) as resp:
+            server = resp.headers.get("Server") or ""
+    except URLError:
+        return
+    except Exception as exc:
+        print(f"[warn] could not probe 127.0.0.1:{port}: {exc}", flush=True)
+        return
+    if "EIFTTAVBundleAPI" in server:
+        return
+    print(
+        f"WARNING: 127.0.0.1:{port} is already serving {server or 'another HTTP app'}. "
+        "Vite proxies /api to 127.0.0.1, so the report page will NOT hit this process "
+        "(common with VS Code / Cursor port forwarding). "
+        f"Unforward {port} in the Ports panel, or pass --port <free>.",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="EIF API for preparing and uploading TTAV bundles.")
     parser.add_argument("--host", default="0.0.0.0")
@@ -2046,6 +2074,7 @@ def main():
     httpd = ThreadingHTTPServer((args.host, args.port), TTAVBundleRequestHandler)
     print(f"EIF TTAV bundle API listening on http://{args.host}:{args.port}", flush=True)
     print(f"CACHE_ONLY_MODE={'ON — live model loading disabled server-wide' if CACHE_ONLY_MODE else 'off'}", flush=True)
+    _warn_if_loopback_stolen(args.port)
     httpd.serve_forever()
 
 

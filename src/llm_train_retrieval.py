@@ -63,7 +63,8 @@ _LANG_PROFILES: dict[str, dict[str, str]] = {
     "java": {
         "name": "Java",
         "example": (
-            '("return this." OR "notifyListeners(") AND "fire" AND ";"'
+            '("yFormat.format" OR "xFormat.format" OR "numberFormat.format") '
+            'AND "else" AND "result["'
         ),
     },
 }
@@ -292,24 +293,45 @@ def build_llm_train_retrieve_messages(
         "（每行完整 prompt+response 文本）里找出同类样本。\n\n"
         "JSON 字段：\n"
         "{\n"
+        '  "hole_relation": "copy_from_context | compose_local | other",\n'
+        '  "sibling_line": "若是镜像抄写，原样引用题面里被抄的那一行；否则空字符串",\n'
         '  "gold_pattern_summary": "概括 gold 的代码格式与模式（中文，2-5句）",\n'
         '  "ideal_train_sample_traits": ["理想训练样本特征1", "特征2"],\n'
         '  "corpus_search_expressions": [\n'
         "    {\n"
         '      "name": "简短英文名",\n'
         '      "expression": "布尔子串表达式",\n'
+        '      "match_in": "full | response | prompt",\n'
         '      "why": "这条式子对应哪种代码模式、宽还是窄"\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
+        "先判断挖空与题面的关系 hole_relation：\n"
+        '- copy_from_context：gold 是把题面 prefix/suffix 里已经出现的某一行（或对称分支）'
+        "改名/换槽位抄过来。例如 suffix 已有 result[2] = this.yFormat.format(y)，"
+        "gold 是 result[1] = this.xFormat.format(x)。\n"
+        "- compose_local：gold 组合了题面 API，但不是镜像抄写。\n"
+        "- other：其它。\n\n"
+        "若 hole_relation=copy_from_context：\n"
+        "1) sibling_line 必须引用题面里被抄的那一行（不要编造）。\n"
+        "2) 检索目标是「同样在做平行槽位/对称分支复用」的训练题，不是 gold 的字面标识符。\n"
+        "3) 宽式子不要把 gold 独有标识符（如 xFormat、result[1]）当作 AND 必选项；"
+        "那些只允许出现在最窄的一条。\n"
+        "4) 至少一条 expression 设 match_in=response，要求补全本身是 .format( / 镜像赋值，"
+        "避免命中仅有 result[0]=...toString() 的样本。\n"
+        "5) 禁止只用 result[ 或 Copies. 当区分特征。\n"
+        "Java 镜像复用示例（宽→窄）：\n"
+        '  full: "DateFormat" AND ".format(" AND "else" AND "result["\n'
+        '  full: ("xFormat" OR "yFormat" OR "zFormat" OR "numberFormat") AND ".format(" AND "result["\n'
+        '  response: ".format(" AND "result["\n\n'
         "corpus_search_expressions 的 expression 语法：\n"
         '- 字面量用双引号，如 "err != nil {"\n'
         '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
         '- AND 连接必须同时出现，如 A AND B AND C\n'
         "- 不要给整条 AND 链再包一层最外层括号；括号只用于 OR 分组。\n"
+        'match_in：full=整行 prompt+response（默认）；response=只匹配补全；prompt=只匹配题面。\n'
         f"- 示例：{example_expr}\n"
         "必须给出 2-5 条 expression，按从宽到窄排序；"
-        "检索会在训练行的完整文本（题面 prompt + 补全 response）上匹配；"
         "只检索代码文本模式，不要检索标注字段。"
     )
     user = (
@@ -319,9 +341,10 @@ def build_llm_train_retrieve_messages(
         "【Gold】挖空处应填写的正确代码：\n"
         f"{gold}\n\n"
         "请按两段回答：\n"
-        "1）这条 gold 是什么样的代码格式/模式？\n"
-        "2）为了训练模型学会该模式，理想训练样本应有哪些特征？"
-        "给出 2-5 条从宽到窄的布尔表达式，用于在训练集完整文本里找同类代码样本。"
+        "1）这条 gold 是什么样的代码格式/模式？它是不是在抄题面里已经出现的对称行？\n"
+        "2）为了训练模型学会该【复用/镜像】模式，理想训练样本应有哪些特征？"
+        "给出 2-5 条从宽到窄的布尔表达式。copy_from_context 时不要用 gold 字面当宽检索，"
+        "并至少一条 match_in=response。"
         "不要讨论标注。"
     )
     return [
@@ -447,6 +470,15 @@ def _row_gold_text(row: dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_match_in(value: Any) -> str:
+    raw = str(value or "full").strip().lower()
+    if raw in ("response", "gold", "label", "completion"):
+        return "response"
+    if raw in ("prompt", "context", "input"):
+        return "prompt"
+    return "full"
+
+
 def _sample_haystack(row: dict[str, Any]) -> str:
     """Full training-row text: prompt/input + response/label."""
     chunks = [c for c in (_row_context_text(row), _row_gold_text(row)) if c]
@@ -455,12 +487,21 @@ def _sample_haystack(row: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+def _haystack_for_match_in(row: dict[str, Any], match_in: str) -> str:
+    if match_in == "response":
+        return _row_gold_text(row)
+    if match_in == "prompt":
+        return _row_context_text(row)
+    return _sample_haystack(row)
+
+
 def normalize_expr_item(item: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize one corpus_search_expressions entry to a single expression."""
     if not isinstance(item, dict):
         return None
     name = str(item.get("name") or "expr").strip() or "expr"
     why = str(item.get("why") or "").strip()
+    match_in = _normalize_match_in(item.get("match_in") or item.get("where") or "full")
     expression = str(
         item.get("expression")
         or item.get("gold_expr")
@@ -473,6 +514,7 @@ def normalize_expr_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "name": name,
         "expression": expression,
         "why": why,
+        "match_in": match_in,
     }
 
 
@@ -483,14 +525,16 @@ def search_corpus_jsonl(
     top_k: int = 20,
     max_scan: int | None = None,
     stats: dict[str, Any] | None = None,
+    match_in: str = "full",
 ) -> list[dict[str, Any]]:
-    """Match ``expression`` against full row text (prompt + response)."""
+    """Match ``expression`` against prompt, response, or full row text."""
     path = Path(corpus_path)
     if not path.is_file():
         raise FileNotFoundError(f"corpus not found: {corpus_path}")
     expr = (expression or "").strip()
     if not expr:
         return []
+    match_in = _normalize_match_in(match_in)
     hits: list[dict[str, Any]] = []
     stop_reason = "eof"
     scanned = 0
@@ -509,12 +553,11 @@ def search_corpus_jsonl(
                 continue
             if not isinstance(row, dict):
                 continue
-            hay = _sample_haystack(row)
+            hay = _haystack_for_match_in(row, match_in)
             if not eval_boolean_expression(hay, expr):
                 continue
             ctx = _row_context_text(row)
             resp = _row_gold_text(row)
-            # Prefer gold: if response matches, keep original MID (no rewrite).
             if eval_boolean_expression(resp, expr):
                 match_region = "gold"
             elif eval_boolean_expression(ctx, expr):
@@ -525,6 +568,7 @@ def search_corpus_jsonl(
                 "line": line_idx,
                 "task_id": row.get("task_id"),
                 "match_region": match_region,
+                "match_in": match_in,
                 "prompt_preview": (ctx[:280] + "…") if len(ctx) > 280 else ctx,
                 "response_preview": (resp[:200] + "…") if len(resp) > 200 else resp,
             })
@@ -536,7 +580,8 @@ def search_corpus_jsonl(
         stats["stop_reason"] = stop_reason
         stats["top_k"] = top_k
         stats["cached"] = False
-        stats["mode"] = "full_prompt"
+        stats["mode"] = f"{match_in}_prompt" if match_in != "full" else "full_prompt"
+        stats["match_in"] = match_in
     return hits
 
 
@@ -677,12 +722,14 @@ def retrieve_llm_train_samples(
         name = str(item.get("name") or "expr")
         expression = str(item.get("expression") or "").strip()
         why = str(item.get("why") or "")
+        match_in = _normalize_match_in(item.get("match_in"))
         if not expression:
             continue
         entry: dict[str, Any] = {
             "name": name,
             "expression": expression,
             "why": why,
+            "match_in": match_in,
             "corpus_hits": [],
             "local_bank_hits": [],
         }
@@ -693,6 +740,7 @@ def retrieve_llm_train_samples(
                     expression,
                     top_k=top_k,
                     max_scan=max_corpus_scan,
+                    match_in=match_in,
                 )
                 entry["corpus_path"] = corpus
             except Exception as exc:

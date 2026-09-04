@@ -425,6 +425,30 @@ def _cast_lora_params_to_dtype(model, dtype: torch.dtype) -> int:
     return n
 
 
+def _dispatch_peft_model(model, *, max_memory=None):
+    """Shard a CPU-resident PeftModel once, so Accelerate names match the wrap."""
+    from accelerate import dispatch_model, infer_auto_device_map
+
+    no_split = list(getattr(model, "_no_split_modules", None) or [])
+    if not no_split:
+        no_split = ["Qwen3DecoderLayer", "Qwen2DecoderLayer", "LlamaDecoderLayer"]
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        dtype=torch.bfloat16,
+        no_split_module_classes=no_split,
+    )
+    offload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache", "eif_offload")
+    os.makedirs(offload_dir, exist_ok=True)
+    print(f"  dispatch device_map={device_map}", flush=True)
+    return dispatch_model(
+        model,
+        device_map=device_map,
+        offload_dir=os.path.abspath(offload_dir),
+        offload_buffers=True,
+    )
+
+
 def ensure_peft_lora_dtype(model, dtype: torch.dtype = torch.bfloat16) -> int:
     """Re-align LoRA to ``dtype`` if anything drifted back to float32."""
     if getattr(model, "_eif_grad_space", None) != "lora" and not any(
@@ -479,22 +503,43 @@ def load_model_and_tokenizer(
             output_attentions=False,
             use_cache=False,
         )
+        # Dispatch AFTER Peft wrap. Loading the base with device_map="auto" first
+        # attaches Accelerate hooks named ``model.layers.N...``; Peft then prefixes
+        # ``base_model.model.``, and a later lookup becomes
+        # ``base_model.model.model.model.layers.N.input_layernorm`` (KeyError on
+        # disk-offloaded layers — live saliency / next-token-probs 500).
         base = AutoModelForCausalLM.from_pretrained(
             base_path,
             config=config,
-            device_map="auto",
-            max_memory=max_memory,
             torch_dtype=torch.bfloat16,
             local_files_only=True,
+            low_cpu_mem_usage=True,
         )
-        model = PeftModel.from_pretrained(
-            base,
-            os.path.abspath(model_path),
-            local_files_only=True,
-        )
+        peft_kwargs: dict = {
+            "local_files_only": True,
+            "device_map": "auto",
+        }
+        if max_memory is not None:
+            peft_kwargs["max_memory"] = max_memory
+        try:
+            model = PeftModel.from_pretrained(
+                base,
+                os.path.abspath(model_path),
+                **peft_kwargs,
+            )
+        except TypeError:
+            model = PeftModel.from_pretrained(
+                base,
+                os.path.abspath(model_path),
+                local_files_only=True,
+            )
+            model = _dispatch_peft_model(model, max_memory=max_memory)
         n_cast = _cast_lora_params_to_dtype(model, torch.bfloat16)
         if n_cast:
             print(f"  Aligned {n_cast} LoRA tensors to bfloat16", flush=True)
+        dm = getattr(model, "hf_device_map", None)
+        if dm:
+            print(f"  hf_device_map devices={sorted({str(v) for v in dm.values()})}", flush=True)
         # Only LoRA params participate in attribution grads (matches viz).
         for n, p in model.named_parameters():
             p.requires_grad = ("lora_" in n)
@@ -632,21 +677,9 @@ def make_lora_param_filter(model=None, last_n_layers: int | None = None):
 
 def _get_decoder_layers_module(model):
     """Return the module that owns ``.layers`` for Qwen (+ optional Peft unwrap)."""
-    m = model
-    if hasattr(m, "get_base_model"):
-        try:
-            m = m.get_base_model()
-        except Exception:
-            pass
-    # CausalLM: .model.layers ; already-decoder: .layers
-    if hasattr(m, "model") and hasattr(m.model, "layers"):
-        return m.model
-    if hasattr(m, "layers"):
-        return m
-    raise ValueError(
-        f"Cannot locate decoder .layers on {type(model).__name__} "
-        f"(unwrapped={type(m).__name__})."
-    )
+    from src.saliency_loss import _unwrap_to_decoder_stack
+
+    return _unwrap_to_decoder_stack(model)
 
 
 # ====== CONFIGURATION ======
