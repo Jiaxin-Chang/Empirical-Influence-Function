@@ -52,7 +52,7 @@ def _load_dotenv(path: Path, *, override: bool = False) -> None:
             continue
         if not override and key in os.environ:
             continue
-        os.environ[key] = value
+            os.environ[key] = value
 
 
 # Prefer repo-root eif_api.env (shared with ttav_bundle_api); local .env is deprecated.
@@ -972,6 +972,96 @@ def _answer_start(labels: list[int]) -> int:
     return len(labels)
 
 
+def _prompt_response_for_log(
+    source: dict[str, Any],
+    *,
+    corpus_line: int | None = None,
+    corpus_path: str | None = None,
+) -> tuple[str, str]:
+    """Full sample text for the human log (not token indices)."""
+    from server.corpus_encode import extract_prompt_response
+
+    if corpus_line is not None:
+        try:
+            raw = _raw_row_with_bound_mid_rewrite(
+                int(corpus_line),
+                _read_corpus_raw_row(int(corpus_line), corpus_path=corpus_path),
+                corpus_path=corpus_path,
+            )
+            prompt, response = extract_prompt_response(raw)
+            if prompt.strip() or response.strip():
+                return prompt, response
+        except Exception:
+            pass
+    prompt, response = extract_prompt_response(source)
+    if prompt.strip() or response.strip():
+        return prompt, response
+    ids = [int(x) for x in (source.get("input_ids") or [])]
+    tokens = _surface_tokens_from_obj(source, ids)
+    labels = [int(x) for x in (source.get("label") or source.get("labels") or [])]
+    ans = _answer_start(labels) if labels else len(tokens)
+
+    def _join(xs: list[str]) -> str:
+        return "".join(str(t).replace("Ġ", " ").replace("▁", " ") for t in xs)
+
+    return _join(tokens[:ans]), _join(tokens[ans:])
+
+
+def _log_human_annot(
+    *,
+    action: str,
+    source: dict[str, Any],
+    src: int,
+    dst: int,
+    subtype: str,
+    contrib: str = "user_add",
+    weight: float | None = None,
+    corpus_line: int | None = None,
+    corpus_path: str = "",
+    train_index: int | None = None,
+    query_expression: str = "",
+    query_name: str = "",
+) -> None:
+    """Append a human add/delete/bump to the sidecar JSONL. Never raises."""
+    try:
+        from server.human_annot_log import append_human_event, build_event
+
+        ids = [int(x) for x in (source.get("input_ids") or [])]
+        tokens = _surface_tokens_from_obj(source, ids)
+        prompt, response = _prompt_response_for_log(
+            source, corpus_line=corpus_line, corpus_path=corpus_path or None,
+        )
+        line = corpus_line
+        if line is None:
+            raw_line = source.get("source_corpus_line")
+            try:
+                line = int(raw_line) if raw_line is not None else None
+            except (TypeError, ValueError):
+                line = None
+        event = build_event(
+            action=action,
+            tokens=tokens,
+            src=src,
+            dst=dst,
+            subtype=subtype,
+            prompt=prompt,
+            response=response,
+            language=str(source.get("language") or ""),
+            task_id=str(source.get("task_id") or ""),
+            uid=str(source.get("uid") or ""),
+            corpus_path=corpus_path or str(source.get("source_corpus_path") or ""),
+            line=line,
+            train_index=train_index,
+            query_expression=query_expression,
+            query_name=query_name,
+            weight=weight,
+            contrib=contrib,
+        )
+        append_human_event(event)
+    except Exception as exc:
+        print(f"[human-log] skip: {exc}", flush=True)
+
+
 def _sync_meta(obj: dict[str, Any]) -> None:
     edges = obj.get("attention_edges") or []
     anns = obj.get("annotations") or []
@@ -1018,6 +1108,8 @@ class DeleteEdgeBody(BaseModel):
     src: int
     dst: int
     subtype: str
+    query_expression: str = ""
+    query_name: str = ""
 
 
 class AddEdgeBody(BaseModel):
@@ -1026,6 +1118,8 @@ class AddEdgeBody(BaseModel):
     subtype: str = Field(..., description="annotation subtype")
     source: str = "Manual"
     weight: float = Field(1.0, description="positive edge weight (default 1)")
+    query_expression: str = ""
+    query_name: str = ""
 
 
 class BumpWeightBody(BaseModel):
@@ -1033,6 +1127,8 @@ class BumpWeightBody(BaseModel):
     dst: int
     subtype: str
     delta: float = Field(1.0, description="add this to weight (use -1 to decrease)")
+    query_expression: str = ""
+    query_name: str = ""
 
 
 class DuplicateContinueBody(BaseModel):
@@ -1056,9 +1152,16 @@ class GraphsignalPreviewActionBody(BaseModel):
 class LlmSemanticAnnotateBody(BaseModel):
     max_sources_per_token: int | None = Field(None, ge=1, le=15)
     max_answer_tokens: int | None = Field(None, ge=1, le=256)
+    max_edges: int | None = Field(None, ge=1, le=4000)
 
     class Config:
         extra = "ignore"
+
+
+class SemanticPromptIterateBody(BaseModel):
+    activate_if_better: bool = False
+    propose_only: bool = False
+    max_shots: int = Field(4, ge=1, le=8)
 
 
 def _duplicate_continue_rows(
@@ -1348,6 +1451,19 @@ def delete_corpus_edge(line: int, body: DeleteEdgeBody, corpusPath: str = ""):
         persist = _write_continue_corpus_payload(
             line, source, viz_edges=viz, continue_edges=cont,
         )
+    cpath = override or (str(_corpus_path) if _corpus_path else "")
+    _log_human_annot(
+        action="delete",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib="user_add",
+        corpus_line=line,
+        corpus_path=cpath,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz),
@@ -1390,6 +1506,20 @@ def add_corpus_edge(line: int, body: AddEdgeBody, corpusPath: str = ""):
         persist = _write_continue_corpus_payload(
             line, source, viz_edges=viz, continue_edges=cont,
         )
+    cpath = override or (str(_corpus_path) if _corpus_path else "")
+    _log_human_annot(
+        action="add",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib="user_add",
+        weight=float(body.weight),
+        corpus_line=line,
+        corpus_path=cpath,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz),
@@ -1439,6 +1569,20 @@ def bump_corpus_edge_weight(line: int, body: BumpWeightBody, corpusPath: str = "
         persist = _write_continue_corpus_payload(
             line, source, viz_edges=viz_out, continue_edges=cont_out,
         )
+    cpath = override or (str(_corpus_path) if _corpus_path else "")
+    _log_human_annot(
+        action="bump",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib="user_bump",
+        weight=new_w,
+        corpus_line=line,
+        corpus_path=cpath,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz_out),
@@ -1832,12 +1976,12 @@ def _build_llm_semantic_annotated_source(
 
 @app.post("/api/llm-semantic-abort")
 def llm_semantic_abort():
-    """Request in-flight per-token semantic annotate to stop (also set on Ctrl+C)."""
+    """Request in-flight full-sample semantic annotate to stop (also set on Ctrl+C)."""
     from server.llm_semantic_annotate import request_llm_semantic_abort
 
     request_llm_semantic_abort()
     print("[llm-semantic] abort requested via API", flush=True)
-    return {"ok": True, "message": "已请求停止 LLM 语义标注（当前 token 结束后退出）"}
+    return {"ok": True, "message": "已请求停止 LLM 语义标注（当前请求结束后退出）"}
 
 
 @app.post("/api/corpus/sample/{line}/llm-semantic-annotate/preview")
@@ -1846,7 +1990,7 @@ def llm_semantic_annotate_preview(
     body: LlmSemanticAnnotateBody | None = None,
     corpusPath: str = Query(""),
 ):
-    """Per-token LLM attention-routing annotation; preview only."""
+    """Full-sample LLM attention-routing annotation; preview only."""
     override = corpusPath.strip() or None
     payload = body or LlmSemanticAnnotateBody()
     from server.corpus_encode import extract_prompt_response
@@ -1877,6 +2021,7 @@ def llm_semantic_annotate_preview(
             tokenizer,
             max_sources_per_token=payload.max_sources_per_token,
             max_answer_tokens=payload.max_answer_tokens,
+            max_edges=payload.max_edges,
         )
     except LlmSemanticCancelled as exc:
         print(f"[llm-semantic] cancelled line={line}: {exc}", flush=True)
@@ -1928,8 +2073,8 @@ def llm_semantic_annotate_preview(
         "sample": sample,
         "message": (
             f"LLM 语义标注预览 {n_edges} 条边"
-            f"（{sem_meta.get('answer_token_count', '?')} 个答案 token ×"
-            f" 最多 {sem_meta.get('max_sources_per_token', 15)} 源/token）。"
+            f"（整样本 1 次 LLM · {sem_meta.get('answer_token_count', '?')} 个答案 token，"
+            f"最多 {sem_meta.get('max_edges') or '?'} 条边）。"
             "接受后写入续训小集；拒绝则回退。"
         ),
     }
@@ -2019,6 +2164,36 @@ def llm_semantic_annotate_reject(line: int, body: GraphsignalPreviewActionBody, 
         obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
         sample = _sample_detail_from_obj(-1, obj, from_continue=from_continue, key=key)
     return {"ok": True, "preview_id": pid, "sample": sample}
+
+
+@app.get("/api/semantic-prompt/status")
+def semantic_prompt_status():
+    from server.eval_semantic_prompt import prompt_status
+
+    return prompt_status()
+
+
+@app.post("/api/semantic-prompt/iterate")
+def semantic_prompt_iterate(body: SemanticPromptIterateBody | None = None):
+    """Propose a new prompt version from human logs; optionally eval + activate."""
+    payload = body or SemanticPromptIterateBody()
+    from server.eval_semantic_prompt import iterate
+
+    try:
+        tokenizer = None if payload.propose_only else _get_tokenizer()
+    except HTTPException:
+        tokenizer = None
+        if not payload.propose_only:
+            raise
+    try:
+        return iterate(
+            activate_if_better=payload.activate_if_better,
+            propose_only=payload.propose_only,
+            max_shots=payload.max_shots,
+            tokenizer=tokenizer,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"semantic prompt iterate failed: {exc}") from exc
 
 
 @app.get("/api/sample/{idx}/saliency/{target}")
@@ -2133,6 +2308,17 @@ def delete_edge(idx: int, body: DeleteEdgeBody):
             idx, source, viz_edges=viz, continue_edges=cont,
         )
 
+    _log_human_annot(
+        action="delete",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib="user_add",
+        train_index=idx,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz),
@@ -2180,6 +2366,18 @@ def add_edge(idx: int, body: AddEdgeBody):
             idx, source, viz_edges=viz, continue_edges=cont,
         )
 
+    _log_human_annot(
+        action="add",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib="user_add",
+        weight=float(body.weight),
+        train_index=idx,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz),
@@ -2237,6 +2435,18 @@ def bump_edge_weight(idx: int, body: BumpWeightBody):
             idx, source, viz_edges=viz, continue_edges=cont,
         )
 
+    _log_human_annot(
+        action="bump",
+        source=source,
+        src=body.src,
+        dst=body.dst,
+        subtype=body.subtype,
+        contrib=new_contrib,
+        weight=new_w,
+        train_index=idx,
+        query_expression=body.query_expression,
+        query_name=body.query_name,
+    )
     return {
         "ok": True,
         "n_edges": len(viz),

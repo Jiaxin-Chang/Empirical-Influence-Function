@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""LLM expression attribution → tight-to-loose corpus scan → MID → tree-sitter.
+"""Java [MASK] + LLM expressions → tight→loose → Incomplete-Code dig → tree-sitter.
 
-For each test row (``prompt`` + gold in ``label``/``response``; ignore ``predict``):
+Same outer loop as ``llm_expr_treesitter`` (LLM boolean exprs, tight→loose scan),
+but train dig is Java ``[MASK]`` style:
 
-  1. Call LLM to summarize gold pattern and emit 2–5 boolean search expressions
-     (LLM emits wide→narrow; this script **reverses** to tight→loose by default)
-  2. For each expression, scan the train corpus; prefer gold-region hits
-  3. Rewrite hits (keep ``<FIM>``): completion-hit → annotate as-is; context-hit →
-     fill old hole, move ``<FIM>`` onto the matched span
-  4. GraphSignal annotate with **tree-sitter only** (fill hole, parse full context)
-  5. Write ``input_ids`` / ``label`` / ``attention_edges`` (× copies)
-
-Needs: OpenAI-compatible LLM (vLLM / DashScope via ``eif_api.env``), tokenizer,
-``tree-sitter`` / ``tree-sitter-cpp``. Train rows should contain ``<PRE>/<SUF>/<MID>``
-for MID rewrite + annotate; non-FIM hits are skipped automatically.
+  1. LLM emits corpus_search_expressions (wide→narrow); we reverse to tight→loose
+  2. ``search_corpus_jsonl`` on prompt+response
+  3. ``rewrite_mask``: fill Incomplete Code ``[MASK]`` with train response, find dig
+     **only inside Incomplete Code**, relocate ``[MASK]`` onto that dig
+     (completion-hit → keep as-is)
+  4. GraphSignal tree-sitter only → ChatML ``input_ids`` / ``label`` / ``attention_edges``
+  5. Write × ``--copies`` (default 1)
 
 Example::
 
-    python -m src.llm_expr_treesitter \\
-      -i /path/to/qwen3-8b-cpp_predictions.jsonl \\
-      --corpus /mnt/md124/jiaxin/Empirical-Influence-Function/cpp_train_fixed.jsonl \\
-      -o /path/to/cpp_llm_expr_ts.jsonl \\
+    python -m src.java_mask_llm_expr_treesitter \\
+      -i /mnt/md124/jiaxin/Empirical-Influence-Function/jfreechart_fim_test_imperfect.predictions.jsonl \\
+      --corpus /mnt/md124/jiaxin/Empirical-Influence-Function/jfreechart_fim_train.jsonl \\
+      -o /mnt/md124/jiaxin/Empirical-Influence-Function/java_mask_llm_expr_ts.jsonl \\
       --tokenizer /mnt/md124/jiaxin/models/Qwen3-8B \\
-      --language cpp --copies 10 --tight-first
+      --copies 1 --tight-first
 """
 
 from __future__ import annotations
@@ -39,13 +36,14 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_TEST = (
-    "/mnt/md124/jiaxin/Empirical-Influence-Function/test/cpp_test_fixed.jsonl"
+    "/mnt/md124/jiaxin/Empirical-Influence-Function/"
+    "jfreechart_fim_test_imperfect.predictions.jsonl"
 )
 DEFAULT_CORPUS = (
-    "/mnt/md124/jiaxin/Empirical-Influence-Function/cpp_train_fixed.jsonl"
+    "/mnt/md124/jiaxin/Empirical-Influence-Function/jfreechart_fim_train.jsonl"
 )
 DEFAULT_OUTPUT = (
-    "/mnt/md124/jiaxin/Empirical-Influence-Function/cpp_llm_expr_treesitter.jsonl"
+    "/mnt/md124/jiaxin/Empirical-Influence-Function/java_mask_llm_expr_ts.jsonl"
 )
 
 _FENCE_RE = re.compile(
@@ -53,7 +51,7 @@ _FENCE_RE = re.compile(
     re.MULTILINE,
 )
 
-_MID_OK_WITHOUT_REWRITE = frozenset({
+_MASK_OK = frozenset({
     "train_mid_already_is_gold",
     "same_as_original_mid",
     "keep_original_gold_response",
@@ -107,7 +105,8 @@ def _load_raw_rows(path: Path) -> list[tuple[int, dict[str, Any]]]:
     return _load(path)
 
 
-def _test_fim_gold(row: dict[str, Any]) -> tuple[str, str]:
+def _test_mask_gold(row: dict[str, Any]) -> tuple[str, str]:
+    """Test row: prompt with [MASK]; gold from label (fallback response/gold)."""
     prompt = str(row.get("prompt") or row.get("input") or "").strip()
     if isinstance(row.get("label"), list):
         gold = str(
@@ -141,7 +140,6 @@ def _expr_items(analysis: dict[str, Any], *, tight_first: bool) -> list[dict[str
             "why": str(item.get("why") or ""),
             "llm_index": i,
         })
-    # LLM emits wide→narrow; reverse for tight→loose.
     if tight_first:
         cleaned.reverse()
     return cleaned
@@ -195,20 +193,18 @@ def _rewrite_train(
     )
     mode = str(out.get("mode") or "unchanged")
     reason = str(out.get("reason") or "")
-    # <FIM> / [MASK] path: keep format (keep hole or relocate onto context dig).
-    if mode in (
-        "angle_fim_keep", "relocate_angle_fim",
-        "mask_keep", "relocate_mask",
-    ):
+    if mode in ("mask_keep", "relocate_mask", "angle_fim_keep", "relocate_angle_fim"):
         return str(out["prompt"]), str(out["response"]), out
     if mode != "unchanged" and reason == "ok":
         return str(out["prompt"]), str(out["response"]), out
-    if reason in _MID_OK_WITHOUT_REWRITE or reason in (
+    if reason in _MASK_OK or reason in (
         "train_mid_already_is_gold",
         "same_as_original_mid",
     ):
         return prompt, response, out
-    raise RuntimeError(f"MID rewrite failed: reason={reason} detail={out.get('detail')}")
+    raise RuntimeError(
+        f"MASK rewrite failed: reason={reason} detail={out.get('detail')}"
+    )
 
 
 def _load_tokenizer(model_path: str):
@@ -278,7 +274,7 @@ def _build_output_rows(
         base_uid = f"{base_uid}:midrw:{dig_hash}"
     meta = {
         "corpus": True,
-        "llm_expr": True,
+        "java_mask_llm_expr": True,
         "treesitter_only": True,
         "use_llm_annotate": False,
         "test_line": int(test_line),
@@ -347,7 +343,8 @@ def _resolve_file(raw: str, *, label: str) -> Path | None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "LLM expr (tight→loose) → MID rewrite → tree-sitter-only annotate"
+            "Java [MASK]: LLM expr (tight→loose) → Incomplete-Code dig → "
+            "tree-sitter-only annotate"
         ),
     )
     p.add_argument("-i", "--input", default=DEFAULT_TEST)
@@ -369,10 +366,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tight-first",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="scan expressions tight→loose (default true; LLM emits wide→narrow)",
+        help="scan expressions tight→loose (default true)",
     )
     p.add_argument("--tokenizer", default="")
-    p.add_argument("--language", default="cpp")
+    p.add_argument("--language", default="Java")
     p.add_argument("--model", default="", help="LLM retrieve model override")
     p.add_argument("--max-len", type=int, default=8192)
     p.add_argument("--max-teacher-edges", type=int, default=64)
@@ -385,7 +382,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--require-edges",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="skip hits that annotate to 0 structural edges",
     )
     return p.parse_args(argv)
 
@@ -424,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = (
         Path(args.state).expanduser()
         if args.state
-        else input_path.with_suffix(input_path.suffix + ".llm_expr_ts_state.json")
+        else input_path.with_suffix(input_path.suffix + ".java_mask_llm_expr_ts_state.json")
     )
     state: dict[str, Any] = {
         "ok_tests": [],
@@ -445,18 +441,21 @@ def main(argv: list[str] | None = None) -> int:
 
     from src.llm_train_retrieval import call_llm_train_retrieve, search_corpus_jsonl
 
-    language = str(args.language or "cpp")
-    print(f"[llm-expr-ts] input={input_path}", flush=True)
-    print(f"[llm-expr-ts] corpus={corpus_path}", flush=True)
-    print(f"[llm-expr-ts] output={out_path}", flush=True)
+    # LLM profile key is lowercase; GraphSignal prefers "Java".
+    language_ann = str(args.language or "Java")
+    language_llm = "java" if language_ann.lower() == "java" else language_ann
+
+    print(f"[java-mask-llm] input={input_path}", flush=True)
+    print(f"[java-mask-llm] corpus={corpus_path}", flush=True)
+    print(f"[java-mask-llm] output={out_path}", flush=True)
     print(
-        f"[llm-expr-ts] tokenizer={tok_path} language={language} "
+        f"[java-mask-llm] tokenizer={tok_path} language={language_ann} "
         f"tight_first={args.tight_first} copies={args.copies} use_llm_annotate=False",
         flush=True,
     )
-    print("[llm-expr-ts] loading tokenizer…", flush=True)
+    print("[java-mask-llm] loading tokenizer…", flush=True)
     tokenizer = _load_tokenizer(tok_path)
-    print("[llm-expr-ts] tokenizer ready", flush=True)
+    print("[java-mask-llm] tokenizer ready", flush=True)
 
     rows = _load_raw_rows(input_path)
     end_line = int(args.end_line) or 10**12
@@ -479,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         task_id = str(row.get("task_id") or f"row_{test_line}")
-        fim, gold_raw = _test_fim_gold(row)
+        fim, gold_raw = _test_mask_gold(row)
         gold = _clean_gold(gold_raw)
         if not fim.strip() or not gold.strip():
             print(f"[test {test_line}] skip: empty prompt/gold", flush=True)
@@ -502,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 fim_prompt=fim,
                 gold_completion=gold,
                 model=model,
-                language=language,
+                language=language_llm,
             )
         except Exception as exc:
             print(f"  LLM retrieve fail: {exc}", flush=True)
@@ -586,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
                         expression=expression,
                     )
                 except Exception as exc:
-                    print(f"      MID fail → next: {exc}", flush=True)
+                    print(f"      MASK fail → next: {exc}", flush=True)
                     continue
                 print(
                     f"      rewrite ok reason={rw.get('reason')} "
@@ -598,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                         tokenizer=tokenizer,
                         prompt=new_prompt,
                         response=new_response,
-                        language=language,
+                        language=language_ann,
                         max_len=max_len,
                         max_teacher_edges=max_edges,
                     )
@@ -644,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             expr_name=expr_name,
             rewrite_meta=rw,
             copies=copies,
-            language=language,
+            language=language_ann,
             ids_only=ids_only,
         )
         _append_jsonl(out_path, cont_rows)

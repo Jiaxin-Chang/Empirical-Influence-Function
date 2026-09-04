@@ -29,6 +29,8 @@ export type Edge = {
   weight?: number
   contrib?: 'source' | 'user_add' | 'user_bump' | 'llm_auto' | string
   reason?: string
+  query_expression?: string
+  query_name?: string
 }
 
 export type SampleSummary = {
@@ -204,7 +206,11 @@ export const api = {
 
   bumpCorpusWeight: (
     line: number,
-    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & { delta?: number },
+    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & {
+      delta?: number
+      query_expression?: string
+      query_name?: string
+    },
     opts?: { corpusPath?: string | null },
   ) =>
     jsonFetch<{
@@ -302,7 +308,7 @@ export const api = {
 
   llmSemanticAnnotatePreview: (
     line: number,
-    body?: { max_sources_per_token?: number; max_answer_tokens?: number },
+    body?: { max_sources_per_token?: number; max_answer_tokens?: number; max_edges?: number },
     opts?: { corpusPath?: string | null; signal?: AbortSignal },
   ) =>
     jsonFetch<{
@@ -396,7 +402,11 @@ export const api = {
 
   bumpWeight: (
     idx: number,
-    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & { delta?: number },
+    edge: Pick<Edge, 'src' | 'dst' | 'subtype'> & {
+      delta?: number
+      query_expression?: string
+      query_name?: string
+    },
   ) =>
     jsonFetch<{
       ok: boolean
@@ -464,4 +474,37 @@ export const api = {
         query_mode?: string
       }
     }>(`/api/probe-focus-cache/${probeId}`),
+
+  semanticPromptStatus: () =>
+    jsonFetch<{
+      ok: boolean
+      active_id: string
+      log_path: string
+      n_events: number
+      n_usable_samples: number
+      n_train: number
+      n_hold_out: number
+      query_families: Record<string, number>
+      versions: string[]
+    }>('/api/semantic-prompt/status'),
+
+  semanticPromptIterate: (body?: {
+    activate_if_better?: boolean
+    propose_only?: boolean
+    max_shots?: number
+  }) =>
+    jsonFetch<{
+      ok: boolean
+      candidate_id?: string
+      activated?: boolean
+      reason?: string
+      n_usable_samples?: number
+      n_train?: number
+      n_hold_out?: number
+      candidate_metrics?: { precision: number; recall: number; f1: number }
+      active_metrics?: { precision: number; recall: number; f1: number }
+    }>('/api/semantic-prompt/iterate', {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
 }

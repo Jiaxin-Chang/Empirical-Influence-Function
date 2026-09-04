@@ -69,7 +69,7 @@ def annotate_corpus_row(
     if result is None:
         raise ValueError(
             "GraphSignal annotate failed: row is not FIM-annotatable "
-            "(need <PRE>/<SUF>/<MID> in prompt and a non-empty response)."
+            "(need <PRE>/<SUF>/<MID>, <FIM>, or [MASK] in prompt and a non-empty response)."
         )
     return {
         **result,

@@ -4292,6 +4292,7 @@ export function ReportPanel({
     const handleOpenCorpusAnnotationViewer = useCallback((
         hit: LlmTrainSearchHit,
         expression?: string,
+        queryName?: string,
     ) => {
         if (hit.line == null || hit.line < 0) return;
         const base = (
@@ -4358,6 +4359,10 @@ export function ReportPanel({
             if (hit.task_id) {
                 url.searchParams.set('taskId', hit.task_id);
             }
+            const qe = (expression || '').trim();
+            if (qe) url.searchParams.set('queryExpr', qe);
+            const qn = (queryName || '').trim();
+            if (qn) url.searchParams.set('queryName', qn);
 
             let rewriteNote = '';
             if (goldCompletion.trim()) {
@@ -5946,6 +5951,7 @@ export function ReportPanel({
                                                                                 handleOpenCorpusAnnotationViewer(
                                                                                     h,
                                                                                     sr.expression,
+                                                                                    sr.name,
                                                                                 );
                                                                             }}
                                                                             onKeyDown={ev => {
@@ -5955,6 +5961,7 @@ export function ReportPanel({
                                                                                     handleOpenCorpusAnnotationViewer(
                                                                                         h,
                                                                                         sr.expression,
+                                                                                        sr.name,
                                                                                     );
                                                                                 }
                                                                             }}
@@ -6077,6 +6084,7 @@ export function ReportPanel({
                                                                         onClick={() => handleOpenCorpusAnnotationViewer(
                                                                             h,
                                                                             sr.expression,
+                                                                            sr.name,
                                                                         )}
                                                                         onKeyDown={ev => {
                                                                             if (ev.key === 'Enter' || ev.key === ' ') {
@@ -6084,6 +6092,7 @@ export function ReportPanel({
                                                                                 handleOpenCorpusAnnotationViewer(
                                                                                     h,
                                                                                     sr.expression,
+                                                                                    sr.name,
                                                                                 );
                                                                             }
                                                                         }}

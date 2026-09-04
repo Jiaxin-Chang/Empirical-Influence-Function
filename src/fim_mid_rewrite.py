@@ -17,6 +17,9 @@ SUF = "<SUF>"
 MID = "<MID>"
 # Single-hole marker used by C/C++ eval / train JSONL (not PRE/SUF/MID).
 ANGLE_FIM = "<FIM>"
+# Java / jfreechart-style hole marker.
+MASK = "[MASK]"
+INCOMPLETE_CODE_MARKER = "* Incomplete Code:\n"
 
 _FENCE_WRAP_RE = re.compile(
     r"^\s*```[^\n]*\n([\s\S]*?)\n```\s*$",
@@ -744,6 +747,205 @@ def rewrite_angle_fim(
     }
 
 
+def has_mask(text: str) -> bool:
+    return MASK in (text or "")
+
+
+def find_mask_index(prompt: str) -> int:
+    """Prefer ``[MASK]`` inside Incomplete Code; else first / last ``[MASK]``."""
+    prompt = prompt or ""
+    marker_pos = prompt.find(INCOMPLETE_CODE_MARKER)
+    if marker_pos >= 0:
+        code_start = marker_pos + len(INCOMPLETE_CODE_MARKER)
+        i = prompt.find(MASK, code_start)
+        if i >= 0:
+            return i
+    i = prompt.find(MASK)
+    if i >= 0:
+        return i
+    return prompt.rfind(MASK)
+
+
+def incomplete_code_span(prompt: str) -> tuple[int, int] | None:
+    """Char span of the Incomplete Code body (after the header), or None."""
+    prompt = prompt or ""
+    marker_pos = prompt.find(INCOMPLETE_CODE_MARKER)
+    if marker_pos < 0:
+        return None
+    start = marker_pos + len(INCOMPLETE_CODE_MARKER)
+    return start, len(prompt)
+
+
+def fill_mask(prompt: str, completion: str) -> tuple[str, int]:
+    """Fill ``[MASK]`` with ``completion``. Returns (filled_text, mask_index)."""
+    i = find_mask_index(prompt)
+    if i < 0:
+        raise ValueError("prompt missing [MASK] marker")
+    filled = prompt[:i] + (completion or "") + prompt[i + len(MASK) :]
+    return filled, i
+
+
+def rewrite_mask(
+    prompt: str,
+    response: str,
+    *,
+    test_gold: str,
+    expression: str = "",
+) -> dict[str, Any]:
+    """Keep ``[MASK]`` format; dig only inside Incomplete Code (response filled in).
+
+    - Hit on the hole completion (response): keep sample.
+    - Hit in Incomplete Code context: fill old ``[MASK]``, move ``[MASK]`` onto
+      the matched dig span; new response is that dig.
+    """
+    prompt = prompt or ""
+    old_raw = response or ""
+    try:
+        from llm_train_retrieval import clean_gold_mid_completion
+    except ImportError:  # pragma: no cover
+        try:
+            from src.llm_train_retrieval import clean_gold_mid_completion
+        except ImportError:
+            clean_gold_mid_completion = lambda s: (s or "").strip()  # type: ignore
+
+    old_mid = strip_response_fence(old_raw)
+    gold = strip_response_fence(
+        clean_gold_mid_completion(test_gold or "") or (test_gold or "")
+    )
+    expr = (expression or "").strip()
+
+    base: dict[str, Any] = {
+        "prompt": prompt,
+        "response": old_raw,
+        "mode": "unchanged",
+        "dig_text": "",
+        "old_mid": old_mid,
+        "reason": "",
+        "dig_locus": "mask",
+        "fim_geometry": "mask",
+    }
+    if not has_mask(prompt):
+        base["reason"] = "no_mask"
+        return base
+
+    # --- completion hit: keep original [MASK] sample ---
+    if expr and _eval_boolean_expression(old_mid, expr):
+        return {
+            **base,
+            "prompt": prompt,
+            "response": old_mid,
+            "mode": "mask_keep",
+            "reason": "ok",
+            "detail": "expression hits MASK completion; keep hole",
+        }
+    if gold.strip():
+        if gold in old_mid or (
+            old_mid.strip() and old_mid.strip() in gold and len(old_mid.strip()) >= 12
+        ):
+            return {
+                **base,
+                "prompt": prompt,
+                "response": old_mid,
+                "mode": "mask_keep",
+                "reason": "train_mid_already_is_gold",
+            }
+        mid_hit = ws_flex_find(old_mid, gold)
+        if mid_hit is not None:
+            covered = mid_hit[1] - mid_hit[0]
+            if covered >= max(12, int(0.8 * len(re.sub(r"\s+", "", gold)))):
+                return {
+                    **base,
+                    "prompt": prompt,
+                    "response": old_mid,
+                    "mode": "mask_keep",
+                    "reason": "train_mid_already_is_gold",
+                }
+
+    # --- context hit inside Incomplete Code only ---
+    try:
+        filled, hole_i = fill_mask(prompt, old_mid)
+    except ValueError:
+        base["reason"] = "no_mask"
+        return base
+    old_mid_start = hole_i
+    old_mid_end = hole_i + len(old_mid)
+
+    code_span = incomplete_code_span(filled)
+    if code_span is None:
+        # No Incomplete Code header: fall back to whole filled prompt (still MASK).
+        code_a, code_b = 0, len(filled)
+    else:
+        code_a, code_b = code_span
+        # After fill, Incomplete Code body grew by len(old_mid)-len(MASK).
+        # incomplete_code_span on filled already uses end=len(filled), OK.
+        # Ensure hole fill is inside the searched region.
+        if hole_i < code_a:
+            code_a = 0
+
+    local = filled[code_a:code_b]
+    local_hole_start = max(0, old_mid_start - code_a)
+    local_hole_end = max(local_hole_start, old_mid_end - code_a)
+
+    chosen = _choose_angle_dig_span(
+        local,
+        old_mid_start=local_hole_start,
+        old_mid_end=local_hole_end,
+        test_gold=gold,
+        expression=expr,
+    )
+    if chosen is None and expr and _eval_boolean_expression(local, expr):
+        cover = _expression_cover_span(local, expr)
+        if cover is not None:
+            chosen = (cover[0], cover[1], "expression_cover_local")
+    if chosen is None:
+        base["reason"] = "no_dig_in_incomplete_code"
+        base["detail"] = (
+            "expression/gold did not yield a diggable span inside Incomplete Code"
+        )
+        return base
+
+    dig_a_local, dig_b_local, dig_kind = chosen
+    dig_a = code_a + dig_a_local
+    dig_b = code_a + dig_b_local
+    if dig_b > len(filled) or dig_a < 0 or dig_b <= dig_a:
+        base["reason"] = "no_dig_span"
+        return base
+
+    # Dig wholly inside old fill → keep
+    if dig_a >= old_mid_start and dig_b <= old_mid_end:
+        return {
+            **base,
+            "prompt": prompt,
+            "response": old_mid,
+            "mode": "mask_keep",
+            "reason": "ok",
+            "detail": "dig landed inside original MASK fill; keep hole",
+            "dig_locus": dig_kind,
+        }
+
+    dig_text = filled[dig_a:dig_b]
+    if not dig_text.strip() or dig_text.strip() == MASK:
+        base["reason"] = "no_dig_span"
+        return base
+
+    new_prompt = filled[:dig_a] + MASK + filled[dig_b:]
+    return {
+        **base,
+        "prompt": new_prompt,
+        "response": dig_text,
+        "mode": "relocate_mask",
+        "reason": "ok",
+        "dig_text": dig_text,
+        "dig_hash": hashlib.sha1(dig_text.encode("utf-8")).hexdigest()[:16],
+        "dig_locus": dig_kind,
+        "fim_geometry": "relocate_mask_in_incomplete_code",
+        "detail": (
+            "filled original [MASK] with old completion; "
+            f"moved [MASK] onto Incomplete Code span ({dig_kind})"
+        ),
+    }
+
+
 def _eval_boolean_expression(text: str, expression: str) -> bool:
     try:
         from llm_train_retrieval import eval_boolean_expression
@@ -1208,6 +1410,15 @@ def rewrite_fim_mid(
     # C/C++ JSONL uses a single <FIM> hole (keep format; relocate on context hits).
     if has_angle_fim(prompt) and not has_fim_markers(prompt):
         return rewrite_angle_fim(
+            prompt,
+            old_mid,
+            test_gold=test_gold,
+            expression=expression,
+        )
+
+    # Java / jfreechart-style [MASK] (dig only in Incomplete Code).
+    if has_mask(prompt) and not has_fim_markers(prompt) and not has_angle_fim(prompt):
+        return rewrite_mask(
             prompt,
             old_mid,
             test_gold=test_gold,

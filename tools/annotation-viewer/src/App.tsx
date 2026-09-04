@@ -30,10 +30,19 @@ export default function App() {
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
   const [corpusLine, setCorpusLine] = useState<number | null>(null)
   const [corpusPath, setCorpusPath] = useState<string | null>(null)
+  const [queryExpr, setQueryExpr] = useState('')
+  const [queryName, setQueryName] = useState('')
   const corpusMode = corpusLine != null
   const corpusOpts = useMemo(
     () => (corpusPath?.trim() ? { corpusPath: corpusPath.trim() } : undefined),
     [corpusPath],
+  )
+  const queryCtx = useMemo(
+    () => ({
+      ...(queryExpr.trim() ? { query_expression: queryExpr.trim() } : {}),
+      ...(queryName.trim() ? { query_name: queryName.trim() } : {}),
+    }),
+    [queryExpr, queryName],
   )
   const [sample, setSample] = useState<SampleDetail | null>(null)
   const [target, setTarget] = useState<number | null>(null)
@@ -227,6 +236,8 @@ export default function App() {
           if (probeDstRaw) setProbeDstToken(probeDstRaw)
           const qm = (params.get('queryMode') || params.get('mode') || 'manual').trim()
           setQueryMode(qm || 'manual')
+          setQueryExpr((params.get('queryExpr') || params.get('query_expression') || '').trim())
+          setQueryName((params.get('queryName') || params.get('query_name') || '').trim())
           const probeId = (params.get('probeId') || '').trim()
           if (probeId) {
             try {
@@ -333,8 +344,8 @@ export default function App() {
       setError('')
       try {
         const added = corpusMode && corpusLine != null
-          ? await api.addCorpusEdge(corpusLine, { src: addSrc, dst: i, subtype: addSubtype }, corpusOpts)
-          : await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype })
+          ? await api.addCorpusEdge(corpusLine, { src: addSrc, dst: i, subtype: addSubtype, ...queryCtx }, corpusOpts)
+          : await api.addEdge(selectedIdx, { src: addSrc, dst: i, subtype: addSubtype, ...queryCtx })
         setAddSrc(null)
         const h = await api.health()
         setNContinue(h.n_continue ?? 0)
@@ -394,9 +405,9 @@ export default function App() {
     setError('')
     try {
       if (corpusMode && corpusLine != null) {
-        await api.deleteCorpusEdge(corpusLine, edge, corpusOpts)
+        await api.deleteCorpusEdge(corpusLine, { ...edge, ...queryCtx }, corpusOpts)
       } else {
-        await api.deleteEdge(selectedIdx, edge)
+        await api.deleteEdge(selectedIdx, { ...edge, ...queryCtx })
       }
       setPendingEdge(null)
       const h = await api.health()
@@ -431,12 +442,14 @@ export default function App() {
             dst: edge.dst,
             subtype: edge.subtype,
             delta,
+            ...queryCtx,
           }, corpusOpts)
         : await api.bumpWeight(selectedIdx, {
             src: edge.src,
             dst: edge.dst,
             subtype: edge.subtype,
             delta,
+            ...queryCtx,
           })
       const h = await api.health()
       setNContinue(h.n_continue ?? 0)
@@ -740,7 +753,7 @@ export default function App() {
         <h1>Train Annotation Viewer</h1>
         <p>
           {corpusMode
-            ? '大语料标注：GraphSignal（结构）或 LLM 语义（逐 token 注意力推断）；预览后接受写入续训小集。'
+            ? '大语料标注：GraphSignal（结构）或 LLM 语义（整样本一次出边）；预览后接受写入续训小集。人工增删边会写入独立日志（完整样本文本 + 边的文本关系）。'
             : (
               <>
                 浏览源 train JSONL（只读）。可视化显示完整标注；续训小集只写入
@@ -1052,9 +1065,11 @@ export default function App() {
                   <div className="card" style={{ borderColor: llmSemPreviewId ? '#fbbf24' : undefined }}>
                     <h3>LLM 语义标注（注意力推断）</h3>
                     <p className="hint" style={{ marginBottom: 8 }}>
-                      跳过 tree-sitter：给定 FIM 题目 + 正确答案，对每个答案 token 单独问 LLM
-                      「正确生成该 token 时，上下文哪些 token 应被关注？」每个 token 最多 15 条源边（subtype=semantic）。
-                      耗时 ≈ 答案 token 数 × 1 次 LLM 调用。
+                      跳过 tree-sitter：给定 FIM 题目 + 正确答案，一次 LLM 调用返回整张 src→dst 边表
+                      （subtype=semantic）。每条 completion token 最多 15 条源边；全样本上限 = 答案 token 数 × 15。
+                      {queryExpr
+                        ? ` 当前检索族：${queryName || queryExpr.slice(0, 80)}`
+                        : ''}
                     </p>
                     <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
                       {!llmSemPreviewId ? (
@@ -1064,7 +1079,7 @@ export default function App() {
                             disabled={llmSemBusy || busy || gsBusy || Boolean(gsPreviewId)}
                             onClick={() => void runLlmSemanticPreview()}
                           >
-                            {llmSemBusy ? '逐 token 标注中…' : 'LLM 语义标注'}
+                            {llmSemBusy ? '整样本标注中…' : 'LLM 语义标注'}
                           </button>
                           {llmSemBusy && (
                             <button

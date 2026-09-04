@@ -60,6 +60,12 @@ _LANG_PROFILES: dict[str, dict[str, str]] = {
             '("TEST_F(" OR "EXPECT_EQ(") AND "SCM_" AND "VOS_OK"'
         ),
     },
+    "java": {
+        "name": "Java",
+        "example": (
+            '("return this." OR "notifyListeners(") AND "fire" AND ";"'
+        ),
+    },
 }
 
 

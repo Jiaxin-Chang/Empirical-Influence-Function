@@ -368,8 +368,29 @@ def prepare_from_raw_prompt(
         prefix, suffix = span.prefix, span.suffix
     elif has_angle_fim(prompt):
         prefix, suffix = "", ""
+    elif MASK in prompt:
+        # Java / jfreechart-style: dig only inside Incomplete Code when present.
+        m = INCOMPLETE_CODE_RE.search(prompt)
+        if m and MASK in m.group(1):
+            code = m.group(1)
+            mi = code.find(MASK)
+            prefix, suffix = code[:mi], code[mi + len(MASK) :]
+        else:
+            # Prefer MASK after Incomplete Code header; else first MASK.
+            marker = "* Incomplete Code:\n"
+            marker_pos = prompt.find(marker)
+            if marker_pos >= 0:
+                code_start = marker_pos + len(marker)
+                mi = prompt.find(MASK, code_start)
+            else:
+                mi = -1
+            if mi < 0:
+                mi = prompt.find(MASK)
+            if mi < 0:
+                raise ValueError("prompt missing [MASK] hole")
+            prefix, suffix = "", ""
     else:
-        raise ValueError("prompt missing <PRE>/<SUF>/<MID> or <FIM> hole")
+        raise ValueError("prompt missing <PRE>/<SUF>/<MID>, <FIM>, or [MASK] hole")
 
     messages = [
         {"role": "system", "content": f"You are a {lang} code completion assistant."},
@@ -466,6 +487,8 @@ def prepare_row(row: dict[str, Any], *, default_language: str = "Go") -> dict[st
         hole_mode = "fim"
     elif has_angle_fim(prompt):
         hole_mode = "angle_fim"
+    elif MASK in prompt:
+        hole_mode = "mask"
     else:
         hole_mode = "unknown"
     out = {

@@ -242,3 +242,4 @@ correlation_matching_results/
 checkpoint-full
 token_embeddings/
 smoke_train_data.jsonl
+tools/annotation-viewer/human_annot_log.jsonl
