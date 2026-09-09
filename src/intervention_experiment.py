@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import signal
 import torch
 import torch.nn.functional as F
 import hashlib
@@ -1633,6 +1634,107 @@ def _saliency_train_bank_cache_path(
     return os.path.join(cache_dir, tag)
 
 
+def _bank_partial_path(cache_path: str) -> str:
+    return f"{cache_path}.partial"
+
+
+def _atomic_torch_save(obj, path: str) -> None:
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _bank_checkpoint_every() -> int:
+    raw = (os.environ.get("EIF_BANK_CHECKPOINT_EVERY") or "50").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 50
+    return max(1, n)
+
+
+def _bank_blob_compatible(
+    blob,
+    *,
+    sketch_dim: int,
+    sketch_seed: int,
+    fine_match_proj: str,
+    cache_tag: str,
+    max_seq_len: int | None,
+    bank_left_truncate: bool,
+    last_n_layers: int,
+) -> bool:
+    if not isinstance(blob, dict):
+        return False
+    if int(blob.get("sketch_dim", -1)) != int(sketch_dim):
+        return False
+    if int(blob.get("sketch_seed", -1)) != int(sketch_seed):
+        return False
+    if blob.get("fine_match_proj") not in (None, fine_match_proj):
+        return False
+    if blob.get("bank_loss_tag") not in (None, cache_tag):
+        return False
+    if blob.get("last_n_layers") not in (None, int(last_n_layers)):
+        return False
+    if blob.get("bank_left_truncate") not in (None, bool(bank_left_truncate)):
+        return False
+    cached_max = blob.get("max_seq_len")
+    if cached_max not in (None, max_seq_len):
+        return False
+    sketches = blob.get("sketches")
+    ids = blob.get("sample_ids")
+    if not isinstance(sketches, torch.Tensor) or not isinstance(ids, torch.Tensor):
+        return False
+    if sketches.dim() != 2 or ids.dim() != 1 or sketches.size(0) != ids.numel():
+        return False
+    return True
+
+
+def _assemble_bank_cache(
+    *,
+    sample_ids: list[int],
+    sketch_chunks: list[torch.Tensor],
+    sketch_dim: int,
+    sketch_seed: int,
+    max_seq_len: int | None,
+    bank_left_truncate: bool,
+    fine_match_proj: str,
+    last_n_layers: int,
+    cache_tag: str,
+    loss_mode: str,
+    model_path: str | None,
+    used_ce: int,
+    used_cesal: int,
+    is_partial: bool,
+    skipped_long: int = 0,
+    skipped_bad: int = 0,
+    truncated_rows: int = 0,
+    truncated_edges_kept: int = 0,
+) -> dict:
+    return {
+        "sample_ids": torch.tensor(sample_ids, dtype=torch.long),
+        "sketches": torch.cat(sketch_chunks, dim=0).contiguous(),
+        "sketch_dim": int(sketch_dim),
+        "sketch_seed": int(sketch_seed),
+        "max_seq_len": max_seq_len,
+        "bank_left_truncate": bool(bank_left_truncate),
+        "fine_match_proj": fine_match_proj,
+        "last_n_layers": int(last_n_layers),
+        "bank_type": "train_obj_on_fine_attn",
+        "bank_loss_tag": cache_tag,
+        "bank_loss_mode": loss_mode,
+        "model_path": str(model_path) if model_path else None,
+        "retrieval": TRAIN_RETRIEVAL_METHOD,
+        "used_ce_rows": used_ce,
+        "used_cesal_rows": used_cesal,
+        "is_partial": bool(is_partial),
+        "skipped_long": int(skipped_long),
+        "skipped_bad": int(skipped_bad),
+        "truncated_rows": int(truncated_rows),
+        "truncated_edges_kept": int(truncated_edges_kept),
+    }
+
+
 def _left_truncate_train_row_for_bank(
     row_batch: dict,
     edges,
@@ -1738,9 +1840,19 @@ def _load_or_build_saliency_train_bank(
         cache_dir=cache_dir,
         bank_left_truncate=bank_left_truncate,
     )
+    partial_path = _bank_partial_path(cache_path)
+    compat_kw = dict(
+        sketch_dim=sketch_dim,
+        sketch_seed=sketch_seed,
+        fine_match_proj=fine_match_proj,
+        cache_tag=cache_tag,
+        max_seq_len=max_seq_len,
+        bank_left_truncate=bank_left_truncate,
+        last_n_layers=last_n_layers,
+    )
     if os.path.exists(cache_path):
         print(f"Loading saliency train bank: {cache_path}", flush=True)
-        blob = torch.load(cache_path, map_location="cpu")
+        blob = torch.load(cache_path, map_location="cpu", weights_only=False)
         if int(blob.get("sketch_dim", -1)) != int(sketch_dim) or int(blob.get("sketch_seed", -1)) != int(sketch_seed):
             raise RuntimeError(
                 f"Saliency train bank sketch mismatch. Delete {cache_path} and rebuild."
@@ -1763,6 +1875,9 @@ def _load_or_build_saliency_train_bank(
     print(
         f"  Bank objective: {bank_cfg.loss_mode} (tag={bank_cfg.cache_tag}). "
         "First run is slow; later runs reuse this file. "
+        f"Partial checkpoints → {partial_path} every "
+        f"{_bank_checkpoint_every()} rows (EIF_BANK_CHECKPOINT_EVERY). "
+        "Ctrl+C / SIGTERM flushes the partial then continues with it. "
         "Legacy .cache/prescreen_sketch is NOT used.",
         flush=True,
     )
@@ -1795,127 +1910,249 @@ def _load_or_build_saliency_train_bank(
     skipped_bad = 0
     used_cesal = 0
     used_ce = 0
+    done_ids: set[int] = set()
+    if os.path.isfile(partial_path):
+        try:
+            partial = torch.load(partial_path, map_location="cpu")
+        except Exception as exc:
+            print(f"[bank] ignore unreadable partial {partial_path}: {exc}", flush=True)
+            partial = None
+        if partial is not None and _bank_blob_compatible(partial, **compat_kw):
+            ids_t = partial["sample_ids"]
+            sk_t = partial["sketches"]
+            sample_ids = [int(x) for x in ids_t.tolist()]
+            sketch_chunks = [sk_t[i].unsqueeze(0).contiguous() for i in range(sk_t.size(0))]
+            done_ids = set(sample_ids)
+            skipped_long = int(partial.get("skipped_long") or 0)
+            skipped_bad = int(partial.get("skipped_bad") or 0)
+            truncated_rows = int(partial.get("truncated_rows") or 0)
+            truncated_edges_kept = int(partial.get("truncated_edges_kept") or 0)
+            used_ce = int(partial.get("used_ce_rows") or 0)
+            used_cesal = int(partial.get("used_cesal_rows") or 0)
+            print(
+                f"[bank] resume partial {len(sample_ids)} rows from {partial_path}",
+                flush=True,
+            )
+        elif os.path.isfile(partial_path):
+            print(
+                f"[bank][WARN] partial fingerprint mismatch; ignoring {partial_path}",
+                flush=True,
+            )
+
     # OOM retry ladder (full-seq CE+saliency grads are much heavier than training forward).
     _oom_retry_caps = (2048, 1536, 1280, 1024, 768)
+    ckpt_every = _bank_checkpoint_every()
+    last_ckpt_n = len(sample_ids)
+    stop = {"flag": False}
 
-    for batch in tqdm(train_loader, desc="Build Saliency Train Bank", leave=False):
-        train_indices = batch["sample_index"].view(-1).tolist()
-        for row, train_idx in enumerate(train_indices):
-            seq_len = int(batch["attention_mask"][row].sum().item())
-            row_batch_full = {
-                k: v[row:row + 1]
-                for k, v in batch.items()
-                if isinstance(v, torch.Tensor) and k != "sample_index"
-            }
-            edges_full = None
-            if 0 <= int(train_idx) < len(train_samples):
-                edges_full = train_samples[int(train_idx)].get("attention_edges")
+    def _flush_partial(*, reason: str) -> dict | None:
+        if not sample_ids or not sketch_chunks:
+            return None
+        blob = _assemble_bank_cache(
+            sample_ids=sample_ids,
+            sketch_chunks=sketch_chunks,
+            sketch_dim=sketch_dim,
+            sketch_seed=sketch_seed,
+            max_seq_len=max_seq_len,
+            bank_left_truncate=bank_left_truncate,
+            fine_match_proj=fine_match_proj,
+            last_n_layers=last_n_layers,
+            cache_tag=cache_tag,
+            loss_mode=bank_cfg.loss_mode,
+            model_path=model_path,
+            used_ce=used_ce,
+            used_cesal=used_cesal,
+            is_partial=True,
+            skipped_long=skipped_long,
+            skipped_bad=skipped_bad,
+            truncated_rows=truncated_rows,
+            truncated_edges_kept=truncated_edges_kept,
+        )
+        _atomic_torch_save(blob, partial_path)
+        print(
+            f"[bank] {reason}: saved {len(sample_ids)} sketches → {partial_path}",
+            flush=True,
+        )
+        return blob
 
-            if max_seq_len is not None and seq_len > max_seq_len and not bank_left_truncate:
-                skipped_long += 1
-                continue
+    prev_term = signal.getsignal(signal.SIGTERM)
 
-            target_cap = seq_len
-            if max_seq_len is not None:
-                target_cap = min(seq_len, int(max_seq_len))
-            attempt_caps = [int(target_cap)]
-            if bank_left_truncate:
-                for cand in _oom_retry_caps:
-                    if cand < target_cap and cand not in attempt_caps:
-                        attempt_caps.append(int(cand))
+    def _on_term(signum, frame):
+        stop["flag"] = True
+        print(
+            "[bank] SIGTERM — will checkpoint after the current sample "
+            "(second kill -9 cannot save).",
+            flush=True,
+        )
 
-            flat = None
-            edges_used = edges_full
-            seq_used = seq_len
-            did_truncate = False
-            for try_cap in attempt_caps:
-                row_batch, edges_used, dropped = _left_truncate_train_row_for_bank(
-                    row_batch_full, edges_full, int(try_cap)
-                )
-                seq_used = int(row_batch["input_ids"].size(1))
-                if dropped:
-                    did_truncate = True
-                    n_e = 0 if not edges_used else len(edges_used)
-                    print(
-                        f"  [bank] left-truncate train_idx={train_idx}: "
-                        f"{seq_len}→{seq_used} (drop {dropped}; edges kept={n_e})",
-                        flush=True,
-                    )
-                try:
-                    flat = _compute_bank_flat_grad_filtered(
-                        model,
-                        row_batch,
-                        param_filter_fn,
-                        accelerator.device,
-                        cfg=bank_cfg,
-                        edges=edges_used,
-                        special_ids=special_ids,
-                    )
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        prev_term = None
+
+    interrupted = False
+    try:
+        for batch in tqdm(train_loader, desc="Build Saliency Train Bank", leave=False):
+            if stop["flag"]:
+                interrupted = True
+                break
+            train_indices = batch["sample_index"].view(-1).tolist()
+            for row, train_idx in enumerate(train_indices):
+                if stop["flag"]:
+                    interrupted = True
                     break
-                except ImportError:
-                    raise
-                except (torch.OutOfMemoryError, RuntimeError) as exc:
-                    if isinstance(exc, RuntimeError) and not _is_cuda_alloc_error(exc):
-                        raise
-                    _clear_cuda_after_oom()
-                    flat = None
-                    if try_cap == attempt_caps[-1] or not bank_left_truncate:
-                        skipped_bad += 1
-                        print(
-                            f"[WARN] Saliency bank OOM/skip train_idx={train_idx} "
-                            f"seq_len={seq_used}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"[WARN] Saliency bank OOM train_idx={train_idx} "
-                            f"seq_len={seq_used}; retry shorter left-truncate…",
-                            flush=True,
-                        )
+                if int(train_idx) in done_ids:
                     continue
-                finally:
-                    del row_batch
+                seq_len = int(batch["attention_mask"][row].sum().item())
+                row_batch_full = {
+                    k: v[row:row + 1]
+                    for k, v in batch.items()
+                    if isinstance(v, torch.Tensor) and k != "sample_index"
+                }
+                edges_full = None
+                if 0 <= int(train_idx) < len(train_samples):
+                    edges_full = train_samples[int(train_idx)].get("attention_edges")
 
-            if flat is None:
-                continue
-            if flat.numel() == 0:
-                skipped_bad += 1
-                continue
-            if did_truncate:
-                truncated_rows += 1
-                truncated_edges_kept += 0 if not edges_used else len(edges_used)
-            if bank_cfg.loss_mode == "ce_saliency" and edges_used:
-                used_cesal += 1
-            else:
-                used_ce += 1
-            sketch = _project_flat_grad(flat, sketch_dim, sketch_seed).to(torch.float16)
-            sample_ids.append(int(train_idx))
-            sketch_chunks.append(sketch.unsqueeze(0))
-            del flat, sketch, row_batch_full
-            torch.cuda.empty_cache()
+                if max_seq_len is not None and seq_len > max_seq_len and not bank_left_truncate:
+                    skipped_long += 1
+                    continue
+
+                target_cap = seq_len
+                if max_seq_len is not None:
+                    target_cap = min(seq_len, int(max_seq_len))
+                attempt_caps = [int(target_cap)]
+                if bank_left_truncate:
+                    for cand in _oom_retry_caps:
+                        if cand < target_cap and cand not in attempt_caps:
+                            attempt_caps.append(int(cand))
+
+                flat = None
+                edges_used = edges_full
+                seq_used = seq_len
+                did_truncate = False
+                for try_cap in attempt_caps:
+                    row_batch, edges_used, dropped = _left_truncate_train_row_for_bank(
+                        row_batch_full, edges_full, int(try_cap)
+                    )
+                    seq_used = int(row_batch["input_ids"].size(1))
+                    if dropped:
+                        did_truncate = True
+                        n_e = 0 if not edges_used else len(edges_used)
+                        print(
+                            f"  [bank] left-truncate train_idx={train_idx}: "
+                            f"{seq_len}→{seq_used} (drop {dropped}; edges kept={n_e})",
+                            flush=True,
+                        )
+                    try:
+                        flat = _compute_bank_flat_grad_filtered(
+                            model,
+                            row_batch,
+                            param_filter_fn,
+                            accelerator.device,
+                            cfg=bank_cfg,
+                            edges=edges_used,
+                            special_ids=special_ids,
+                        )
+                        break
+                    except ImportError:
+                        raise
+                    except (torch.OutOfMemoryError, RuntimeError) as exc:
+                        if isinstance(exc, RuntimeError) and not _is_cuda_alloc_error(exc):
+                            raise
+                        _clear_cuda_after_oom()
+                        flat = None
+                        if try_cap == attempt_caps[-1] or not bank_left_truncate:
+                            skipped_bad += 1
+                            print(
+                                f"[WARN] Saliency bank OOM/skip train_idx={train_idx} "
+                                f"seq_len={seq_used}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[WARN] Saliency bank OOM train_idx={train_idx} "
+                                f"seq_len={seq_used}; retry shorter left-truncate…",
+                                flush=True,
+                            )
+                        continue
+                    finally:
+                        del row_batch
+
+                if flat is None:
+                    continue
+                if flat.numel() == 0:
+                    skipped_bad += 1
+                    continue
+                if did_truncate:
+                    truncated_rows += 1
+                    truncated_edges_kept += 0 if not edges_used else len(edges_used)
+                if bank_cfg.loss_mode == "ce_saliency" and edges_used:
+                    used_cesal += 1
+                else:
+                    used_ce += 1
+                sketch = _project_flat_grad(flat, sketch_dim, sketch_seed).to(torch.float16)
+                sample_ids.append(int(train_idx))
+                done_ids.add(int(train_idx))
+                sketch_chunks.append(sketch.unsqueeze(0))
+                del flat, sketch, row_batch_full
+                torch.cuda.empty_cache()
+                if len(sample_ids) - last_ckpt_n >= ckpt_every:
+                    _flush_partial(reason=f"checkpoint every {ckpt_every}")
+                    last_ckpt_n = len(sample_ids)
+            if interrupted:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        print("[bank] Ctrl+C — flushing partial bank…", flush=True)
+
+    if prev_term is not None:
+        try:
+            signal.signal(signal.SIGTERM, prev_term)
+        except (ValueError, OSError):
+            pass
+
+    if interrupted:
+        partial_blob = _flush_partial(reason="interrupted")
+        if partial_blob is not None:
+            print(
+                f"[bank] using incomplete bank ({len(sample_ids)} rows). "
+                "Re-run the same command to resume remaining samples.",
+                flush=True,
+            )
+            return partial_blob
+        print("[bank] interrupted with no sketches; nothing to save.", flush=True)
+        raise KeyboardInterrupt
 
     if not sketch_chunks:
         print("[WARN] Saliency train bank empty; cannot retrieve trains by saliency probe.", flush=True)
         return None
 
-    cache = {
-        "sample_ids": torch.tensor(sample_ids, dtype=torch.long),
-        "sketches": torch.cat(sketch_chunks, dim=0).contiguous(),
-        "sketch_dim": int(sketch_dim),
-        "sketch_seed": int(sketch_seed),
-        "max_seq_len": max_seq_len,
-        "bank_left_truncate": bool(bank_left_truncate),
-        "fine_match_proj": fine_match_proj,
-        "last_n_layers": int(last_n_layers),
-        "bank_type": "train_obj_on_fine_attn",
-        "bank_loss_tag": cache_tag,
-        "bank_loss_mode": bank_cfg.loss_mode,
-        "model_path": str(model_path) if model_path else None,
-        "retrieval": TRAIN_RETRIEVAL_METHOD,
-        "used_ce_rows": used_ce,
-        "used_cesal_rows": used_cesal,
-    }
-    torch.save(cache, cache_path)
+    cache = _assemble_bank_cache(
+        sample_ids=sample_ids,
+        sketch_chunks=sketch_chunks,
+        sketch_dim=sketch_dim,
+        sketch_seed=sketch_seed,
+        max_seq_len=max_seq_len,
+        bank_left_truncate=bank_left_truncate,
+        fine_match_proj=fine_match_proj,
+        last_n_layers=last_n_layers,
+        cache_tag=cache_tag,
+        loss_mode=bank_cfg.loss_mode,
+        model_path=model_path,
+        used_ce=used_ce,
+        used_cesal=used_cesal,
+        is_partial=False,
+        skipped_long=skipped_long,
+        skipped_bad=skipped_bad,
+        truncated_rows=truncated_rows,
+        truncated_edges_kept=truncated_edges_kept,
+    )
+    _atomic_torch_save(cache, cache_path)
+    if os.path.isfile(partial_path):
+        try:
+            os.remove(partial_path)
+        except OSError:
+            pass
     if truncated_rows:
         print(
             f"  Bank left-truncated {truncated_rows} long samples "

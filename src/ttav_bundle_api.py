@@ -1803,6 +1803,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             max_scan_i = None
         run_corpus = bool(req.get("runCorpusSearch", True))
         search_local = bool(req.get("searchLocalBank", True))
+        language = str(req.get("language") or "").strip() or None
 
         print(
             f"[llm-train] retrieve gold_chars={len(gold)} prompt_chars={len(fim_prompt)} "
@@ -1820,6 +1821,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 max_corpus_scan=max_scan_i,
                 run_corpus_search=run_corpus,
                 search_local_bank=search_local,
+                language=language,
             )
         except Exception as exc:
             print(f"[llm-train] failed: {exc}", flush=True)

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -167,6 +168,37 @@ def _load_raw_rows(path: Path) -> list[tuple[int, dict[str, Any]]]:
         if isinstance(obj, dict):
             out.append((i, obj))
     return out
+
+
+def _strip_think(text: str) -> str:
+    t = (text or "").replace("\r\n", "\n")
+    t = re.sub(
+        r"^\s*<think>.*?</think>\s*",
+        "",
+        t,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return t.strip()
+
+
+def _gold_and_predict(row: dict[str, Any]) -> tuple[str, str]:
+    gold = _strip_think(
+        str(row.get("label") or row.get("response") or row.get("gold") or "")
+    )
+    pred = _strip_think(
+        str(row.get("predict") or row.get("prediction") or row.get("output") or "")
+    )
+    return gold, pred
+
+
+def _is_mismatch(row: dict[str, Any]) -> bool:
+    gold, pred = _gold_and_predict(row)
+    return bool(gold) and gold != pred
+
+
+def _row_language(row: dict[str, Any], fallback: str = "") -> str:
+    return str(row.get("language") or fallback or "").strip()
 
 
 def _fim_and_gold(row: dict[str, Any]) -> tuple[str, str]:
@@ -322,7 +354,13 @@ class PipelineClient:
             except Exception as exc:
                 print(f"[warn] {name} API {base} may be down: {exc}", flush=True)
 
-    def llm_retrieve(self, fim_prompt: str, gold: str) -> dict[str, Any]:
+    def llm_retrieve(
+        self,
+        fim_prompt: str,
+        gold: str,
+        *,
+        language: str | None = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "fimPrompt": fim_prompt,
             "goldCompletion": gold,
@@ -333,6 +371,9 @@ class PipelineClient:
         }
         if self.corpus_path:
             body["corpusPath"] = self.corpus_path
+        lang = (language or "").strip()
+        if lang:
+            body["language"] = lang
         return _http_json(
             "POST",
             f"{self.eif_url}/api/llm-train-retrieve",
@@ -504,6 +545,7 @@ def process_test_row(
     row: dict[str, Any],
     tight_first: bool,
     state_path: Path | None,
+    language: str = "",
 ) -> None:
     """Find one usable train hit → annotate once → duplicate ``copies_per_hit`` → done."""
     if state.done():
@@ -529,7 +571,11 @@ def process_test_row(
     print(f"  gold_chars={len(gold)} prompt_chars={len(fim)}", flush=True)
 
     try:
-        retrieve = client.llm_retrieve(fim, gold)
+        retrieve = client.llm_retrieve(
+            fim,
+            gold,
+            language=_row_language(row, language) or None,
+        )
     except Exception as exc:
         print(f"  [fail] llm-train-retrieve: {exc}", flush=True)
         state.skipped.append({
@@ -765,6 +811,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override EIF_LLM_TRAIN_CORPUS for search / MID prep",
     )
     p.add_argument(
+        "--language",
+        default="",
+        help="language hint for LLM retrieve (default: row.language, else go)",
+    )
+    p.add_argument(
+        "--mismatches-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="only process rows where stripped label ≠ predict (skip exact matches)",
+    )
+    p.add_argument(
         "--annotate",
         choices=("graphsignal", "llm-semantic", "none"),
         default="graphsignal",
@@ -850,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[apis] eif={client.eif_url} viewer={client.viewer_url}", flush=True)
     print(
         f"[opts] annotate={args.annotate} tight_first={args.tight_first} "
+        f"mismatches_only={args.mismatches_only} language={args.language or '(row/go)'} "
         f"dry_run={args.dry_run} state={state_path}",
         flush=True,
     )
@@ -870,6 +928,13 @@ def main(argv: list[str] | None = None) -> int:
         if test_line in processed:
             print(f"[skip] test line={test_line} already in state", flush=True)
             continue
+        if args.mismatches_only and not _is_mismatch(row):
+            print(
+                f"[skip] test line={test_line} label==predict "
+                f"({row.get('task_id') or ''})",
+                flush=True,
+            )
+            continue
         process_test_row(
             client,
             state,
@@ -877,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
             row=row,
             tight_first=bool(args.tight_first),
             state_path=state_path,
+            language=str(args.language or ""),
         )
 
     _save_state(state_path, state)

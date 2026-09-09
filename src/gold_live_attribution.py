@@ -550,7 +550,8 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
         f"[gold-live] ready trains={len(train_samples)} "
         f"raw_edges={_raw_edge_count(train_samples)} "
         f"bank_rows={int(bank['sample_ids'].numel())} filter={filter_tag} "
-        f"train={train_path}",
+        f"train={train_path}"
+        + (" (partial bank; Stage3 only sees completed rows)" if bank.get("is_partial") else ""),
         flush=True,
     )
     return _SESSION
