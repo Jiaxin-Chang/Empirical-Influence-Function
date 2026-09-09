@@ -729,7 +729,7 @@ function experimentDataPlugin(): Plugin {
 
 // Reverse-proxy remaining /api/* to the EIF bundle API (tokenize / prepare).
 // 127.0.0.1:8766 is often a VS Code forward to a remote uvicorn — probe first.
-const EIF_REPORT_PORT = 5273
+const EIF_REPORT_PORT = Number(process.env.EIF_REPORT_PORT || 5273)
 
 export default defineConfig(async () => {
   const eifApiTarget = await resolveEifApiProxyTarget()

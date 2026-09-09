@@ -798,7 +798,7 @@ def _encode_corpus_row(
         "raw_id": task_id,
         "language": str(raw_row.get("language") or "go"),
         "source_corpus_line": int(line),
-        "source_corpus_path": str(_corpus_path) if _corpus_path else "",
+        "source_corpus_path": str(corpus_path or _corpus_path or ""),
         "attention_edges": [],
         "annotation_meta": meta,
     }
@@ -1989,9 +1989,11 @@ def llm_semantic_annotate_preview(
     line: int,
     body: LlmSemanticAnnotateBody | None = None,
     corpusPath: str = Query(""),
+    language: str = Query(""),
 ):
     """Full-sample LLM attention-routing annotation; preview only."""
     override = corpusPath.strip() or None
+    lang_override = language.strip()
     payload = body or LlmSemanticAnnotateBody()
     from server.corpus_encode import extract_prompt_response
     from server.llm_semantic_annotate import (
@@ -2005,6 +2007,9 @@ def llm_semantic_annotate_preview(
             _read_corpus_raw_row(line, corpus_path=override),
             corpus_path=override,
         )
+        if lang_override:
+            raw_row = dict(raw_row)
+            raw_row["language"] = lang_override
         source_enc = _encode_corpus_row(line, raw_row, corpus_path=override)
         key, _ = _lookup_continue(-1, source_enc)
         tokenizer = _get_tokenizer()
@@ -2012,6 +2017,7 @@ def llm_semantic_annotate_preview(
     print(
         f"[llm-semantic] preview start line={line} "
         f"prompt_chars={len(prompt)} response_chars={len(response)} "
+        f"language={raw_row.get('language') or '-'} "
         f"keys={sorted(str(k) for k in raw_row.keys())[:24]}",
         flush=True,
     )
@@ -2019,6 +2025,7 @@ def llm_semantic_annotate_preview(
         annotated = annotate_corpus_row_semantic(
             raw_row,
             tokenizer,
+            language=str(raw_row.get("language") or "") or None,
             max_sources_per_token=payload.max_sources_per_token,
             max_answer_tokens=payload.max_answer_tokens,
             max_edges=payload.max_edges,

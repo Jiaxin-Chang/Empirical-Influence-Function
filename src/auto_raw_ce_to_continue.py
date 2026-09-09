@@ -201,6 +201,30 @@ def _row_language(row: dict[str, Any], fallback: str = "") -> str:
     return str(row.get("language") or fallback or "").strip()
 
 
+def _norm_fs_path(path: str) -> str:
+    return (path or "").strip().replace("\\", "/").rstrip("/")
+
+
+def _continue_paths_match(expected: str, actual: str) -> bool:
+    """True if viewer continue JSONL is the file we asked to write."""
+    exp = _norm_fs_path(expected)
+    act = _norm_fs_path(actual)
+    if not exp or not act:
+        return False
+    if exp == act or exp.lower() == act.lower():
+        return True
+    el, al = exp.lower(), act.lower()
+    if el.endswith(al) or al.endswith(el):
+        return True
+    e_name, a_name = Path(exp).name.lower(), Path(act).name.lower()
+    e_parent, a_parent = Path(exp).parent.name.lower(), Path(act).parent.name.lower()
+    return bool(e_name) and e_name == a_name and e_parent == a_parent
+
+
+def _viewer_health(viewer_url: str) -> dict[str, Any]:
+    return _http_json("GET", f"{viewer_url.rstrip('/')}/api/health", timeout=10.0)
+
+
 def _fim_and_gold(row: dict[str, Any]) -> tuple[str, str]:
     prompt = str(row.get("prompt") or row.get("input") or "").strip()
     gold = str(
@@ -440,12 +464,19 @@ class PipelineClient:
         *,
         line: int,
         corpus_path: str | None,
+        language: str | None = None,
     ) -> dict[str, Any]:
         if self.dry_run:
             return {"ok": True, "dry_run": True, "n_continue_edges": 0}
 
         cp = corpus_path or self.corpus_path or ""
-        qs = urllib.parse.urlencode({"corpusPath": cp}) if cp else ""
+        q: dict[str, str] = {}
+        if cp:
+            q["corpusPath"] = cp
+        lang = (language or "").strip()
+        if lang:
+            q["language"] = lang
+        qs = urllib.parse.urlencode(q) if q else ""
         base = f"{self.viewer_url}/api/corpus/sample/{int(line)}"
 
         if self.annotate == "none":
@@ -702,6 +733,7 @@ def process_test_row(
                 accept = client.annotate_and_accept(
                     line=cline,
                     corpus_path=hit_corpus,
+                    language=_row_language(row, language),
                 )
                 continue_rows = _duplicate_to_total(
                     client,
@@ -811,6 +843,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override EIF_LLM_TRAIN_CORPUS for search / MID prep",
     )
     p.add_argument(
+        "--continue-path",
+        default="",
+        help=(
+            "require annotation-viewer /api/health continue_path to match this JSONL "
+            "(refuses to run if the viewer would write elsewhere)"
+        ),
+    )
+    p.add_argument(
         "--language",
         default="",
         help="language hint for LLM retrieve (default: row.language, else go)",
@@ -898,6 +938,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     client.ping()
 
+    want_continue = str(args.continue_path or "").strip()
+    if want_continue:
+        try:
+            health = _viewer_health(client.viewer_url)
+        except Exception as exc:
+            print(
+                f"cannot read viewer /api/health at {client.viewer_url}: {exc}\n"
+                f"start annotation-viewer with --continue-data {want_continue}",
+                file=sys.stderr,
+            )
+            return 2
+        actual = str(health.get("continue_path") or "").strip()
+        if not _continue_paths_match(want_continue, actual):
+            print(
+                f"viewer continue_path mismatch.\n"
+                f"  expected: {want_continue}\n"
+                f"  actual:   {actual or '(unset)'}\n"
+                f"Restart annotation-viewer writing to the expected file, e.g.\n"
+                f"  cd tools/annotation-viewer && python -m server.main "
+                f"--continue-data {want_continue}\n"
+                f"If another job already owns :8765, use a new --port and pass "
+                f"--viewer-url. Do not edit a running stack's eif_api.env.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"[continue] viewer writes to {actual}", flush=True)
+
     rows = _load_raw_rows(input_path)
     print(
         f"[input] {input_path} rows={len(rows)} "
@@ -908,6 +975,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[opts] annotate={args.annotate} tight_first={args.tight_first} "
         f"mismatches_only={args.mismatches_only} language={args.language or '(row/go)'} "
+        f"continue_path={want_continue or '(viewer default)'} "
         f"dry_run={args.dry_run} state={state_path}",
         flush=True,
     )

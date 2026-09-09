@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 
-/** Fixed port for annotation-viewer. Fail if busy — do not silently bump. */
-const ANNOTATION_VIEWER_PORT = 5275
+/** Defaults: UI 5275 → API 8765. Override with ANNOTATION_VIEWER_PORT / ANNOTATION_API_PORT. */
+const ANNOTATION_VIEWER_PORT = Number(process.env.ANNOTATION_VIEWER_PORT || 5275)
+const ANNOTATION_API_PORT = Number(process.env.ANNOTATION_API_PORT || 8765)
 
 export default defineConfig({
   plugins: [react()],
@@ -11,7 +12,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8765',
+        target: `http://127.0.0.1:${ANNOTATION_API_PORT}`,
         changeOrigin: true,
       },
     },

@@ -3171,24 +3171,27 @@ export function ReportPanel({
                 return '点击右侧 Gold 答案中的任意 token，现场计算 teacher-force saliency。';
             }
             if (goldBusy && goldTopCorrelations.length === 0) {
-                return '正在计算 Gold saliency…（首次会加载模型/bank，可能较慢）';
+                return '正在计算特征归因（Gold saliency）…（首次会加载模型/bank，可能较慢）';
             }
-            if (goldBusy || goldSelectedCorrIdx === null) {
-                return '正在检索 train + Stage3 matching…';
+            if (goldSelectedCorrIdx === null) {
+                return '特征归因完成。点击左侧一条 source→target saliency 边，再做数据归因（训练检索）。';
+            }
+            if (goldBusy) {
+                return '正在数据归因：检索 train + Stage3 matching…';
             }
             return 'No matching pairs for this gold edge. Try another source→target.';
         }
         if (predictLiveBusy) {
-            return '正在计算 Predict saliency…';
+            return '正在计算特征归因（Predict saliency）…';
         }
         if (predictStage3Busy) {
-            return '正在检索 train + Stage3 matching…';
+            return '正在数据归因：检索 train + Stage3 matching…';
         }
         if (!selectedResult && !(predictLiveTop && predictLiveTop.length > 0)) {
-            return '点击 Model 输出 token，现场计算 saliency 并自动跑梯度归因。';
+            return '点击 Model 输出 token，先做特征归因（top saliency）。再点一条边做数据归因。';
         }
         if (selectedTestCorrIdx === null) {
-            return 'Saliency 已算出，正在准备梯度归因…';
+            return '特征归因完成。点击左侧一条 source→target saliency 边，再做数据归因（训练检索）。';
         }
         if (importedReportActive && allDisplayPairs.length === 0) {
             return 'No training correlation pairs are included for this selected source→target edge.';
@@ -3368,16 +3371,13 @@ export function ReportPanel({
                     absIdx,
                 );
                 setGoldTopCorrelations(top);
+                setGoldBusy(false);
                 if (top.length > 0) {
-                    setGoldSelectedCorrIdx(top[0].source_token_index);
-                    await runLiveStage3({
-                        mode: 'gold',
-                        sourceIndex: top[0].source_token_index,
-                        targetIndex: absIdx,
-                    });
+                    setTtavLaunchStatus(
+                        `Gold 特征归因完成 · ${top.length} sources @ idx ${absIdx} · 点击一条边做数据归因`,
+                    );
                 } else {
                     setTtavLaunchStatus(`Gold saliency ready · 0 sources @ idx ${absIdx}`);
-                    setGoldBusy(false);
                 }
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Gold saliency failed';
@@ -3389,7 +3389,7 @@ export function ReportPanel({
     }, [
         importedReportActive, promptLen, eifApiUrl, selectedMeta.fileName,
         clearGoldLive, clearManualPair, setSelectedTokIdx, attrMode, goldResponseTokens,
-        reportApiPayload, runLiveStage3, correctTokens,
+        reportApiPayload, correctTokens,
     ]);
 
     const handleManualSourceClick = useCallback((idx: number) => {
@@ -3900,13 +3900,13 @@ export function ReportPanel({
                         focus.selectedTokIdx,
                     );
                     setPredictLiveTop(top);
+                    setSelectedTestCorrIdx(null);
+                    setPredictPairs([]);
+                    setPredictTrainDetails({});
                     if (top.length > 0) {
-                        setSelectedTestCorrIdx(top[0].source_token_index);
-                        await runLiveStage3({
-                            mode: 'predict',
-                            sourceIndex: top[0].source_token_index,
-                            targetIndex: focus.selectedTokIdx,
-                        });
+                        setTtavLaunchStatus(
+                            `Predict 特征归因完成 · ${top.length} sources @ idx ${focus.selectedTokIdx} · 点击一条边做数据归因`,
+                        );
                     }
                 } catch (error) {
                     const msg = error instanceof Error ? error.message : 'Predict live saliency failed';
@@ -3933,13 +3933,13 @@ export function ReportPanel({
                     abs,
                 );
                 setGoldTopCorrelations(top);
+                setGoldSelectedCorrIdx(null);
+                setGoldPairs([]);
+                setGoldTrainDetails({});
                 if (top.length > 0) {
-                    setGoldSelectedCorrIdx(top[0].source_token_index);
-                    await runLiveStage3({
-                        mode: 'gold',
-                        sourceIndex: top[0].source_token_index,
-                        targetIndex: abs,
-                    });
+                    setTtavLaunchStatus(
+                        `Gold 特征归因完成 · ${top.length} sources @ idx ${abs} · 点击一条边做数据归因`,
+                    );
                 }
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Gold live saliency failed';
@@ -3974,7 +3974,7 @@ export function ReportPanel({
                 setManualEdgeSaliencyBusy(false);
             }
         }
-    }, [importedReportActive, selectedMeta, fetchLiveSaliency, runLiveStage3, modelTokens, correctTokens]);
+    }, [importedReportActive, selectedMeta, fetchLiveSaliency, modelTokens, correctTokens]);
 
     // Live predict saliency: continued adapter OR raw eval (no precomputed report edges).
     useEffect(() => {
@@ -3985,7 +3985,13 @@ export function ReportPanel({
             return;
         }
         let cancelled = false;
+        liveStage3GenRef.current += 1;
         setPredictLiveBusy(true);
+        setSelectedTestCorrIdx(null);
+        setPredictPairs([]);
+        setPredictTrainDetails({});
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(`Predict live saliency @ ${selectedTokIdx}…`);
         void (async () => {
             try {
                 const parsed = await fetchLiveSaliency({
@@ -4001,18 +4007,16 @@ export function ReportPanel({
                 );
                 setPredictLiveTop(top);
                 if (cancelled) return;
-                if (top.length > 0 && selectedTokIdx != null) {
-                    setSelectedTestCorrIdx(top[0].source_token_index);
-                    await runLiveStage3({
-                        mode: 'predict',
-                        sourceIndex: top[0].source_token_index,
-                        targetIndex: selectedTokIdx,
-                    });
-                }
+                setTtavLaunchStatus(
+                    top.length > 0
+                        ? `Predict 特征归因完成 · ${top.length} sources @ idx ${selectedTokIdx} · 点击一条边做数据归因`
+                        : `Predict saliency ready · 0 sources @ idx ${selectedTokIdx}`,
+                );
             } catch (error) {
                 if (cancelled) return;
                 const msg = error instanceof Error ? error.message : 'Predict live saliency failed';
                 setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
             } finally {
                 if (!cancelled) setPredictLiveBusy(false);
             }
@@ -4020,7 +4024,7 @@ export function ReportPanel({
         return () => { cancelled = true; };
     }, [
         attrMode, selectedTokIdx, continueAdapterActive, rawEvalActive, livePredictOverride,
-        importedReportActive, fetchLiveSaliency, runLiveStage3, modelTokens,
+        importedReportActive, fetchLiveSaliency, modelTokens,
     ]);
 
     // 指定 pair: fetch edge saliency whenever source+target are set.
@@ -5581,7 +5585,7 @@ export function ReportPanel({
                             {attrMode === 'gold' && goldLocalIdx !== null && (
                                 <div className={styles.correlationList}>
                                     <div className={styles.correlationListTitle}>
-                                        Gold live · Top Correlations for "
+                                        Gold 特征归因 · 点击边做数据归因 · "
                                         {decodeToken(goldResponseTokens[goldLocalIdx] ?? '').trim()}"
                                         {' '}@ idx {promptLen + goldLocalIdx}
                                         {goldBusy ? ' …' : ''}
@@ -5619,12 +5623,12 @@ export function ReportPanel({
                             {attrMode === 'predict' && selectedTokIdx != null && (selectedResult || livePredictOverride || rawEvalActive) && (
                                 <div className={styles.correlationList}>
                                     <div className={styles.correlationListTitle}>
-                                        Top Correlations for "{decodeToken(
+                                        特征归因 · 点击边做数据归因 · "{decodeToken(
                                             selectedResult?.target_token
                                             ?? modelTokens[selectedTokIdx]
                                             ?? ''
                                         ).trim()}" @ idx {selectedTokIdx}
-                                        {predictLiveBusy ? ' …' : ''}
+                                        {predictLiveBusy || predictStage3Busy ? ' …' : ''}
                                         {predictLiveTop
                                             ? (rawEvalActive
                                                 ? ' · live(raw)'
@@ -5642,15 +5646,22 @@ export function ReportPanel({
                                                 type="button"
                                                 title={`Select ${formatTokenChip(c.source_token, c.source_display_index ?? c.source_token_index, modelTokens)} → ${formatTokenChip(c.target_token || selectedResult?.target_token || modelTokens[selectedTokIdx] || '')} for train retrieval`}
                                                 className={`${styles.corrBtn} ${c.source_token_index === selectedTestCorrIdx ? styles.corrBtnActive : ''}`}
+                                                disabled={predictLiveBusy || predictStage3Busy}
                                                 onClick={() => {
                                                     setDegradePairs([]);
                                                     setDegradeTrainDetails({});
                                                     if (selectedTestCorrIdx === c.source_token_index) {
+                                                        liveStage3GenRef.current += 1;
                                                         setSelectedTestCorrIdx(null);
                                                         setPredictPairs([]);
                                                         setPredictTrainDetails({});
+                                                        setPredictStage3Busy(false);
                                                         return;
                                                     }
+                                                    setSelectedTestCorrIdx(c.source_token_index);
+                                                    setPredictPairs([]);
+                                                    setPredictTrainDetails({});
+                                                    if (importedReportActive) return;
                                                     void runLiveStage3({
                                                         mode: 'predict',
                                                         sourceIndex: c.source_token_index,

@@ -601,20 +601,33 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: dict):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        except OSError as exc:
+            if getattr(exc, "errno", None) in (32, 104):
+                return
+            raise
 
     def do_OPTIONS(self):
         self._send_json(200, {"status": "ok"})
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path in ("/", "/api/health"):
+            self._send_json(200, {
+                "status": "ok",
+                "server": self.server_version,
+            })
+            return
         if parsed.path == "/api/degradation-retrieve-progress":
             self._send_json(200, {"status": "success", **_get_degrade_progress()})
             return
@@ -2187,7 +2200,7 @@ def _warn_if_loopback_stolen(port: int) -> None:
     from urllib.error import URLError
     from urllib.request import urlopen
 
-    url = f"http://127.0.0.1:{port}/api/raw-eval-files"
+    url = f"http://127.0.0.1:{port}/api/health"
     try:
         with urlopen(url, timeout=1.5) as resp:
             server = resp.headers.get("Server") or ""
