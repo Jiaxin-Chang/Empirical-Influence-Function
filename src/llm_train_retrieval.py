@@ -1,11 +1,7 @@
-"""LLM-based train-sample retrieval for a whole test FIM.
+"""LLM Boolean train-sample retrieval for a whole test FIM.
 
-Two-stage analysis (no attention-edge / annotation design):
-  1) summarize the gold <MID> completion's code pattern
-  2) describe ideal train-sample traits and emit boolean corpus search expressions
-
-Search matches each expression against the full training row text
-(prompt/input + response/label).
+Boolean substring queries only. Structured semantic retrieval lives in
+``src/llm_semantic_retrieval.py`` and uses ``EIF_LLM_SEMANTIC_CORPUS``.
 
 Uses OpenAI-compatible API from repo-root ``eif_api.env``.
 """
@@ -50,11 +46,19 @@ _LANG_PROFILES: dict[str, dict[str, str]] = {
         "example": (
             '("if err :=" OR "if err !=") AND "err != nil {" AND "return" AND "Wrap(err"'
         ),
+        "boolean_extra": (
+            "Go copy_from_context：宽式子不要把 gold 独有标识符当 AND 必选项；"
+            "至少一条 match_in=response。"
+        ),
     },
     "cpp": {
         "name": "C/C++",
         "example": (
             '("TEST_F(" OR "EXPECT_EQ(") AND "SCM_" AND "VOS_OK"'
+        ),
+        "boolean_extra": (
+            "C/C++ copy_from_context：宽式子不要把 gold 独有宏/标识符当 AND 必选项；"
+            "至少一条 match_in=response。"
         ),
     },
     "c": {
@@ -62,12 +66,29 @@ _LANG_PROFILES: dict[str, dict[str, str]] = {
         "example": (
             '("TEST_F(" OR "EXPECT_EQ(") AND "SCM_" AND "VOS_OK"'
         ),
+        "boolean_extra": (
+            "C/C++ copy_from_context：宽式子不要把 gold 独有宏/标识符当 AND 必选项；"
+            "至少一条 match_in=response。"
+        ),
     },
     "java": {
         "name": "Java",
         "example": (
             '("yFormat.format" OR "xFormat.format" OR "numberFormat.format") '
             'AND "else" AND "result["'
+        ),
+        "boolean_extra": (
+            "Java 镜像复用（copy_from_context）Boolean 基线：\n"
+            "1) sibling_line 必须引用题面里被抄的那一行（不要编造）。\n"
+            "2) 宽式子不要把 gold 独有标识符（如 xFormat、result[1]）当作 AND 必选项；"
+            "那些只允许出现在最窄的一条。\n"
+            "3) 至少一条 expression 设 match_in=response。\n"
+            "4) 禁止只用 result[ 或 Copies. 当区分特征。\n"
+            "示例（宽→窄）：\n"
+            '  full: "DateFormat" AND ".format(" AND "else" AND "result["\n'
+            '  full: ("xFormat" OR "yFormat" OR "zFormat" OR "numberFormat") '
+            'AND ".format(" AND "result["\n'
+            '  response: ".format(" AND "result["'
         ),
     },
 }
@@ -267,28 +288,30 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     raise ValueError("LLM response is not valid JSON object")
 
 
-def build_llm_train_retrieve_messages(
+def build_llm_boolean_retrieve_messages(
     *,
     fim_prompt: str,
     gold_completion: str,
     example_expression: str | None = None,
     language: str | None = None,
 ) -> list[dict[str, str]]:
-    """Assemble system + user messages: pattern summary then corpus search."""
+    """Boolean-only: pattern summary + corpus substring expressions."""
     prepared = prepare_llm_train_query(fim_prompt, gold_completion)
     problem = prepared["fim_problem_surface"]
     gold = prepared["gold_mid_completion"]
     profile = _lang_profile(language)
     lang_name = profile["name"]
     example_expr = example_expression or profile["example"]
+    boolean_extra = (profile.get("boolean_extra") or "").strip()
     system = (
         f"你是 {lang_name} 代码补全训练数据检索助手。\n"
         f"用户会给出一条 **{lang_name} FIM 测试题**（Fill-in-the-Middle，"
-        "中间缺失处可能标记为 <MID> 或 <FIM>）"
+        "中间缺失处可能标记为 <MID>、<FIM> 或 [MASK]）"
         "及其 gold 补全（仅挖空处应填写的代码片段）。\n"
         "题面已去除 ChatML 对话包装（不是 system/user/assistant 聊天消息）。\n"
-        "本阶段只做「相关代码模式 → 检索训练样本」，不要设计、不要提及 "
-        "attention_edges、标注、saliency、subtype 或 source→target 边。\n\n"
+        "本阶段只做「相关代码模式 → 布尔子串检索」，不要输出 semantic / domain / "
+        "pattern / relations 等结构化语义字段，也不要提及 attention_edges、"
+        "标注、saliency、subtype 或 source→target 边。\n\n"
         "请分两段思考，并输出**严格 JSON**（不要 markdown 包裹）：\n"
         "第一段：概括这条 FIM 的 gold 回答是什么样的代码格式/模式。\n"
         "第二段：为了让模型学会这种模式，理想训练样本应具备哪些特征；"
@@ -310,7 +333,7 @@ def build_llm_train_retrieve_messages(
         "  ]\n"
         "}\n\n"
         "先判断挖空与题面的关系 hole_relation：\n"
-        '- copy_from_context：gold 是把题面 prefix/suffix 里已经出现的某一行（或对称分支）'
+        "- copy_from_context：gold 是把题面 prefix/suffix 里已经出现的某一行（或对称分支）"
         "改名/换槽位抄过来。例如 suffix 已有 result[2] = this.yFormat.format(y)，"
         "gold 是 result[1] = this.xFormat.format(x)。\n"
         "- compose_local：gold 组合了题面 API，但不是镜像抄写。\n"
@@ -318,21 +341,16 @@ def build_llm_train_retrieve_messages(
         "若 hole_relation=copy_from_context：\n"
         "1) sibling_line 必须引用题面里被抄的那一行（不要编造）。\n"
         "2) 检索目标是「同样在做平行槽位/对称分支复用」的训练题，不是 gold 的字面标识符。\n"
-        "3) 宽式子不要把 gold 独有标识符（如 xFormat、result[1]）当作 AND 必选项；"
-        "那些只允许出现在最窄的一条。\n"
-        "4) 至少一条 expression 设 match_in=response，要求补全本身是 .format( / 镜像赋值，"
-        "避免命中仅有 result[0]=...toString() 的样本。\n"
+        "3) 宽式子不要把 gold 独有标识符当作 AND 必选项；那些只允许出现在最窄的一条。\n"
+        "4) 至少一条 expression 设 match_in=response。\n"
         "5) 禁止只用 result[ 或 Copies. 当区分特征。\n"
-        "Java 镜像复用示例（宽→窄）：\n"
-        '  full: "DateFormat" AND ".format(" AND "else" AND "result["\n'
-        '  full: ("xFormat" OR "yFormat" OR "zFormat" OR "numberFormat") AND ".format(" AND "result["\n'
-        '  response: ".format(" AND "result["\n\n'
-        "corpus_search_expressions 的 expression 语法：\n"
+        + (f"{boolean_extra}\n\n" if boolean_extra else "\n")
+        + "corpus_search_expressions 的 expression 语法：\n"
         '- 字面量用双引号，如 "err != nil {"\n'
         '- OR 连接备选，如 ("if err :=" OR "if err !=")\n'
-        '- AND 连接必须同时出现，如 A AND B AND C\n'
+        "- AND 连接必须同时出现，如 A AND B AND C\n"
         "- 不要给整条 AND 链再包一层最外层括号；括号只用于 OR 分组。\n"
-        'match_in：full=整行 prompt+response（默认）；response=只匹配补全；prompt=只匹配题面。\n'
+        "match_in：full=整行 prompt+response（默认）；response=只匹配补全；prompt=只匹配题面。\n"
         f"- 示例：{example_expr}\n"
         "必须给出 2-5 条 expression，按从宽到窄排序；"
         "只检索代码文本模式，不要检索标注字段。"
@@ -345,15 +363,32 @@ def build_llm_train_retrieve_messages(
         f"{gold}\n\n"
         "请按两段回答：\n"
         "1）这条 gold 是什么样的代码格式/模式？它是不是在抄题面里已经出现的对称行？\n"
-        "2）为了训练模型学会该【复用/镜像】模式，理想训练样本应有哪些特征？"
+        "2）为了训练模型学会该模式，理想训练样本应有哪些特征？"
         "给出 2-5 条从宽到窄的布尔表达式。copy_from_context 时不要用 gold 字面当宽检索，"
         "并至少一条 match_in=response。"
-        "不要讨论标注。"
+        "不要输出结构化 semantic 字段，不要讨论标注。"
     )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+def build_llm_train_retrieve_messages(
+    *,
+    fim_prompt: str,
+    gold_completion: str,
+    example_expression: str | None = None,
+    language: str | None = None,
+    mode: str | None = None,
+) -> list[dict[str, str]]:
+    """Boolean-only. ``mode`` is ignored (kept for old callers)."""
+    return build_llm_boolean_retrieve_messages(
+        fim_prompt=fim_prompt,
+        gold_completion=gold_completion,
+        example_expression=example_expression,
+        language=language,
+    )
 
 
 def _strip_outer_parens(expr: str) -> str:
@@ -642,7 +677,9 @@ def call_llm_train_retrieve(
     model: str | None = None,
     max_tokens: int | None = None,
     language: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
+    del mode  # boolean-only; semantic is src.llm_semantic_retrieval
     client = _build_openai_client()
     model_name = model or _env("ANNOTATE_MODEL") or _env("LLM_RETRIEVE_MODEL") or "qwen-plus"
     mt = max_tokens or int(_env("ANNOTATE_MAX_TOKENS") or "4096")
@@ -661,13 +698,15 @@ def call_llm_train_retrieve(
     if extra:
         kwargs["extra_body"] = extra
     print(
-        f"[llm-train] model={model_name} surface_chars={len(fim_prompt)} "
-        f"gold_chars={len(gold_completion)}",
+        f"[llm-train] boolean model={model_name} "
+        f"surface_chars={len(fim_prompt)} gold_chars={len(gold_completion)}",
         flush=True,
     )
     resp = client.chat.completions.create(**kwargs)
     raw = (resp.choices[0].message.content or "").strip()
     parsed = _parse_json_object(raw)
+    parsed.pop("semantic", None)
+    parsed.pop("semantic_flat_text", None)
     raw_exprs = parsed.get("corpus_search_expressions")
     if isinstance(raw_exprs, list):
         normalized: list[dict[str, Any]] = []
@@ -683,6 +722,7 @@ def call_llm_train_retrieve(
         "raw": raw,
         "analysis": parsed,
         "messages": messages,
+        "retrieve_mode": "boolean",
     }
 
 
@@ -696,7 +736,9 @@ def retrieve_llm_train_samples(
     run_corpus_search: bool = True,
     search_local_bank: bool = True,
     language: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
+    del mode
     if not (fim_prompt or "").strip():
         raise ValueError("fim_prompt is required")
     if not (gold_completion or "").strip():
@@ -712,11 +754,13 @@ def retrieve_llm_train_samples(
         language=language,
     )
     analysis = llm_out.get("analysis") or {}
+    if not isinstance(analysis, dict):
+        analysis = {}
     exprs = analysis.get("corpus_search_expressions") or []
     if not isinstance(exprs, list):
         exprs = []
 
-    corpus = corpus_path or _env("EIF_LLM_TRAIN_CORPUS") or _env("EIF_TRAIN_CORPUS") or ""
+    raw_corpus = corpus_path or _env("EIF_LLM_TRAIN_CORPUS") or _env("EIF_TRAIN_CORPUS") or ""
     search_results: list[dict[str, Any]] = []
 
     for item in exprs:
@@ -728,7 +772,7 @@ def retrieve_llm_train_samples(
         match_in = _normalize_match_in(item.get("match_in"))
         if not expression:
             continue
-        entry: dict[str, Any] = {
+        entry = {
             "name": name,
             "expression": expression,
             "why": why,
@@ -736,16 +780,17 @@ def retrieve_llm_train_samples(
             "corpus_hits": [],
             "local_bank_hits": [],
         }
-        if run_corpus_search and corpus and Path(corpus).is_file():
+        if run_corpus_search and raw_corpus and Path(raw_corpus).is_file():
             try:
                 entry["corpus_hits"] = search_corpus_jsonl(
-                    corpus,
+                    raw_corpus,
                     expression,
                     top_k=top_k,
                     max_scan=max_corpus_scan,
                     match_in=match_in,
                 )
-                entry["corpus_path"] = corpus
+                entry["corpus_path"] = raw_corpus
+                entry["retrieval"] = "boolean"
             except Exception as exc:
                 entry["corpus_error"] = str(exc)
         if search_local_bank:
@@ -754,6 +799,7 @@ def retrieve_llm_train_samples(
 
     return {
         "status": "success",
+        "retrieve_mode": "boolean",
         "query": {
             "fim_prompt_chars": len(fim_prompt),
             "fim_surface_chars": len(prepared["fim_problem_surface"]),
@@ -766,6 +812,6 @@ def retrieve_llm_train_samples(
         "llm": llm_out,
         "analysis": analysis,
         "search_results": search_results,
-        "corpus_path": corpus or None,
+        "corpus_path": raw_corpus or None,
         "local_bank_path": _env("EIF_TRAIN_DATA") or _env("ANNOTATION_TRAIN_DATA") or None,
     }

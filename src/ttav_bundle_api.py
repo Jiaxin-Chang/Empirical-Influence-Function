@@ -721,6 +721,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/llm-train-retrieve":
             self._handle_llm_train_retrieve()
             return
+        if parsed.path == "/api/llm-semantic-retrieve":
+            self._handle_llm_semantic_retrieve()
+            return
         if parsed.path == "/api/llm-corpus-search":
             self._handle_llm_corpus_search()
             return
@@ -1819,8 +1822,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         language = str(req.get("language") or "").strip() or None
 
         print(
-            f"[llm-train] retrieve gold_chars={len(gold)} prompt_chars={len(fim_prompt)} "
-            f"corpus={corpus_path or 'env'}",
+            f"[llm-train] boolean gold_chars={len(gold)} "
+            f"prompt_chars={len(fim_prompt)} corpus={corpus_path or 'env'}",
             flush=True,
         )
         try:
@@ -1838,6 +1841,65 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             print(f"[llm-train] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _handle_llm_semantic_retrieve(self):
+        """Structured semantic attribution + match against EIF_LLM_SEMANTIC_CORPUS."""
+        _hydrate_eif_env()
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        fim_prompt = str(req.get("fimPrompt") or req.get("promptText") or "").strip()
+        gold = str(req.get("goldCompletion") or req.get("goldText") or "").strip()
+        if not fim_prompt or not gold:
+            self._send_json(400, {
+                "status": "error",
+                "message": "fimPrompt and goldCompletion are required",
+            })
+            return
+
+        corpus_path = str(req.get("semanticCorpusPath") or req.get("corpusPath") or "").strip() or None
+        try:
+            top_k = int(req.get("topK", 15) or 15)
+        except (TypeError, ValueError):
+            top_k = 15
+        max_scan = req.get("maxCorpusScan")
+        try:
+            max_scan_i = int(max_scan) if max_scan is not None else None
+        except (TypeError, ValueError):
+            max_scan_i = None
+        run_corpus = bool(req.get("runCorpusSearch", True))
+        language = str(req.get("language") or "").strip() or None
+
+        print(
+            f"[llm-semantic] gold_chars={len(gold)} prompt_chars={len(fim_prompt)} "
+            f"corpus={corpus_path or 'env'}",
+            flush=True,
+        )
+        try:
+            from src.llm_semantic_retrieval import retrieve_llm_semantic_samples
+
+            result = retrieve_llm_semantic_samples(
+                fim_prompt=fim_prompt,
+                gold_completion=gold,
+                corpus_path=corpus_path,
+                top_k=top_k,
+                max_corpus_scan=max_scan_i,
+                run_corpus_search=run_corpus,
+                language=language,
+            )
+        except Exception as exc:
+            print(f"[llm-semantic] failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
             return
         self._send_json(200, result)

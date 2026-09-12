@@ -392,6 +392,7 @@ class PipelineClient:
             # Expressions only here; we search ourselves tight→loose.
             "runCorpusSearch": False,
             "searchLocalBank": False,
+            "mode": "boolean",
         }
         if self.corpus_path:
             body["corpusPath"] = self.corpus_path
@@ -632,6 +633,13 @@ def process_test_row(
             })
             state.processed_test_lines.append(test_line)
             return
+
+    analysis = retrieve.get("analysis") or {}
+    if not isinstance(analysis, dict):
+        analysis = {}
+    summary = str(analysis.get("gold_pattern_summary") or "").strip()
+    if summary:
+        print(f"  gold_pattern_summary={summary[:280]}", flush=True)
 
     exprs = _expr_items(retrieve, tight_first=tight_first)
     if not exprs:

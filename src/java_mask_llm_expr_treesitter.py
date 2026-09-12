@@ -502,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                 gold_completion=gold,
                 model=model,
                 language=language_llm,
+                mode="boolean",
             )
         except Exception as exc:
             print(f"  LLM retrieve fail: {exc}", flush=True)
@@ -517,9 +518,10 @@ def main(argv: list[str] | None = None) -> int:
 
         analysis = retrieve.get("analysis") or {}
         exprs = _expr_items(analysis, tight_first=bool(args.tight_first))
-        summary = str(analysis.get("gold_pattern_summary") or "")[:160]
+        sem = analysis.get("semantic") if isinstance(analysis.get("semantic"), dict) else {}
+        summary = str(sem.get("summary") or analysis.get("gold_pattern_summary") or "")[:160]
         if summary:
-            print(f"  pattern: {summary}", flush=True)
+            print(f"  semantic: {summary}", flush=True)
         if not exprs:
             print("  no expressions from LLM", flush=True)
             processed.add(test_line)

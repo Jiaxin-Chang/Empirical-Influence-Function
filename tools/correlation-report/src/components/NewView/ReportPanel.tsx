@@ -191,6 +191,23 @@ interface DegradeProgress {
     cacheMisses?: number;
 }
 
+interface LlmSemanticRelation {
+    source?: string;
+    target?: string;
+    type?: string;
+}
+
+interface LlmSemanticRepr {
+    role?: string;
+    domain?: string[];
+    pattern?: string[];
+    entities?: string[];
+    operations?: string[];
+    conditions?: string[];
+    relations?: Array<LlmSemanticRelation | string>;
+    summary?: string;
+}
+
 interface LlmTrainSearchHit {
     line?: number;
     task_id?: string;
@@ -201,6 +218,7 @@ interface LlmTrainSearchHit {
     response_preview?: string;
     preview?: string;
     match_region?: 'gold' | 'context' | 'cross' | string;
+    semantic_score?: number;
 }
 
 interface LlmTrainSearchExprResult {
@@ -208,6 +226,7 @@ interface LlmTrainSearchExprResult {
     expression?: string;
     why?: string;
     match_in?: string;
+    retrieval?: string;
     corpus_hits?: LlmTrainSearchHit[];
     local_bank_hits?: LlmTrainSearchHit[];
     corpus_error?: string;
@@ -222,6 +241,7 @@ interface LlmTrainExprItem {
 
 interface LlmTrainRetrieveResult {
     status?: string;
+    retrieve_mode?: 'boolean' | 'semantic' | string;
     analysis?: {
         gold_pattern_summary?: string;
         hole_relation?: string;
@@ -230,12 +250,112 @@ interface LlmTrainRetrieveResult {
         required_code_patterns?: string[];
         ideal_train_sample_traits?: string[];
         corpus_search_expressions?: LlmTrainExprItem[];
+        semantic?: LlmSemanticRepr;
+        semantic_flat_text?: string;
+        retrieve_mode?: 'boolean' | 'semantic' | string;
     };
     search_results?: LlmTrainSearchExprResult[];
     corpus_path?: string | null;
+    semantic_corpus_path?: string | null;
     local_bank_path?: string | null;
+    semantic?: LlmSemanticRepr;
+    semantic_flat_text?: string;
     llm?: { model?: string; raw?: string };
     message?: string;
+}
+
+function formatLlmRelation(rel: LlmSemanticRelation | string): string {
+    if (typeof rel === 'string') return rel;
+    const src = (rel.source || '').trim();
+    const tgt = (rel.target || '').trim();
+    const typ = (rel.type || '').trim();
+    if (src && tgt) return typ ? `${src} -${typ}-> ${tgt}` : `${src} → ${tgt}`;
+    return src || tgt;
+}
+
+function LlmSemanticAttribution({
+    analysis,
+}: {
+    analysis: NonNullable<LlmTrainRetrieveResult['analysis']>;
+}) {
+    const sem = analysis.semantic;
+    const role = (sem?.role || '').trim();
+    const summary = (sem?.summary || '').trim();
+    const chipRow = (label: string, items?: string[]) => {
+        if (!items?.length) return null;
+        return (
+            <div style={{ marginBottom: 6, fontSize: 11, lineHeight: 1.45 }}>
+                <strong style={{ color: '#0f766e' }}>{label}：</strong>
+                {items.join(' · ')}
+            </div>
+        );
+    };
+    const rels = (sem?.relations ?? []).map(formatLlmRelation).filter(Boolean);
+    return (
+        <>
+            {role ? (
+                <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
+                    <strong>role：</strong>
+                    {role}
+                </div>
+            ) : null}
+            {summary ? (
+                <div style={{ marginBottom: 8, lineHeight: 1.45, color: '#334155' }}>
+                    <strong>summary：</strong>
+                    {summary}
+                </div>
+            ) : null}
+            {chipRow('domain', sem?.domain)}
+            {chipRow('pattern', sem?.pattern)}
+            {chipRow('entities', sem?.entities)}
+            {chipRow('operations', sem?.operations)}
+            {chipRow('conditions', sem?.conditions)}
+            {rels.length ? (
+                <div style={{ marginBottom: 8, fontSize: 11, lineHeight: 1.45 }}>
+                    <strong style={{ color: '#9a3412' }}>relations：</strong>
+                    <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
+                        {rels.map((r, i) => (
+                            <li key={`rel-${i}`}>{r}</li>
+                        ))}
+                    </ul>
+                </div>
+            ) : null}
+        </>
+    );
+}
+
+function LlmBooleanAttribution({
+    analysis,
+}: {
+    analysis: NonNullable<LlmTrainRetrieveResult['analysis']>;
+}) {
+    return (
+        <>
+            {analysis.gold_pattern_summary ? (
+                <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
+                    <strong>Gold 模式：</strong>
+                    {analysis.gold_pattern_summary}
+                </div>
+            ) : null}
+            {analysis.hole_relation ? (
+                <div style={{ marginBottom: 6, fontSize: 12, color: '#57534e' }}>
+                    <strong>挖空关系：</strong>
+                    {analysis.hole_relation}
+                    {analysis.sibling_line ? ` · sibling: ${analysis.sibling_line}` : ''}
+                </div>
+            ) : null}
+            {analysis.ideal_train_sample_traits?.length ? (
+                <div style={{ marginBottom: 8 }}>
+                    <strong>理想训练样本：</strong>
+                    <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
+                        {analysis.ideal_train_sample_traits.map((t, i) => (
+                            <li key={`bool-trait-${i}`}>{t}</li>
+                        ))}
+                    </ul>
+                </div>
+            ) : null}
+        </>
+    );
 }
 
 interface PerTokenResult {
@@ -2607,6 +2727,7 @@ export function ReportPanel({
     const [llmTrainResult, setLlmTrainResult] = useState<LlmTrainRetrieveResult | null>(null);
     const [llmTrainPanelOpen, setLlmTrainPanelOpen] = useState(false);
     const [llmTrainExprsOnly, setLlmTrainExprsOnly] = useState(false);
+    const [llmTrainMode, setLlmTrainMode] = useState<'boolean' | 'semantic' | 'semantic-test'>('boolean');
     const [llmTrainActiveExprIdx, setLlmTrainActiveExprIdx] = useState<number | null>(null);
     const [llmTrainExprHits, setLlmTrainExprHits] = useState<Record<number, LlmTrainSearchHit[]>>({});
     const [llmTrainExprSearchBusy, setLlmTrainExprSearchBusy] = useState(false);
@@ -4213,9 +4334,15 @@ export function ReportPanel({
         fetchStructuralPairs(activeQueryEdge);
     }, [structuralAttributionEnabled, activeQueryEdge, fetchStructuralPairs]);
 
-    const fetchLlmTrainRetrieve = useCallback((opts?: { exprsOnly?: boolean }) => {
+    const fetchLlmTrainRetrieve = useCallback((opts?: {
+        kind?: 'boolean' | 'semantic' | 'semantic-test';
+        exprsOnly?: boolean;
+    }) => {
         if (importedReportActive) return;
-        const exprsOnly = Boolean(opts?.exprsOnly);
+        const kind = opts?.kind === 'semantic' || opts?.kind === 'semantic-test'
+            ? opts.kind
+            : 'boolean';
+        const exprsOnly = kind === 'boolean' && Boolean(opts?.exprsOnly);
         const fimPrompt = (
             report.test_sample_baseline.raw_prompt
             || decodeTokens(correctTokens.slice(0, promptLen)).join('')
@@ -4231,6 +4358,7 @@ export function ReportPanel({
         setLlmTrainBusy(true);
         setLlmTrainError(null);
         setLlmTrainPanelOpen(true);
+        setLlmTrainMode(kind);
         setLlmTrainExprsOnly(exprsOnly);
         setLlmTrainActiveExprIdx(null);
         setLlmTrainExprHits({});
@@ -4238,21 +4366,37 @@ export function ReportPanel({
         setLlmTrainExprSearchError(null);
         void (async () => {
             try {
-                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/llm-train-retrieve'), {
+                const isSemantic = kind === 'semantic' || kind === 'semantic-test';
+                const apiPath = isSemantic
+                    ? '/api/llm-semantic-retrieve'
+                    : '/api/llm-train-retrieve';
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, apiPath), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        fimPrompt,
-                        goldCompletion,
-                        topK: 12,
-                        runCorpusSearch: !exprsOnly,
-                        searchLocalBank: !exprsOnly,
-                    }),
+                    body: JSON.stringify(
+                        isSemantic
+                            ? {
+                                fimPrompt,
+                                goldCompletion,
+                                topK: 12,
+                                runCorpusSearch: kind === 'semantic',
+                            }
+                            : {
+                                fimPrompt,
+                                goldCompletion,
+                                topK: 12,
+                                runCorpusSearch: !exprsOnly,
+                                searchLocalBank: !exprsOnly,
+                            },
+                    ),
                 });
                 const raw = await resp.text();
                 let parsed: LlmTrainRetrieveResult = {};
                 if (raw.trim()) {
                     parsed = JSON.parse(raw) as LlmTrainRetrieveResult;
+                }
+                if (isSemantic && parsed.semantic && !parsed.analysis?.semantic) {
+                    parsed.analysis = { ...(parsed.analysis || {}), semantic: parsed.semantic };
                 }
                 if (!resp.ok || parsed.status !== 'success') {
                     throw new Error(
@@ -5751,20 +5895,40 @@ export function ReportPanel({
                                         <button
                                             type="button"
                                             disabled={llmTrainBusy || importedReportActive}
-                                            onClick={() => fetchLlmTrainRetrieve()}
-                                            title="对当前整条测试 FIM + gold：概括 gold 代码模式，再给出从宽到窄的语料检索表达式（本阶段不涉及标注）"
-                                            className={`${styles.ghostBtn}${llmTrainBusy && !llmTrainExprsOnly ? ` ${styles.ghostBtnWait}` : ''}`}
+                                            onClick={() => fetchLlmTrainRetrieve({ kind: 'boolean' })}
+                                            title="Boolean 入口：LLM 生成子串检索式，再从训练语料召回。不跑结构化语义。"
+                                            className={`${styles.ghostBtn}${llmTrainBusy && llmTrainMode === 'boolean' && !llmTrainExprsOnly ? ` ${styles.ghostBtnWait}` : ''}`}
                                         >
-                                            {llmTrainBusy && !llmTrainExprsOnly ? 'LLM 分析中…' : 'LLM 拉训练样本'}
+                                            {llmTrainBusy && llmTrainMode === 'boolean' && !llmTrainExprsOnly
+                                                ? 'Boolean 检索中…'
+                                                : 'Boolean 检索'}
                                         </button>
                                         <button
                                             type="button"
                                             disabled={llmTrainBusy || importedReportActive}
-                                            onClick={() => fetchLlmTrainRetrieve({ exprsOnly: true })}
-                                            title="[调试] 只调 LLM，不检索语料；面板仅展示 corpus_search_expressions"
-                                            className={`${styles.ghostBtn}${llmTrainBusy && llmTrainExprsOnly ? ` ${styles.ghostBtnWait}` : ''}`}
+                                            onClick={() => fetchLlmTrainRetrieve({ kind: 'semantic-test' })}
+                                            title="只对当前 test sample 生成结构化语义 JSON，不检索训练语料"
+                                            className={`${styles.ghostBtn}${llmTrainBusy && llmTrainMode === 'semantic-test' ? ` ${styles.ghostBtnWait}` : ''}`}
                                         >
-                                            {llmTrainBusy && llmTrainExprsOnly ? '取表达式…' : '调试·只看表达式'}
+                                            {llmTrainBusy && llmTrainMode === 'semantic-test' ? 'Semantic 测试中…' : 'Semantic 测试'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={llmTrainBusy || importedReportActive}
+                                            onClick={() => fetchLlmTrainRetrieve({ kind: 'semantic' })}
+                                            title="Semantic 入口：生成结构化语义，再与预处理后的 EIF_LLM_SEMANTIC_CORPUS 匹配。不跑 Boolean Query。"
+                                            className={`${styles.ghostBtn}${llmTrainBusy && llmTrainMode === 'semantic' ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {llmTrainBusy && llmTrainMode === 'semantic' ? 'Semantic 归因中…' : 'Semantic 归因'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={llmTrainBusy || importedReportActive}
+                                            onClick={() => fetchLlmTrainRetrieve({ kind: 'boolean', exprsOnly: true })}
+                                            title="[调试] Boolean 入口只出表达式，不检索语料"
+                                            className={`${styles.ghostBtn}${llmTrainBusy && llmTrainMode === 'boolean' && llmTrainExprsOnly ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {llmTrainBusy && llmTrainMode === 'boolean' && llmTrainExprsOnly ? '取表达式…' : '调试·只看表达式'}
                                         </button>
                                         {llmTrainResult && (
                                             <button
@@ -6063,53 +6227,43 @@ export function ReportPanel({
                                         margin: '8px 12px',
                                         padding: '10px 12px',
                                         borderRadius: 8,
-                                        border: '1px solid #bae6fd',
-                                        background: '#f0f9ff',
+                                        border: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '1px solid #99f6e4' : '1px solid #bae6fd',
+                                        background: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#f0fdfa' : '#f0f9ff',
                                         fontSize: 12,
-                                        color: '#0c4a6e',
-                                        maxHeight: 360,
+                                        color: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#115e59' : '#0c4a6e',
+                                        maxHeight: 480,
                                         overflow: 'auto',
                                     }}>
-                                        <div style={{ fontWeight: 800, marginBottom: 6, color: '#0369a1' }}>
-                                            {llmTrainExprsOnly
-                                                ? 'LLM 表达式（调试 · 未检索语料）'
-                                                : 'LLM 拉训练样本（完整文本布尔检索）'}
+                                        <div style={{
+                                            fontWeight: 800,
+                                            marginBottom: 6,
+                                            color: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#0f766e' : '#0369a1',
+                                        }}>
+                                            {llmTrainMode === 'semantic-test'
+                                                ? 'Semantic 测试（当前 test sample，不检索）'
+                                                : llmTrainMode === 'semantic'
+                                                ? 'Semantic 归因 → 预处理语料检索'
+                                                : llmTrainExprsOnly
+                                                    ? 'Boolean 检索（调试 · 未检索语料）'
+                                                    : 'Boolean 检索'}
                                         </div>
                                         {llmTrainBusy && (
-                                            <div style={{ color: '#0284c7' }}>
-                                                {llmTrainExprsOnly ? '调用大模型，等待表达式…' : '调用大模型分析 FIM + gold…'}
+                                            <div style={{ color: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#0f766e' : '#0284c7' }}>
+                                                {llmTrainMode === 'semantic-test'
+                                                    ? '调用大模型，生成当前样本的结构化语义…'
+                                                    : llmTrainMode === 'semantic'
+                                                    ? '调用大模型生成结构化语义，再检索预处理语料…'
+                                                    : llmTrainExprsOnly
+                                                        ? '调用大模型，等待 Boolean 表达式…'
+                                                        : '调用大模型分析模式并检索…'}
                                             </div>
                                         )}
                                         {llmTrainError && (
                                             <div style={{ color: '#b91c1c' }}>{llmTrainError}</div>
                                         )}
-                                        {llmTrainResult?.analysis && llmTrainExprsOnly && (
+                                        {llmTrainResult?.analysis && llmTrainMode === 'boolean' && llmTrainExprsOnly && (
                                             <>
-                                                {llmTrainResult.analysis.gold_pattern_summary && (
-                                                    <div style={{ marginBottom: 8, lineHeight: 1.45 }}>
-                                                        <strong>Gold 模式：</strong>
-                                                        {llmTrainResult.analysis.gold_pattern_summary}
-                                                    </div>
-                                                )}
-                                                {llmTrainResult.analysis.hole_relation && (
-                                                    <div style={{ marginBottom: 6, fontSize: 12, color: '#57534e' }}>
-                                                        <strong>挖空关系：</strong>
-                                                        {llmTrainResult.analysis.hole_relation}
-                                                        {llmTrainResult.analysis.sibling_line
-                                                            ? ` · sibling: ${llmTrainResult.analysis.sibling_line}`
-                                                            : ''}
-                                                    </div>
-                                                )}
-                                                {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
-                                                    <div style={{ marginBottom: 8 }}>
-                                                        <strong>理想训练样本：</strong>
-                                                        <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
-                                                            {llmTrainResult.analysis.ideal_train_sample_traits.map((t, i) => (
-                                                                <li key={`trait-${i}`}>{t}</li>
-                                                            ))}
-                                                        </ul>
-                                                    </div>
-                                                ) : null}
+                                                <LlmBooleanAttribution analysis={llmTrainResult.analysis} />
                                                 <div style={{ fontSize: 11, color: '#78716c', marginBottom: 6 }}>
                                                     点击表达式 → 在完整训练文本（prompt+response）上检索（每条最多 15 个候选）；点击命中行 → 打开手动标注页
                                                 </div>
@@ -6241,6 +6395,7 @@ export function ReportPanel({
                                                                         >
                                                                             L{h.line}
                                                                             {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                            {h.semantic_score != null ? ` · sem ${h.semantic_score}` : ''}
                                                                             {h.match_region === 'gold'
                                                                                 ? ' · gold命中'
                                                                                 : h.match_region === 'context'
@@ -6284,33 +6439,175 @@ export function ReportPanel({
                                                 )}
                                             </>
                                         )}
-                                        {llmTrainResult?.analysis && !llmTrainExprsOnly && (
+                                        {llmTrainResult?.analysis && llmTrainMode === 'semantic-test' && (
                                             <>
-                                                {llmTrainResult.analysis.gold_pattern_summary && (
-                                                    <div style={{ marginBottom: 6, lineHeight: 1.45 }}>
-                                                        <strong>Gold 模式：</strong>
-                                                        {llmTrainResult.analysis.gold_pattern_summary}
+                                                <LlmSemanticAttribution analysis={llmTrainResult.analysis} />
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: '#0f766e', margin: '8px 0 4px' }}>
+                                                    结构化 JSON
+                                                </div>
+                                                <pre style={{
+                                                    margin: 0,
+                                                    maxHeight: 280,
+                                                    overflow: 'auto',
+                                                    fontSize: 11,
+                                                    whiteSpace: 'pre-wrap',
+                                                    wordBreak: 'break-word',
+                                                    background: '#fff',
+                                                    border: '1px solid #99f6e4',
+                                                    borderRadius: 6,
+                                                    padding: '8px 10px',
+                                                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                                }}>
+                                                    {JSON.stringify(
+                                                        llmTrainResult.analysis.semantic
+                                                        || llmTrainResult.semantic
+                                                        || {},
+                                                        null,
+                                                        2,
+                                                    )}
+                                                </pre>
+                                                {(llmTrainResult.semantic_flat_text
+                                                    || llmTrainResult.analysis.semantic_flat_text) && (
+                                                    <details style={{ marginTop: 8, fontSize: 11 }}>
+                                                        <summary style={{ cursor: 'pointer', color: '#64748b' }}>
+                                                            canonical text（以后 embedding 用这段）
+                                                        </summary>
+                                                        <pre style={{
+                                                            marginTop: 6,
+                                                            maxHeight: 140,
+                                                            overflow: 'auto',
+                                                            fontSize: 10,
+                                                            whiteSpace: 'pre-wrap',
+                                                        }}>
+                                                            {llmTrainResult.semantic_flat_text
+                                                                || llmTrainResult.analysis.semantic_flat_text}
+                                                        </pre>
+                                                    </details>
+                                                )}
+                                                {llmTrainResult.llm?.model && (
+                                                    <div style={{ marginTop: 8, fontSize: 10, color: '#94a3b8' }}>
+                                                        model: {llmTrainResult.llm.model}
                                                     </div>
                                                 )}
-                                                {llmTrainResult.analysis.hole_relation && (
-                                                    <div style={{ marginBottom: 6, fontSize: 12, color: '#57534e' }}>
-                                                        <strong>挖空关系：</strong>
-                                                        {llmTrainResult.analysis.hole_relation}
-                                                        {llmTrainResult.analysis.sibling_line
-                                                            ? ` · sibling: ${llmTrainResult.analysis.sibling_line}`
-                                                            : ''}
+                                                {llmTrainResult.llm?.raw && (
+                                                    <details style={{ marginTop: 8, fontSize: 11 }}>
+                                                        <summary style={{ cursor: 'pointer', color: '#64748b' }}>
+                                                            模型原文
+                                                        </summary>
+                                                        <pre style={{
+                                                            marginTop: 6,
+                                                            maxHeight: 160,
+                                                            overflow: 'auto',
+                                                            fontSize: 10,
+                                                            whiteSpace: 'pre-wrap',
+                                                        }}>
+                                                            {llmTrainResult.llm.raw}
+                                                        </pre>
+                                                    </details>
+                                                )}
+                                            </>
+                                        )}
+                                        {llmTrainResult?.analysis && llmTrainMode === 'semantic' && (
+                                            <>
+                                                <LlmSemanticAttribution analysis={llmTrainResult.analysis} />
+                                                {(llmTrainResult.search_results ?? []).map((sr, idx) => (
+                                                    <div
+                                                        key={`sem-${sr.name ?? 'hit'}-${idx}`}
+                                                        style={{
+                                                            marginTop: 8,
+                                                            paddingTop: 8,
+                                                            borderTop: '1px solid #ccfbf1',
+                                                        }}
+                                                    >
+                                                        <div style={{ fontWeight: 700, color: '#0f766e' }}>
+                                                            {sr.name || 'structured_semantic'}
+                                                            {sr.retrieval ? ` · ${sr.retrieval}` : ''}
+                                                        </div>
+                                                        {sr.why && (
+                                                            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                                                                {sr.why}
+                                                            </div>
+                                                        )}
+                                                        {sr.corpus_error && (
+                                                            <div style={{ color: '#b91c1c', fontSize: 11, marginTop: 4 }}>
+                                                                {sr.corpus_error}
+                                                            </div>
+                                                        )}
+                                                        {(sr.corpus_hits?.length ?? 0) > 0 && (
+                                                            <div style={{ marginTop: 4, fontSize: 11 }}>
+                                                                <strong>语义命中 {sr.corpus_hits?.length}：</strong>
+                                                                {(sr.corpus_hits ?? []).slice(0, 12).map(h => (
+                                                                    <div
+                                                                        key={`sem-hit-${h.line}-${h.task_id}`}
+                                                                        role="button"
+                                                                        tabIndex={0}
+                                                                        onClick={() => handleOpenCorpusAnnotationViewer(
+                                                                            h,
+                                                                            sr.expression,
+                                                                            sr.name,
+                                                                        )}
+                                                                        onKeyDown={ev => {
+                                                                            if (ev.key === 'Enter' || ev.key === ' ') {
+                                                                                ev.preventDefault();
+                                                                                handleOpenCorpusAnnotationViewer(
+                                                                                    h,
+                                                                                    sr.expression,
+                                                                                    sr.name,
+                                                                                );
+                                                                            }
+                                                                        }}
+                                                                        style={{
+                                                                            marginLeft: 8,
+                                                                            marginTop: 2,
+                                                                            padding: '2px 4px',
+                                                                            borderRadius: 3,
+                                                                            cursor: 'pointer',
+                                                                            background: '#ecfeff',
+                                                                        }}
+                                                                    >
+                                                                        L{h.line}
+                                                                        {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                        {h.semantic_score != null ? ` · sem ${h.semantic_score}` : ''}
+                                                                        {h.response_preview
+                                                                            ? ` · ${h.response_preview.slice(0, 80)}`
+                                                                            : ''}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                                {llmTrainResult.semantic_corpus_path && (
+                                                    <div style={{ marginTop: 8, fontSize: 10, color: '#94a3b8' }}>
+                                                        semantic corpus: {llmTrainResult.semantic_corpus_path}
                                                     </div>
                                                 )}
-                                                {llmTrainResult.analysis.ideal_train_sample_traits?.length ? (
-                                                    <div style={{ marginBottom: 8 }}>
-                                                        <strong>理想训练样本：</strong>
-                                                        <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
-                                                            {llmTrainResult.analysis.ideal_train_sample_traits.map((t, i) => (
-                                                                <li key={`full-trait-${i}`}>{t}</li>
-                                                            ))}
-                                                        </ul>
+                                                {llmTrainResult.llm?.model && (
+                                                    <div style={{ marginTop: 8, fontSize: 10, color: '#94a3b8' }}>
+                                                        model: {llmTrainResult.llm.model}
                                                     </div>
-                                                ) : null}
+                                                )}
+                                                {llmTrainResult.llm?.raw && (
+                                                    <details style={{ marginTop: 8, fontSize: 11 }}>
+                                                        <summary style={{ cursor: 'pointer', color: '#64748b' }}>
+                                                            raw JSON
+                                                        </summary>
+                                                        <pre style={{
+                                                            marginTop: 6,
+                                                            maxHeight: 160,
+                                                            overflow: 'auto',
+                                                            fontSize: 10,
+                                                            whiteSpace: 'pre-wrap',
+                                                        }}>
+                                                            {llmTrainResult.llm.raw}
+                                                        </pre>
+                                                    </details>
+                                                )}
+                                            </>
+                                        )}
+                                        {llmTrainResult?.analysis && llmTrainMode === 'boolean' && !llmTrainExprsOnly && (
+                                            <>
+                                                <LlmBooleanAttribution analysis={llmTrainResult.analysis} />
                                                 {(llmTrainResult.search_results ?? []).map((sr, idx) => (
                                                     <div
                                                         key={`${sr.name ?? 'expr'}-${idx}`}
@@ -6323,6 +6620,7 @@ export function ReportPanel({
                                                         <div style={{ fontWeight: 700, color: '#075985' }}>
                                                             {sr.name || `expr${idx + 1}`}
                                                             {sr.match_in && sr.match_in !== 'full' ? ` · ${sr.match_in}` : ''}
+                                                            {sr.retrieval ? ` · ${sr.retrieval}` : ''}
                                                         </div>
                                                         <code style={{ fontSize: 11, wordBreak: 'break-all' }}>
                                                             {sr.expression}
@@ -6375,6 +6673,7 @@ export function ReportPanel({
                                                                     >
                                                                         L{h.line}
                                                                         {h.task_id ? ` · ${h.task_id}` : ''}
+                                                                        {h.semantic_score != null ? ` · sem ${h.semantic_score}` : ''}
                                                                         {h.match_region === 'gold'
                                                                             ? ' · gold'
                                                                             : h.match_region === 'context'
