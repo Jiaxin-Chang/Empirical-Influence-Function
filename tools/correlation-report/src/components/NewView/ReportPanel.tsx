@@ -3171,21 +3171,21 @@ export function ReportPanel({
                 return '点击右侧 Gold 答案中的任意 token，现场计算 teacher-force saliency。';
             }
             if (goldBusy && goldTopCorrelations.length === 0) {
-                return '正在计算特征归因（Gold saliency）…（首次会加载模型/bank，可能较慢）';
+                return '正在计算特征归因（Gold saliency）…（首次只加载模型，不算 bank）';
             }
             if (goldSelectedCorrIdx === null) {
-                return '特征归因完成。点击左侧一条 source→target saliency 边，再做数据归因（训练检索）。';
+                return '特征归因完成。点击左侧一条 source→target saliency 边，再做数据归因（此时才会加载/构建 train bank）。';
             }
             if (goldBusy) {
-                return '正在数据归因：检索 train + Stage3 matching…';
+                return '正在数据归因：加载 bank + 检索 train + Stage3 matching…';
             }
             return 'No matching pairs for this gold edge. Try another source→target.';
         }
         if (predictLiveBusy) {
-            return '正在计算特征归因（Predict saliency）…';
+            return '正在计算特征归因（Predict saliency）…（首次只加载模型，不算 bank）';
         }
         if (predictStage3Busy) {
-            return '正在数据归因：检索 train + Stage3 matching…';
+            return '正在数据归因：加载 bank + 检索 train + Stage3 matching…';
         }
         if (!selectedResult && !(predictLiveTop && predictLiveTop.length > 0)) {
             return '点击 Model 输出 token，先做特征归因（top saliency）。再点一条边做数据归因。';

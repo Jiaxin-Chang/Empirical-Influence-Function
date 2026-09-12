@@ -564,7 +564,7 @@ def retrieve_degradation(
     """Rank train saliency edges by contrib = −cos(∇f, ∇L_sal(edge))."""
     from src.gold_live_attribution import (
         _completion_tokens_and_ids,
-        _ensure_session,
+        _ensure_bank,
         infer_sample_id_from_report,
     )
     from src.NIF import build_single_sample_dataset
@@ -573,7 +573,7 @@ def retrieve_degradation(
     if compare == "live":
         raise ValueError("degradation retrieve needs compareFamily=ce|base|saliency, not live.")
 
-    session = _ensure_session(report)
+    session = _ensure_bank(report)
     model = session["model"]
     tokenizer = session["tokenizer"]
     device = session["device"]

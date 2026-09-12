@@ -2,9 +2,9 @@
 
 Three stages (same math as intervention_experiment, completion = gold):
 
-1. ``gold_saliency_top_k`` — last-layer ALTI top sources for a gold target token
-2. ``gold_retrieve_trains`` — bank Top-K trains via sketched L_probe gradient
-3. ``gold_stage3_pairs`` — Stage3 ∇C matching on those trains
+1. ``gold_saliency_top_k`` — last-layer ALTI top sources (model only; no train bank)
+2. ``gold_retrieve_and_stage3`` — load/build bank, then Top-K trains + Stage3 ∇C matching
+3. Bank is built on first gradient retrieve, not on token-click saliency.
 
 Configure paths in repo-root ``eif_api.env`` (see ``eif_api.env.example``).
 """
@@ -387,39 +387,23 @@ class _DummyAccelerator:
 
 
 def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
+    """Load the live model for feature attribution. Does **not** build the train bank."""
     global _SESSION
     _hydrate_eif_env()
     model_path, base_path = _resolve_model_paths(report)
-    train_path = _resolve_train_data()
-    train_stamp = _file_stamp(train_path)
+    try:
+        train_path = _resolve_train_data()
+        train_key = str(train_path)
+    except (ValueError, FileNotFoundError):
+        train_path = None
+        train_key = ""
     key = (
         os.path.abspath(model_path),
         os.path.abspath(base_path) if base_path else "",
-        str(train_path),
+        train_key,
     )
     if _SESSION is not None and _SESSION.get("key") == key:
         ensure_peft_lora_dtype(_SESSION["model"], torch.bfloat16)
-        if _SESSION.get("train_stamp") != train_stamp:
-            print(
-                f"[gold-live] train JSONL changed on disk ({train_path}); "
-                f"reloading samples without reloading the model",
-                flush=True,
-            )
-            samples = load_train_samples(str(train_path))
-            _SESSION["train_samples"] = samples
-            _SESSION["train_stamp"] = train_stamp
-            _SESSION["train_detail_cache"] = {}
-            print(
-                f"[gold-live] reloaded trains={len(samples)} "
-                f"raw_edges={_raw_edge_count(samples)} path={train_path}",
-                flush=True,
-            )
-            _warn_train_path_mismatch(train_path)
-            print(
-                "[gold-live][WARN] saliency train bank may still match the old JSONL; "
-                "degrade pair scan uses the reloaded samples.",
-                flush=True,
-            )
         return _SESSION
 
     print(f"[gold-live] loading model adapter={model_path} base={base_path or '-'}", flush=True)
@@ -442,6 +426,65 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
     else:
         param_filter = make_attention_projection_filter(model, last_n, FINE_MATCH_PROJ)
         filter_tag = f"fineattn_{FINE_MATCH_PROJ}_L{last_n}"
+
+    marker = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    _SESSION = {
+        "key": key,
+        "model": model,
+        "tokenizer": tokenizer,
+        "device": device,
+        "param_filter": param_filter,
+        "filter_tag": filter_tag,
+        "last_n_layers": last_n,
+        "bank": None,
+        "bank_cfg": None,
+        "train_samples": None,
+        "collator": None,
+        "marker_ids": marker,
+        "model_path": model_path,
+        "base_path": base_path,
+        "train_path": train_key,
+        "train_stamp": _file_stamp(train_path) if train_path is not None else "",
+        "train_detail_cache": {},
+    }
+    print(
+        f"[gold-live] model ready filter={filter_tag} "
+        f"(train bank deferred until gradient retrieve)",
+        flush=True,
+    )
+    return _SESSION
+
+
+def _ensure_bank(report: dict[str, Any]) -> dict[str, Any]:
+    """Load/build the saliency train bank. Called only for gradient retrieve (Stage3)."""
+    session = _ensure_session(report)
+    train_path = _resolve_train_data()
+    train_stamp = _file_stamp(train_path)
+    bank = session.get("bank")
+    if (
+        bank is not None
+        and session.get("train_path") == str(train_path)
+        and session.get("train_stamp") == train_stamp
+        and session.get("train_samples")
+        and session.get("collator") is not None
+        and session.get("bank_cfg") is not None
+    ):
+        return session
+
+    model = session["model"]
+    tokenizer = session["tokenizer"]
+    device = session["device"]
+    param_filter = session["param_filter"]
+    filter_tag = session["filter_tag"]
+    last_n = int(session.get("last_n_layers") or FINE_MATCH_LAST_N_LAYERS)
+    model_path = session["model_path"]
+
+    if session.get("train_path") == str(train_path) and session.get("train_stamp") != train_stamp:
+        print(
+            f"[gold-live] train JSONL changed on disk ({train_path}); "
+            f"reloading samples and bank without reloading the model",
+            flush=True,
+        )
 
     bank_override = (os.environ.get("EIF_BANK_LOSS_MODE") or "").strip() or None
     from src.eif_adapter_env import (
@@ -502,7 +545,7 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
                 f"falling back to cache/build under {SALIENCY_TRAIN_BANK_CACHE_DIR}",
                 flush=True,
             )
-        print("[gold-live] load/build saliency train bank (may be slow on first call)…", flush=True)
+        print("[gold-live] load/build saliency train bank (may be slow on first retrieve)…", flush=True)
         bank = _load_or_build_saliency_train_bank(
             model,
             train_ds,
@@ -525,36 +568,23 @@ def _ensure_session(report: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Failed to load/build saliency train bank.")
 
     prepare_last_layer_grad_checkpointing(model)
-
-    marker = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
-    _SESSION = {
-        "key": key,
-        "model": model,
-        "tokenizer": tokenizer,
-        "device": device,
-        "param_filter": param_filter,
-        "filter_tag": filter_tag,
-        "bank": bank,
-        "bank_cfg": bank_cfg,
-        "train_samples": train_samples,
-        "collator": base_collator,
-        "marker_ids": marker,
-        "model_path": model_path,
-        "base_path": base_path,
-        "train_path": str(train_path),
-        "train_stamp": train_stamp,
-        "train_detail_cache": {},
-    }
+    session["bank"] = bank
+    session["bank_cfg"] = bank_cfg
+    session["train_samples"] = train_samples
+    session["collator"] = base_collator
+    session["train_path"] = str(train_path)
+    session["train_stamp"] = train_stamp
+    session["train_detail_cache"] = {}
     _warn_train_path_mismatch(train_path)
     print(
-        f"[gold-live] ready trains={len(train_samples)} "
+        f"[gold-live] bank ready trains={len(train_samples)} "
         f"raw_edges={_raw_edge_count(train_samples)} "
         f"bank_rows={int(bank['sample_ids'].numel())} filter={filter_tag} "
         f"train={train_path}"
         + (" (partial bank; Stage3 only sees completed rows)" if bank.get("is_partial") else ""),
         flush=True,
     )
-    return _SESSION
+    return session
 
 
 def _completion_tokens_and_ids(
@@ -931,11 +961,13 @@ def gold_retrieve_and_stage3(
     prompt_len_override: int | None = None,
 ) -> dict[str, Any]:
     """Stage 2+3 for one saliency edge (gold teacher-force or predict completion)."""
-    session = _ensure_session(report)
+    session = _ensure_bank(report)
     model = session["model"]
     tokenizer = session["tokenizer"]
     device = session["device"]
     bank = session["bank"]
+    if bank is None:
+        raise RuntimeError("Saliency train bank is not available after _ensure_bank.")
     n_trains = max(1, int(top_trains if top_trains is not None else _env_int("EIF_GOLD_TOP_TRAINS", 10)))
     # Defensive: shared unlearn/probs paths can leave LoRA in float32.
     ensure_peft_lora_dtype(model, torch.bfloat16)
