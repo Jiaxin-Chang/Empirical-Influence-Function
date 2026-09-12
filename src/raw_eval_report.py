@@ -2,11 +2,11 @@
 
 Layout under ``correlation_matching_results``::
 
-    raw_ce/*.jsonl   → report_family=ce        → EIF_ADAPTER_PATH_CE
-    raw_sa/*.jsonl   → report_family=saliency   → EIF_ADAPTER_PATH_SALIENCY
+    raw_ce/*.jsonl    → report_family=ce        → EIF_ADAPTER_PATH_CE
+    raw_sal/*.jsonl   → report_family=saliency  → EIF_ADAPTER_PATH_SALIENCY
 
-Legacy ``raw/`` is still listed (family unknown / must set meta) but new data
-should go in ``raw_ce`` / ``raw_sa``.
+``raw_sa/`` is still accepted as a legacy alias of ``raw_sal/``.
+Legacy ``raw/`` is listed only for resolve (family unknown).
 """
 
 from __future__ import annotations
@@ -22,28 +22,29 @@ RawFamily = Literal["ce", "saliency"]
 # folder name → adapter family
 RAW_FAMILY_DIRS: dict[str, RawFamily] = {
     "raw_ce": "ce",
-    "raw_sa": "saliency",
+    "raw_sal": "saliency",
+    "raw_sa": "saliency",  # legacy alias of raw_sal
 }
-# Legacy unscoped folder (prefer migrating files into raw_ce / raw_sa).
+# Legacy unscoped folder (prefer migrating files into raw_ce / raw_sal).
 RAW_LEGACY_DIR = "raw"
-ALL_RAW_DIRS: tuple[str, ...] = ("raw_ce", "raw_sa", RAW_LEGACY_DIR)
+ALL_RAW_DIRS: tuple[str, ...] = ("raw_ce", "raw_sal", "raw_sa", RAW_LEGACY_DIR)
 
 
 def family_from_raw_relpath(file_name: str) -> RawFamily | None:
-    """Return ce/saliency from ``raw_ce/foo.jsonl`` / ``raw_sa/foo.jsonl``."""
+    """Return ce/saliency from ``raw_ce/foo.jsonl`` / ``raw_sal/foo.jsonl``."""
     rel = (file_name or "").strip().replace("\\", "/").lstrip("/")
     top = rel.split("/", 1)[0].lower() if rel else ""
     return RAW_FAMILY_DIRS.get(top)
 
 
 def resolve_raw_jsonl(corr_results_dir: Path, file_name: str) -> Path | None:
-    """Resolve ``raw_ce/foo.jsonl``, ``raw_sa/foo.jsonl``, or legacy ``raw/foo.jsonl``."""
+    """Resolve ``raw_ce/foo.jsonl``, ``raw_sal/foo.jsonl``, or legacy ``raw/foo.jsonl``."""
     rel = (file_name or "").strip().replace("\\", "/").lstrip("/")
     if not rel or ".." in rel.split("/"):
         return None
     parts = [p for p in rel.split("/") if p]
     if len(parts) == 1:
-        # Bare filename: search raw_ce → raw_sa → raw
+        # Bare filename: search raw_ce → raw_sal → raw_sa → raw
         name = parts[0]
         if not name.lower().endswith(".jsonl"):
             return None
@@ -86,7 +87,7 @@ def list_raw_jsonl_files(corr_results_dir: Path) -> list[dict[str, Any]]:
                             n += 1
             except OSError:
                 continue
-            tag = "CE" if family == "ce" else "SA"
+            tag = "CE" if family == "ce" else "SAL"
             out.append({
                 "fileName": f"{folder}/{path.name}",
                 "label": f"[{tag}] {path.stem}",
@@ -207,11 +208,11 @@ def build_raw_eval_report(
     family = report_family or family_from_raw_relpath(rel)
     if family is None:
         raise ValueError(
-            f"raw file must live under raw_ce/ or raw_sa/ (got {rel!r}). "
+            f"raw file must live under raw_ce/ or raw_sal/ (got {rel!r}). "
             "Move the JSONL out of legacy raw/."
         )
-    if not rel.startswith(("raw_ce/", "raw_sa/")):
-        rel = f"{'raw_ce' if family == 'ce' else 'raw_sa'}/{Path(rel).name}"
+    if not rel.startswith(("raw_ce/", "raw_sal/", "raw_sa/")):
+        rel = f"{'raw_ce' if family == 'ce' else 'raw_sal'}/{Path(rel).name}"
 
     tok = tokenizer or _load_tokenizer()
     # Shared prompt ids so Model/Gold share the same prompt_len boundary.
@@ -236,7 +237,7 @@ def build_raw_eval_report(
 
     task_id = str(row.get("task_id") or f"row_{line_no}")
     n_answer = len(pred_ans_ids)
-    family_tag = "ce" if family == "ce" else "sa"
+    family_tag = "ce" if family == "ce" else "sal"
     return {
         "experiment_meta": {
             "test_sample_index": int(line_no),

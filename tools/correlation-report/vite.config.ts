@@ -10,8 +10,12 @@ const DATA_ROOT          = resolve(__dirname, '../../')
 const MODEL_COMPARE_DIR  = resolve(DATA_ROOT, 'legacy_by_model_sample')
 const CORR_RESULTS_DIR   = resolve(DATA_ROOT, 'correlation_matching_results')
 const REAL_BUNDLE_DIR    = resolve(DATA_ROOT, 'ttav_bundles_real')
-const RAW_FAMILY_DIRS: Record<string, 'ce' | 'saliency'> = { raw_ce: 'ce', raw_sa: 'saliency' }
-const ALL_RAW_DIRS = ['raw_ce', 'raw_sa', 'raw'] as const
+const RAW_FAMILY_DIRS: Record<string, 'ce' | 'saliency'> = {
+  raw_ce: 'ce',
+  raw_sal: 'saliency',
+  raw_sa: 'saliency',
+}
+const ALL_RAW_DIRS = ['raw_ce', 'raw_sal', 'raw_sa', 'raw'] as const
 const EIF_API_PORT = Number(process.env.EIF_API_PORT || 8766)
 const JSONL_CHUNK = 1024 * 1024
 const JSONL_LINE_CAP = 64 * 1024 * 1024
@@ -55,7 +59,7 @@ function listRawJsonlFiles(): Record<string, unknown>[] {
       } catch {
         continue
       }
-      const tag = family === 'ce' ? 'CE' : 'SA'
+      const tag = family === 'ce' ? 'CE' : 'SAL'
       out.push({
         fileName: `${folder}/${name}`,
         label: `[${tag}] ${name.replace(/\.jsonl$/i, '')}`,

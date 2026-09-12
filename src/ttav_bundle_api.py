@@ -1223,7 +1223,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if path is None:
             self._send_json(404, {"status": "error", "message": f"raw jsonl not found: {file_name}"})
             return
-        # Preserve caller folder (raw_ce / raw_sa); fall back from resolved path.
+        # Preserve caller folder (raw_ce / raw_sal); fall back from resolved path.
         rel = file_name.replace("\\", "/").lstrip("/")
         if "/" not in rel:
             parent = path.parent.name.lower()

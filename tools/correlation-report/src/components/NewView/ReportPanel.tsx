@@ -344,7 +344,7 @@ function stemFromSource(sourceName: string): string {
 
 function isRawEvalPath(fileName: string | undefined | null): boolean {
     const p = (fileName || '').replace(/\\/g, '/');
-    return p.startsWith('raw_ce/') || p.startsWith('raw_sa/') || p.startsWith('raw/');
+    return p.startsWith('raw_ce/') || p.startsWith('raw_sal/') || p.startsWith('raw_sa/') || p.startsWith('raw/');
 }
 
 function buildImportedMeta(report: AllTokensReport, sourceName: string): AllTokensExperimentMeta {
@@ -2453,10 +2453,10 @@ function inferContinueAdapterFamily(
     const rel = String(fileName || '').replace(/\\/g, '/').replace(/^\.\//, '');
     const top = rel.split('/')[0]?.toLowerCase() || '';
     if (top === 'ce' || top === 'raw_ce') return 'ce';
-    if (top === 'saliency' || top === 'raw_sa') return 'saliency';
+    if (top === 'saliency' || top === 'raw_sal' || top === 'raw_sa') return 'saliency';
     const low = rel.toLowerCase();
     if (low.includes('ce_only') || low.startsWith('ce_') || low.includes('raw_ce')) return 'ce';
-    if (low.includes('saliency') || low.includes('cesal') || low.includes('raw_sa')) return 'saliency';
+    if (low.includes('saliency') || low.includes('cesal') || low.includes('raw_sal') || low.includes('raw_sa')) return 'saliency';
     return 'unknown';
 }
 

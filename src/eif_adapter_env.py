@@ -4,8 +4,9 @@ Reports live under::
 
     correlation_matching_results/ce/*.json
     correlation_matching_results/saliency/*.json
-    correlation_matching_results/raw_ce/*.jsonl   # live CE LoRA
-    correlation_matching_results/raw_sa/*.jsonl   # live saliency LoRA
+    correlation_matching_results/raw_ce/*.jsonl    # live CE LoRA
+    correlation_matching_results/raw_sal/*.jsonl   # live saliency LoRA
+    correlation_matching_results/raw_sa/*.jsonl    # legacy alias of raw_sal
 
 Env (see ``eif_api.env.example``)::
 
@@ -25,7 +26,7 @@ from typing import Any, Literal
 ReportFamily = Literal["ce", "saliency", "unknown"]
 
 _FAMILY_DIRS = ("ce", "saliency")
-_RAW_FAMILY_DIRS = ("raw_ce", "raw_sa", "raw")
+_RAW_FAMILY_DIRS = ("raw_ce", "raw_sal", "raw_sa", "raw")
 
 
 def normalize_report_relpath(report_file_name: str) -> str:
@@ -58,14 +59,14 @@ def infer_report_family(
     top = rel.split("/", 1)[0].lower()
     if top in ("ce", "raw_ce"):
         return "ce"
-    if top in ("saliency", "raw_sa"):
+    if top in ("saliency", "raw_sal", "raw_sa"):
         return "saliency"
 
     # Legacy flat filenames: guess from stem tags.
     low = rel.lower()
     if "ce_only" in low or "/ce/" in f"/{low}" or low.startswith("ce_"):
         return "ce"
-    if "saliency" in low or "cesal" in low or "/raw_sa/" in f"/{low}":
+    if "saliency" in low or "cesal" in low or "/raw_sal/" in f"/{low}" or "/raw_sa/" in f"/{low}":
         return "saliency"
     return "unknown"
 

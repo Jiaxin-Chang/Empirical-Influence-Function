@@ -230,7 +230,7 @@ def _resolve_model_paths(report: dict[str, Any]) -> tuple[str, str | None]:
         str(meta.get("report_file") or meta.get("fileName") or ""),
         report,
     )
-    # Raw CE/SA folders must pin the env LoRA even if a continue-train override
+    # Raw CE/SAL folders must pin the env LoRA even if a continue-train override
     # is active (otherwise raw_ce could silently use a saliency continue adapter).
     if meta.get("raw_eval"):
         env_model = env_adapter_path_for_family(family).strip()

@@ -181,7 +181,7 @@ export function NewView({ metas }: Props) {
             const data = normalizeAllTokensReport(parsed.report);
             const taskId = data.experiment_meta.task_id || `line_${line}`;
             const family = data.experiment_meta.report_family;
-            const familyTag = family === 'ce' ? 'CE' : family === 'saliency' ? 'SA' : 'raw';
+            const familyTag = family === 'ce' ? 'CE' : family === 'saliency' ? 'SAL' : 'raw';
             const meta: AllTokensExperimentMeta = {
                 taskId,
                 label: `[${familyTag}] ${fileName} · L${line}`,
@@ -318,6 +318,9 @@ export function NewView({ metas }: Props) {
     const canPrev = !rawBusy && sampleIdx > 0;
     const canNext = !rawBusy && sampleIdx >= 0 && sampleIdx < rawRows.length - 1;
     const displayError = rawError || slot.error;
+    const ceRawFiles = rawFiles.filter(f => f.reportFamily === 'ce' || f.folder === 'raw_ce');
+    const salRawFiles = rawFiles.filter(f => f.reportFamily === 'saliency' || f.folder === 'raw_sal' || f.folder === 'raw_sa');
+    const otherRawFiles = rawFiles.filter(f => !ceRawFiles.includes(f) && !salRawFiles.includes(f));
 
     const goDelta = (delta: number) => {
         if (rawBusy || rawRows.length === 0) return;
@@ -339,7 +342,25 @@ export function NewView({ metas }: Props) {
                             onChange={e => setRawFile(e.target.value)}
                         >
                     {rawFiles.length === 0 && <option value="">暂无 JSONL</option>}
-                            {rawFiles.map(f => (
+                            {ceRawFiles.length > 0 && (
+                                <optgroup label="raw_ce · CE 测试结果 · 从 CE adapter 续训">
+                                    {ceRawFiles.map(f => (
+                                        <option key={f.fileName} value={f.fileName}>
+                                            {f.label} · {f.nRows}
+                                        </option>
+                                    ))}
+                                </optgroup>
+                            )}
+                            {salRawFiles.length > 0 && (
+                                <optgroup label="raw_sal · SAL 测试结果 · 从 sal adapter 续训">
+                                    {salRawFiles.map(f => (
+                                        <option key={f.fileName} value={f.fileName}>
+                                            {f.label} · {f.nRows}
+                                        </option>
+                                    ))}
+                                </optgroup>
+                            )}
+                            {otherRawFiles.map(f => (
                                 <option key={f.fileName} value={f.fileName}>
                                     {f.label} · {f.nRows}
                                 </option>
