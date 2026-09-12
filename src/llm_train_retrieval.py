@@ -269,7 +269,7 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
-    raw = _strip_code_fence(text)
+    raw = _strip_code_fence(_strip_thinking_blocks(text))
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
@@ -286,6 +286,76 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
     raise ValueError("LLM response is not valid JSON object")
+
+
+_JSON_RETRY_USER = (
+    "Your previous reply was not a valid JSON object. "
+    "Return STRICT JSON only: no markdown, no commentary, no code fences, "
+    "no thinking tags. The entire reply must start with { and end with }."
+)
+
+
+def _json_max_attempts() -> int:
+    raw = _env("LLM_JSON_MAX_ATTEMPTS") or "3"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 3
+    return max(1, min(n, 8))
+
+
+def _chat_complete_json(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    extra_body: dict[str, Any] | None = None,
+    temperature: float = 0.2,
+    max_attempts: int | None = None,
+    log_prefix: str = "[llm]",
+) -> tuple[str, dict[str, Any]]:
+    """Call chat.completions and parse a JSON object; retry on invalid JSON."""
+    attempts = _json_max_attempts() if max_attempts is None else max(1, min(int(max_attempts), 8))
+    convo = list(messages)
+    last_err: Exception | None = None
+    last_raw = ""
+    for i in range(attempts):
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": convo,
+            "temperature": temperature if i == 0 else min(0.7, temperature + 0.2 * i),
+            "max_tokens": max_tokens,
+        }
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        print(f"{log_prefix} json_attempt={i + 1}/{attempts}", flush=True)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            last_raw = (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_err = exc
+            print(f"{log_prefix} api error attempt={i + 1}/{attempts}: {exc}", flush=True)
+            continue
+        try:
+            parsed = _parse_json_object(last_raw)
+            if i:
+                print(f"{log_prefix} recovered JSON on attempt={i + 1}", flush=True)
+            return last_raw, parsed
+        except ValueError as exc:
+            last_err = exc
+            preview = last_raw.replace("\n", " ")[:240] or "(empty)"
+            print(
+                f"{log_prefix} invalid JSON attempt={i + 1}/{attempts}: {preview}",
+                flush=True,
+            )
+            convo = list(convo) + [
+                {"role": "assistant", "content": last_raw or "(empty)"},
+                {"role": "user", "content": _JSON_RETRY_USER},
+            ]
+    raise ValueError(
+        f"LLM response is not valid JSON object after {attempts} attempts"
+    ) from last_err
 
 
 def build_llm_boolean_retrieve_messages(
@@ -688,23 +758,21 @@ def call_llm_train_retrieve(
         gold_completion=gold_completion,
         language=language,
     )
-    kwargs: dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": mt,
-    }
     extra = _extra_body()
-    if extra:
-        kwargs["extra_body"] = extra
     print(
         f"[llm-train] boolean model={model_name} "
         f"surface_chars={len(fim_prompt)} gold_chars={len(gold_completion)}",
         flush=True,
     )
-    resp = client.chat.completions.create(**kwargs)
-    raw = (resp.choices[0].message.content or "").strip()
-    parsed = _parse_json_object(raw)
+    raw, parsed = _chat_complete_json(
+        client,
+        model=model_name,
+        messages=messages,
+        max_tokens=mt,
+        extra_body=extra or None,
+        temperature=0.2,
+        log_prefix="[llm-train]",
+    )
     parsed.pop("semantic", None)
     parsed.pop("semantic_flat_text", None)
     raw_exprs = parsed.get("corpus_search_expressions")

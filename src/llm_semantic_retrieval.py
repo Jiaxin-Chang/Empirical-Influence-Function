@@ -31,9 +31,9 @@ from src.fim_semantic_schema import (
 )
 from src.llm_train_retrieval import (
     _build_openai_client,
+    _chat_complete_json,
     _env,
     _extra_body,
-    _parse_json_object,
     prepare_llm_train_query,
 )
 
@@ -73,7 +73,11 @@ def build_llm_semantic_messages(
         "conditions/relations/operations should reuse that same phrase, not SecurityToken / sessionToken / tok.\n"
         "- Do not paste the same phrase into both pattern and operations. "
         "pattern = transferable mechanism; operations = actions the hole performs.\n"
-        "- Prefer lowercase multi-word phrases (2-6 words) for role, pattern, entities, and operations.\n\n"
+        "- Prefer lowercase multi-word phrases (2-6 words) for role, pattern, entities, and operations.\n"
+        "- Look at the code AFTER the hole. If the hole feeds, enables, or guards a later step, "
+        "that later step MUST appear in relations (and usually in role).\n"
+        "- role, pattern, and operations must be different: role = this hole's job; "
+        "pattern = mechanism class reusable across programs; operations = concrete actions.\n\n"
         "Return STRICT JSON (no markdown) with exactly these keys:\n"
         "{\n"
         '  "role": "short semantic role of the missing span",\n'
@@ -95,31 +99,41 @@ def build_llm_semantic_messages(
         '- Example: "propagate a credential into request metadata before request signing"\n'
         '- Other examples: "error handling and early exit"; "initialize a required dependency before use"\n\n'
         "domain:\n"
-        "- 2-4 coarse domains such as HTTP, authentication, AWS, database, concurrency, file I/O.\n"
-        "- Do not use overly specific labels such as \"AWS Signature Version 4 authentication\".\n\n"
+        "- 2-4 coarse domains of the HOLE itself, not every topic in the whole function.\n"
+        "- Valid: HTTP, authentication, AWS, database, concurrency, file I/O.\n"
+        "- Do not add authentication just because an earlier permission check exists.\n"
+        "- Do not use overly specific labels such as \"AWS Signature Version 4 authentication\".\n"
+        "- Avoid filler domains such as \"API calls\" or \"data handling\" unless that is the hole's actual domain.\n\n"
         "pattern:\n"
-        "- Describe transferable behavioral mechanisms at a stable granularity.\n"
+        "- A mechanism class, NOT a restatement of role or operations.\n"
         '- Valid: "conditional credential propagation", "request metadata injection", '
-        '"configuration-driven request modification", "resource initialization before use", '
-        '"error-driven early return".\n'
+        '"consume stream then parse", "error-driven early return", '
+        '"resource initialization before use".\n'
         '- Invalid: "if statement", "header set", "function call", '
-        '"propagate authentication credentials" vs "credential injection into request metadata" '
-        "as two names for the same mechanism — pick one stable phrase.\n\n"
+        '"read request body into variable for processing" (that is a role, not a pattern), '
+        '"set header field" (too syntactic).\n'
+        "- If a credential/token is injected into a request, prefer "
+        "\"conditional credential propagation\" over generic \"conditional header injection\".\n\n"
         "entities:\n"
         "- 3-8 semantically important entities related to the hole.\n"
-        '- Prefer concepts such as "security token", "HTTP request", "authentication credential".\n'
-        "- Avoid dumping local variable names (s, r, k, h, sig) or gold literals.\n\n"
+        '- Prefer concepts such as "security token", "HTTP request", "request body", "parsed form".\n'
+        "- Not entities: local variables, Go type names (Keys struct), or processes "
+        "(\"error handling\", \"request context\") unless they are real objects.\n\n"
         "operations:\n"
-        "- 1-4 meaningful semantic actions of the hole, plus a strongly related following action when it matters.\n"
-        '- Prefer "propagate credential to request header" over "call Header.Set".\n'
-        "- API names may be included only when the API itself carries important domain meaning.\n\n"
+        "- 1-4 actions of the hole, plus one following action when the suffix depends on it.\n"
+        '- Prefer "propagate credential to request header" over "set header field" or "call Header.Set".\n'
+        "- Do not copy role into operations.\n\n"
         "conditions:\n"
-        "- 0-3 meaningful execution conditions that trigger the hole.\n"
-        '- Example: "security token is present".\n'
-        '- Do not output generic syntax such as "inside an if statement".\n\n'
+        "- 0-3 real guards. Empty is better than tautology.\n"
+        '- Good: "security token is present"; "database create failed".\n'
+        '- Bad: "request body needs to be processed"; "inside an if statement".\n\n'
         "relations:\n"
         "- This is the most important retrieval field.\n"
-        "- Emit 1-3 relations that involve the missing span when a dependency exists; otherwise [].\n"
+        "- Emit 1-3 relations. Prefer: (1) data into/out of the hole, "
+        "(2) how the hole affects the NEXT statement in the suffix.\n"
+        "- Example pair for signing: "
+        '{"source":"security token","target":"HTTP request header","type":"dataflow"} and '
+        '{"source":"header injection","target":"request signing","type":"semantic_dependency"}.\n'
         "- source and target MUST be semantic concepts, not identifiers (not k.SecurityToken / r.Header).\n"
         '- Example: {"source":"security token","target":"HTTP request header","type":"dataflow"}\n'
         "- type MUST be one of:\n"
@@ -137,7 +151,9 @@ def build_llm_semantic_messages(
         "- One concise English sentence for humans and auxiliary rerank, NOT the primary retrieval key.\n"
         "- Answer: what does the missing code do, under what condition, using what data, "
         "and with what effect on the surrounding computation?\n"
-        "- Do not simply summarize the whole function.\n\n"
+        "- Do not simply summarize the whole function.\n"
+        "- Forbidden in summary: header names, string literals, API identifiers from gold "
+        "(no X-Amz-Security-Token, Header.Set, ioutil.ReadAll).\n\n"
         "Do NOT output:\n"
         "- hole_relation, sibling_line, Boolean queries, corpus_search_expressions, "
         "keyword-search strings, or source code from the gold fill."
@@ -176,23 +192,21 @@ def call_llm_semantic_analyze(
         gold_completion=gold_completion,
         language=language,
     )
-    kwargs: dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": mt,
-    }
     extra = _extra_body()
-    if extra:
-        kwargs["extra_body"] = extra
     print(
         f"[llm-semantic] model={model_name} surface_chars={len(fim_prompt)} "
         f"gold_chars={len(gold_completion)}",
         flush=True,
     )
-    resp = client.chat.completions.create(**kwargs)
-    raw = (resp.choices[0].message.content or "").strip()
-    parsed = _parse_json_object(raw)
+    raw, parsed = _chat_complete_json(
+        client,
+        model=model_name,
+        messages=messages,
+        max_tokens=mt,
+        extra_body=extra or None,
+        temperature=0.2,
+        log_prefix="[llm-semantic]",
+    )
     sem = normalize_semantic_repr(parsed)
     return {
         "model": model_name,
