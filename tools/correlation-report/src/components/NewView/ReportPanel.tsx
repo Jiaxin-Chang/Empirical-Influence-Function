@@ -4381,8 +4381,8 @@ export function ReportPanel({
                             ? {
                                 fimPrompt,
                                 goldCompletion,
-                                topK: 12,
-                                runCorpusSearch: kind === 'semantic',
+                                topK: 10,
+                                runCorpusSearch: true,
                             }
                             : {
                                 fimPrompt,
@@ -5910,7 +5910,7 @@ export function ReportPanel({
                                             type="button"
                                             disabled={llmTrainBusy || importedReportActive}
                                             onClick={() => fetchLlmTrainRetrieve({ kind: 'semantic-test' })}
-                                            title="只对当前 test sample 生成结构化语义 JSON，不检索训练语料"
+                                            title="生成当前 test 的结构化语义，检索 Top-10，点击命中打开标注页"
                                             className={`${styles.ghostBtn}${llmTrainBusy && llmTrainMode === 'semantic-test' ? ` ${styles.ghostBtnWait}` : ''}`}
                                         >
                                             {llmTrainBusy && llmTrainMode === 'semantic-test' ? 'Semantic 测试中…' : 'Semantic 测试'}
@@ -6243,7 +6243,7 @@ export function ReportPanel({
                                             color: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#0f766e' : '#0369a1',
                                         }}>
                                             {llmTrainMode === 'semantic-test'
-                                                ? 'Semantic 测试（当前 test sample，不检索）'
+                                                ? 'Semantic 测试 → Top-10 命中（点击进入标注页）'
                                                 : llmTrainMode === 'semantic'
                                                 ? 'Semantic 归因 → 预处理语料检索'
                                                 : llmTrainExprsOnly
@@ -6253,7 +6253,7 @@ export function ReportPanel({
                                         {llmTrainBusy && (
                                             <div style={{ color: (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') ? '#0f766e' : '#0284c7' }}>
                                                 {llmTrainMode === 'semantic-test'
-                                                    ? '调用大模型，生成当前样本的结构化语义…'
+                                                    ? '生成结构化语义并检索 Top-10…'
                                                     : llmTrainMode === 'semantic'
                                                     ? '调用大模型生成结构化语义，再检索预处理语料…'
                                                     : llmTrainExprsOnly
@@ -6448,6 +6448,9 @@ export function ReportPanel({
                                                 <div style={{ fontSize: 11, fontWeight: 700, color: '#0f766e', margin: '8px 0 4px' }}>
                                                     结构化 JSON
                                                 </div>
+                                                <div style={{ fontSize: 11, color: '#0f766e', marginBottom: 4 }}>
+                                                    下方 Top-10 命中可点击，进入标注页
+                                                </div>
                                                 <pre style={{
                                                     margin: 0,
                                                     maxHeight: 280,
@@ -6510,9 +6513,11 @@ export function ReportPanel({
                                                 )}
                                             </>
                                         )}
-                                        {llmTrainResult?.analysis && llmTrainMode === 'semantic' && (
+                                        {llmTrainResult?.analysis && (llmTrainMode === 'semantic' || llmTrainMode === 'semantic-test') && (
                                             <>
-                                                <LlmSemanticAttribution analysis={llmTrainResult.analysis} />
+                                                {llmTrainMode === 'semantic' && (
+                                                    <LlmSemanticAttribution analysis={llmTrainResult.analysis} />
+                                                )}
                                                 {(llmTrainResult.search_results ?? []).map((sr, idx) => (
                                                     <div
                                                         key={`sem-${sr.name ?? 'hit'}-${idx}`}
@@ -6525,6 +6530,9 @@ export function ReportPanel({
                                                         <div style={{ fontWeight: 700, color: '#0f766e' }}>
                                                             {sr.name || 'structured_semantic'}
                                                             {sr.retrieval ? ` · ${sr.retrieval}` : ''}
+                                                        </div>
+                                                        <div style={{ fontSize: 11, color: '#0f766e', marginTop: 2 }}>
+                                                            Top-10 候选，点击一行打开标注页
                                                         </div>
                                                         {sr.why && (
                                                             <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
@@ -6539,7 +6547,7 @@ export function ReportPanel({
                                                         {(sr.corpus_hits?.length ?? 0) > 0 && (
                                                             <div style={{ marginTop: 4, fontSize: 11 }}>
                                                                 <strong>语义命中 {sr.corpus_hits?.length}：</strong>
-                                                                {(sr.corpus_hits ?? []).slice(0, 12).map(h => (
+                                                                {(sr.corpus_hits ?? []).slice(0, 10).map(h => (
                                                                     <div
                                                                         key={`sem-hit-${h.line}-${h.task_id}`}
                                                                         role="button"

@@ -310,7 +310,7 @@ def search_embed_then_rerank(
     corpus_path: str,
     query_sem: dict[str, Any] | None,
     *,
-    top_k: int = 12,
+    top_k: int = 10,
     recall_k: int | None = None,
     embed_model: str | None = None,
 ) -> list[dict[str, Any]]:

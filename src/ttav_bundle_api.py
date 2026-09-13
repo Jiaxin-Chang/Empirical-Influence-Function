@@ -1870,9 +1870,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
         corpus_path = str(req.get("semanticCorpusPath") or req.get("corpusPath") or "").strip() or None
         try:
-            top_k = int(req.get("topK", 15) or 15)
+            top_k = int(req.get("topK", 10) or 10)
         except (TypeError, ValueError):
-            top_k = 15
+            top_k = 10
         max_scan = req.get("maxCorpusScan")
         try:
             max_scan_i = int(max_scan) if max_scan is not None else None
