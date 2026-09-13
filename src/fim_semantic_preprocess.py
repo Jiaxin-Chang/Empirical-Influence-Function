@@ -12,10 +12,11 @@ Semantic retrieval uses this script's output (schema JSON, optional embeddings):
       -o /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl \\
       --language go
 
-    # optional second pass
+    # Stage-1 embeddings (mechanism-weighted text). Re-run after more LLM rows.
     python -m src.fim_semantic_preprocess \\
       --embed-only \\
-      -o /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl
+      -o /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl \\
+      --embed-model text-embedding-v3
 
 Then in eif_api.env::
 
@@ -128,20 +129,14 @@ def _write_row(out_path: Path, row: dict[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _embed_texts(texts: list[str], *, model: str) -> list[list[float]]:
-    from src.llm_train_retrieval import _build_openai_client
-
-    client = _build_openai_client()
-    resp = client.embeddings.create(model=model, input=texts)
-    by_idx = {int(item.index): list(item.embedding) for item in resp.data}
-    return [by_idx[i] for i in range(len(texts))]
-
-
 def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
     try:
         import numpy as np
     except ImportError as exc:
         raise RuntimeError("pip install numpy") from exc
+
+    from src.fim_semantic_index import embed_texts, embedding_meta_path, embedding_npz_path
+    from src.fim_semantic_schema import EMBED_TEXT_KIND, flatten_semantic_text_for_embedding
 
     rows: list[dict[str, Any]] = []
     with out_path.open(encoding="utf-8") as fh:
@@ -152,16 +147,13 @@ def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
             obj = json.loads(line)
             if isinstance(obj, dict):
                 rows.append(obj)
-    texts = [str(r.get("semantic_flat_text") or r.get("summary") or "").strip() for r in rows]
+    texts = [flatten_semantic_text_for_embedding(r) for r in rows]
     vectors: list[list[float]] = []
     source_lines: list[int] = []
     for start in range(0, len(rows), max(1, batch)):
         chunk_rows = rows[start : start + batch]
-        chunk_texts = [
-            t or "empty semantic representation"
-            for t in texts[start : start + batch]
-        ]
-        vecs = _embed_texts(chunk_texts, model=model)
+        chunk_texts = texts[start : start + batch]
+        vecs = embed_texts(chunk_texts, model=model)
         vectors.extend(vecs)
         for r in chunk_rows:
             try:
@@ -171,13 +163,13 @@ def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
         print(f"  embedded {min(start + batch, len(rows))}/{len(rows)}", flush=True)
 
     arr = np.asarray(vectors, dtype="float32")
-    npz_path = out_path.with_suffix(out_path.suffix + ".embeddings.npz")
+    npz_path = embedding_npz_path(out_path)
     np.savez_compressed(
         npz_path,
         vectors=arr,
         source_lines=np.asarray(source_lines, dtype="int64"),
     )
-    meta_path = out_path.with_suffix(out_path.suffix + ".embeddings.meta.json")
+    meta_path = embedding_meta_path(out_path)
     meta_path.write_text(
         json.dumps(
             {
@@ -186,13 +178,15 @@ def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
                 "dim": int(arr.shape[1]) if arr.ndim == 2 else 0,
                 "npz": str(npz_path),
                 "semantic_jsonl": str(out_path),
+                "text": EMBED_TEXT_KIND,
+                "pipeline": "embed_recall+struct_rerank",
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    print(f"wrote {npz_path} shape={arr.shape}", flush=True)
+    print(f"wrote {npz_path} shape={arr.shape} text={EMBED_TEXT_KIND}", flush=True)
     return 0
 
 

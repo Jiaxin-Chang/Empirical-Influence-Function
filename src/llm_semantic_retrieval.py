@@ -14,13 +14,16 @@ Query and train preprocessing share one schema::
       "summary": "..."
     }
 
-Structured fields are the retrieval signal. ``summary`` is for display and
-auxiliary embedding. Canonical text from ``flatten_semantic_text`` is what
-should be embedded later — not raw JSON and not summary alone.
+Structured fields are the retrieval signal. ``summary`` is for display.
+Canonical display text is ``flatten_semantic_text``. Dense recall embeds
+``flatten_semantic_text_for_embedding`` (pattern/relations repeated; no domain/summary).
+Retrieval is two-stage when ``*.embeddings.npz`` exists: embedding coarse recall,
+then structured rerank. Otherwise falls back to full schema scan.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -224,11 +227,52 @@ def search_semantic_corpus_jsonl(
     top_k: int = 20,
     max_scan: int | None = None,
     min_score: float = 0.01,
+    recall_k: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank preprocessed semantic JSONL rows against a query representation."""
+    """Two-stage retrieve when embeddings exist; else full schema scan."""
+    from src.fim_semantic_index import embedding_npz_path, search_embed_then_rerank
+
     path = Path(corpus_path)
     if not path.is_file():
         raise FileNotFoundError(f"semantic corpus not found: {corpus_path}")
+    npz = embedding_npz_path(path)
+    if npz.is_file():
+        try:
+            hits = search_embed_then_rerank(
+                str(path),
+                query_sem,
+                top_k=top_k,
+                recall_k=recall_k,
+            )
+            print(
+                f"[llm-semantic] pipeline=embed_recall+struct_rerank "
+                f"hits={len(hits)} npz={npz} "
+                f"relation_align={hits[0].get('relation_align') if hits else ''}",
+                flush=True,
+            )
+            return hits
+        except Exception as exc:
+            print(
+                f"[llm-semantic] embed recall failed ({exc}); fallback schema scan",
+                flush=True,
+            )
+    return _search_semantic_schema_scan(
+        path,
+        query_sem,
+        top_k=top_k,
+        max_scan=max_scan,
+        min_score=min_score,
+    )
+
+
+def _search_semantic_schema_scan(
+    path: Path,
+    query_sem: dict[str, Any] | None,
+    *,
+    top_k: int = 20,
+    max_scan: int | None = None,
+    min_score: float = 0.01,
+) -> list[dict[str, Any]]:
     q = normalize_semantic_repr(query_sem if isinstance(query_sem, dict) else {})
     scored: list[tuple[float, int, dict[str, Any]]] = []
     scanned = 0
@@ -265,12 +309,14 @@ def search_semantic_corpus_jsonl(
                 "response_preview": str(row.get("response_preview") or "")[:200],
                 "summary": str(doc.get("summary") or "")[:240],
                 "pattern": list(doc.get("pattern") or [])[:6],
+                "retrieval": "schema_scan",
             }
             scored.append((score, idx, hit))
     scored.sort(key=lambda x: (-x[0], x[1]))
     hits = [row for _, _, row in scored[: max(1, top_k)]]
     for h in hits:
         h["scanned_rows"] = scanned
+    print(f"[llm-semantic] pipeline=schema_scan hits={len(hits)} scanned={scanned}", flush=True)
     return hits
 
 
@@ -304,7 +350,7 @@ def retrieve_llm_semantic_samples(
     entry: dict[str, Any] = {
         "name": "structured_semantic",
         "expression": flatten_semantic_text(sem)[:500],
-        "why": "schema-to-schema match on EIF_LLM_SEMANTIC_CORPUS",
+        "why": "embed recall + relations/pattern rerank on EIF_LLM_SEMANTIC_CORPUS",
         "match_in": "semantic",
         "corpus_hits": [],
         "local_bank_hits": [],
@@ -313,13 +359,24 @@ def retrieve_llm_semantic_samples(
     if run_corpus_search:
         if semantic_corpus and Path(semantic_corpus).is_file():
             try:
-                entry["corpus_hits"] = search_semantic_corpus_jsonl(
+                hits = search_semantic_corpus_jsonl(
                     semantic_corpus,
                     sem,
                     top_k=top_k,
                     max_scan=max_corpus_scan,
                 )
+                entry["corpus_hits"] = hits
                 entry["semantic_corpus_path"] = semantic_corpus
+                pipe = ""
+                if hits:
+                    pipe = str(hits[0].get("retrieval") or "")
+                if pipe:
+                    entry["retrieval"] = pipe
+                    if pipe == "schema_scan":
+                        entry["why"] = (
+                            "schema-to-schema scan (no embeddings.npz / embed failed). "
+                            "Run: python -m src.fim_semantic_preprocess --embed-only"
+                        )
             except Exception as exc:
                 entry["corpus_error"] = str(exc)
         else:

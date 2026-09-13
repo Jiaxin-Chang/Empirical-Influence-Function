@@ -219,6 +219,9 @@ interface LlmTrainSearchHit {
     preview?: string;
     match_region?: 'gold' | 'context' | 'cross' | string;
     semantic_score?: number;
+    struct_score?: number;
+    embed_score?: number;
+    retrieval?: string;
 }
 
 interface LlmTrainSearchExprResult {
@@ -6568,6 +6571,8 @@ export function ReportPanel({
                                                                         L{h.line}
                                                                         {h.task_id ? ` · ${h.task_id}` : ''}
                                                                         {h.semantic_score != null ? ` · sem ${h.semantic_score}` : ''}
+                                                                        {h.struct_score != null ? ` · struct ${h.struct_score}` : ''}
+                                                                        {h.embed_score != null ? ` · emb ${h.embed_score}` : ''}
                                                                         {h.response_preview
                                                                             ? ` · ${h.response_preview.slice(0, 80)}`
                                                                             : ''}
