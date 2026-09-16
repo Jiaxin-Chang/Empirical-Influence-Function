@@ -102,21 +102,13 @@ def _already_done(out_path: Path) -> set[int]:
     done: set[int] = set()
     if not out_path.is_file():
         return done
-    with out_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(row, dict):
-                continue
-            try:
-                done.add(int(row.get("source_line")))
-            except (TypeError, ValueError):
-                continue
+    from src.fim_semantic_index import iter_jsonl_dicts
+
+    for _lineno, row in iter_jsonl_dicts(out_path, warn=False):
+        try:
+            done.add(int(row.get("source_line")))
+        except (TypeError, ValueError):
+            continue
     return done
 
 
@@ -138,18 +130,19 @@ def _embed_only(
     except ImportError as exc:
         raise RuntimeError("pip install numpy") from exc
 
-    from src.fim_semantic_index import embed_texts, embedding_meta_path, embedding_npz_path
+    from src.fim_semantic_index import (
+        embed_texts,
+        embedding_meta_path,
+        embedding_npz_path,
+        iter_jsonl_dicts,
+    )
     from src.fim_semantic_schema import EMBED_TEXT_KIND, flatten_semantic_text_for_embedding
 
-    rows: list[dict[str, Any]] = []
-    with out_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                rows.append(obj)
+    rows: list[dict[str, Any]] = [row for _lineno, row in iter_jsonl_dicts(out_path)]
+    if not rows:
+        print(f"no semantic rows in {out_path}", file=sys.stderr)
+        return 2
+    print(f"embed {len(rows)} rows from {out_path} model={model}", flush=True)
     texts = [flatten_semantic_text_for_embedding(r) for r in rows]
     vectors: list[list[float]] = []
     source_lines: list[int] = []

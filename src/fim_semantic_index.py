@@ -292,6 +292,45 @@ def _search_ip(vectors: Any, query: Any, k: int, faiss_index: Any = None) -> tup
 _JSONL_CACHE: dict[str, Any] = {}
 
 
+def iter_jsonl_dicts(path: Path, *, warn: bool = True):
+    """Yield dict records from jsonl. Splits concatenated objects on one physical line."""
+    decoder = json.JSONDecoder()
+    glued = 0
+    with path.open(encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            s = raw.strip()
+            if not s:
+                continue
+            idx = 0
+            n = len(s)
+            n_on_line = 0
+            while idx < n:
+                while idx < n and s[idx].isspace():
+                    idx += 1
+                if idx >= n:
+                    break
+                try:
+                    obj, end = decoder.raw_decode(s, idx)
+                except json.JSONDecodeError as exc:
+                    if warn:
+                        print(
+                            f"[semantic-jsonl] skip {path}:{lineno} col={idx}: {exc}",
+                            flush=True,
+                        )
+                    break
+                n_on_line += 1
+                if isinstance(obj, dict):
+                    yield lineno, obj
+                idx = end
+            if n_on_line > 1:
+                glued += 1
+    if warn and glued:
+        print(
+            f"[semantic-jsonl] {glued} line(s) contained multiple JSON objects in {path}",
+            flush=True,
+        )
+
+
 def load_semantic_rows(jsonl_path: Path) -> dict[int, dict[str, Any]]:
     st = jsonl_path.stat()
     key = f"{jsonl_path}:{st.st_mtime}:{st.st_size}"
@@ -299,24 +338,14 @@ def load_semantic_rows(jsonl_path: Path) -> dict[int, dict[str, Any]]:
     if cached is not None:
         return cached
     by_line: dict[int, dict[str, Any]] = {}
-    with jsonl_path.open(encoding="utf-8") as fh:
-        for idx, line in enumerate(fh):
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                row = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(row, dict):
-                continue
-            try:
-                source_line = int(row.get("source_line"))
-            except (TypeError, ValueError):
-                source_line = idx
-            row = dict(row)
-            row["_semantic_line"] = idx
-            by_line[source_line] = row
+    for rec_i, (_lineno, row) in enumerate(iter_jsonl_dicts(jsonl_path)):
+        try:
+            source_line = int(row.get("source_line"))
+        except (TypeError, ValueError):
+            source_line = rec_i
+        row = dict(row)
+        row["_semantic_line"] = rec_i
+        by_line[source_line] = row
     _JSONL_CACHE.clear()
     _JSONL_CACHE[key] = by_line
     return by_line
