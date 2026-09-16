@@ -33,14 +33,10 @@ Each output row::
       "task_id": "...",
       "language": "go",
       "role": "propagate a credential into request metadata before request signing",
-      "domain": [...],
       "pattern": [...],
-      "entities": [...],
       "operations": [...],
-      "conditions": [...],
       "relations": [{"source": "...", "target": "...", "type": "dataflow"}],
-      "summary": "...",
-      "semantic_flat_text": "Role: ...\\nDomain: ...",
+      "semantic_flat_text": "Role: ...\\nPattern: ...",
       "prompt_preview": "...",
       "response_preview": "..."
     }
@@ -326,9 +322,9 @@ def main(argv: list[str] | None = None) -> int:
                 _write_row(out_path, out_row)
             processed += 1
             dt = time.perf_counter() - t0
-            summary = (sem.get("summary") or "")[:120]
+            role = (sem.get("role") or "")[:120]
             print(
-                f"  line={source_line} +{dt:.1f}s pattern={sem.get('pattern')!r} {summary}",
+                f"  line={source_line} +{dt:.1f}s pattern={sem.get('pattern')!r} {role}",
                 flush=True,
             )
             if args.sleep > 0:

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Automate: raw_ce → LLM 表达式归因 → 从紧到松搜语料 → MID 改写 → 标注 → 写入续训小集.
+"""Automate: raw_ce → retrieve → MID 改写 → 标注 → 写入续训小集.
 
 Mirrors the manual UI flow in correlation-report + annotation-viewer, but
 runs headless over HTTP.
+
+``--retrieve-mode boolean`` (default): LLM 表达式归因 → 从紧到松搜语料。
+``--retrieve-mode semantic``: Semantic 测试 API → 按 semantic_score 从高到低取 hit。
 
 Prerequisites (both must be running, with eif_api.env loaded)::
 
@@ -10,14 +13,15 @@ Prerequisites (both must be running, with eif_api.env loaded)::
     python -m src.ttav_bundle_api
 
     # annotation-viewer API (MID rewrite + annotate → continue JSONL) — default :8765
-    cd tools/annotation-viewer && python -m server.main
+    cd tools/annotation-viewer && python -m server.main \\
+      --continue-data /path/to/continue.jsonl
 
 Per test sample (default)::
 
     1 successful corpus hit → GraphSignal annotate once → duplicate to 20
     continue-train rows → next test.
 
-Example::
+Example (boolean)::
 
     python -m src.auto_raw_ce_to_continue \\
         --input correlation_matching_results/raw_ce/foo.jsonl \\
@@ -25,9 +29,15 @@ Example::
         --annotate graphsignal \\
         --tight-first
 
-Expression order: LLM returns 从宽到窄; ``--tight-first`` (default) reverses
-to try the narrowest expression first. MID rewrite failures skip that hit
-and try the next corpus line / next looser expression.
+Example (semantic top-1 + LLM annotate)::
+
+    python -m src.auto_raw_ce_to_continue \\
+        --retrieve-mode semantic --annotate llm-semantic --copies 1 \\
+        --input /path/to/predictions.jsonl
+
+Boolean expression order: LLM returns 从宽到窄; ``--tight-first`` (default)
+reverses to try the narrowest expression first. MID rewrite failures skip
+that hit and try the next corpus line / next looser expression.
 """
 
 from __future__ import annotations
@@ -267,7 +277,12 @@ def _rank_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(hits, key=key)
 
 
-def _mid_decision(prep: dict[str, Any], match_region: str) -> tuple[bool, str | None, str]:
+def _mid_decision(
+    prep: dict[str, Any],
+    match_region: str,
+    *,
+    keep_original_if_unrewritten: bool = False,
+) -> tuple[bool, str | None, str]:
     """Return (accept_hit, rewrite_id_or_none, note)."""
     reason = str(prep.get("reason") or prep.get("mode") or "")
     rewrite_id = str(prep.get("rewrite_id") or "").strip() or None
@@ -279,9 +294,17 @@ def _mid_decision(prep: dict[str, Any], match_region: str) -> tuple[bool, str | 
     if reason in _MID_OK_WITHOUT_REWRITE:
         return True, None, f"keep original ({reason})"
 
-    if region == "gold" and reason in ("unchanged", ""):
-        # Gold hit but dig already aligned / nothing to move — still usable.
-        return True, None, "gold hit, keep original MID"
+    if region in ("gold", "semantic") and reason in ("unchanged", ""):
+        # Gold/semantic hit but dig already aligned / nothing to move — still usable.
+        return True, None, f"{region or 'gold'} hit, keep original MID"
+
+    # Semantic 测试前端：挖空失败仍打开原样本再标注。Boolean 检索则换下一条。
+    if keep_original_if_unrewritten and reason != "no_fim_markers":
+        detail = str(prep.get("detail") or "")
+        return True, None, (
+            f"keep original after MID {reason}"
+            f"{': ' + detail if detail else ''}"
+        )
 
     if reason in _MID_SKIP_REASONS or reason == "unchanged":
         detail = str(prep.get("detail") or "")
@@ -289,6 +312,126 @@ def _mid_decision(prep: dict[str, Any], match_region: str) -> tuple[bool, str | 
 
     # Unknown failure → skip to be safe
     return False, None, f"MID skip (unexpected reason={reason!r})"
+
+
+def _try_annotate_hits(
+    client: "PipelineClient",
+    state: RunState,
+    *,
+    test_line: int,
+    task_id: str,
+    gold: str,
+    language: str,
+    hits: list[dict[str, Any]],
+    expression: str,
+    expr_name: str,
+    hit_corpus: str | None,
+    state_path: Path | None,
+    keep_original_if_unrewritten: bool = False,
+) -> bool:
+    """MID-prep + LLM/graphsignal annotate the first usable hit. True if written."""
+    for hit in hits:
+        cline = hit.get("line")
+        if cline is None:
+            continue
+        cline = int(cline)
+        if cline in state.used_corpus_lines:
+            continue
+        region = str(hit.get("match_region") or "")
+        score = hit.get("semantic_score")
+        print(
+            f"     try corpus line={cline} region={region} "
+            f"sem={score} task={hit.get('task_id') or '-'}",
+            flush=True,
+        )
+        try:
+            prep = client.mid_rewrite_prep(
+                line=cline,
+                gold=gold,
+                expression=expression,
+                corpus_path=hit_corpus,
+            )
+        except Exception as exc:
+            print(f"       MID prep error → skip: {exc}", flush=True)
+            state.skipped.append({
+                "test_line": test_line,
+                "corpus_line": cline,
+                "reason": f"mid_prep_error: {exc}",
+            })
+            continue
+
+        ok, rewrite_id, note = _mid_decision(
+            prep,
+            region,
+            keep_original_if_unrewritten=keep_original_if_unrewritten,
+        )
+        if not ok:
+            print(f"       {note} → next hit", flush=True)
+            state.skipped.append({
+                "test_line": test_line,
+                "corpus_line": cline,
+                "reason": note,
+                "mid_reason": prep.get("reason"),
+                "detail": prep.get("detail"),
+            })
+            continue
+        print(f"       MID ok: {note}", flush=True)
+
+        try:
+            client.bind_rewrite(
+                line=cline,
+                rewrite_id=rewrite_id,
+                corpus_path=hit_corpus,
+            )
+            accept = client.annotate_and_accept(
+                line=cline,
+                corpus_path=hit_corpus,
+                language=language,
+            )
+            continue_rows = _duplicate_to_total(
+                client,
+                line=cline,
+                corpus_path=hit_corpus,
+                total_copies=state.copies_per_hit,
+            )
+        except Exception as exc:
+            print(f"       annotate/duplicate failed → next hit: {exc}", flush=True)
+            state.skipped.append({
+                "test_line": test_line,
+                "corpus_line": cline,
+                "reason": f"annotate_or_dup_failed: {exc}",
+            })
+            continue
+
+        state.used_corpus_lines.add(cline)
+        rec = {
+            "test_line": test_line,
+            "task_id": task_id,
+            "corpus_line": cline,
+            "corpus_path": hit_corpus,
+            "match_region": region,
+            "semantic_score": score,
+            "expression": expression,
+            "expr_name": expr_name,
+            "mid_note": note,
+            "rewrite_id": rewrite_id,
+            "n_continue_edges": accept.get("n_continue_edges"),
+            "continue_path": accept.get("continue_path"),
+            "continue_rows": continue_rows,
+            "dry_run": bool(accept.get("dry_run")),
+        }
+        state.annotated.append(rec)
+        state.processed_test_lines.append(test_line)
+        print(
+            f"       ✓ 1 hit annotated + duplicated → {continue_rows} continue rows "
+            f"(ok_tests={state.n_ok_tests}, continue_rows≈{state.n_continue_rows}) "
+            f"path={accept.get('continue_path') or '-'}",
+            flush=True,
+        )
+        print(f"  [done] test line={test_line} → next test", flush=True)
+        _save_state(state_path, state)
+        return True
+    return False
 
 
 def _save_state(path: Path | None, state: RunState) -> None:
@@ -358,15 +501,19 @@ class PipelineClient:
         max_scan: int | None,
         graphsignal_use_llm: bool | None,
         dry_run: bool,
+        retrieve_mode: str = "boolean",
+        semantic_corpus_path: str | None = None,
     ):
         self.eif_url = eif_url.rstrip("/")
         self.viewer_url = viewer_url.rstrip("/")
         self.corpus_path = (corpus_path or "").strip() or None
+        self.semantic_corpus_path = (semantic_corpus_path or "").strip() or None
         self.annotate = annotate
         self.top_k = top_k
         self.max_scan = max_scan
         self.graphsignal_use_llm = graphsignal_use_llm
         self.dry_run = dry_run
+        self.retrieve_mode = (retrieve_mode or "boolean").strip().lower() or "boolean"
 
     def ping(self) -> None:
         # Soft checks — endpoints may 404 on GET; connection errors are hard fail.
@@ -404,6 +551,34 @@ class PipelineClient:
             f"{self.eif_url}/api/llm-train-retrieve",
             body,
             timeout=300.0,
+        )
+
+    def llm_semantic_retrieve(
+        self,
+        fim_prompt: str,
+        gold: str,
+        *,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "fimPrompt": fim_prompt,
+            "goldCompletion": gold,
+            "topK": self.top_k,
+            "runCorpusSearch": True,
+        }
+        # Frontend Semantic 测试 does not send corpusPath. The API treats
+        # corpusPath/semanticCorpusPath as EIF_LLM_SEMANTIC_CORPUS (schema jsonl),
+        # not the raw FIM file used for MID/annotate.
+        if self.semantic_corpus_path:
+            body["semanticCorpusPath"] = self.semantic_corpus_path
+        lang = (language or "").strip()
+        if lang:
+            body["language"] = lang
+        return _http_json(
+            "POST",
+            f"{self.eif_url}/api/llm-semantic-retrieve",
+            body,
+            timeout=600.0,
         )
 
     def corpus_search(self, expression: str) -> dict[str, Any]:
@@ -569,6 +744,142 @@ def _duplicate_to_total(
     return 1 + written_extra
 
 
+def _collect_semantic_hits(retrieve: dict[str, Any]) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for sr in retrieve.get("search_results") or []:
+        if not isinstance(sr, dict):
+            continue
+        for hit in sr.get("corpus_hits") or []:
+            if isinstance(hit, dict):
+                hits.append(hit)
+    hits.sort(key=lambda h: -float(h.get("semantic_score") or 0))
+    return hits
+
+
+def _process_semantic_row(
+    client: PipelineClient,
+    state: RunState,
+    *,
+    test_line: int,
+    task_id: str,
+    fim: str,
+    gold: str,
+    language: str,
+    state_path: Path | None,
+) -> None:
+    """Semantic 测试：最高分 corpus hit → MID → LLM 标注。"""
+    try:
+        retrieve = client.llm_semantic_retrieve(
+            fim,
+            gold,
+            language=language or None,
+        )
+    except Exception as exc:
+        print(f"  [fail] llm-semantic-retrieve: {exc}", flush=True)
+        state.skipped.append({
+            "test_line": test_line,
+            "task_id": task_id,
+            "reason": f"semantic_retrieve_failed: {exc}",
+        })
+        state.processed_test_lines.append(test_line)
+        _save_state(state_path, state)
+        return
+
+    if str(retrieve.get("status") or "") not in ("success", "ok", ""):
+        print(
+            f"  [fail] semantic retrieve status={retrieve.get('status')}: "
+            f"{retrieve.get('message')}",
+            flush=True,
+        )
+        state.skipped.append({
+            "test_line": test_line,
+            "task_id": task_id,
+            "reason": "semantic_retrieve_bad_status",
+            "detail": retrieve.get("message"),
+        })
+        state.processed_test_lines.append(test_line)
+        _save_state(state_path, state)
+        return
+
+    sr0 = (retrieve.get("search_results") or [{}])[0]
+    if isinstance(sr0, dict) and sr0.get("corpus_error"):
+        print(f"  [fail] semantic corpus: {sr0.get('corpus_error')}", flush=True)
+        state.skipped.append({
+            "test_line": test_line,
+            "task_id": task_id,
+            "reason": "semantic_corpus_error",
+            "detail": sr0.get("corpus_error"),
+        })
+        state.processed_test_lines.append(test_line)
+        _save_state(state_path, state)
+        return
+
+    hits = _collect_semantic_hits(retrieve)
+    expression = str(
+        retrieve.get("semantic_flat_text")
+        or (sr0.get("expression") if isinstance(sr0, dict) else "")
+        or ""
+    )
+    corpus_path = (
+        str(retrieve.get("corpus_path") or "").strip()
+        or client.corpus_path
+    )
+    sem_corpus = str(retrieve.get("semantic_corpus_path") or "").strip()
+    print(
+        f"  semantic hits={len(hits)} "
+        f"raw_corpus={corpus_path or '-'} "
+        f"semantic_corpus={sem_corpus or '-'}",
+        flush=True,
+    )
+    if sem_corpus and corpus_path and Path(sem_corpus).resolve() == Path(corpus_path).resolve():
+        print(
+            "  [warn] semantic_corpus == raw FIM; search needs *.semantic.jsonl "
+            "(set EIF_LLM_SEMANTIC_CORPUS or --semantic-corpus-path)",
+            flush=True,
+        )
+    if sem_corpus and ".semantic." not in Path(sem_corpus).name:
+        print(
+            f"  [warn] semantic_corpus filename looks like raw FIM: {sem_corpus}",
+            flush=True,
+        )
+    for i, h in enumerate(hits[:5]):
+        print(
+            f"    [{i}] line={h.get('line')} sem={h.get('semantic_score')} "
+            f"task={h.get('task_id') or '-'}",
+            flush=True,
+        )
+    if not hits:
+        print("  [fail] no semantic corpus hits", flush=True)
+        state.skipped.append({
+            "test_line": test_line,
+            "task_id": task_id,
+            "reason": "no_semantic_hits",
+        })
+        state.processed_test_lines.append(test_line)
+        _save_state(state_path, state)
+        return
+
+    if _try_annotate_hits(
+        client,
+        state,
+        test_line=test_line,
+        task_id=task_id,
+        gold=gold,
+        language=language,
+        hits=hits,
+        expression=expression,
+        expr_name="semantic_top1",
+        hit_corpus=corpus_path,
+        state_path=state_path,
+        keep_original_if_unrewritten=True,
+    ):
+        return
+
+    state.processed_test_lines.append(test_line)
+    print(f"  [done] no usable semantic hit for test line={test_line}", flush=True)
+    _save_state(state_path, state)
+
+
 def process_test_row(
     client: PipelineClient,
     state: RunState,
@@ -601,12 +912,26 @@ def process_test_row(
         flush=True,
     )
     print(f"  gold_chars={len(gold)} prompt_chars={len(fim)}", flush=True)
+    lang = _row_language(row, language)
+
+    if getattr(client, "retrieve_mode", "boolean") == "semantic":
+        _process_semantic_row(
+            client,
+            state,
+            test_line=test_line,
+            task_id=task_id,
+            fim=fim,
+            gold=gold,
+            language=lang,
+            state_path=state_path,
+        )
+        return
 
     try:
         retrieve = client.llm_retrieve(
             fim,
             gold,
-            language=_row_language(row, language) or None,
+            language=lang or None,
         )
     except Exception as exc:
         print(f"  [fail] llm-train-retrieve: {exc}", flush=True)
@@ -689,101 +1014,19 @@ def process_test_row(
 
         hit_corpus = str(search.get("corpus_path") or corpus_path or "") or None
 
-        for hit in hits:
-            cline = hit.get("line")
-            if cline is None:
-                continue
-            cline = int(cline)
-            if cline in state.used_corpus_lines:
-                continue
-            region = str(hit.get("match_region") or "")
-            print(
-                f"     try corpus line={cline} region={region} "
-                f"task={hit.get('task_id') or '-'}",
-                flush=True,
-            )
-
-            try:
-                prep = client.mid_rewrite_prep(
-                    line=cline,
-                    gold=gold,
-                    expression=expression,
-                    corpus_path=hit_corpus,
-                )
-            except Exception as exc:
-                print(f"       MID prep error → skip: {exc}", flush=True)
-                state.skipped.append({
-                    "test_line": test_line,
-                    "corpus_line": cline,
-                    "reason": f"mid_prep_error: {exc}",
-                })
-                continue
-
-            ok, rewrite_id, note = _mid_decision(prep, region)
-            if not ok:
-                print(f"       {note} → next hit", flush=True)
-                state.skipped.append({
-                    "test_line": test_line,
-                    "corpus_line": cline,
-                    "reason": note,
-                    "mid_reason": prep.get("reason"),
-                    "detail": prep.get("detail"),
-                })
-                continue
-            print(f"       MID ok: {note}", flush=True)
-
-            try:
-                client.bind_rewrite(
-                    line=cline,
-                    rewrite_id=rewrite_id,
-                    corpus_path=hit_corpus,
-                )
-                accept = client.annotate_and_accept(
-                    line=cline,
-                    corpus_path=hit_corpus,
-                    language=_row_language(row, language),
-                )
-                continue_rows = _duplicate_to_total(
-                    client,
-                    line=cline,
-                    corpus_path=hit_corpus,
-                    total_copies=state.copies_per_hit,
-                )
-            except Exception as exc:
-                print(f"       annotate/duplicate failed → next hit: {exc}", flush=True)
-                state.skipped.append({
-                    "test_line": test_line,
-                    "corpus_line": cline,
-                    "reason": f"annotate_or_dup_failed: {exc}",
-                })
-                continue
-
-            state.used_corpus_lines.add(cline)
-            rec = {
-                "test_line": test_line,
-                "task_id": task_id,
-                "corpus_line": cline,
-                "corpus_path": hit_corpus,
-                "match_region": region,
-                "expression": expression,
-                "expr_name": expr["name"],
-                "mid_note": note,
-                "rewrite_id": rewrite_id,
-                "n_continue_edges": accept.get("n_continue_edges"),
-                "continue_path": accept.get("continue_path"),
-                "continue_rows": continue_rows,
-                "dry_run": bool(accept.get("dry_run")),
-            }
-            state.annotated.append(rec)
-            state.processed_test_lines.append(test_line)
-            print(
-                f"       ✓ 1 hit annotated + duplicated → {continue_rows} continue rows "
-                f"(ok_tests={state.n_ok_tests}, continue_rows≈{state.n_continue_rows}) "
-                f"path={accept.get('continue_path') or '-'}",
-                flush=True,
-            )
-            print(f"  [done] test line={test_line} → next test", flush=True)
-            _save_state(state_path, state)
+        if _try_annotate_hits(
+            client,
+            state,
+            test_line=test_line,
+            task_id=task_id,
+            gold=gold,
+            language=lang,
+            hits=hits,
+            expression=expression,
+            expr_name=str(expr.get("name") or ""),
+            hit_corpus=hit_corpus,
+            state_path=state_path,
+        ):
             return
 
         print(
@@ -799,7 +1042,7 @@ def process_test_row(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Automate raw_ce → LLM expressions → corpus search (tight→loose) "
+            "Automate raw_ce → retrieve (boolean expressions or semantic) "
             "→ MID rewrite → annotate 1 hit → duplicate N rows → next test"
         ),
     )
@@ -848,7 +1091,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--corpus-path",
         default="",
-        help="override EIF_LLM_TRAIN_CORPUS for search / MID prep",
+        help="raw FIM jsonl for MID / annotate (EIF_LLM_TRAIN_CORPUS)",
+    )
+    p.add_argument(
+        "--semantic-corpus-path",
+        default="",
+        help=(
+            "schema jsonl from fim_semantic_preprocess (EIF_LLM_SEMANTIC_CORPUS). "
+            "Do not pass the raw FIM file here"
+        ),
     )
     p.add_argument(
         "--continue-path",
@@ -868,6 +1119,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="only process rows where stripped label ≠ predict (skip exact matches)",
+    )
+    p.add_argument(
+        "--retrieve-mode",
+        choices=("boolean", "semantic"),
+        default="boolean",
+        help=(
+            "boolean: LLM expressions + corpus search (tight→loose). "
+            "semantic: /api/llm-semantic-retrieve then highest-score hit"
+        ),
     )
     p.add_argument(
         "--annotate",
@@ -904,6 +1164,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="skip test lines listed in state file (default: true)",
+    )
+    p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignore and overwrite the state checkpoint; process from test line 1",
     )
     return p.parse_args(argv)
 
@@ -943,6 +1208,8 @@ def main(argv: list[str] | None = None) -> int:
         max_scan=int(args.max_scan) if int(args.max_scan) > 0 else None,
         graphsignal_use_llm=gs_llm,
         dry_run=bool(args.dry_run),
+        retrieve_mode=str(args.retrieve_mode),
+        semantic_corpus_path=str(args.semantic_corpus_path or "").strip() or None,
     )
     client.ping()
 
@@ -981,19 +1248,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"[apis] eif={client.eif_url} viewer={client.viewer_url}", flush=True)
     print(
-        f"[opts] annotate={args.annotate} tight_first={args.tight_first} "
+        f"[opts] retrieve={args.retrieve_mode} annotate={args.annotate} "
+        f"tight_first={args.tight_first} "
         f"mismatches_only={args.mismatches_only} language={args.language or '(row/go)'} "
+        f"raw_corpus={args.corpus_path or '(env)'} "
+        f"semantic_corpus={args.semantic_corpus_path or '(env EIF_LLM_SEMANTIC_CORPUS)'} "
         f"continue_path={want_continue or '(viewer default)'} "
-        f"dry_run={args.dry_run} state={state_path}",
+        f"dry_run={args.dry_run} fresh={args.fresh} state={state_path}",
         flush=True,
     )
 
-    state = _load_state(
-        state_path if state_path else None,
-        copies_per_hit=copies,
-        max_tests=int(args.max_tests),
-    )
-    processed = set(state.processed_test_lines) if args.skip_processed else set()
+    if args.fresh:
+        if state_path.is_file():
+            print(f"[fresh] removing checkpoint {state_path}", flush=True)
+            try:
+                state_path.unlink()
+            except OSError as exc:
+                print(f"[fresh] could not delete state file: {exc}", file=sys.stderr)
+                return 2
+        print("[fresh] starting with empty checkpoint (line 1)", flush=True)
+        state = RunState(copies_per_hit=copies, max_tests=int(args.max_tests))
+        _save_state(state_path, state)
+    else:
+        state = _load_state(
+            state_path if state_path else None,
+            copies_per_hit=copies,
+            max_tests=int(args.max_tests),
+        )
+    processed = set(state.processed_test_lines) if args.skip_processed and not args.fresh else set()
 
     end_line = int(args.end_line) or 10**12
     for test_line, row in rows:

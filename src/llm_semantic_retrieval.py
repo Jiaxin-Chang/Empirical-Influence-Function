@@ -1,22 +1,22 @@
 """Structured semantic FIM retrieval — independent of Boolean query retrieval.
 
 This module never emits hole_relation / sibling_line / corpus_search_expressions.
-Query and train preprocessing share one schema::
+Query and train preprocessing share one four-field schema::
 
     {
       "role": "...",
-      "domain": [...],
       "pattern": [...],
-      "entities": [...],
       "operations": [...],
-      "conditions": [...],
-      "relations": [...],
-      "summary": "..."
+      "relations": [{"source": "...", "target": "...", "type": "..."}]
     }
 
-Structured fields are the retrieval signal. ``summary`` is for display.
+Role locates *overall semantic role / duty of the hole in the surrounding logic*;
+pattern locates *which transferable mechanism*; operations describe *what the
+missing span does semantically*; relations explain *how it connects to context
+and later code*.
+
 Canonical display text is ``flatten_semantic_text``. Dense recall embeds
-``flatten_semantic_text_for_embedding`` (pattern/relations repeated; no domain/summary).
+``flatten_semantic_text_for_embedding`` (pattern/relations repeated).
 Retrieval is two-stage when ``*.embeddings.npz`` exists: embedding coarse recall,
 then structured rerank. Otherwise falls back to full schema scan.
 """
@@ -54,112 +54,120 @@ def build_llm_semantic_messages(
     system = (
         "You analyze Fill-in-the-Middle (FIM) code completion samples. "
         "The hole may be marked <MID>, <FIM>, or [MASK]. ChatML wrappers are already stripped.\n\n"
-        "Your task is to infer the semantic role of the missing span from the prefix, suffix, "
-        "and gold fill, and represent that role using a normalized, structured semantic representation "
-        "that is stable enough for large-scale retrieval.\n\n"
+        "Infer the semantic meaning of the MISSING SPAN from prefix, suffix, and gold fill. "
+        "Use exactly four fields. They form one closed loop and MUST NOT repeat each other:\n"
+        "  Role      = ROLE     — overall semantic role / responsibility of the missing span "
+        "in the current code logic (not a so-that purpose clause, not a whole-function summary)\n"
+        "  Pattern   = WHICH    — which transferable code mechanism this is\n"
+        "  Operation = WHAT     — what semantic action the missing code performs\n"
+        "  Relation  = CONNECTS — semantic links to surrounding context and later code\n\n"
+        "Loop:\n"
+        "  Role (semantic role / duty) → Pattern (mechanism) → "
+        "Operation (semantic action of the missing span) → Relation (links to context and later code).\n"
+        "If two fields would say the same thing, rewrite until they answer different questions.\n\n"
+        "Do NOT emit domain, entities, conditions, summary, hole_relation, sibling_line, "
+        "Boolean queries, or keyword-search strings.\n\n"
         "IMPORTANT:\n"
-        "- Center every field on the missing span and its relationship with the surrounding code.\n"
-        "- Use the gold fill ONLY to infer the semantic role of the missing span.\n"
-        "- Do NOT reproduce or paraphrase the implementation line-by-line.\n"
-        "- Do NOT copy the gold source code, exact code fragments, or implementation-specific literals.\n"
-        "- Do not use the exact API names, string literals, identifiers, or code fragments from the gold "
-        "unless they represent an essential domain concept. Generalize implementation-specific details "
-        "into semantic concepts.\n"
-        "- Preserve domain concepts when they are semantically important "
-        "(e.g. security token, HTTP request), but generalize variable names "
-        "(k.SecurityToken, r.Header) and implementation details (X-Amz-Security-Token, Header.Set).\n"
-        "- Focus on transferable code mechanisms, data dependencies, control conditions, "
-        "API effects, and semantic relationships.\n"
-        "- The representation should retrieve semantically related FIM samples written with "
-        "different variable names, APIs, or implementation details.\n"
-        "- Prefer a shared vocabulary across fields: if an entity is \"security token\", "
-        "conditions/relations/operations should reuse that same phrase, not SecurityToken / sessionToken / tok.\n"
-        "- Do not paste the same phrase into both pattern and operations. "
-        "pattern = transferable mechanism; operations = actions the hole performs.\n"
-        "- Prefer lowercase multi-word phrases (2-6 words) for role, pattern, entities, and operations.\n"
-        "- Look at the code AFTER the hole. If the hole feeds, enables, or guards a later step, "
-        "that later step MUST appear in relations (and usually in role).\n"
-        "- role, pattern, and operations must be different: role = this hole's job; "
-        "pattern = mechanism class reusable across programs; operations = concrete actions.\n\n"
+        "- Center every field on the missing span, not the entire function.\n"
+        "- Use the gold fill ONLY to infer semantics. Do NOT copy gold source, API names, "
+        "string literals, or identifiers. Generalize into concepts "
+        "(security token, HTTP request, creation error).\n"
+        "- Shared vocabulary, different questions: role is overall semantic role / duty, "
+        "pattern is mechanism class, operations are semantic acts, relations are links.\n"
+        "- Consider BOTH the prefix (what the hole depends on) AND the suffix "
+        "(what the hole enables, guards, or changes) — not only the immediately next line.\n\n"
         "Return STRICT JSON (no markdown) with exactly these keys:\n"
         "{\n"
-        '  "role": "short semantic role of the missing span",\n'
-        '  "domain": ["2-4 coarse technical or functional domains"],\n'
-        '  "pattern": ["1-3 transferable behavioral mechanisms, NOT syntax"],\n'
-        '  "entities": ["3-8 important semantic entities directly related to the hole"],\n'
-        '  "operations": ["1-4 important semantic operations"],\n'
-        '  "conditions": ["0-3 conditions under which the missing behavior occurs"],\n'
+        '  "role": "overall semantic role / duty of this hole in the surrounding logic",\n'
+        '  "pattern": ["one primary mechanism class; at most 3 if truly distinct"],\n'
+        '  "operations": ["1-4 semantic operations the missing span performs"],\n'
         '  "relations": [\n'
-        '    {"source": "semantic entity or concept", "target": "semantic entity or concept", '
-        '"type": "dataflow | control | api | transform | init | error | config | semantic_dependency | other"}\n'
-        "  ],\n"
-        '  "summary": "one concise English sentence describing the core semantic behavior of the missing span"\n'
+        '    {"source": "semantic concept", "target": "semantic concept", '
+        '"type": "dataflow | control | semantic_dependency | transform | init | error | config | api | <invented if none fit>"}\n'
+        "  ]\n"
         "}\n\n"
-        "Field requirements:\n\n"
-        "role:\n"
-        "- Describe what the missing span contributes to the surrounding code (a phrase, not a full function summary).\n"
-        "- Keep it implementation-independent.\n"
-        '- Example: "propagate a credential into request metadata before request signing"\n'
-        '- Other examples: "error handling and early exit"; "initialize a required dependency before use"\n\n'
-        "domain:\n"
-        "- 2-4 coarse domains of the HOLE itself, not every topic in the whole function.\n"
-        "- Valid: HTTP, authentication, AWS, database, concurrency, file I/O.\n"
-        "- Do not add authentication just because an earlier permission check exists.\n"
-        "- Do not use overly specific labels such as \"AWS Signature Version 4 authentication\".\n"
-        "- Avoid filler domains such as \"API calls\" or \"data handling\" unless that is the hole's actual domain.\n\n"
-        "pattern:\n"
-        "- A mechanism class, NOT a restatement of role or operations.\n"
-        '- Valid: "conditional credential propagation", "request metadata injection", '
-        '"consume stream then parse", "error-driven early return", '
+        "Worked examples (pick the matching kind; do not copy unless the sample is the same):\n\n"
+        "1) Credential / setup before a later step:\n"
+        "func addSecurityToken(req, token) { <MID> signRequest(req) }\n"
+        "{\n"
+        '  "role": "request authentication preparation",\n'
+        '  "pattern": ["credential propagation before signing"],\n'
+        '  "operations": ["attach security token to request metadata"],\n'
+        '  "relations": [\n'
+        '    {"source": "security token", "target": "request metadata", "type": "dataflow"},\n'
+        '    {"source": "request authentication", "target": "request signing", "type": "semantic_dependency"}\n'
+        "  ]\n"
+        "}\n\n"
+        "2) Return the already-built result (plain return hole):\n"
+        "func PutParams() map[string]string { m := map[string]string{...}; <MID> }\n"
+        "{\n"
+        '  "role": "return of assembled result",\n'
+        '  "pattern": ["hand back constructed value"],\n'
+        '  "operations": ["return the prepared map"],\n'
+        '  "relations": [\n'
+        '    {"source": "assembled parameter map", "target": "function result", "type": "dataflow"}\n'
+        "  ]\n"
+        "}\n\n"
+        "3) Assignment that captures a computed value:\n"
+        "n := <MID>\\nuse(n)\n"
+        "{\n"
+        '  "role": "bind computed value for later use",\n'
+        '  "pattern": ["capture result then consume"],\n'
+        '  "operations": ["assign computed length to a local"],\n'
+        '  "relations": [\n'
+        '    {"source": "computed value", "target": "local binding", "type": "dataflow"},\n'
+        '    {"source": "local binding", "target": "later use", "type": "semantic_dependency"}\n'
+        "  ]\n"
+        "}\n\n"
+        "4) Error-driven early exit:\n"
+        "x, err := Open(); if err != nil { <MID> }; use(x)\n"
+        "{\n"
+        '  "role": "failed-resource guard before later use",\n'
+        '  "pattern": ["error-driven early return"],\n'
+        '  "operations": ["abort and surface the open error"],\n'
+        '  "relations": [\n'
+        '    {"source": "open error", "target": "hole", "type": "control"},\n'
+        '    {"source": "early failure", "target": "later resource use", "type": "semantic_dependency"}\n'
+        "  ]\n"
+        "}\n\n"
+        "role (ROLE):\n"
+        "- Answer: what semantic role does this missing position play in the current code logic?\n"
+        "- A short responsibility / positioning phrase for this hole in the local logic.\n"
+        "- You MAY summarize the hole's overall duty. Do NOT summarize the whole function. "
+        "Do NOT restate Operation. Do NOT write so that / in order to / 以便 clauses.\n"
+        '- Good: "request authentication preparation"; "return of assembled result"; '
+        '"bind computed value for later use"; "failed-resource guard before later use"\n'
+        '- Bad: "so a present credential can be used when the request is later signed" '
+        '(purpose clause); "attach security token to request metadata" (that is Operation); '
+        '"return m"; "complete addSecurityToken"; "if statement"\n\n'
+        "pattern (WHICH):\n"
+        "- One PRIMARY transferable mechanism / contextual behavior pattern. "
+        "Add a 2nd/3rd only if they are genuinely distinct.\n"
+        "- Never more than 3. Do not list operations as extra patterns.\n"
+        '- Good: "credential propagation before signing"; "hand back constructed value"; '
+        '"capture result then consume"; "error-driven early return"; '
         '"resource initialization before use".\n'
-        '- Invalid: "if statement", "header set", "function call", '
-        '"read request body into variable for processing" (that is a role, not a pattern), '
-        '"set header field" (too syntactic).\n'
-        "- If a credential/token is injected into a request, prefer "
-        "\"conditional credential propagation\" over generic \"conditional header injection\".\n\n"
-        "entities:\n"
-        "- 3-8 semantically important entities related to the hole.\n"
-        '- Prefer concepts such as "security token", "HTTP request", "request body", "parsed form".\n'
-        "- Not entities: local variables, Go type names (Keys struct), or processes "
-        "(\"error handling\", \"request context\") unless they are real objects.\n\n"
-        "operations:\n"
-        "- 1-4 actions of the hole, plus one following action when the suffix depends on it.\n"
-        '- Prefer "propagate credential to request header" over "set header field" or "call Header.Set".\n'
-        "- Do not copy role into operations.\n\n"
-        "conditions:\n"
-        "- 0-3 real guards. Empty is better than tautology.\n"
-        '- Good: "security token is present"; "database create failed".\n'
-        '- Bad: "request body needs to be processed"; "inside an if statement".\n\n'
-        "relations:\n"
-        "- This is the most important retrieval field.\n"
-        "- Emit 1-3 relations. Prefer: (1) data into/out of the hole, "
-        "(2) how the hole affects the NEXT statement in the suffix.\n"
-        "- Example pair for signing: "
-        '{"source":"security token","target":"HTTP request header","type":"dataflow"} and '
-        '{"source":"header injection","target":"request signing","type":"semantic_dependency"}.\n'
-        "- source and target MUST be semantic concepts, not identifiers (not k.SecurityToken / r.Header).\n"
-        '- Example: {"source":"security token","target":"HTTP request header","type":"dataflow"}\n'
-        "- type MUST be one of:\n"
-        "  dataflow: value/state moves or is copied (credential -> request header).\n"
-        "  control: a condition gates whether the hole runs (token present -> header write).\n"
-        "  api: the hole's effect is an API/semantic operation (request -> set header).\n"
-        "  transform: data is converted (payload -> HMAC digest; object -> JSON).\n"
-        "  init: create/setup a dependency before later use (nil cache -> initialize cache).\n"
-        "  error: error/failure path (error -> wrap and return).\n"
-        "  config: configuration or flag drives behavior (option -> request modification).\n"
-        "  semantic_dependency: required ordering or functional prerequisite "
-        "(header injection -> request signing).\n"
-        "  other: none of the above; do not invent extra type names.\n\n"
-        "summary:\n"
-        "- One concise English sentence for humans and auxiliary rerank, NOT the primary retrieval key.\n"
-        "- Answer: what does the missing code do, under what condition, using what data, "
-        "and with what effect on the surrounding computation?\n"
-        "- Do not simply summarize the whole function.\n"
-        "- Forbidden in summary: header names, string literals, API identifiers from gold "
-        "(no X-Amz-Security-Token, Header.Set, ioutil.ReadAll).\n\n"
-        "Do NOT output:\n"
-        "- hole_relation, sibling_line, Boolean queries, corpus_search_expressions, "
-        "keyword-search strings, or source code from the gold fill."
+        '- Bad: "if statement"; "header set"; "function call"; copying role or operations.\n'
+        "- Do not force the sample into the mechanisms shown in the examples. "
+        "Discover the most appropriate transferable mechanism from the given code.\n\n"
+        "operations (WHAT):\n"
+        "- Semantic behavior of the gold / missing span: what it does as meaning, "
+        "not API spelling or syntax.\n"
+        "- 1-4 items, in order if there are several steps.\n"
+        '- Good: "attach security token to request metadata"; "return the prepared map"; '
+        '"assign computed length to a local"; "abort and surface the open error".\n'
+        '- Bad: repeating role; "call Header.Set"; "write some code"; "return m".\n\n'
+        "relations (CONNECTS):\n"
+        "- Semantic links between contextual entities and the hole, AND the hole's "
+        "semantic effect on later code.\n"
+        "- Prefix: what the hole depends on. Suffix: the most important later semantic "
+        "dependence or effect — not necessarily the next statement "
+        "(skip over unrelated lines if the real dependence is farther).\n"
+        "- Emit 1-3 meaningful relations. Do not invent relations just to reach the minimum. "
+        "source/target MUST be semantic concepts, not identifiers.\n"
+        "- type: pick from this list first — dataflow, control, semantic_dependency, "
+        "transform, init, error, config, api. "
+        "Invent a new short label ONLY if none of those eight fit. Do not leave type empty.\n"
     )
     user = (
         f"Language: {lang}\n\n"
@@ -167,11 +175,12 @@ def build_llm_semantic_messages(
         f"{problem}\n\n"
         "Gold fill for the hole:\n"
         f"{gold}\n\n"
-        "Infer the semantic role of the missing span from the prefix, suffix, and gold fill.\n\n"
-        "Then return the structured semantic representation using the required JSON schema.\n\n"
-        "The representation should describe the missing span at a transferable semantic level "
-        "so that it can be matched against semantically related code samples with different "
-        "variable names, APIs, or implementations."
+        "Fill the four-field loop. Do not repeat the same claim in two fields:\n"
+        "Role = ROLE (overall semantic role / duty of this hole, not a so-that clause, "
+        "not a whole-function summary) → Pattern = WHICH (one primary mechanism) → "
+        "Operation = WHAT (semantic action of the missing span) → Relation = CONNECTS "
+        "(context + later-code links, not only the next line).\n"
+        "Return only the required JSON object."
     )
     return [
         {"role": "system", "content": system},

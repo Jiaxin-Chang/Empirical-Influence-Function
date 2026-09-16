@@ -1,8 +1,8 @@
-"""Structured FIM semantic representation (error query and train sample share one schema).
+"""Structured FIM semantic representation (query and train share one schema).
 
-Boolean substring queries remain a baseline. This module normalizes the
-structured fields and can rerank lexical hits by relation/pattern overlap
-until a full embedding index exists.
+Canonical generation fields: role, pattern, operations, relations.
+Older corpora may still carry domain/entities/conditions/summary; those are
+kept on normalize for backward-compatible retrieval, not requested from the LLM.
 """
 
 from __future__ import annotations
@@ -145,9 +145,14 @@ _RELATION_TYPE_ALIASES = {
 
 def canonicalize_relation_type(value: Any) -> str:
     raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    while "__" in raw:
+        raw = raw.replace("__", "_")
+    raw = raw.strip("_")[:48]
+    if not raw:
+        return "other"
     if raw in RELATION_TYPES:
         return raw
-    return _RELATION_TYPE_ALIASES.get(raw, "other")
+    return _RELATION_TYPE_ALIASES.get(raw, raw)
 
 
 def _parse_relation(item: Any) -> dict[str, str] | None:
@@ -199,12 +204,15 @@ def normalize_semantic_repr(obj: dict[str, Any] | None) -> dict[str, Any]:
         src = {}
     summary = str(src.get("summary") or obj.get("gold_pattern_summary") or "").strip()
     role = str(src.get("role") or "").strip()
+    operations = src.get("operations")
+    if operations is None:
+        operations = src.get("operation")
     out = {
         "role": role,
         "domain": _as_str_list(src.get("domain"), limit=_FIELD_LIMITS["domain"]),
         "pattern": _as_str_list(src.get("pattern"), limit=_FIELD_LIMITS["pattern"]),
         "entities": _as_str_list(src.get("entities"), limit=_FIELD_LIMITS["entities"]),
-        "operations": _as_str_list(src.get("operations"), limit=_FIELD_LIMITS["operations"]),
+        "operations": _as_str_list(operations, limit=_FIELD_LIMITS["operations"]),
         "conditions": _as_str_list(src.get("conditions"), limit=_FIELD_LIMITS["conditions"]),
         "relations": normalize_relations(src.get("relations"), limit=6),
         "summary": summary,

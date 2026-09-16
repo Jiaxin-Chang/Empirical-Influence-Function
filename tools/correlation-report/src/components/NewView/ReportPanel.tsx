@@ -308,10 +308,10 @@ function LlmSemanticAttribution({
                     {summary}
                 </div>
             ) : null}
-            {chipRow('domain', sem?.domain)}
             {chipRow('pattern', sem?.pattern)}
-            {chipRow('entities', sem?.entities)}
             {chipRow('operations', sem?.operations)}
+            {chipRow('domain', sem?.domain)}
+            {chipRow('entities', sem?.entities)}
             {chipRow('conditions', sem?.conditions)}
             {rels.length ? (
                 <div style={{ marginBottom: 8, fontSize: 11, lineHeight: 1.45 }}>
