@@ -29,27 +29,59 @@ _PHRASE_VEC_CACHE: dict[tuple[str, str], Any] = {}
 _PHRASE_CACHE_MAX = 20000
 
 
-def embedding_npz_path(semantic_jsonl: str | Path) -> Path:
-    path = Path(semantic_jsonl)
-    return path.with_suffix(path.suffix + ".embeddings.npz")
-
-
-def embedding_meta_path(semantic_jsonl: str | Path) -> Path:
-    path = Path(semantic_jsonl)
-    return path.with_suffix(path.suffix + ".embeddings.meta.json")
-
-
 def _env(name: str, default: str = "") -> str:
     import os
     return (os.environ.get(name) or default).strip()
 
 
+def embedding_npz_path(
+    semantic_jsonl: str | Path | None = None,
+    *,
+    override: str | Path | None = None,
+) -> Path:
+    """Stage-1 npz: EIF_LLM_SEMANTIC_EMBEDDINGS, else sidecar of the semantic jsonl."""
+    raw = (str(override).strip() if override else "") or _env("EIF_LLM_SEMANTIC_EMBEDDINGS")
+    if raw:
+        return Path(raw).expanduser()
+    if semantic_jsonl:
+        path = Path(semantic_jsonl)
+        return path.with_suffix(path.suffix + ".embeddings.npz")
+    raise ValueError("set EIF_LLM_SEMANTIC_EMBEDDINGS or pass the semantic jsonl")
+
+
+def embedding_meta_path(npz_path: str | Path) -> Path:
+    return Path(str(Path(npz_path)) + ".meta.json")
+
+
+_LOCAL_EMBED: dict[str, Any] = {}
+_LOCAL_EMBED_MAX_LEN = 512
+
+
+def _local_base_model_dir() -> str:
+    raw = _env("EIF_BASE_MODEL_PATH")
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    return str(path.resolve()) if path.is_dir() else ""
+
+
+def _local_model_dir(model: str) -> str:
+    raw = (model or "").strip()
+    if raw.startswith("local:"):
+        raw = raw[6:]
+    path = Path(raw).expanduser()
+    return str(path.resolve()) if path.is_dir() else ""
+
+
 def embed_model_id() -> str:
-    return (
-        _env("EIF_SEMANTIC_EMBED_MODEL")
-        or _env("EMBED_MODEL")
-        or ""
-    )
+    """Local Qwen weights (EIF_BASE_MODEL_PATH), unless a dedicated API embedder is set."""
+    dedicated = _env("EIF_SEMANTIC_EMBED_MODEL") or _env("EMBED_MODEL")
+    if dedicated:
+        return dedicated
+    base = _local_base_model_dir()
+    if base:
+        return f"local:{base}"
+    return _env("ANNOTATE_MODEL") or ""
 
 
 def recall_k_default(n: int) -> int:
@@ -87,9 +119,84 @@ def _build_embed_client():
     return OpenAI(api_key=key, base_url=base)
 
 
+def _load_local_embedder(model_dir: str) -> dict[str, Any]:
+    cached = _LOCAL_EMBED.get("pack")
+    if cached is not None and cached.get("dir") == model_dir:
+        return cached
+
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(
+        model_dir, trust_remote_code=True, local_files_only=True,
+    )
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    print(f"[llm-semantic] local embed load {model_dir} device={device}", flush=True)
+    try:
+        mdl = AutoModel.from_pretrained(
+            model_dir,
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=dtype,
+        )
+    except Exception:
+        from transformers import AutoModelForCausalLM
+
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=dtype,
+        )
+    mdl.to(device)
+    mdl.eval()
+    pack = {"dir": model_dir, "tok": tok, "mdl": mdl, "device": device}
+    _LOCAL_EMBED["pack"] = pack
+    return pack
+
+
+def _embed_texts_local(texts: list[str], *, model_dir: str, batch: int) -> list[list[float]]:
+    import torch
+
+    pack = _load_local_embedder(model_dir)
+    tok, mdl, device = pack["tok"], pack["mdl"], pack["device"]
+    left_pad = getattr(tok, "padding_side", "right") == "left"
+    out: list[list[float]] = []
+    step = max(1, int(batch))
+    for start in range(0, len(texts), step):
+        chunk = [t if t.strip() else " " for t in texts[start : start + step]]
+        enc = tok(
+            chunk,
+            padding=True,
+            truncation=True,
+            max_length=_LOCAL_EMBED_MAX_LEN,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            pred = mdl(**enc, output_hidden_states=True)
+            hidden = pred.hidden_states[-1] if getattr(pred, "hidden_states", None) else pred.last_hidden_state
+            mask = enc["attention_mask"]
+            bsz, seqlen = mask.shape
+            if left_pad:
+                idx = torch.full((bsz,), seqlen - 1, device=device, dtype=torch.long)
+            else:
+                idx = mask.long().sum(dim=1).clamp(min=1) - 1
+            pooled = hidden[torch.arange(bsz, device=device), idx].float()
+            pooled = torch.nn.functional.normalize(pooled, dim=-1)
+        out.extend(pooled.cpu().tolist())
+    return out
+
+
 def embed_texts(texts: list[str], *, model: str, batch: int = 32) -> list[list[float]]:
     if not texts:
         return []
+    local_dir = _local_model_dir(model)
+    if local_dir:
+        return _embed_texts_local(texts, model_dir=local_dir, batch=batch)
     client = _build_embed_client()
     out: list[list[float] | None] = [None] * len(texts)
     step = max(1, int(batch))
@@ -322,7 +429,7 @@ def search_embed_then_rerank(
         raise FileNotFoundError(f"semantic embeddings not found: {npz_path}")
     model = (embed_model or embed_model_id()).strip()
     if not model:
-        raise RuntimeError("set EIF_SEMANTIC_EMBED_MODEL / EMBED_MODEL")
+        raise RuntimeError("set EIF_BASE_MODEL_PATH (or EIF_SEMANTIC_EMBED_MODEL)")
 
     q = normalize_semantic_repr(query_sem if isinstance(query_sem, dict) else {})
     q_text = flatten_semantic_text_for_embedding(q)

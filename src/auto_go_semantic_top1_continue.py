@@ -21,6 +21,7 @@ Env（Linux 示例）::
 
     EIF_LLM_TRAIN_CORPUS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.jsonl
     EIF_LLM_SEMANTIC_CORPUS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl
+    EIF_LLM_SEMANTIC_EMBEDDINGS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl.embeddings.npz
     ANNOTATION_CONTINUE_TRAIN_DATA=/mnt/md124/jiaxin/Empirical-Influence-Function/go_continue_annotated_subset.jsonl
 
 Example::

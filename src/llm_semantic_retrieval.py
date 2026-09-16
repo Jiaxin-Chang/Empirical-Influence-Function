@@ -17,8 +17,8 @@ and later code*.
 
 Canonical display text is ``flatten_semantic_text``. Dense recall embeds
 ``flatten_semantic_text_for_embedding`` (pattern/relations repeated).
-Retrieval is two-stage when ``*.embeddings.npz`` exists: embedding coarse recall,
-then structured rerank. Otherwise falls back to full schema scan.
+Retrieval is two-stage when ``EIF_LLM_SEMANTIC_EMBEDDINGS`` (or the jsonl sidecar
+npz) exists: embedding coarse recall, then structured rerank. Otherwise schema scan.
 """
 
 from __future__ import annotations
@@ -383,7 +383,7 @@ def retrieve_llm_semantic_samples(
                     entry["retrieval"] = pipe
                     if pipe == "schema_scan":
                         entry["why"] = (
-                            "schema-to-schema scan (no embeddings.npz / embed failed). "
+                            "schema-to-schema scan (no EIF_LLM_SEMANTIC_EMBEDDINGS / embed failed). "
                             "Run: python -m src.fim_semantic_preprocess --embed-only"
                         )
             except Exception as exc:
@@ -391,7 +391,8 @@ def retrieve_llm_semantic_samples(
         else:
             entry["corpus_error"] = (
                 "Set EIF_LLM_SEMANTIC_CORPUS to the jsonl from "
-                "python -m src.fim_semantic_preprocess. "
+                "python -m src.fim_semantic_preprocess, and "
+                "EIF_LLM_SEMANTIC_EMBEDDINGS to the npz from --embed-only. "
                 "Keep EIF_LLM_TRAIN_CORPUS as the raw FIM file."
             )
     return {

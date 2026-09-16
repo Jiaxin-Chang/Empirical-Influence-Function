@@ -2,7 +2,7 @@
 
 Canonical generation fields: role, pattern, operations, relations.
 Older corpora may still carry domain/entities/conditions/summary; those are
-kept on normalize for backward-compatible retrieval, not requested from the LLM.
+parsed on normalize but unused for flatten/rerank. The LLM is not asked for them.
 """
 
 from __future__ import annotations
@@ -19,26 +19,21 @@ _FIELD_LIMITS = {
     "conditions": 3,
 }
 
-# Coarse-to-fine weights: role/pattern/relations matter more than a bare entity name.
+# Coarse-to-fine list weights for lexical haystack overlap (schema-scan helpers).
 _FIELD_WEIGHTS = {
-    "domain": 0.6,
     "pattern": 2.2,
-    "entities": 1.0,
     "operations": 1.6,
-    "conditions": 1.6,
 }
 _ROLE_WEIGHT = 2.4
 _REL_BOTH = 3.2
 _REL_ONE = 0.9
 
-# Stage-2 rerank: embedding is only a 0.1 tie-break, not the ranker.
+# Stage-2 rerank: four generation fields only. Sum = 0.90; embed is a 0.10 tie-break.
 RERANK_WEIGHTS = {
     "relation": 0.40,
     "pattern": 0.22,
     "role": 0.15,
     "operations": 0.13,
-    "conditions": 0.07,
-    "entities": 0.03,
 }
 EMBED_TIE_WEIGHT = 0.10
 EMBED_TEXT_KIND = "mechanism_v1"
@@ -380,7 +375,7 @@ def semantic_repr_similarity(
     query: dict[str, Any] | None,
     doc: dict[str, Any] | None,
 ) -> float:
-    """Compare two structured representations. Relations/pattern weigh more than entities."""
+    """Compare two structured representations on role/pattern/operations/relations."""
     q = normalize_semantic_repr(query if isinstance(query, dict) else {})
     d = normalize_semantic_repr(doc if isinstance(doc, dict) else {})
     score = 0.0
@@ -392,53 +387,35 @@ def semantic_repr_similarity(
             qw, dw = set(qrole.split()), set(drole.split())
             if qw and dw:
                 score += _ROLE_WEIGHT * (len(qw & dw) / max(len(qw), 1))
-    score += _FIELD_WEIGHTS["domain"] * _list_overlap(q["domain"], d["domain"])
     score += _FIELD_WEIGHTS["pattern"] * _list_overlap(q["pattern"], d["pattern"])
-    score += _FIELD_WEIGHTS["entities"] * _list_overlap(q["entities"], d["entities"])
     score += _FIELD_WEIGHTS["operations"] * _list_overlap(q["operations"], d["operations"])
-    score += _FIELD_WEIGHTS["conditions"] * _list_overlap(q["conditions"], d["conditions"])
     score += _REL_BOTH * _relation_overlap(q["relations"], d["relations"])
-    qsum, dsum = _norm_term(q["summary"]), _norm_term(d["summary"])
-    if qsum and dsum:
-        qw = set(qsum.split())
-        dw = set(dsum.split())
-        if qw and dw:
-            score += 1.2 * (len(qw & dw) / max(len(qw), 1))
     return float(score)
 
 
 def flatten_semantic_text(sem: dict[str, Any] | None) -> str:
-    """Canonical text for embedding / display. Not JSON dump, not summary-only."""
+    """Canonical text for display. Four generation fields first; legacy keys if present."""
     s = normalize_semantic_repr(sem if isinstance(sem, dict) else {})
     lines: list[str] = []
     if s.get("role"):
         lines.append("Role: " + str(s["role"]).rstrip(".") + ".")
-    if s["domain"]:
-        lines.append("Domain: " + "; ".join(s["domain"]) + ".")
     if s["pattern"]:
         lines.append("Pattern: " + "; ".join(s["pattern"]) + ".")
-    if s["entities"]:
-        lines.append("Entities: " + "; ".join(s["entities"]) + ".")
     if s["operations"]:
         lines.append("Operations: " + "; ".join(s["operations"]) + ".")
-    if s["conditions"]:
-        lines.append("Conditions: " + "; ".join(s["conditions"]) + ".")
     if s["relations"]:
         rels = [
             f'{r["source"]} -> {r["target"]} [{r["type"]}]'
             for r in s["relations"]
         ]
         lines.append("Relations: " + "; ".join(rels) + ".")
-    if s["summary"]:
-        lines.append("Summary: " + s["summary"])
     return "\n".join(lines)
 
 
 def flatten_semantic_text_for_embedding(sem: dict[str, Any] | None) -> str:
-    """Mechanism-heavy canonical text for dense recall.
+    """Mechanism-heavy canonical text for dense recall (four fields only).
 
-    Pattern and relations are repeated; domain and summary are omitted so AWS/HTTP
-    boilerplate does not dominate the neighborhood.
+    Pattern and relations are repeated; role twice; operations once.
     """
     s = normalize_semantic_repr(sem if isinstance(sem, dict) else {})
     chunks: list[str] = []
@@ -457,10 +434,6 @@ def flatten_semantic_text_for_embedding(sem: dict[str, Any] | None) -> str:
         chunks.extend([line, line])
     if s["operations"]:
         chunks.append("Operations: " + "; ".join(s["operations"]) + ".")
-    if s["conditions"]:
-        chunks.append("Conditions: " + "; ".join(s["conditions"]) + ".")
-    if s["entities"]:
-        chunks.append("Entities: " + "; ".join(s["entities"][:4]) + ".")
     return "\n".join(chunks) or "empty semantic representation"
 
 
@@ -499,7 +472,7 @@ def semantic_struct_components(
     *,
     endpoint_sim: Any | None = None,
 ) -> dict[str, float]:
-    """Each component in [0, 1]. Domain/summary are not used for rerank."""
+    """Each component in [0, 1]. Only the four generation fields."""
     q = normalize_semantic_repr(query if isinstance(query, dict) else {})
     d = normalize_semantic_repr(doc if isinstance(doc, dict) else {})
     if endpoint_sim is not None:
@@ -511,8 +484,6 @@ def semantic_struct_components(
         "pattern": _list_overlap(q["pattern"], d["pattern"]),
         "role": _role_overlap(str(q.get("role") or ""), str(d.get("role") or "")),
         "operations": _list_overlap(q["operations"], d["operations"]),
-        "conditions": _list_overlap(q["conditions"], d["conditions"]),
-        "entities": _list_overlap(q["entities"], d["entities"]),
     }
 
 

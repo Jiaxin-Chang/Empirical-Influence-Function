@@ -5,22 +5,23 @@ Boolean retrieval still uses the **raw** FIM jsonl::
 
     EIF_LLM_TRAIN_CORPUS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.jsonl
 
-Semantic retrieval uses this script's output (schema JSON, optional embeddings)::
+Semantic retrieval uses this script's output (schema JSON + embeddings npz)::
+
+    EIF_LLM_SEMANTIC_CORPUS=.../csn_go_train_fim.semantic.jsonl
+    EIF_LLM_SEMANTIC_EMBEDDINGS=.../csn_go_train_fim.semantic.jsonl.embeddings.npz
 
     python -m src.fim_semantic_preprocess \\
       -i /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.jsonl \\
-      -o /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl \\
+      -o "$EIF_LLM_SEMANTIC_CORPUS" \\
       --language go
 
-    # Stage-1 embeddings (mechanism-weighted text). Re-run after more LLM rows.
-    python -m src.fim_semantic_preprocess \\
-      --embed-only \\
-      -o /mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl \\
-      --embed-model text-embedding-v3
+    # Stage-1 embeddings from EIF_BASE_MODEL_PATH (local last-token pool).
+    python -m src.fim_semantic_preprocess --embed-only -o "$EIF_LLM_SEMANTIC_CORPUS"
 
 Then in eif_api.env::
 
     EIF_LLM_SEMANTIC_CORPUS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl
+    EIF_LLM_SEMANTIC_EMBEDDINGS=/mnt/md124/jiaxin/training_code/data/csn_go_train_fim.semantic.jsonl.embeddings.npz
 
 Do **not** point EIF_LLM_TRAIN_CORPUS at the preprocessed file. Boolean substring
 search and MID rewrite need original prompt/response. The semantic jsonl only
@@ -125,7 +126,13 @@ def _write_row(out_path: Path, row: dict[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
+def _embed_only(
+    out_path: Path,
+    *,
+    model: str,
+    batch: int,
+    embeddings_out: str | Path | None = None,
+) -> int:
     try:
         import numpy as np
     except ImportError as exc:
@@ -159,13 +166,14 @@ def _embed_only(out_path: Path, *, model: str, batch: int) -> int:
         print(f"  embedded {min(start + batch, len(rows))}/{len(rows)}", flush=True)
 
     arr = np.asarray(vectors, dtype="float32")
-    npz_path = embedding_npz_path(out_path)
+    npz_path = embedding_npz_path(out_path, override=embeddings_out)
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         npz_path,
         vectors=arr,
         source_lines=np.asarray(source_lines, dtype="int64"),
     )
-    meta_path = embedding_meta_path(out_path)
+    meta_path = embedding_meta_path(npz_path)
     meta_path.write_text(
         json.dumps(
             {
@@ -224,8 +232,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="after LLM pass, also write embeddings npz")
     parser.add_argument(
         "--embed-model",
-        default=os.environ.get("EIF_SEMANTIC_EMBED_MODEL") or os.environ.get("EMBED_MODEL") or "",
-        help="OpenAI-compatible embedding model id",
+        default="",
+        help="embed id (default: local EIF_BASE_MODEL_PATH; API only if EIF_SEMANTIC_EMBED_MODEL is set)",
+    )
+    parser.add_argument(
+        "--embeddings-out",
+        default="",
+        help="npz path (default: EIF_LLM_SEMANTIC_EMBEDDINGS, else sidecar of -o)",
     )
     parser.add_argument("--embed-batch", type=int, default=16)
     args = parser.parse_args(argv)
@@ -239,14 +252,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.embed_only:
-        model = (args.embed_model or "").strip()
+        from src.fim_semantic_index import embed_model_id
+
+        model = (args.embed_model or "").strip() or embed_model_id()
         if not model:
-            print("need --embed-model / EIF_SEMANTIC_EMBED_MODEL", file=sys.stderr)
+            print("need EIF_BASE_MODEL_PATH (or --embed-model / EIF_SEMANTIC_EMBED_MODEL)", file=sys.stderr)
             return 2
         if not out_path.is_file():
             print(f"semantic jsonl not found: {out_path}", file=sys.stderr)
             return 2
-        return _embed_only(out_path, model=model, batch=args.embed_batch)
+        return _embed_only(
+            out_path,
+            model=model,
+            batch=args.embed_batch,
+            embeddings_out=args.embeddings_out,
+        )
 
     in_path = Path(args.input).expanduser()
     if not in_path.is_file():
@@ -336,11 +356,18 @@ def main(argv: list[str] | None = None) -> int:
     if print_only:
         return 0
     if args.embed:
-        model = (args.embed_model or "").strip()
+        from src.fim_semantic_index import embed_model_id
+
+        model = (args.embed_model or "").strip() or embed_model_id()
         if not model:
-            print("skip embed: set --embed-model / EIF_SEMANTIC_EMBED_MODEL", flush=True)
+            print("skip embed: set EIF_BASE_MODEL_PATH (or --embed-model)", flush=True)
             return 0
-        return _embed_only(out_path, model=model, batch=args.embed_batch)
+        return _embed_only(
+            out_path,
+            model=model,
+            batch=args.embed_batch,
+            embeddings_out=args.embeddings_out,
+        )
     return 0
 
 
