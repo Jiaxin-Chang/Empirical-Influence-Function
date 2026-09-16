@@ -195,6 +195,7 @@ def _embed_only(
 
 
 def main(argv: list[str] | None = None) -> int:
+    _hydrate_env()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-i", "--input",
@@ -243,9 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embed-batch", type=int, default=16)
     args = parser.parse_args(argv)
 
-    _hydrate_env()
     print_only = bool(args.print_only)
-    out_raw = str(args.output or "").strip()
+    out_raw = str(args.output or os.environ.get("EIF_LLM_SEMANTIC_CORPUS") or "").strip()
     out_path = Path(out_raw).expanduser() if out_raw else Path()
     if not print_only and not out_raw:
         print("need -o / EIF_LLM_SEMANTIC_CORPUS (or --print-only)", file=sys.stderr)
