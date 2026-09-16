@@ -254,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         print("EIF_LLM_TRAIN_CORPUS must stay the original FIM jsonl.", file=sys.stderr)
         return 2
 
-    from src.fim_semantic_schema import flatten_semantic_text, normalize_semantic_repr
+    from src.fim_semantic_schema import flatten_semantic_text, semantic_export_repr
     from src.llm_semantic_retrieval import call_llm_semantic_analyze
 
     done = set() if args.force or print_only or not out_raw else _already_done(out_path)
@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  fail line={source_line}: {exc}", flush=True)
                 continue
             analysis = llm_out.get("semantic") if isinstance(llm_out.get("semantic"), dict) else {}
-            sem = normalize_semantic_repr(analysis if analysis else llm_out)
+            sem = semantic_export_repr(analysis if analysis else llm_out)
             out_row = {
                 "source_line": source_line,
                 "task_id": _row_task_id(row, source_line),

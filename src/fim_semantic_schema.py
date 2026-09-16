@@ -9,13 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SEMANTIC_LIST_KEYS = (
-    "domain",
-    "pattern",
-    "entities",
-    "operations",
-    "conditions",
-)
+SEMANTIC_EXPORT_KEYS = ("role", "pattern", "operations", "relations")
 
 _FIELD_LIMITS = {
     "domain": 4,
@@ -218,6 +212,12 @@ def normalize_semantic_repr(obj: dict[str, Any] | None) -> dict[str, Any]:
         "summary": summary,
     }
     return out
+
+
+def semantic_export_repr(obj: dict[str, Any] | None) -> dict[str, Any]:
+    """Four-field dict for new semantic jsonl rows (no empty legacy keys)."""
+    s = normalize_semantic_repr(obj)
+    return {k: s[k] for k in SEMANTIC_EXPORT_KEYS}
 
 
 def empty_semantic_repr() -> dict[str, Any]:
