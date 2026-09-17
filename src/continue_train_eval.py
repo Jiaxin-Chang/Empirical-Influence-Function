@@ -783,6 +783,70 @@ def generate_one(tokenizer, model, prompt: str, max_new_tokens: int) -> dict[str
     return row
 
 
+@torch.no_grad()
+def gold_teacher_forced_ce(
+    model,
+    tokenizer,
+    prompt: str,
+    label: str,
+) -> dict[str, Any]:
+    """Mean CE of the gold completion under the same ChatML prefix as greedy eval."""
+    gold = str(label or "")
+    if not gold.strip():
+        return {"loss": None, "nll": None, "n_tokens": 0}
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        prefix = _render_eval_prompt(tokenizer, prompt or "")
+        prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+        gold_ids = tokenizer(gold, add_special_tokens=False)["input_ids"]
+        if not isinstance(prefix_ids, list):
+            prefix_ids = [int(x) for x in prefix_ids]
+        if not isinstance(gold_ids, list):
+            gold_ids = [int(x) for x in gold_ids]
+        if not gold_ids:
+            return {"loss": None, "nll": None, "n_tokens": 0}
+        device = _device_of(model)
+        input_ids = torch.tensor([prefix_ids + gold_ids], dtype=torch.long, device=device)
+        labels = torch.tensor(
+            [[-100] * len(prefix_ids) + gold_ids],
+            dtype=torch.long,
+            device=device,
+        )
+        out = model(input_ids=input_ids, labels=labels)
+        loss = float(out.loss.detach().float().cpu())
+        n_tok = int(len(gold_ids))
+        return {
+            "loss": round(loss, 6),
+            "nll": round(loss * n_tok, 6),
+            "n_tokens": n_tok,
+        }
+    finally:
+        if was_training:
+            model.train()
+
+
+def _attach_gold_ce(
+    dest: dict[str, Any],
+    *,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+) -> None:
+    if before:
+        dest["loss_before"] = before.get("loss")
+        dest["nll_before"] = before.get("nll")
+        dest["loss_tokens"] = before.get("n_tokens")
+    if after:
+        dest["loss_after"] = after.get("loss")
+        dest["nll_after"] = after.get("nll")
+        if after.get("n_tokens"):
+            dest["loss_tokens"] = after.get("n_tokens")
+    b = None if not before else before.get("loss")
+    a = None if not after else after.get("loss")
+    if isinstance(b, (int, float)) and isinstance(a, (int, float)):
+        dest["loss_delta"] = round(float(a) - float(b), 6)
+
+
 def evaluate_line_hit(
     model,
     tokenizer,
@@ -1369,6 +1433,27 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             )
         except Exception:
             pass
+    want_current = bool(
+        cfg.current_test_prompt
+        or cfg.current_test_label
+        or cfg.current_test_task_id
+    )
+    cur_row: dict[str, Any] | None = None
+    loss_before: dict[str, Any] | None = None
+    if want_current:
+        cur_row = _resolve_current_test_sample(cfg, eval_samples)
+        if cur_row is not None:
+            _prog("eval_current_before", "Gold CE on current test (before continue)…")
+            loss_before = gold_teacher_forced_ce(
+                model, tokenizer, cur_row.get("prompt") or "", cur_row.get("label") or "",
+            )
+            print(
+                f"[continue-eval] current test gold CE before="
+                f"{loss_before.get('loss')} n_tokens={loss_before.get('n_tokens')}",
+                flush=True,
+            )
+            model.zero_grad(set_to_none=True)
+            _release_cuda()
     if torch.cuda.is_available():
         try:
             free_b, total_b = torch.cuda.mem_get_info()
@@ -1388,37 +1473,36 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
     )
 
     current_test_out: dict[str, Any] | None = None
-    if (
-        cfg.current_test_prompt
-        or cfg.current_test_label
-        or cfg.current_test_task_id
-    ):
+    if want_current and cur_row is not None:
         _prog("predict_current", "Generating on current test sample…")
-        cur = _resolve_current_test_sample(cfg, eval_samples)
-        if cur is not None:
-            gen = generate_one(tokenizer, model, cur["prompt"], cfg.max_new_tokens)
-            pre = line_hit(cur["label"], gen["predict"], "precision")
-            rec = line_hit(cur["label"], gen["predict"], "recall")
-            current_test_out = {
-                "task_id": cur.get("task_id"),
-                "prompt": cur["prompt"],
-                "label": cur["label"],
-                "predict": gen["predict"],
-                "predict_token_ids": gen.get("predict_token_ids") or [],
-                "predict_tokens": gen.get("predict_tokens") or [],
-                "line_hit_pre": round(pre, 4),
-                "line_hit_rec": round(rec, 4),
-                "finish_reason": gen.get("finish_reason"),
-            }
-            print(
-                f"[continue-eval] current test task_id={cur.get('task_id')!r} "
-                f"pre={pre:.4f} rec={rec:.4f}",
-                flush=True,
-            )
-            print(
-                f"[continue-eval] predict:\n{gen['predict'][:2000]}",
-                flush=True,
-            )
+        gen = generate_one(tokenizer, model, cur_row["prompt"], cfg.max_new_tokens)
+        pre = line_hit(cur_row["label"], gen["predict"], "precision")
+        rec = line_hit(cur_row["label"], gen["predict"], "recall")
+        loss_after = gold_teacher_forced_ce(
+            model, tokenizer, cur_row.get("prompt") or "", cur_row.get("label") or "",
+        )
+        current_test_out = {
+            "task_id": cur_row.get("task_id"),
+            "prompt": cur_row["prompt"],
+            "label": cur_row["label"],
+            "predict": gen["predict"],
+            "predict_token_ids": gen.get("predict_token_ids") or [],
+            "predict_tokens": gen.get("predict_tokens") or [],
+            "line_hit_pre": round(pre, 4),
+            "line_hit_rec": round(rec, 4),
+            "finish_reason": gen.get("finish_reason"),
+        }
+        _attach_gold_ce(current_test_out, before=loss_before, after=loss_after)
+        print(
+            f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
+            f"pre={pre:.4f} rec={rec:.4f} "
+            f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
+            flush=True,
+        )
+        print(
+            f"[continue-eval] predict:\n{gen['predict'][:2000]}",
+            flush=True,
+        )
 
     after = None
     if cfg.eval_after_full:

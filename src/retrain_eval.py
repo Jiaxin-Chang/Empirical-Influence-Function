@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_co
 
 from src.bank_loss import BankLossConfig, compute_bank_loss
 from src.continue_train_eval import (
+    _attach_gold_ce,
     _evict_cached_models,
     _pick_continue_attn_implementation,
     _release_cuda,
@@ -35,6 +36,7 @@ from src.continue_train_eval import (
     _sample_batch,
     _trainable_lora_params,
     generate_one,
+    gold_teacher_forced_ce,
     line_hit,
     load_eval_samples,
     save_adapter,
@@ -354,6 +356,24 @@ def run_retrain_and_eval(cfg: RetrainConfig, progress_cb=None) -> dict[str, Any]
         flush=True,
     )
 
+    want_current = bool(
+        cfg.current_test_prompt or cfg.current_test_label or cfg.current_test_task_id
+    )
+    cur_row = _resolve_current_test_sample(cfg, eval_samples) if want_current else None
+    loss_before: dict[str, Any] | None = None
+    if cur_row is not None:
+        _prog("eval_current_before", "Gold CE on current test (before retrain)…")
+        loss_before = gold_teacher_forced_ce(
+            model, tokenizer, cur_row.get("prompt") or "", cur_row.get("label") or "",
+        )
+        print(
+            f"[retrain] current test gold CE before="
+            f"{loss_before.get('loss')} n_tokens={loss_before.get('n_tokens')}",
+            flush=True,
+        )
+        model.zero_grad(set_to_none=True)
+        _release_cuda()
+
     bank_cfg = BankLossConfig(
         loss_mode="ce_saliency" if cfg.loss_mode != "ce_only" else "ce_only",
         saliency_loss_type="contrastive",
@@ -381,30 +401,33 @@ def run_retrain_and_eval(cfg: RetrainConfig, progress_cb=None) -> dict[str, Any]
         model.config.use_cache = True
 
     current_test_out: dict[str, Any] | None = None
-    if cfg.current_test_prompt or cfg.current_test_label or cfg.current_test_task_id:
+    if cur_row is not None:
         _prog("predict_current", "Generating on current test sample…")
-        cur = _resolve_current_test_sample(cfg, eval_samples)
-        if cur is not None:
-            gen = generate_one(tokenizer, model, cur["prompt"], cfg.max_new_tokens)
-            pre = line_hit(cur.get("label") or "", gen["predict"], "precision")
-            rec = line_hit(cur.get("label") or "", gen["predict"], "recall")
-            current_test_out = {
-                "task_id": cur.get("task_id"),
-                "prompt": cur["prompt"],
-                "label": cur.get("label"),
-                "predict": gen["predict"],
-                "predict_token_ids": gen.get("predict_token_ids") or [],
-                "predict_tokens": gen.get("predict_tokens") or [],
-                "line_hit_pre": round(pre, 4),
-                "line_hit_rec": round(rec, 4),
-                "finish_reason": gen.get("finish_reason"),
-            }
-            print(
-                f"[retrain] current test task_id={cur.get('task_id')!r} "
-                f"pre={pre:.4f} rec={rec:.4f}",
-                flush=True,
-            )
-            print(f"[retrain] predict:\n{gen['predict'][:2000]}", flush=True)
+        gen = generate_one(tokenizer, model, cur_row["prompt"], cfg.max_new_tokens)
+        pre = line_hit(cur_row.get("label") or "", gen["predict"], "precision")
+        rec = line_hit(cur_row.get("label") or "", gen["predict"], "recall")
+        loss_after = gold_teacher_forced_ce(
+            model, tokenizer, cur_row.get("prompt") or "", cur_row.get("label") or "",
+        )
+        current_test_out = {
+            "task_id": cur_row.get("task_id"),
+            "prompt": cur_row["prompt"],
+            "label": cur_row.get("label"),
+            "predict": gen["predict"],
+            "predict_token_ids": gen.get("predict_token_ids") or [],
+            "predict_tokens": gen.get("predict_tokens") or [],
+            "line_hit_pre": round(pre, 4),
+            "line_hit_rec": round(rec, 4),
+            "finish_reason": gen.get("finish_reason"),
+        }
+        _attach_gold_ce(current_test_out, before=loss_before, after=loss_after)
+        print(
+            f"[retrain] current test task_id={cur_row.get('task_id')!r} "
+            f"pre={pre:.4f} rec={rec:.4f} "
+            f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
+            flush=True,
+        )
+        print(f"[retrain] predict:\n{gen['predict'][:2000]}", flush=True)
 
     meta = {
         "config": asdict(cfg),

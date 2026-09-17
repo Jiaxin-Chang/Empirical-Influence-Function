@@ -328,6 +328,7 @@ def _try_annotate_hits(
     hit_corpus: str | None,
     state_path: Path | None,
     keep_original_if_unrewritten: bool = False,
+    target_semantic: dict[str, Any] | None = None,
 ) -> bool:
     """MID-prep + LLM/graphsignal annotate the first usable hit. True if written."""
     for hit in hits:
@@ -376,6 +377,12 @@ def _try_annotate_hits(
             })
             continue
         print(f"       MID ok: {note}", flush=True)
+        if target_semantic:
+            print(
+                "       annotate with test target_semantic "
+                f"(role={str(target_semantic.get('role') or '')[:80]!r})",
+                flush=True,
+            )
 
         try:
             client.bind_rewrite(
@@ -387,6 +394,7 @@ def _try_annotate_hits(
                 line=cline,
                 corpus_path=hit_corpus,
                 language=language,
+                target_semantic=target_semantic,
             )
             continue_rows = _duplicate_to_total(
                 client,
@@ -641,6 +649,7 @@ class PipelineClient:
         line: int,
         corpus_path: str | None,
         language: str | None = None,
+        target_semantic: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.dry_run:
             return {"ok": True, "dry_run": True, "n_continue_edges": 0}
@@ -662,7 +671,7 @@ class PipelineClient:
             preview = _http_json(
                 "POST",
                 f"{base}/llm-semantic-annotate/preview" + (f"?{qs}" if qs else ""),
-                {},
+                {"target_semantic": target_semantic} if target_semantic else {},
                 timeout=1800.0,
             )
             pid = str(preview.get("preview_id") or "")
@@ -872,6 +881,11 @@ def _process_semantic_row(
         hit_corpus=corpus_path,
         state_path=state_path,
         keep_original_if_unrewritten=True,
+        target_semantic=(
+            retrieve.get("semantic")
+            if isinstance(retrieve.get("semantic"), dict)
+            else None
+        ),
     ):
         return
 

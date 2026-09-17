@@ -1153,6 +1153,7 @@ class LlmSemanticAnnotateBody(BaseModel):
     max_sources_per_token: int | None = Field(None, ge=1, le=15)
     max_answer_tokens: int | None = Field(None, ge=1, le=256)
     max_edges: int | None = Field(None, ge=1, le=4000)
+    target_semantic: dict[str, Any] | None = None
 
     class Config:
         extra = "ignore"
@@ -2018,6 +2019,7 @@ def llm_semantic_annotate_preview(
         f"[llm-semantic] preview start line={line} "
         f"prompt_chars={len(prompt)} response_chars={len(response)} "
         f"language={raw_row.get('language') or '-'} "
+        f"target_semantic={bool(payload.target_semantic)} "
         f"keys={sorted(str(k) for k in raw_row.keys())[:24]}",
         flush=True,
     )
@@ -2029,6 +2031,7 @@ def llm_semantic_annotate_preview(
             max_sources_per_token=payload.max_sources_per_token,
             max_answer_tokens=payload.max_answer_tokens,
             max_edges=payload.max_edges,
+            target_semantic=payload.target_semantic,
         )
     except LlmSemanticCancelled as exc:
         print(f"[llm-semantic] cancelled line={line}: {exc}", flush=True)

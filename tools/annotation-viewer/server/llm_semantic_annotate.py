@@ -214,6 +214,44 @@ def default_max_context() -> int:
     return max(80, min(2000, _env_int("ANNOTATE_SEMANTIC_MAX_CONTEXT", 800)))
 
 
+def _compact_target_semantic(obj: Any) -> dict[str, Any] | None:
+    """TEST-hole 4-field schema. Relations are the attention template."""
+    if not isinstance(obj, dict):
+        return None
+    rels: list[dict[str, str]] = []
+    raw_rels = obj.get("relations")
+    if isinstance(raw_rels, list):
+        for item in raw_rels:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("source") or item.get("src") or "").strip()
+            tgt = str(item.get("target") or item.get("dst") or "").strip()
+            typ = str(item.get("type") or "").strip()
+            if src and tgt:
+                rels.append({"source": src, "target": tgt, **({"type": typ} if typ else {})})
+            if len(rels) >= 3:
+                break
+    pats = [
+        str(x).strip()
+        for x in (obj.get("pattern") or [])
+        if str(x).strip()
+    ][:3]
+    ops = [
+        str(x).strip()
+        for x in (obj.get("operations") or [])
+        if str(x).strip()
+    ][:4]
+    out = {
+        "role": str(obj.get("role") or "").strip(),
+        "pattern": pats,
+        "operations": ops,
+        "relations": rels,
+    }
+    if not out["role"] and not pats and not ops and not rels:
+        return None
+    return out
+
+
 def _build_full_sample_messages(
     *,
     language: str,
@@ -224,11 +262,22 @@ def _build_full_sample_messages(
     max_edges: int,
     max_sources_per_dst: int,
     prompt_bundle: dict[str, Any] | None = None,
+    target_semantic: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     from server.semantic_prompt import DEFAULT_SYSTEM, format_few_shots_block, load_active
 
     bundle = prompt_bundle if isinstance(prompt_bundle, dict) else load_active()
     system = str(bundle.get("system") or DEFAULT_SYSTEM).strip() + "\n"
+    target = _compact_target_semantic(target_semantic)
+    if target:
+        system += (
+            "A target_mechanism object may be attached: it describes the TEST hole "
+            "that retrieved this train sample. Map those semantic relations onto "
+            "THIS sample's tokens. Relations are the primary attention template "
+            "(bind source/target concepts to actual context_tokens / completion_tokens). "
+            "Role/pattern/operations only disambiguate. Do not copy concept strings as "
+            "indices. You may still add other high-confidence edges the completion needs.\n"
+        )
     shots = format_few_shots_block(list(bundle.get("few_shots") or []))
     if shots:
         system += "\n" + shots
@@ -265,6 +314,8 @@ def _build_full_sample_messages(
             ],
         },
     }
+    if target:
+        user_obj["target_mechanism"] = target
     user = (
         "Annotate the whole completion in one shot. Return every high-confidence "
         "src→dst routing edge (dst in completion_tokens).\n"
@@ -453,6 +504,7 @@ def annotate_prompt_response_semantic(
     max_answer_tokens: int | None = None,
     max_edges: int | None = None,
     prompt_bundle: dict[str, Any] | None = None,
+    target_semantic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One LLM call → compact src→dst edge table for a FIM prompt+completion."""
     from server.semantic_prompt import load_active
@@ -500,12 +552,14 @@ def annotate_prompt_response_semantic(
         max_edges=max_e,
         max_sources_per_dst=max_src,
         prompt_bundle=bundle,
+        target_semantic=target_semantic,
     )
 
     clear_llm_semantic_abort()
     print(
         f"[llm-semantic] start mode=full answer_tokens={len(answer_indices)} "
-        f"max_edges={max_e} max_sources={max_src} seq_len={n} prompt={vid}",
+        f"max_edges={max_e} max_sources={max_src} seq_len={n} prompt={vid} "
+        f"target_semantic={bool(_compact_target_semantic(target_semantic))}",
         flush=True,
     )
     t0 = time.perf_counter()
@@ -560,6 +614,7 @@ def annotate_prompt_response_semantic(
             "annotate_model": _env("ANNOTATE_MODEL") or "",
             "prompt_version": vid,
             "elapsed_sec": round(elapsed, 2),
+            "target_semantic": bool(_compact_target_semantic(target_semantic)),
         },
     }
 
@@ -573,6 +628,7 @@ def annotate_corpus_row_semantic(
     max_answer_tokens: int | None = None,
     max_edges: int | None = None,
     prompt_bundle: dict[str, Any] | None = None,
+    target_semantic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt, response = extract_prompt_response(raw_row)
     return annotate_prompt_response_semantic(
@@ -584,4 +640,5 @@ def annotate_corpus_row_semantic(
         max_answer_tokens=max_answer_tokens,
         max_edges=max_edges,
         prompt_bundle=prompt_bundle,
+        target_semantic=target_semantic,
     )

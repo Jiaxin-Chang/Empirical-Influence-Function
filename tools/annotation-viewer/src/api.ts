@@ -308,7 +308,12 @@ export const api = {
 
   llmSemanticAnnotatePreview: (
     line: number,
-    body?: { max_sources_per_token?: number; max_answer_tokens?: number; max_edges?: number },
+    body?: {
+      max_sources_per_token?: number
+      max_answer_tokens?: number
+      max_edges?: number
+      target_semantic?: Record<string, unknown> | null
+    },
     opts?: { corpusPath?: string | null; signal?: AbortSignal },
   ) =>
     jsonFetch<{

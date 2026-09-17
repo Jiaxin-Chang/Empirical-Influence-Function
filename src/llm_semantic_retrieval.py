@@ -30,6 +30,7 @@ from typing import Any
 from src.fim_semantic_schema import (
     flatten_semantic_text,
     normalize_semantic_repr,
+    semantic_export_repr,
     semantic_repr_similarity,
 )
 from src.llm_train_retrieval import (
@@ -219,7 +220,7 @@ def call_llm_semantic_analyze(
         temperature=0.2,
         log_prefix="[llm-semantic]",
     )
-    sem = normalize_semantic_repr(parsed)
+    sem = semantic_export_repr(parsed)
     return {
         "model": model_name,
         "raw": raw,
@@ -350,7 +351,7 @@ def retrieve_llm_semantic_samples(
         gold_completion=prepared["gold_mid_completion"],
         language=language,
     )
-    sem = llm_out.get("semantic") or normalize_semantic_repr({})
+    sem = semantic_export_repr(llm_out.get("semantic") or {})
     semantic_corpus = (
         (corpus_path or "").strip()
         or _env("EIF_LLM_SEMANTIC_CORPUS")

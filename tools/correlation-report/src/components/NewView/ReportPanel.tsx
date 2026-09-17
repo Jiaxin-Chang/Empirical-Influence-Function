@@ -276,6 +276,32 @@ function formatLlmRelation(rel: LlmSemanticRelation | string): string {
     return src || tgt;
 }
 
+function semanticExportView(sem: LlmSemanticRepr | undefined | null): {
+    role: string;
+    pattern: string[];
+    operations: string[];
+    relations: LlmSemanticRelation[];
+} {
+    const rels: LlmSemanticRelation[] = [];
+    for (const r of sem?.relations ?? []) {
+        if (typeof r === 'string') {
+            const t = r.trim();
+            if (t) rels.push({ source: t, target: '', type: '' });
+            continue;
+        }
+        const src = (r.source || '').trim();
+        const tgt = (r.target || '').trim();
+        const typ = (r.type || '').trim();
+        if (src && tgt) rels.push({ source: src, target: tgt, ...(typ ? { type: typ } : {}) });
+    }
+    return {
+        role: (sem?.role || '').trim(),
+        pattern: (sem?.pattern || []).map(x => String(x).trim()).filter(Boolean).slice(0, 3),
+        operations: (sem?.operations || []).map(x => String(x).trim()).filter(Boolean).slice(0, 4),
+        relations: rels.slice(0, 3),
+    };
+}
+
 function LlmSemanticAttribution({
     analysis,
 }: {
@@ -283,7 +309,6 @@ function LlmSemanticAttribution({
 }) {
     const sem = analysis.semantic;
     const role = (sem?.role || '').trim();
-    const summary = (sem?.summary || '').trim();
     const chipRow = (label: string, items?: string[]) => {
         if (!items?.length) return null;
         return (
@@ -302,17 +327,8 @@ function LlmSemanticAttribution({
                     {role}
                 </div>
             ) : null}
-            {summary ? (
-                <div style={{ marginBottom: 8, lineHeight: 1.45, color: '#334155' }}>
-                    <strong>summary：</strong>
-                    {summary}
-                </div>
-            ) : null}
             {chipRow('pattern', sem?.pattern)}
             {chipRow('operations', sem?.operations)}
-            {chipRow('domain', sem?.domain)}
-            {chipRow('entities', sem?.entities)}
-            {chipRow('conditions', sem?.conditions)}
             {rels.length ? (
                 <div style={{ marginBottom: 8, fontSize: 11, lineHeight: 1.45 }}>
                     <strong style={{ color: '#9a3412' }}>relations：</strong>
@@ -427,6 +443,64 @@ function asString(value: unknown): string | null {
 function asStringArray(value: unknown): string[] | null {
     if (!Array.isArray(value) || !value.every(item => typeof item === 'string')) return null;
     return value;
+}
+
+function numOrUndef(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+type ContinueCurrentTestState = {
+    task_id?: string;
+    label?: string;
+    predict?: string;
+    predict_tokens?: string[];
+    predict_token_ids?: number[];
+    line_hit_pre?: number;
+    line_hit_rec?: number;
+    loss_before?: number;
+    loss_after?: number;
+    loss_delta?: number;
+    loss_tokens?: number;
+};
+
+function parseContinueCurrentTest(cur: Record<string, unknown>): ContinueCurrentTestState | null {
+    if (typeof cur.predict !== 'string' || !cur.predict.trim()) return null;
+    const predTok = asStringArray(cur.predict_tokens) ?? undefined;
+    const predIds = asIntArray(cur.predict_token_ids);
+    const aligned = Boolean(
+        predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
+    );
+    return {
+        task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
+        label: typeof cur.label === 'string' ? cur.label : undefined,
+        predict: cur.predict,
+        predict_tokens: aligned ? predTok : undefined,
+        predict_token_ids: aligned ? predIds : undefined,
+        line_hit_pre: numOrUndef(cur.line_hit_pre),
+        line_hit_rec: numOrUndef(cur.line_hit_rec),
+        loss_before: numOrUndef(cur.loss_before),
+        loss_after: numOrUndef(cur.loss_after),
+        loss_delta: numOrUndef(cur.loss_delta),
+        loss_tokens: numOrUndef(cur.loss_tokens),
+    };
+}
+
+function formatContinueDoneSummary(kind: string, cur: Record<string, unknown>): string {
+    const fmt2 = (v: unknown) =>
+        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+    const fmt4 = (v: unknown) =>
+        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : '—';
+    let s = `${kind} · 当前 test line_hit_pre=${fmt2(cur.line_hit_pre)} rec=${fmt2(cur.line_hit_rec)}`;
+    if (typeof cur.loss_before === 'number' && typeof cur.loss_after === 'number') {
+        const d = typeof cur.loss_delta === 'number'
+            ? cur.loss_delta
+            : cur.loss_after - cur.loss_before;
+        const sign = d > 0 ? '+' : '';
+        s += ` · gold CE ${fmt4(cur.loss_before)} → ${fmt4(cur.loss_after)} (Δ ${sign}${d.toFixed(4)})`;
+    } else if (typeof cur.loss_after === 'number') {
+        s += ` · gold CE ${fmt4(cur.loss_after)}`;
+    }
+    return s;
 }
 
 function asNumberArray(value: unknown): number[] | null {
@@ -2696,15 +2770,7 @@ export function ReportPanel({
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
-    const [continueCurrentTestOutput, setContinueCurrentTestOutput] = useState<{
-        task_id?: string;
-        label?: string;
-        predict?: string;
-        predict_tokens?: string[];
-        predict_token_ids?: number[];
-        line_hit_pre?: number;
-        line_hit_rec?: number;
-    } | null>(null);
+    const [continueCurrentTestOutput, setContinueCurrentTestOutput] = useState<ContinueCurrentTestState | null>(null);
     const [livePredictViewActive, setLivePredictViewActive] = useState(false);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
     const [continueRecoverBusy, setContinueRecoverBusy] = useState(false);
@@ -4561,6 +4627,17 @@ export function ReportPanel({
             if (qe) url.searchParams.set('queryExpr', qe);
             const qn = (queryName || '').trim();
             if (qn) url.searchParams.set('queryName', qn);
+            const targetSem = semanticExportView(
+                llmTrainResult?.analysis?.semantic || llmTrainResult?.semantic || {},
+            );
+            if (
+                targetSem.role
+                || targetSem.pattern.length
+                || targetSem.operations.length
+                || targetSem.relations.length
+            ) {
+                url.searchParams.set('targetSem', JSON.stringify(targetSem));
+            }
 
             let rewriteNote = '';
             if (goldCompletion.trim()) {
@@ -4635,6 +4712,8 @@ export function ReportPanel({
         })();
     }, [
         llmTrainResult?.corpus_path,
+        llmTrainResult?.analysis?.semantic,
+        llmTrainResult?.semantic,
         report.test_sample_baseline.raw_label,
         goldResponseTokens,
     ]);
@@ -4882,27 +4961,10 @@ export function ReportPanel({
                 setContinueJobId(jobId);
                 await pollContinueJob(jobId, (result) => {
                     const cur = (result.currentTest || {}) as Record<string, unknown>;
-                    const fmt = (v: unknown) =>
-                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
-                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
-                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
-                        const predIds = asIntArray(cur.predict_token_ids);
-                        const aligned = Boolean(
-                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
-                        );
-                        setContinueCurrentTestOutput({
-                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
-                            label: typeof cur.label === 'string' ? cur.label : undefined,
-                            predict: cur.predict,
-                            predict_tokens: aligned ? predTok : undefined,
-                            predict_token_ids: aligned ? predIds : undefined,
-                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
-                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
-                        });
-                        setContinueResultSummary(
-                            `续训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
-                            + ` rec=${fmt(cur.line_hit_rec)}`,
-                        );
+                    const parsed = parseContinueCurrentTest(cur);
+                    if (parsed) {
+                        setContinueCurrentTestOutput(parsed);
+                        setContinueResultSummary(formatContinueDoneSummary('续训完成', cur));
                     } else {
                         setContinueResultSummary('续训完成（未拿到当前 test 生成结果）');
                     }
@@ -4994,27 +5056,10 @@ export function ReportPanel({
                 setContinueJobId(jobId);
                 await pollContinueJob(jobId, (result) => {
                     const cur = (result.currentTest || {}) as Record<string, unknown>;
-                    const fmt = (v: unknown) =>
-                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
-                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
-                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
-                        const predIds = asIntArray(cur.predict_token_ids);
-                        const aligned = Boolean(
-                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
-                        );
-                        setContinueCurrentTestOutput({
-                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
-                            label: typeof cur.label === 'string' ? cur.label : undefined,
-                            predict: cur.predict,
-                            predict_tokens: aligned ? predTok : undefined,
-                            predict_token_ids: aligned ? predIds : undefined,
-                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
-                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
-                        });
-                        setContinueResultSummary(
-                            `CE 续训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
-                            + ` rec=${fmt(cur.line_hit_rec)}`,
-                        );
+                    const parsed = parseContinueCurrentTest(cur);
+                    if (parsed) {
+                        setContinueCurrentTestOutput(parsed);
+                        setContinueResultSummary(formatContinueDoneSummary('CE 续训完成', cur));
                     } else {
                         setContinueResultSummary('CE 续训完成（未拿到当前 test 生成结果）');
                     }
@@ -5106,27 +5151,10 @@ export function ReportPanel({
                 setContinueJobId(jobId);
                 await pollContinueJob(jobId, (result) => {
                     const cur = (result.currentTest || {}) as Record<string, unknown>;
-                    const fmt = (v: unknown) =>
-                        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
-                    if (typeof cur.predict === 'string' && cur.predict.trim()) {
-                        const predTok = asStringArray(cur.predict_tokens) ?? undefined;
-                        const predIds = asIntArray(cur.predict_token_ids);
-                        const aligned = Boolean(
-                            predTok && predIds && predTok.length === predIds.length && predTok.length > 0,
-                        );
-                        setContinueCurrentTestOutput({
-                            task_id: typeof cur.task_id === 'string' ? cur.task_id : undefined,
-                            label: typeof cur.label === 'string' ? cur.label : undefined,
-                            predict: cur.predict,
-                            predict_tokens: aligned ? predTok : undefined,
-                            predict_token_ids: aligned ? predIds : undefined,
-                            line_hit_pre: typeof cur.line_hit_pre === 'number' ? cur.line_hit_pre : undefined,
-                            line_hit_rec: typeof cur.line_hit_rec === 'number' ? cur.line_hit_rec : undefined,
-                        });
-                        setContinueResultSummary(
-                            `重训完成 · 当前 test line_hit_pre=${fmt(cur.line_hit_pre)}`
-                            + ` rec=${fmt(cur.line_hit_rec)}`,
-                        );
+                    const parsedOut = parseContinueCurrentTest(cur);
+                    if (parsedOut) {
+                        setContinueCurrentTestOutput(parsedOut);
+                        setContinueResultSummary(formatContinueDoneSummary('重训完成', cur));
                     } else {
                         setContinueResultSummary('重训完成（未拿到当前 test 生成结果）');
                     }
@@ -6088,6 +6116,42 @@ export function ReportPanel({
                                                         : ''}
                                                     {livePredictViewActive ? ' · 已接到 test 页' : ' · 点击 token 查看 saliency'}
                                                 </summary>
+                                                {(continueCurrentTestOutput.loss_before != null
+                                                    || continueCurrentTestOutput.loss_after != null) && (
+                                                    <div style={{
+                                                        marginTop: 6,
+                                                        fontSize: 11,
+                                                        lineHeight: 1.45,
+                                                        color: '#334155',
+                                                    }}>
+                                                        gold CE（teacher-force
+                                                        {continueCurrentTestOutput.loss_tokens != null
+                                                            ? ` · ${continueCurrentTestOutput.loss_tokens} tokens`
+                                                            : ''}
+                                                        ）：
+                                                        {continueCurrentTestOutput.loss_before != null
+                                                            ? continueCurrentTestOutput.loss_before.toFixed(4)
+                                                            : '—'}
+                                                        {' → '}
+                                                        {continueCurrentTestOutput.loss_after != null
+                                                            ? continueCurrentTestOutput.loss_after.toFixed(4)
+                                                            : '—'}
+                                                        {continueCurrentTestOutput.loss_delta != null && (
+                                                            <span style={{
+                                                                marginLeft: 6,
+                                                                fontWeight: 700,
+                                                                color: continueCurrentTestOutput.loss_delta < 0
+                                                                    ? '#166534'
+                                                                    : continueCurrentTestOutput.loss_delta > 0
+                                                                        ? '#b91c1c'
+                                                                        : '#64748b',
+                                                            }}>
+                                                                Δ {continueCurrentTestOutput.loss_delta > 0 ? '+' : ''}
+                                                                {continueCurrentTestOutput.loss_delta.toFixed(4)}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                )}
                                                 {(continueCurrentTestOutput.predict_tokens?.length ?? 0) > 0 ? (
                                                     <div
                                                         style={{
@@ -6465,9 +6529,11 @@ export function ReportPanel({
                                                     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                                                 }}>
                                                     {JSON.stringify(
-                                                        llmTrainResult.analysis.semantic
-                                                        || llmTrainResult.semantic
-                                                        || {},
+                                                        semanticExportView(
+                                                            llmTrainResult.analysis.semantic
+                                                            || llmTrainResult.semantic
+                                                            || {},
+                                                        ),
                                                         null,
                                                         2,
                                                     )}
@@ -6476,7 +6542,7 @@ export function ReportPanel({
                                                     || llmTrainResult.analysis.semantic_flat_text) && (
                                                     <details style={{ marginTop: 8, fontSize: 11 }}>
                                                         <summary style={{ cursor: 'pointer', color: '#64748b' }}>
-                                                            canonical text（以后 embedding 用这段）
+                                                            canonical text（四字段）
                                                         </summary>
                                                         <pre style={{
                                                             marginTop: 6,

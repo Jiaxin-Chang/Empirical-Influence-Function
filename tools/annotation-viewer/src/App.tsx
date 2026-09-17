@@ -20,6 +20,51 @@ function displayToken(tok: string): string {
   return tok.replace(/\r/g, '␍').replace(/\n/g, '↵\n').replace(/\t/g, '⇥')
 }
 
+type TargetSemantic = {
+  role: string
+  pattern: string[]
+  operations: string[]
+  relations: Array<{ source: string; target: string; type?: string }>
+}
+
+function compactTargetSemantic(raw: unknown): TargetSemantic | null {
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as Record<string, unknown>
+  const rels: TargetSemantic['relations'] = []
+  const rawRels = Array.isArray(obj.relations) ? obj.relations : []
+  for (const item of rawRels) {
+    if (!item || typeof item !== 'object') continue
+    const r = item as Record<string, unknown>
+    const source = String(r.source || r.src || '').trim()
+    const target = String(r.target || r.dst || '').trim()
+    const typ = String(r.type || '').trim()
+    if (source && target) {
+      rels.push({ source, target, ...(typ ? { type: typ } : {}) })
+    }
+    if (rels.length >= 3) break
+  }
+  const pattern = (Array.isArray(obj.pattern) ? obj.pattern : [])
+    .map(x => String(x).trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  const operations = (Array.isArray(obj.operations) ? obj.operations : [])
+    .map(x => String(x).trim())
+    .filter(Boolean)
+    .slice(0, 4)
+  const role = String(obj.role || '').trim()
+  if (!role && !pattern.length && !operations.length && !rels.length) return null
+  return { role, pattern, operations, relations: rels }
+}
+
+function parseTargetSemParam(raw: string | null): TargetSemantic | null {
+  if (!raw?.trim()) return null
+  try {
+    return compactTargetSemantic(JSON.parse(raw))
+  } catch {
+    return null
+  }
+}
+
 export default function App() {
   const [dataPath, setDataPath] = useState(DEFAULT_DATA)
   const [continuePath, setContinuePath] = useState<string | null>(null)
@@ -32,6 +77,7 @@ export default function App() {
   const [corpusPath, setCorpusPath] = useState<string | null>(null)
   const [queryExpr, setQueryExpr] = useState('')
   const [queryName, setQueryName] = useState('')
+  const [targetSemantic, setTargetSemantic] = useState<TargetSemantic | null>(null)
   const corpusMode = corpusLine != null
   const corpusOpts = useMemo(
     () => (corpusPath?.trim() ? { corpusPath: corpusPath.trim() } : undefined),
@@ -238,6 +284,7 @@ export default function App() {
           setQueryMode(qm || 'manual')
           setQueryExpr((params.get('queryExpr') || params.get('query_expression') || '').trim())
           setQueryName((params.get('queryName') || params.get('query_name') || '').trim())
+          setTargetSemantic(parseTargetSemParam(params.get('targetSem')))
           const probeId = (params.get('probeId') || '').trim()
           if (probeId) {
             try {
@@ -604,7 +651,7 @@ export default function App() {
     try {
       const res = await api.llmSemanticAnnotatePreview(
         corpusLine,
-        {},
+        targetSemantic ? { target_semantic: targetSemantic } : {},
         { ...corpusOpts, signal: ac.signal },
       )
       setSample(res.sample)
@@ -1070,7 +1117,25 @@ export default function App() {
                       {queryExpr
                         ? ` 当前检索族：${queryName || queryExpr.slice(0, 80)}`
                         : ''}
+                      {targetSemantic
+                        ? ' 已附带 test sample 的四字段语义（relation 为主模板）。'
+                        : ''}
                     </p>
+                    {targetSemantic ? (
+                      <pre style={{
+                        margin: '0 0 8px',
+                        maxHeight: 140,
+                        overflow: 'auto',
+                        fontSize: 11,
+                        whiteSpace: 'pre-wrap',
+                        background: '#f8fafc',
+                        border: '1px solid #e2e8f0',
+                        borderRadius: 6,
+                        padding: '6px 8px',
+                      }}>
+                        {JSON.stringify(targetSemantic, null, 2)}
+                      </pre>
+                    ) : null}
                     <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
                       {!llmSemPreviewId ? (
                         <>
