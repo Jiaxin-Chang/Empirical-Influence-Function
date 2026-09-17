@@ -106,6 +106,27 @@ def default_max_answer_tokens() -> int:
     return max(1, _env_int("ANNOTATE_SEMANTIC_MAX_ANSWER_TOKENS", 48))
 
 
+def _thinking_enabled() -> bool:
+    think = _env("ANNOTATE_ENABLE_THINKING", _env("ENABLE_THINKING", "")).lower()
+    if think in ("0", "false", "no", "off"):
+        return False
+    if think in ("1", "true", "yes", "on"):
+        return True
+    extra = _extra_body()
+    return bool(extra.get("enable_thinking"))
+
+
+def _semantic_max_tokens() -> int:
+    """Thinking + JSON share one budget. 4096 is often all thinking, zero edges."""
+    override = _optional_env_int("ANNOTATE_SEMANTIC_MAX_TOKENS")
+    if override is not None:
+        return max(256, override)
+    base = _env_int("ANNOTATE_MAX_TOKENS", 4096)
+    if _thinking_enabled():
+        return max(base, 16384)
+    return max(256, base)
+
+
 def resolve_max_edges(
     n_answer_tokens: int,
     max_sources_per_token: int,
@@ -271,12 +292,14 @@ def _build_full_sample_messages(
     target = _compact_target_semantic(target_semantic)
     if target:
         system += (
-            "A target_mechanism object may be attached: it describes the TEST hole "
-            "that retrieved this train sample. Map those semantic relations onto "
-            "THIS sample's tokens. Relations are the primary attention template "
-            "(bind source/target concepts to actual context_tokens / completion_tokens). "
-            "Role/pattern/operations only disambiguate. Do not copy concept strings as "
-            "indices. You may still add other high-confidence edges the completion needs.\n"
+            "A target_mechanism object may be attached: it is only a HINT about the "
+            "TEST hole that retrieved this train sample. Use its relations to decide "
+            "WHICH concepts to bind, then copy integer indices from context_tokens / "
+            "completion_tokens. Role/pattern/operations only disambiguate. "
+            "src and dst MUST be integers from those lists (src < dst). Never put "
+            "concept names, identifiers, or relation endpoints in src/dst. Never "
+            "return an empty edges array if any completion token has a supporting "
+            "context token. You may still add other high-confidence edges.\n"
         )
     shots = format_few_shots_block(list(bundle.get("few_shots") or []))
     if shots:
@@ -327,6 +350,36 @@ def _build_full_sample_messages(
     ]
 
 
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.I).strip()
+
+
+def _message_text(resp: Any) -> str:
+    msg = resp.choices[0].message if getattr(resp, "choices", None) else None
+    if msg is None:
+        return ""
+    content = str(getattr(msg, "content", None) or "")
+    reasoning = str(getattr(msg, "reasoning_content", None) or "")
+    text = _strip_think_blocks(content)
+    if text:
+        return text
+    return _strip_think_blocks(reasoning)
+
+
+def _as_token_index(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if re.fullmatch(r"-?\d+", raw):
+            return int(raw)
+    return None
+
+
 def _parse_full_edges_json(
     text: str,
     *,
@@ -337,6 +390,7 @@ def _parse_full_edges_json(
 ) -> list[tuple[int, int, str]]:
     text = (text or "").strip()
     if not text:
+        print("[llm-semantic] parse kept=0 empty llm content", flush=True)
         return []
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence:
@@ -348,10 +402,22 @@ def _parse_full_edges_json(
         if start < 0 or end <= start:
             start, end = text.find("["), text.rfind("]")
         if start < 0 or end <= start:
+            preview = text[:400].replace("\n", "\\n")
+            print(
+                f"[llm-semantic] parse kept=0 not_json raw_chars={len(text)} "
+                f"preview={preview!r}",
+                flush=True,
+            )
             return []
         try:
             parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError:
+            preview = text[:400].replace("\n", "\\n")
+            print(
+                f"[llm-semantic] parse kept=0 json_decode raw_chars={len(text)} "
+                f"preview={preview!r}",
+                flush=True,
+            )
             return []
 
     raw_edges: list[Any] = []
@@ -378,21 +444,22 @@ def _parse_full_edges_json(
     per_dst: dict[int, int] = {}
     out: list[tuple[int, int, str]] = []
     seen: set[tuple[int, int]] = set()
+    n_non_int = 0
+    n_oob = 0
     for item in raw_edges:
         src = dst = None
         reason = ""
         if isinstance(item, dict):
             for sk, dk in (("src", "dst"), ("i", "j"), ("token_i_idx", "token_j_idx")):
                 if sk in item and dk in item:
-                    try:
-                        src, dst = int(item[sk]), int(item[dk])
-                    except (TypeError, ValueError):
-                        src = dst = None
+                    src, dst = _as_token_index(item[sk]), _as_token_index(item[dk])
                     break
             reason = str(item.get("reason") or item.get("rationale") or "")
         if src is None or dst is None:
+            n_non_int += 1
             continue
         if dst not in allowed_dst or src not in allowed_src or src >= dst:
+            n_oob += 1
             continue
         key = (src, dst)
         if key in seen:
@@ -404,6 +471,14 @@ def _parse_full_edges_json(
         out.append((src, dst, reason))
         if len(out) >= max_edges:
             break
+    if not out:
+        preview = (text or "")[:400].replace("\n", "\\n")
+        print(
+            f"[llm-semantic] parse kept=0 raw_items={len(raw_edges)} "
+            f"non_int={n_non_int} oob_or_order={n_oob} "
+            f"raw_chars={len(text or '')} preview={preview!r}",
+            flush=True,
+        )
     return out
 
 
@@ -423,7 +498,8 @@ def _call_llm_full_sample(
         or _env("OPENAI_MODEL")
         or default_model
     )
-    max_tokens = int(_env("ANNOTATE_MAX_TOKENS", "4096") or "4096")
+    max_tokens = _semantic_max_tokens()
+    thinking = _thinking_enabled()
     client = _build_client()
     kwargs: dict[str, Any] = {
         "model": model,
@@ -432,20 +508,36 @@ def _call_llm_full_sample(
         "max_tokens": max_tokens,
     }
     extra = _extra_body()
-    if extra:
-        kwargs["extra_body"] = extra
+    extra["enable_thinking"] = thinking
+    kwargs["extra_body"] = extra
 
     raw = ""
+    finish = ""
     try:
         resp = client.chat.completions.create(
             **kwargs,
             response_format={"type": "json_object"},
         )
-        raw = resp.choices[0].message.content or ""
-    except Exception:
+        raw = _message_text(resp)
+        finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
+    except Exception as exc:
+        print(f"[llm-semantic] json_object request failed ({exc}); retry plain", flush=True)
+        kwargs.pop("response_format", None)
         resp = client.chat.completions.create(**kwargs)
-        raw = resp.choices[0].message.content or ""
+        raw = _message_text(resp)
+        finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
 
+    print(
+        f"[llm-semantic] llm raw_chars={len(raw)} finish={finish or '-'} "
+        f"thinking={'on' if thinking else 'off'} max_tokens={max_tokens}",
+        flush=True,
+    )
+    if finish in ("length", "max_tokens"):
+        print(
+            "[llm-semantic] truncated: raise ANNOTATE_SEMANTIC_MAX_TOKENS "
+            "(thinking and JSON share this budget)",
+            flush=True,
+        )
     edges = _parse_full_edges_json(
         raw,
         allowed_src=allowed_src,

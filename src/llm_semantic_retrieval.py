@@ -417,3 +417,79 @@ def retrieve_llm_semantic_samples(
         },
         "prepared": prepared,
     }
+
+
+def _hydrate_env() -> None:
+    try:
+        from src.gold_live_attribution import _hydrate_eif_env
+        _hydrate_eif_env(force_file=True)
+    except Exception:
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Search the semantic corpus with a ready-made 4-field JSON (no LLM analyze)."""
+    import argparse
+    import sys
+
+    _hydrate_env()
+    p = argparse.ArgumentParser(
+        description="Search EIF_LLM_SEMANTIC_CORPUS with a 4-field semantic JSON. "
+        "Does not call the generative LLM. Loads repo-root eif_api.env.",
+    )
+    p.add_argument(
+        "--query-json",
+        default="-",
+        help="path to query JSON, or '-' for stdin (default: stdin)",
+    )
+    p.add_argument(
+        "--corpus",
+        default="",
+        help="semantic jsonl (default: EIF_LLM_SEMANTIC_CORPUS)",
+    )
+    p.add_argument("--top-k", type=int, default=10)
+    args = p.parse_args(argv)
+
+    raw = sys.stdin.read() if args.query_json.strip() == "-" else Path(args.query_json).read_text(encoding="utf-8")
+    try:
+        query = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"invalid query JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(query, dict):
+        print("query JSON must be an object", file=sys.stderr)
+        return 2
+    sem = semantic_export_repr(query)
+    corpus = (args.corpus or "").strip() or _env("EIF_LLM_SEMANTIC_CORPUS")
+    if not corpus:
+        print("set EIF_LLM_SEMANTIC_CORPUS in eif_api.env or pass --corpus", file=sys.stderr)
+        return 2
+
+    print(f"corpus={corpus}", flush=True)
+    print(f"query={json.dumps(sem, ensure_ascii=False)}", flush=True)
+    print(f"flat=\n{flatten_semantic_text(sem)}", flush=True)
+    hits = search_semantic_corpus_jsonl(corpus, sem, top_k=max(1, int(args.top_k)))
+    print(f"hits={len(hits)}", flush=True)
+    for i, h in enumerate(hits):
+        print(
+            json.dumps(
+                {
+                    "rank": i,
+                    "line": h.get("line"),
+                    "semantic_score": h.get("semantic_score"),
+                    "struct_score": h.get("struct_score"),
+                    "embed_score": h.get("embed_score"),
+                    "task_id": h.get("task_id"),
+                    "pattern": h.get("pattern"),
+                    "prompt_preview": h.get("prompt_preview"),
+                    "response_preview": h.get("response_preview"),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
