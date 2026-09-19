@@ -107,24 +107,25 @@ def default_max_answer_tokens() -> int:
 
 
 def _thinking_enabled() -> bool:
-    think = _env("ANNOTATE_ENABLE_THINKING", _env("ENABLE_THINKING", "")).lower()
-    if think in ("0", "false", "no", "off"):
-        return False
+    """Semantic annotate defaults thinking OFF.
+
+    ``ANNOTATE_ENABLE_THINKING`` is for GraphSignal / other chat. Qwen thinking
+    shares max_tokens with the JSON; 16k of prose then ``finish=length`` yields 0 edges.
+    Opt in with ``ANNOTATE_SEMANTIC_ENABLE_THINKING=1``.
+    """
+    think = _env("ANNOTATE_SEMANTIC_ENABLE_THINKING", "").lower()
     if think in ("1", "true", "yes", "on"):
         return True
-    extra = _extra_body()
-    return bool(extra.get("enable_thinking"))
+    if think in ("0", "false", "no", "off"):
+        return False
+    return False
 
 
 def _semantic_max_tokens() -> int:
-    """Thinking + JSON share one budget. 4096 is often all thinking, zero edges."""
     override = _optional_env_int("ANNOTATE_SEMANTIC_MAX_TOKENS")
     if override is not None:
         return max(256, override)
-    base = _env_int("ANNOTATE_MAX_TOKENS", 4096)
-    if _thinking_enabled():
-        return max(base, 16384)
-    return max(256, base)
+    return max(256, _env_int("ANNOTATE_MAX_TOKENS", 4096))
 
 
 def resolve_max_edges(
@@ -511,40 +512,58 @@ def _call_llm_full_sample(
     extra["enable_thinking"] = thinking
     kwargs["extra_body"] = extra
 
-    raw = ""
-    finish = ""
-    try:
-        resp = client.chat.completions.create(
-            **kwargs,
-            response_format={"type": "json_object"},
-        )
-        raw = _message_text(resp)
-        finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
-    except Exception as exc:
-        print(f"[llm-semantic] json_object request failed ({exc}); retry plain", flush=True)
-        kwargs.pop("response_format", None)
-        resp = client.chat.completions.create(**kwargs)
-        raw = _message_text(resp)
-        finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
-
-    print(
-        f"[llm-semantic] llm raw_chars={len(raw)} finish={finish or '-'} "
-        f"thinking={'on' if thinking else 'off'} max_tokens={max_tokens}",
-        flush=True,
-    )
-    if finish in ("length", "max_tokens"):
+    def _once() -> tuple[list[tuple[int, int, str]], str, str]:
+        local_raw = ""
+        local_finish = ""
+        try:
+            resp = client.chat.completions.create(
+                **kwargs,
+                response_format={"type": "json_object"},
+            )
+            local_raw = _message_text(resp)
+            local_finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
+        except Exception as exc:
+            print(f"[llm-semantic] json_object request failed ({exc}); retry plain", flush=True)
+            kwargs.pop("response_format", None)
+            resp = client.chat.completions.create(**kwargs)
+            local_raw = _message_text(resp)
+            local_finish = str(getattr(resp.choices[0], "finish_reason", "") or "")
         print(
-            "[llm-semantic] truncated: raise ANNOTATE_SEMANTIC_MAX_TOKENS "
-            "(thinking and JSON share this budget)",
+            f"[llm-semantic] llm raw_chars={len(local_raw)} finish={local_finish or '-'} "
+            f"thinking={'on' if extra.get('enable_thinking') else 'off'} "
+            f"max_tokens={max_tokens}",
             flush=True,
         )
-    edges = _parse_full_edges_json(
-        raw,
-        allowed_src=allowed_src,
-        allowed_dst=allowed_dst,
-        max_edges=max_edges,
-        max_sources_per_dst=max_sources_per_dst,
-    )
+        local_edges = _parse_full_edges_json(
+            local_raw,
+            allowed_src=allowed_src,
+            allowed_dst=allowed_dst,
+            max_edges=max_edges,
+            max_sources_per_dst=max_sources_per_dst,
+        )
+        return local_edges, local_raw, local_finish
+
+    edges, raw, finish = _once()
+    if (
+        extra.get("enable_thinking")
+        and not edges
+        and finish in ("length", "max_tokens", "")
+    ):
+        print(
+            "[llm-semantic] thinking filled the budget with no JSON; "
+            "retrying once with thinking=off",
+            flush=True,
+        )
+        extra["enable_thinking"] = False
+        kwargs["extra_body"] = extra
+        kwargs["response_format"] = {"type": "json_object"}
+        edges, raw, finish = _once()
+    elif finish in ("length", "max_tokens") and extra.get("enable_thinking"):
+        print(
+            "[llm-semantic] truncated while thinking on "
+            "(JSON and thinking share max_tokens)",
+            flush=True,
+        )
     return edges, raw
 
 

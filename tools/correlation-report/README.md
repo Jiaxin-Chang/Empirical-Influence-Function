@@ -1,6 +1,12 @@
 # Attribution Analysis Visualizer
 
-React/Vite frontend for inspecting **token-level ALTI saliency** and **training correlation** reports produced by this repo’s all-tokens pipeline (`src/intervention_experiment.py`).
+React/Vite 前端：看 token 级 ALTI / 训练相关报告，并做 **Semantic 检索 → 打开标注页 → 小集续训**。
+
+日常四终端启动与配置见仓库根 [README.md](../../README.md)。本页偏报告格式与 New View 读数。
+
+---
+
+## What the current pipeline does
 
 ## What the current pipeline does
 

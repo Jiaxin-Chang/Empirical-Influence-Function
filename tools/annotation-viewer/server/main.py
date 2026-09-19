@@ -1901,6 +1901,62 @@ def graphsignal_annotate_reject(line: int, body: GraphsignalPreviewActionBody, c
     return {"ok": True, "preview_id": pid, "sample": sample}
 
 
+def _llm_sem_preview_dir() -> Path:
+    d = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp") / "eif_llm_sem_preview"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _llm_sem_preview_path(pid: str) -> Path:
+    safe = "".join(c for c in str(pid) if c.isalnum())
+    return _llm_sem_preview_dir() / f"{safe}.json"
+
+
+def _save_llm_sem_preview(entry: dict[str, Any]) -> None:
+    pid = str(entry.get("preview_id") or "").strip()
+    if len(pid) < 8:
+        return
+    try:
+        _llm_sem_preview_path(pid).write_text(
+            json.dumps(entry, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"[llm-semantic] preview disk save failed: {exc}", flush=True)
+
+
+def _drop_llm_sem_preview(pid: str) -> None:
+    _llm_sem_preview_cache.pop(pid, None)
+    try:
+        _llm_sem_preview_path(pid).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _load_llm_sem_preview(pid: str, line: int) -> dict[str, Any] | None:
+    pid = str(pid or "").strip()
+    if len(pid) < 8:
+        return None
+    entry = _llm_sem_preview_cache.get(pid)
+    if isinstance(entry, dict) and int(entry.get("line", -1)) == int(line):
+        return entry
+    path = _llm_sem_preview_path(pid)
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict) or int(loaded.get("line", -1)) != int(line):
+        return None
+    age = time.time() - float(loaded.get("created_at") or 0)
+    if age > _GS_PREVIEW_TTL_SEC:
+        _drop_llm_sem_preview(pid)
+        return None
+    _llm_sem_preview_cache[pid] = loaded
+    return loaded
+
+
 def _prune_llm_sem_preview_cache() -> None:
     now = time.time()
     stale = [
@@ -1908,13 +1964,13 @@ def _prune_llm_sem_preview_cache() -> None:
         if now - float(ent.get("created_at") or 0) > _GS_PREVIEW_TTL_SEC
     ]
     for pid in stale:
-        _llm_sem_preview_cache.pop(pid, None)
+        _drop_llm_sem_preview(pid)
     while len(_llm_sem_preview_cache) > _GS_PREVIEW_CACHE_MAX:
         oldest = min(
             _llm_sem_preview_cache.items(),
             key=lambda kv: float(kv[1].get("created_at") or 0),
         )[0]
-        _llm_sem_preview_cache.pop(oldest, None)
+        _drop_llm_sem_preview(oldest)
 
 
 def _llm_semantic_llm_edges(raw_edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2062,6 +2118,7 @@ def llm_semantic_annotate_preview(
             "meta": dict(annotated.get("_llm_semantic_meta") or {}),
             "created_at": time.time(),
         }
+        _save_llm_sem_preview(_llm_sem_preview_cache[preview_id])
         sample = _sample_detail_from_graphsignal_preview(
             line, annotated_source, from_continue=False, key=key,
         )
@@ -2095,9 +2152,13 @@ def llm_semantic_annotate_accept(line: int, body: GraphsignalPreviewActionBody, 
     override = corpusPath.strip() or None
     pid = str(body.preview_id or "").strip()
     with _state_lock:
-        entry = _llm_sem_preview_cache.get(pid)
-        if not entry or int(entry.get("line", -1)) != int(line):
-            raise HTTPException(404, "LLM semantic preview not found or expired")
+        entry = _load_llm_sem_preview(pid, line)
+        if not entry:
+            raise HTTPException(
+                404,
+                "LLM 语义预览不存在或已失效（服务重启 / 超过 1 小时）。"
+                "请再点一次「LLM 语义标注」，成功后再接受写入续训小集。",
+            )
         if override and str(entry.get("corpus_path") or "") not in ("", override):
             raise HTTPException(400, "preview corpus path mismatch")
         if not override and entry.get("corpus_path"):
@@ -2141,7 +2202,7 @@ def llm_semantic_annotate_accept(line: int, body: GraphsignalPreviewActionBody, 
             viz_edges=viz_out,
             continue_edges=cont_out,
         )
-        _llm_sem_preview_cache.pop(pid, None)
+        _drop_llm_sem_preview(pid)
         _, cont_idx = _lookup_continue(-1, merged_source)
         obj, _, key2 = _effective_corpus_sample(line, corpus_path=override)
         sample = _sample_detail_from_obj(-1, obj, from_continue=cont_idx is not None, key=key2)
@@ -2167,10 +2228,10 @@ def llm_semantic_annotate_reject(line: int, body: GraphsignalPreviewActionBody, 
     override = corpusPath.strip() or None
     pid = str(body.preview_id or "").strip()
     with _state_lock:
-        entry = _llm_sem_preview_cache.pop(pid, None)
+        entry = _load_llm_sem_preview(pid, line)
         if entry and int(entry.get("line", -1)) != int(line):
-            _llm_sem_preview_cache[pid] = entry
             raise HTTPException(400, "preview line mismatch")
+        _drop_llm_sem_preview(pid)
         obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
         sample = _sample_detail_from_obj(-1, obj, from_continue=from_continue, key=key)
     return {"ok": True, "preview_id": pid, "sample": sample}

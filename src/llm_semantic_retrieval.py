@@ -18,7 +18,8 @@ and later code*.
 Canonical display text is ``flatten_semantic_text``. Dense recall embeds
 ``flatten_semantic_text_for_embedding`` (pattern/relations repeated).
 Retrieval is two-stage when ``EIF_LLM_SEMANTIC_EMBEDDINGS`` (or the jsonl sidecar
-npz) exists: embedding coarse recall, then structured rerank. Otherwise schema scan.
+npz) exists: embedding coarse recall, then structured rerank. Otherwise Stage-2
+runs on the full semantic jsonl (no Top-500 cutoff).
 """
 
 from __future__ import annotations
@@ -28,10 +29,12 @@ from pathlib import Path
 from typing import Any
 
 from src.fim_semantic_schema import (
+    collect_relation_endpoints,
     flatten_semantic_text,
+    lexical_endpoint_sim,
     normalize_semantic_repr,
+    semantic_combined_score,
     semantic_export_repr,
-    semantic_repr_similarity,
 )
 from src.llm_train_retrieval import (
     _build_openai_client,
@@ -239,7 +242,7 @@ def search_semantic_corpus_jsonl(
     min_score: float = 0.01,
     recall_k: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Two-stage retrieve when embeddings exist; else full schema scan."""
+    """Two-stage retrieve when embeddings exist; else Stage-2 on the full jsonl."""
     from src.fim_semantic_index import embedding_npz_path, search_embed_then_rerank
 
     path = Path(corpus_path)
@@ -263,10 +266,11 @@ def search_semantic_corpus_jsonl(
             return hits
         except Exception as exc:
             print(
-                f"[llm-semantic] embed recall failed ({exc}); fallback schema scan",
+                f"[llm-semantic] embed recall failed ({exc}); "
+                "fallback full-corpus Stage-2",
                 flush=True,
             )
-    return _search_semantic_schema_scan(
+    return _search_stage2_full_corpus(
         path,
         query_sem,
         top_k=top_k,
@@ -275,7 +279,7 @@ def search_semantic_corpus_jsonl(
     )
 
 
-def _search_semantic_schema_scan(
+def _search_stage2_full_corpus(
     path: Path,
     query_sem: dict[str, Any] | None,
     *,
@@ -283,12 +287,18 @@ def _search_semantic_schema_scan(
     max_scan: int | None = None,
     min_score: float = 0.01,
 ) -> list[dict[str, Any]]:
+    """Stage-2 struct score on every semantic jsonl row (no embedding Top-500)."""
+    from src.fim_semantic_index import (
+        _hit_from_row,
+        build_endpoint_sim,
+        diversify_mechanism_hits,
+        embed_model_id,
+    )
+
     q = normalize_semantic_repr(query_sem if isinstance(query_sem, dict) else {})
-    scored: list[tuple[float, int, dict[str, Any]]] = []
-    scanned = 0
+    rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as fh:
         for idx, line in enumerate(fh):
-            scanned = idx + 1
             if max_scan is not None and idx >= max_scan:
                 break
             text = line.strip()
@@ -300,33 +310,61 @@ def _search_semantic_schema_scan(
                 continue
             if not isinstance(row, dict):
                 continue
-            doc = normalize_semantic_repr(row)
-            score = semantic_repr_similarity(q, doc)
-            if score < min_score:
-                continue
-            source_line = row.get("source_line")
-            try:
-                source_line_i = int(source_line)
-            except (TypeError, ValueError):
-                source_line_i = idx
-            hit = {
-                "line": source_line_i,
-                "semantic_line": idx,
-                "task_id": str(row.get("task_id") or row.get("id") or ""),
-                "semantic_score": round(float(score), 3),
-                "match_region": "semantic",
-                "prompt_preview": str(row.get("prompt_preview") or "")[:280],
-                "response_preview": str(row.get("response_preview") or "")[:200],
-                "summary": str(doc.get("summary") or "")[:240],
-                "pattern": list(doc.get("pattern") or [])[:6],
-                "retrieval": "schema_scan",
-            }
-            scored.append((score, idx, hit))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    hits = [row for _, _, row in scored[: max(1, top_k)]]
+            row = dict(row)
+            row["_semantic_line"] = idx
+            rows.append(row)
+
+    rel_mode = "lexical"
+    endpoint_sim = lexical_endpoint_sim
+    model = embed_model_id()
+    if model:
+        try:
+            phrases = collect_relation_endpoints(q, *rows)
+            endpoint_sim = build_endpoint_sim(phrases, model)
+            rel_mode = "endpoint_embed"
+        except Exception as exc:
+            print(
+                f"[llm-semantic] full-corpus endpoint embed failed ({exc}); "
+                "lexical relation endpoints",
+                flush=True,
+            )
+            endpoint_sim = lexical_endpoint_sim
+            rel_mode = "lexical"
+
+    ranked_items: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    for rank, row in enumerate(rows, start=1):
+        combined, struct, parts = semantic_combined_score(
+            q,
+            row,
+            embed_cos=None,
+            endpoint_sim=endpoint_sim,
+        )
+        if combined < min_score:
+            continue
+        hit = _hit_from_row(
+            row,
+            score=combined,
+            struct_score=struct,
+            embed_score=0.0,
+            recall_rank=rank,
+            parts=parts,
+        )
+        ranked_items.append((combined, hit, row))
+
+    ranked_items.sort(key=lambda x: (-x[0], x[1].get("line") or 0))
+    hits = diversify_mechanism_hits(ranked_items, max(1, top_k), endpoint_sim)
+    scanned = len(rows)
     for h in hits:
         h["scanned_rows"] = scanned
-    print(f"[llm-semantic] pipeline=schema_scan hits={len(hits)} scanned={scanned}", flush=True)
+        h["recall_k"] = scanned
+        h["retrieval"] = "struct_rerank_full"
+        h["relation_align"] = rel_mode
+        h["embed_score"] = 0.0
+    print(
+        f"[llm-semantic] pipeline=struct_rerank_full hits={len(hits)} "
+        f"scanned={scanned} relation_align={rel_mode}",
+        flush=True,
+    )
     return hits
 
 
@@ -382,10 +420,11 @@ def retrieve_llm_semantic_samples(
                     pipe = str(hits[0].get("retrieval") or "")
                 if pipe:
                     entry["retrieval"] = pipe
-                    if pipe == "schema_scan":
+                    if pipe == "struct_rerank_full":
                         entry["why"] = (
-                            "schema-to-schema scan (no EIF_LLM_SEMANTIC_EMBEDDINGS / embed failed). "
-                            "Run: python -m src.fim_semantic_preprocess --embed-only"
+                            "full-corpus Stage-2 (no EIF_LLM_SEMANTIC_EMBEDDINGS / sidecar npz). "
+                            "Same relation/pattern/role/operations score as two-stage rerank; "
+                            "no embedding Top-500."
                         )
             except Exception as exc:
                 entry["corpus_error"] = str(exc)
