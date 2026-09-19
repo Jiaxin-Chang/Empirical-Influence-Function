@@ -7,8 +7,9 @@
   2. 按分数从高到低依次验证 Top-``--max-verify``（默认前 3 条；检索仍取 Top-10）
   3. 每条候选：MID 对齐 → LLM 语义标注（附带 **测试样本** 的 4 字段 semantic）
   4. 把标注后的 **这一条** 复制 20 份写进独立 trial JSONL（不叠加其它续训样本）
-  5. 用这 20 条做 CE+saliency 续训，看当前 test 的 gold CE 是否下降
-  6. 恢复原始 adapter 后，再用同一 20 条做纯 CE 续训
+  5. 用这 20 条做 CE+saliency 续训；若当前 test 的 gold CE **上升**，
+     立刻跳过该训练样本（不跑纯 CE），试下一条 hit
+  6. 仅当 CE 下降后：恢复原始 adapter，再用同一 20 条做纯 CE 续训
   7. 若 saliency 下降量 > 0 **且** 纯 CE 下降量 < saliency 下降量 →
      把这 20 份追加进 ``--accepted-path``，进入下一条测试
   8. 第 1 条不满足就试第 2 条，第 3 条仍不行则跳过该测试
@@ -489,11 +490,17 @@ def _verify_candidate(
         f"       saliency gold CE {sal_b} → {sal_a} drop={sal_drop}",
         flush=True,
     )
+    if sal_b is not None and sal_a is not None and sal_a > sal_b:
+        rec["fail_reason"] = (
+            f"ce+saliency gold CE rose ({sal_b} → {sal_a}); skip hit, no ce-only"
+        )
+        print(f"       skip: {rec['fail_reason']}", flush=True)
+        return False, rec
     if sal_drop is None or sal_drop <= float(min_drop):
         rec["fail_reason"] = (
-            f"saliency drop {sal_drop} not > min_drop={min_drop}"
+            f"saliency drop {sal_drop} not > min_drop={min_drop}; skip hit, no ce-only"
         )
-        print(f"       fail: {rec['fail_reason']}", flush=True)
+        print(f"       skip: {rec['fail_reason']}", flush=True)
         return False, rec
 
     print("       CE-only continue-train on the same 20 copies…", flush=True)
