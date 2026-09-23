@@ -2756,9 +2756,9 @@ export function ReportPanel({
     const [interventionSteps, setInterventionSteps] = useState(0);
     const [pairInterveneLr, setPairInterveneLr] = useState(DEFAULT_PAIR_INTERVENE_LR);
     const [pairInterveneLrInput, setPairInterveneLrInput] = useState(String(DEFAULT_PAIR_INTERVENE_LR));
-    const [continueStepsInput, setContinueStepsInput] = useState('20');
+    const [continueStepsInput, setContinueStepsInput] = useState('1');
     const [continueLrInput, setContinueLrInput] = useState('2e-5');
-    const [continueStepsDefault, setContinueStepsDefault] = useState(20);
+    const [continueStepsDefault, setContinueStepsDefault] = useState(1);
     const [continueLrDefault, setContinueLrDefault] = useState('2e-5');
     const [continueStartAdapterPath, setContinueStartAdapterPath] = useState<string | null>(null);
     const [retrainEpochsInput, setRetrainEpochsInput] = useState('1');
@@ -4915,7 +4915,7 @@ export function ReportPanel({
         }
         const maxSteps = Math.max(
             1,
-            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 1,
         );
         const learningRate = Number(continueLrInput);
         if (!Number.isFinite(learningRate) || learningRate <= 0) {
@@ -5010,7 +5010,7 @@ export function ReportPanel({
         }
         const maxSteps = Math.max(
             1,
-            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 20,
+            Math.floor(Number(continueStepsInput)) || continueStepsDefault || 1,
         );
         const learningRate = Number(continueLrInput);
         if (!Number.isFinite(learningRate) || learningRate <= 0) {

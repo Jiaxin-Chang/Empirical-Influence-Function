@@ -60,7 +60,7 @@ class ContinueTrainConfig:
     train_data: str  # small annotated subset only
     test_data: str
     output_dir: str
-    max_steps: int = 20
+    max_steps: int = 1
     learning_rate: float = 2e-5
     loss_mode: str = "ce_saliency"  # ce_only | ce_saliency
     adapter_family: str = "unknown"  # ce | saliency | unknown
@@ -176,7 +176,7 @@ def default_paths_from_env(
                 return max(1, int(raw))
             except ValueError:
                 pass
-        return 20
+        return 1
 
     def _lr_default() -> float:
         raw = (os.environ.get("EIF_CONTINUE_LR") or "").strip()
@@ -1731,7 +1731,7 @@ def main():
         help="Precomputed baseline line_hit JSONL (EIF_CONTINUE_EVAL_BEFORE_CACHE); skips GPU eval_before",
     )
     p.add_argument("--output-dir", default=defaults["output_dir"])
-    p.add_argument("--max-steps", type=int, default=int(defaults.get("max_steps") or 20),
+    p.add_argument("--max-steps", type=int, default=int(defaults.get("max_steps") or 1),
                    help="AdamW updates; cycles the continue-train subset with step % n")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--loss-mode", default="ce_saliency", choices=["ce_only", "ce_saliency"])
