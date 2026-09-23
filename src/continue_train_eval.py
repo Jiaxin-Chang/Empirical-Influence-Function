@@ -71,6 +71,8 @@ class ContinueTrainConfig:
     current_test_task_id: str | None = None
     current_test_prompt: str | None = None
     current_test_label: str | None = None
+    # Gold CE before/after still runs. Generation is the slow extra step.
+    predict_current: bool = True
     # Precomputed baseline line_hit JSONL (skip GPU eval_before when set + file exists).
     eval_before_cache: str | None = None
     max_new_tokens: int = 1024
@@ -1474,10 +1476,6 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
 
     current_test_out: dict[str, Any] | None = None
     if want_current and cur_row is not None:
-        _prog("predict_current", "Generating on current test sample…")
-        gen = generate_one(tokenizer, model, cur_row["prompt"], cfg.max_new_tokens)
-        pre = line_hit(cur_row["label"], gen["predict"], "precision")
-        rec = line_hit(cur_row["label"], gen["predict"], "recall")
         loss_after = gold_teacher_forced_ce(
             model, tokenizer, cur_row.get("prompt") or "", cur_row.get("label") or "",
         )
@@ -1485,24 +1483,39 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             "task_id": cur_row.get("task_id"),
             "prompt": cur_row["prompt"],
             "label": cur_row["label"],
-            "predict": gen["predict"],
-            "predict_token_ids": gen.get("predict_token_ids") or [],
-            "predict_tokens": gen.get("predict_tokens") or [],
-            "line_hit_pre": round(pre, 4),
-            "line_hit_rec": round(rec, 4),
-            "finish_reason": gen.get("finish_reason"),
         }
+        if cfg.predict_current:
+            _prog("predict_current", "Generating on current test sample…")
+            gen = generate_one(tokenizer, model, cur_row["prompt"], cfg.max_new_tokens)
+            pre = line_hit(cur_row["label"], gen["predict"], "precision")
+            rec_hit = line_hit(cur_row["label"], gen["predict"], "recall")
+            current_test_out.update({
+                "predict": gen["predict"],
+                "predict_token_ids": gen.get("predict_token_ids") or [],
+                "predict_tokens": gen.get("predict_tokens") or [],
+                "line_hit_pre": round(pre, 4),
+                "line_hit_rec": round(rec_hit, 4),
+                "finish_reason": gen.get("finish_reason"),
+            })
+            print(
+                f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
+                f"pre={pre:.4f} rec={rec_hit:.4f} "
+                f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
+                flush=True,
+            )
+            print(
+                f"[continue-eval] predict:\n{gen['predict'][:2000]}",
+                flush=True,
+            )
+        else:
+            _prog("eval_current_after", "Gold CE on current test (after continue)…")
+            print(
+                f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
+                f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')} "
+                f"(skip predict)",
+                flush=True,
+            )
         _attach_gold_ce(current_test_out, before=loss_before, after=loss_after)
-        print(
-            f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
-            f"pre={pre:.4f} rec={rec:.4f} "
-            f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
-            flush=True,
-        )
-        print(
-            f"[continue-eval] predict:\n{gen['predict'][:2000]}",
-            flush=True,
-        )
 
     after = None
     if cfg.eval_after_full:
@@ -1699,6 +1712,7 @@ def build_config_from_request(req: dict[str, Any] | None = None) -> ContinueTrai
         current_test_task_id=ct_task,
         current_test_prompt=ct_prompt,
         current_test_label=ct_label,
+        predict_current=bool(req.get("predictCurrent", True)),
         eval_before_cache=eval_before_cache,
         max_new_tokens=max(16, int(req.get("maxNewTokens", 1024))),
         seed=int(req.get("seed", 42)),

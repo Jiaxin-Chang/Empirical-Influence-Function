@@ -322,6 +322,7 @@ def _run_continue_train(
     adapter_family: str,
     timeout: float,
     poll: float,
+    predict_current: bool = True,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "mode": "train",
@@ -336,6 +337,7 @@ def _run_continue_train(
         "reportFamily": adapter_family,
         "adapterFamily": adapter_family,
         "currentTest": current_test,
+        "predictCurrent": bool(predict_current),
     }
     t0 = time.time()
     while True:
