@@ -685,6 +685,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/continue-train-eval":
             self._handle_continue_train_eval()
             return
+        if parsed.path == "/api/grad-align-edges":
+            self._handle_grad_align_edges()
+            return
+        if parsed.path == "/api/grad-align-undo":
+            self._handle_grad_align_undo()
+            return
         if parsed.path == "/api/retrain-eval":
             self._handle_retrain_eval()
             return
@@ -877,6 +883,121 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "statusMessage": upload_result.get("statusMessage"),
         }
         self._send_json(200, response)
+
+    def _handle_grad_align_edges(self):
+        """Leave-one-out LoRA gradient check on the latest continue-subset annotation."""
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "EIF_CACHE_ONLY=1 — gradient align disabled on this server.",
+            })
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+        ct = req.get("currentTest") if isinstance(req.get("currentTest"), dict) else {}
+        prompt = str(ct.get("prompt") or req.get("prompt") or "").strip()
+        label = str(ct.get("label") or ct.get("gold") or req.get("label") or "").strip()
+        if not prompt or not label:
+            self._send_json(400, {
+                "status": "error",
+                "message": "currentTest.prompt and currentTest.label are required",
+            })
+            return
+        active = _active_train_jobs()
+        if active:
+            self._send_json(409, {
+                "status": "error",
+                "message": f"Another training job is active: {active[0].get('jobId')}",
+                "jobId": active[0].get("jobId"),
+            })
+            return
+        job_id = uuid.uuid4().hex[:12]
+        filtering = str(req.get("mode") or "").strip().lower() == "filter"
+        _set_continue_job(
+            job_id,
+            kind="grad-align",
+            stage="queued",
+            message="梯度筛边排队…" if filtering else "梯度验证排队…",
+            active=True,
+            error=False,
+        )
+
+        def _run() -> None:
+            try:
+                from src.grad_align_edges import run_grad_align
+
+                def progress(stage: str, message: str) -> None:
+                    _set_continue_job(
+                        job_id,
+                        kind="grad-align",
+                        stage=stage,
+                        message=message,
+                        active=True,
+                        error=False,
+                    )
+
+                with CONTINUE_TRAIN_LOCK:
+                    result = run_grad_align(
+                        prompt=prompt,
+                        label=label,
+                        train_data=str(req.get("trainData") or "") or None,
+                        adapter_path=str(req.get("adapterPath") or "") or None,
+                        report_family=str(req.get("reportFamily") or req.get("adapterFamily") or "") or None,
+                        report_file_name=str(req.get("reportFileName") or "") or None,
+                        mode="filter" if str(req.get("mode") or "").strip().lower() == "filter" else "verify",
+                        progress_cb=progress,
+                    )
+                _set_continue_job(
+                    job_id,
+                    kind="grad-align",
+                    stage="completed",
+                    message=str(result.get("summary") or "梯度筛边完成"),
+                    active=False,
+                    error=False,
+                    result=result,
+                )
+            except Exception as exc:
+                _set_continue_job(
+                    job_id,
+                    kind="grad-align",
+                    stage="error",
+                    message=str(exc),
+                    active=False,
+                    error=True,
+                )
+
+        threading.Thread(target=_run, name=f"grad-align-{job_id}", daemon=True).start()
+        self._send_json(200, {
+            "status": "success",
+            "jobId": job_id,
+            "message": "梯度筛边已开始" if filtering else "梯度验证已开始",
+        })
+
+    def _handle_grad_align_undo(self):
+        """Restore edges removed by the latest 梯度筛边. No GPU."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            req = {}
+        if not isinstance(req, dict):
+            req = {}
+        try:
+            from src.grad_align_edges import undo_grad_align
+            result = undo_grad_align(str(req.get("trainData") or "") or None)
+        except Exception as exc:
+            self._send_json(400, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
 
     def _handle_continue_train_eval(self):
         """Start async continue-train on small annotated subset + line_hit eval."""

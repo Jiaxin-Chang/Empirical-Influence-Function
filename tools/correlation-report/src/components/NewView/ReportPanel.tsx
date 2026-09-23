@@ -2770,6 +2770,12 @@ export function ReportPanel({
     const [continueBusy, setContinueBusy] = useState(false);
     const [continueJobId, setContinueJobId] = useState<string | null>(null);
     const [continueResultSummary, setContinueResultSummary] = useState<string | null>(null);
+    const [gradAlignDots, setGradAlignDots] = useState<{
+        ceSaliency: number | null;
+        saliency: number | null;
+        bothPositive: boolean;
+    } | null>(null);
+    const [gradAlignCanUndo, setGradAlignCanUndo] = useState(false);
     const [continueCurrentTestOutput, setContinueCurrentTestOutput] = useState<ContinueCurrentTestState | null>(null);
     const [livePredictViewActive, setLivePredictViewActive] = useState(false);
     const [continueAdapterActive, setContinueAdapterActive] = useState(false);
@@ -5091,6 +5097,120 @@ export function ReportPanel({
         refreshSaliencyPanels,
     ]);
 
+    const handleGradAlign = useCallback((mode: 'verify' | 'filter') => {
+        if (importedReportActive) return;
+        if (!continueCurrentTestPayload) {
+            setTtavLaunchError('当前 test 没有 prompt/gold，无法做梯度对齐');
+            return;
+        }
+        if (continueAdapterFamily === 'unknown') {
+            setTtavLaunchError('无法从当前 report 路径判断 CE/saliency adapter');
+            return;
+        }
+        setContinueBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus(mode === 'filter'
+            ? '梯度筛边：逐条边算 marginal，小于 0 的删掉…'
+            : '验证：最近一条标注的两个点积…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/grad-align-edges'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mode,
+                        currentTest: continueCurrentTestPayload,
+                        ...continueAdapterPayload(continueAdapterFamily, meta.fileName),
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`梯度对齐 non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `梯度对齐失败 (HTTP ${resp.status})`,
+                    );
+                }
+                const jobId = String(parsed.jobId || '');
+                if (!jobId) throw new Error('梯度对齐响应缺少 jobId');
+                await pollContinueJob(jobId, (result) => {
+                    if (mode === 'verify') {
+                        const ceSal = result.dot_ce_saliency;
+                        const sal = result.dot_saliency;
+                        setGradAlignDots({
+                            ceSaliency: typeof ceSal === 'number' ? ceSal : null,
+                            saliency: typeof sal === 'number' ? sal : null,
+                            bothPositive: result.both_positive === true,
+                        });
+                    }
+                    if (result.can_undo === true) setGradAlignCanUndo(true);
+                    setContinueResultSummary(String(result.summary || ''));
+                    setTtavLaunchStatus(null);
+                });
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : '梯度对齐失败';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [
+        importedReportActive,
+        continueCurrentTestPayload,
+        continueAdapterFamily,
+        eifApiUrl,
+        meta.fileName,
+        pollContinueJob,
+    ]);
+
+    const handleGradAlignUndo = useCallback(() => {
+        if (importedReportActive) return;
+        setContinueBusy(true);
+        setTtavLaunchError(null);
+        setTtavLaunchStatus('撤回刚刚筛掉的边…');
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/grad-align-undo'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}',
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                if (raw.trim()) {
+                    try {
+                        parsed = JSON.parse(raw) as Record<string, unknown>;
+                    } catch {
+                        throw new Error(`撤回 non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                    }
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string' ? parsed.message : `撤回失败 (HTTP ${resp.status})`,
+                    );
+                }
+                setGradAlignCanUndo(false);
+                setContinueResultSummary(String(parsed.summary || '已撤回筛边'));
+                setTtavLaunchStatus(null);
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : '撤回失败';
+                setTtavLaunchError(msg);
+                setTtavLaunchStatus(null);
+            } finally {
+                setContinueBusy(false);
+            }
+        })();
+    }, [importedReportActive, eifApiUrl]);
+
     const handleRetrainEval = useCallback(() => {
         if (importedReportActive) return;
         const stepsRaw = retrainStepsInput.trim();
@@ -6064,6 +6184,48 @@ export function ReportPanel({
                                         >
                                             {continueBusy ? 'Training…' : '续训(CE)'}
                                         </button>
+                                        <button
+                                            type="button"
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
+                                            onClick={() => handleGradAlign('verify')}
+                                            title="不改边。对续训小集最后一条标注算 ∇(CE+λSaliency) 和 ∇Saliency，看是否都大于 0"
+                                            className={`${styles.ghostBtn}${continueBusy ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {continueBusy ? '…' : '验证'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
+                                            onClick={() => handleGradAlign('filter')}
+                                            title="逐条边算 marginal，小于 0 就从续训小集删掉。删完再点验证看两个点积"
+                                            className={`${styles.ghostBtn}${continueBusy ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {continueBusy ? '…' : '梯度筛边'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={
+                                                continueBusy
+                                                || !gradAlignCanUndo
+                                                || Boolean(interveningPairId)
+                                                || recoverBusy
+                                                || continueRecoverBusy
+                                            }
+                                            onClick={handleGradAlignUndo}
+                                            title="恢复刚刚筛掉的边。筛完再验证若两个点积变差，用这个撤回"
+                                            className={styles.ghostBtn}
+                                        >
+                                            撤回筛边
+                                        </button>
+                                        {gradAlignDots && (
+                                            <span className={styles.toolRowMuted} style={{ fontSize: 11 }}>
+                                                ∇(CE+λSal)={gradAlignDots.ceSaliency ?? '—'}
+                                                {' · '}
+                                                ∇Sal={gradAlignDots.saliency ?? '—'}
+                                                {' · '}
+                                                {gradAlignDots.bothPositive ? '都 > 0' : '未都 > 0'}
+                                            </span>
+                                        )}
                                         <button
                                             type="button"
                                             disabled={
