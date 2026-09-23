@@ -4426,6 +4426,13 @@ export function ReportPanel({
             report.test_sample_baseline.raw_label
             || decodeTokens(goldResponseTokens).join('')
         );
+        const modelPrediction = (
+            (modelTokens.length > promptLen
+                ? decodeTokens(modelTokens.slice(promptLen)).join('')
+                : '')
+            || report.test_sample_baseline.raw_predict
+            || ''
+        ).trim();
         if (!fimPrompt.trim() || !goldCompletion.trim()) {
             setLlmTrainError('缺少 FIM prompt 或 gold completion');
             return;
@@ -4453,6 +4460,7 @@ export function ReportPanel({
                             ? {
                                 fimPrompt,
                                 goldCompletion,
+                                modelPrediction,
                                 topK: 10,
                                 runCorpusSearch: true,
                             }
@@ -4492,9 +4500,11 @@ export function ReportPanel({
         importedReportActive,
         report.test_sample_baseline.raw_prompt,
         report.test_sample_baseline.raw_label,
+        report.test_sample_baseline.raw_predict,
         correctTokens,
         promptLen,
         goldResponseTokens,
+        modelTokens,
         eifApiUrl,
     ]);
 

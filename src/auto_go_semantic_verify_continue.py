@@ -51,6 +51,7 @@ from src.auto_raw_ce_to_continue import (
     _collect_semantic_hits,
     _continue_paths_match,
     _fim_and_gold,
+    _gold_and_predict,
     _http_json,
     _is_mismatch,
     _load_raw_rows,
@@ -578,6 +579,7 @@ def _process_test(
 ) -> None:
     task_id = str(row.get("task_id") or f"row_{test_line}")
     fim, gold = _fim_and_gold(row)
+    _, pred = _gold_and_predict(row)
     if not fim or not gold:
         print(f"[test {test_line}] skip: missing prompt/gold ({task_id})", flush=True)
         state.skipped.append({
@@ -597,7 +599,9 @@ def _process_test(
     lang = _row_language(row, language)
 
     try:
-        retrieve = client.llm_semantic_retrieve(fim, gold, language=lang or None)
+        retrieve = client.llm_semantic_retrieve(
+            fim, gold, language=lang or None, model_prediction=pred,
+        )
     except Exception as exc:
         print(f"  [fail] llm-semantic-retrieve: {exc}", flush=True)
         state.skipped.append({

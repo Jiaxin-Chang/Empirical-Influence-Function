@@ -567,6 +567,7 @@ class PipelineClient:
         gold: str,
         *,
         language: str | None = None,
+        model_prediction: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "fimPrompt": fim_prompt,
@@ -574,6 +575,9 @@ class PipelineClient:
             "topK": self.top_k,
             "runCorpusSearch": True,
         }
+        pred = (model_prediction or "").strip()
+        if pred:
+            body["modelPrediction"] = pred
         # Frontend Semantic 测试 does not send corpusPath. The API treats
         # corpusPath/semanticCorpusPath as EIF_LLM_SEMANTIC_CORPUS (schema jsonl),
         # not the raw FIM file used for MID/annotate.
@@ -775,6 +779,7 @@ def _process_semantic_row(
     gold: str,
     language: str,
     state_path: Path | None,
+    model_prediction: str = "",
 ) -> None:
     """Semantic 测试：最高分 corpus hit → MID → LLM 标注。"""
     try:
@@ -782,6 +787,7 @@ def _process_semantic_row(
             fim,
             gold,
             language=language or None,
+            model_prediction=model_prediction,
         )
     except Exception as exc:
         print(f"  [fail] llm-semantic-retrieve: {exc}", flush=True)
@@ -910,6 +916,7 @@ def process_test_row(
 
     task_id = str(row.get("task_id") or f"row_{test_line}")
     fim, gold = _fim_and_gold(row)
+    _, pred = _gold_and_predict(row)
     if not fim or not gold:
         print(f"[test {test_line}] skip: missing prompt/gold ({task_id})", flush=True)
         state.skipped.append({
@@ -938,6 +945,7 @@ def process_test_row(
             gold=gold,
             language=lang,
             state_path=state_path,
+            model_prediction=pred,
         )
         return
 

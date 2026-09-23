@@ -41,6 +41,7 @@ from src.llm_train_retrieval import (
     _chat_complete_json,
     _env,
     _extra_body,
+    clean_gold_mid_completion,
     prepare_llm_train_query,
 )
 
@@ -192,6 +193,122 @@ def build_llm_semantic_messages(
     ]
 
 
+def _fills_equivalent(a: str, b: str) -> bool:
+    """True when two hole fills differ only by whitespace."""
+    return " ".join((a or "").split()) == " ".join((b or "").split())
+
+
+def build_valid_semantic_messages(
+    *,
+    fim_prompt: str,
+    gold_completion: str,
+    model_prediction: str,
+    language: str | None = None,
+) -> list[dict[str, str]]:
+    """Valid-side prompt: four fields describe the gold-vs-prediction residual.
+
+    Train-corpus preprocess keeps ``build_llm_semantic_messages`` (full gold span).
+    """
+    prepared = prepare_llm_train_query(fim_prompt, gold_completion)
+    problem = prepared["fim_problem_surface"]
+    gold = prepared["gold_mid_completion"]
+    pred = clean_gold_mid_completion(model_prediction) or (model_prediction or "").strip()
+    lang = (language or "code").strip() or "code"
+    system = (
+        "You analyze a Fill-in-the-Middle (FIM) sample the model answered incorrectly. "
+        "The hole may be marked <MID>, <FIM>, or [MASK]. ChatML wrappers are already stripped.\n\n"
+        "You receive the prefix and suffix, the GOLD fill, and the MODEL PREDICTION for the same hole. "
+        "Describe only the semantic residual: the association the prediction failed to realize "
+        "and the gold still requires. Do not describe behavior the prediction already got right.\n\n"
+        "How to locate the residual:\n"
+        "- Compare the prediction to the gold fill. Ignore pure whitespace and indentation.\n"
+        "- The residual is the gold content that is missing or wrong in the prediction, "
+        "plus the link that content must have to the surrounding code "
+        "(including code the prediction already wrote, and the suffix).\n"
+        "- If the prediction is empty, unrelated, or shares no real structure with the gold, "
+        "the residual is the whole gold span. Describe that whole span.\n"
+        "- If the prediction already matches the gold, there is no residual. "
+        "Describe the gold span as a whole.\n\n"
+        "Use exactly four fields. They form one closed loop and MUST NOT repeat each other:\n"
+        "  Role      = ROLE of the residual only — its duty in the local logic\n"
+        "  Pattern   = WHICH transferable mechanism the residual is\n"
+        "  Operation = WHAT semantic action the residual performs\n"
+        "  Relation  = CONNECTS — the semantic links the model still needs to learn. "
+        "This is the primary field.\n\n"
+        "Relation rules (primary):\n"
+        "- Anchor every relation on the residual, not on steps the prediction already got right.\n"
+        "- Emit 1-3 relations. Each one is a link the model failed to make.\n"
+        "- Typical shape: what the missing piece consumes → what it produces, and "
+        "what it produces → the later use the prediction skipped "
+        "(the lookup, the suffix, or a binding the model wrote with the wrong input).\n"
+        "- source/target are semantic concepts, not raw identifiers or API spellings.\n"
+        "- Keep the concept specific to the missing mechanism. "
+        "If the gold case-folds a key, say normalized key / lowercased key, "
+        "not a generic transformed key, and not a different mechanism such as "
+        "encoding a key for storage.\n"
+        "- type: pick from dataflow, control, semantic_dependency, transform, init, "
+        "error, config, api. Invent a short label ONLY if none of those fit.\n\n"
+        "Role: a short duty of the residual inside the local logic. "
+        "Not a whole-function summary. Not a so-that / in order to clause. "
+        "Do not restate an operation the prediction already did.\n"
+        "Pattern: one primary mechanism of the residual. Add a second only if it is "
+        "truly distinct. Specific enough that a different mechanism with the same "
+        "cartoon shape would not use the same phrase.\n"
+        "Operations: 1-4 semantic acts of the residual only, in order. "
+        "Do not list acts the prediction already performed correctly.\n"
+        "Do NOT copy gold source, API names, string literals, or identifiers. "
+        "Generalize into concepts, but do not generalize away the missing mechanism.\n\n"
+        "Do NOT emit domain, entities, conditions, summary, hole_relation, sibling_line, "
+        "Boolean queries, or keyword-search strings.\n\n"
+        "Return STRICT JSON (no markdown) with exactly these keys:\n"
+        "{\n"
+        '  "role": "duty of the residual in the surrounding logic",\n'
+        '  "pattern": ["one primary mechanism of the residual"],\n'
+        '  "operations": ["1-4 semantic acts of the residual only"],\n'
+        '  "relations": [\n'
+        '    {"source": "semantic concept", "target": "semantic concept", '
+        '"type": "dataflow | control | semantic_dependency | transform | init | error | config | api"}\n'
+        "  ]\n"
+        "}\n\n"
+        "Worked example (near-miss; do not copy unless the sample is the same):\n"
+        "Context: read a map, then type-switch on the value when the lookup succeeds.\n"
+        "Prediction: val, ok := values[key]\n"
+        "Gold: key = strings.ToLower(key), then val, ok := values[key]\n"
+        "The prediction already reads the map. It skipped case-folding the key and "
+        "still indexed the map with the original key.\n"
+        "{\n"
+        '  "role": "case-fold the lookup key before the map read",\n'
+        '  "pattern": ["key normalization before lookup"],\n'
+        '  "operations": ["convert key to lowercase"],\n'
+        '  "relations": [\n'
+        '    {"source": "original key", "target": "normalized key", "type": "transform"},\n'
+        '    {"source": "normalized key", "target": "map lookup key", "type": "dataflow"}\n'
+        "  ]\n"
+        "}\n\n"
+        "Worked example (prediction shares no structure with the gold; describe the whole span):\n"
+        "Prediction: return nil\n"
+        "Gold: an error-driven early return that surfaces the open error before later use.\n"
+        "Role, pattern, operations, and relations then describe that whole guard."
+    )
+    user = (
+        f"Language: {lang}\n\n"
+        "Prefix + suffix (hole in the middle):\n"
+        f"{problem}\n\n"
+        "Gold fill for the hole:\n"
+        f"{gold}\n\n"
+        "Model prediction for the hole (incorrect):\n"
+        f"{pred}\n\n"
+        "Describe the residual only. Relations are the links the model still needs to learn, "
+        "anchored on what the gold has and the prediction lacks. "
+        "If the prediction shares no real structure with the gold, describe the whole gold span instead.\n"
+        "Return only the required JSON object."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
 def call_llm_semantic_analyze(
     *,
     fim_prompt: str,
@@ -199,19 +316,31 @@ def call_llm_semantic_analyze(
     model: str | None = None,
     max_tokens: int | None = None,
     language: str | None = None,
+    model_prediction: str | None = None,
 ) -> dict[str, Any]:
     client = _build_openai_client()
     model_name = model or _env("ANNOTATE_MODEL") or _env("LLM_RETRIEVE_MODEL") or "qwen-plus"
     mt = max_tokens or int(_env("ANNOTATE_MAX_TOKENS") or "4096")
-    messages = build_llm_semantic_messages(
-        fim_prompt=fim_prompt,
-        gold_completion=gold_completion,
-        language=language,
-    )
+    pred = (model_prediction or "").strip()
+    residual = bool(pred) and not _fills_equivalent(gold_completion, pred)
+    if residual:
+        messages = build_valid_semantic_messages(
+            fim_prompt=fim_prompt,
+            gold_completion=gold_completion,
+            model_prediction=pred,
+            language=language,
+        )
+    else:
+        messages = build_llm_semantic_messages(
+            fim_prompt=fim_prompt,
+            gold_completion=gold_completion,
+            language=language,
+        )
     extra = _extra_body()
     print(
-        f"[llm-semantic] model={model_name} surface_chars={len(fim_prompt)} "
-        f"gold_chars={len(gold_completion)}",
+        f"[llm-semantic] model={model_name} mode={'residual' if residual else 'full_span'} "
+        f"surface_chars={len(fim_prompt)} gold_chars={len(gold_completion)} "
+        f"pred_chars={len(pred)}",
         flush=True,
     )
     raw, parsed = _chat_complete_json(
@@ -230,6 +359,7 @@ def call_llm_semantic_analyze(
         "semantic": sem,
         "semantic_flat_text": flatten_semantic_text(sem),
         "messages": messages,
+        "query_mode": "residual" if residual else "full_span",
     }
 
 
@@ -377,6 +507,7 @@ def retrieve_llm_semantic_samples(
     max_corpus_scan: int | None = None,
     run_corpus_search: bool = True,
     language: str | None = None,
+    model_prediction: str | None = None,
 ) -> dict[str, Any]:
     if not (fim_prompt or "").strip():
         raise ValueError("fim_prompt is required")
@@ -384,10 +515,12 @@ def retrieve_llm_semantic_samples(
         raise ValueError("gold_completion is required")
 
     prepared = prepare_llm_train_query(fim_prompt, gold_completion)
+    pred = clean_gold_mid_completion(model_prediction or "") or (model_prediction or "").strip()
     llm_out = call_llm_semantic_analyze(
         fim_prompt=prepared["fim_problem_surface"],
         gold_completion=prepared["gold_mid_completion"],
         language=language,
+        model_prediction=pred,
     )
     sem = semantic_export_repr(llm_out.get("semantic") or {})
     semantic_corpus = (
@@ -453,6 +586,8 @@ def retrieve_llm_semantic_samples(
             "gold_completion_chars": len(gold_completion),
             "gold_preview": prepared["gold_mid_completion"][:400],
             "fim_surface_preview": prepared["fim_problem_surface"][:600],
+            "model_prediction_preview": pred[:400],
+            "query_mode": llm_out.get("query_mode") or "full_span",
         },
         "prepared": prepared,
     }

@@ -1982,6 +1982,12 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
 
         fim_prompt = str(req.get("fimPrompt") or req.get("promptText") or "").strip()
         gold = str(req.get("goldCompletion") or req.get("goldText") or "").strip()
+        prediction = str(
+            req.get("modelPrediction")
+            or req.get("predictText")
+            or req.get("predict")
+            or ""
+        ).strip()
         if not fim_prompt or not gold:
             self._send_json(400, {
                 "status": "error",
@@ -2003,8 +2009,8 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         language = str(req.get("language") or "").strip() or None
 
         print(
-            f"[llm-semantic] gold_chars={len(gold)} prompt_chars={len(fim_prompt)} "
-            f"corpus={corpus_path or 'env'}",
+            f"[llm-semantic] gold_chars={len(gold)} pred_chars={len(prediction)} "
+            f"prompt_chars={len(fim_prompt)} corpus={corpus_path or 'env'}",
             flush=True,
         )
         try:
@@ -2018,6 +2024,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                 max_corpus_scan=max_scan_i,
                 run_corpus_search=run_corpus,
                 language=language,
+                model_prediction=prediction,
             )
         except Exception as exc:
             print(f"[llm-semantic] failed: {exc}", flush=True)
