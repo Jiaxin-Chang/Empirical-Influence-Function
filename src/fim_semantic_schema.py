@@ -42,7 +42,7 @@ EMBED_TEXT_KIND = "mechanism_v1"
 REL_SRC_W = 0.4
 REL_TGT_W = 0.4
 REL_TYPE_W = 0.2
-REL_COS_FLOOR = 0.35
+REL_COS_FLOOR = 0.55
 
 _TYPE_NEAR_PAIRS = {
     frozenset(("dataflow", "transform")),
@@ -320,7 +320,9 @@ def relation_pair_score(
     typ = relation_type_soft_match(qr.get("type") or "", dr.get("type") or "")
     src = max(0.0, min(1.0, src))
     tgt = max(0.0, min(1.0, tgt))
-    return REL_SRC_W * src + REL_TGT_W * tgt + REL_TYPE_W * typ
+    # Both ends matter: one strong end cannot carry the pair. No hard cutoff.
+    ends = (src * tgt) ** 0.5
+    return ends * ((REL_SRC_W + REL_TGT_W) + REL_TYPE_W * typ)
 
 
 def relation_semantic_overlap(

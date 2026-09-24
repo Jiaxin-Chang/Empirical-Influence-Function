@@ -14,7 +14,6 @@ from typing import Any
 from src.fim_semantic_schema import (
     EMBED_TEXT_KIND,
     EMBED_TIE_WEIGHT,
-    REL_COS_FLOOR,
     collect_relation_endpoints,
     flatten_semantic_text_for_embedding,
     lexical_endpoint_sim,
@@ -238,7 +237,7 @@ def embed_relation_phrases(phrases: list[str], model: str) -> dict[str, Any]:
 
 
 def build_endpoint_sim(phrases: list[str], model: str):
-    """Cosine of relation endpoints, with lexical backup and a 0.35 floor."""
+    """Cosine of relation endpoints. Lexical only when a vector is missing."""
     import numpy as np
 
     table = embed_relation_phrases(phrases, model)
@@ -247,14 +246,11 @@ def build_endpoint_sim(phrases: list[str], model: str):
         from src.fim_semantic_schema import _norm_term
 
         an, bn = _norm_term(a), _norm_term(b)
-        lex = lexical_endpoint_sim(an, bn)
         va, vb = table.get(an), table.get(bn)
         if va is None or vb is None:
-            return lex
+            return lexical_endpoint_sim(an, bn)
         cos = float(np.dot(va, vb))
-        if cos >= REL_COS_FLOOR:
-            return max(lex, max(0.0, min(1.0, cos)))
-        return lex
+        return max(0.0, min(1.0, cos))
 
     return sim
 
