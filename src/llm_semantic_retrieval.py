@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from src.fim_semantic_schema import (
-    collect_relation_endpoints,
+    collect_semantic_embed_phrases,
     flatten_semantic_text,
     lexical_endpoint_sim,
     normalize_semantic_repr,
@@ -399,34 +399,12 @@ def search_semantic_corpus_jsonl(
     min_score: float = 0.01,
     recall_k: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Two-stage retrieve when embeddings exist; else Stage-2 on the full jsonl."""
-    from src.fim_semantic_index import embedding_npz_path, search_embed_then_rerank
-
+    """Stage-2 on the full semantic jsonl. Stage-1 embed recall is skipped for now."""
+    del recall_k
     path = Path(corpus_path)
     if not path.is_file():
         raise FileNotFoundError(f"semantic corpus not found: {corpus_path}")
-    npz = embedding_npz_path(path)
-    if npz.is_file():
-        try:
-            hits = search_embed_then_rerank(
-                str(path),
-                query_sem,
-                top_k=top_k,
-                recall_k=recall_k,
-            )
-            print(
-                f"[llm-semantic] pipeline=embed_recall+struct_rerank "
-                f"hits={len(hits)} npz={npz} "
-                f"relation_align={hits[0].get('relation_align') if hits else ''}",
-                flush=True,
-            )
-            return hits
-        except Exception as exc:
-            print(
-                f"[llm-semantic] embed recall failed ({exc}); "
-                "fallback full-corpus Stage-2",
-                flush=True,
-            )
+    print("[llm-semantic] pipeline=struct_rerank_full (stage-1 skipped)", flush=True)
     return _search_stage2_full_corpus(
         path,
         query_sem,
@@ -448,7 +426,6 @@ def _search_stage2_full_corpus(
     from src.fim_semantic_index import (
         _hit_from_row,
         build_endpoint_sim,
-        diversify_mechanism_hits,
         embed_model_id,
     )
 
@@ -476,9 +453,9 @@ def _search_stage2_full_corpus(
     model = embed_model_id()
     if model:
         try:
-            phrases = collect_relation_endpoints(q, *rows)
+            phrases = collect_semantic_embed_phrases(q, *rows)
             endpoint_sim = build_endpoint_sim(phrases, model)
-            rel_mode = "endpoint_embed"
+            rel_mode = "relation_embed"
         except Exception as exc:
             print(
                 f"[llm-semantic] full-corpus endpoint embed failed ({exc}); "
@@ -509,7 +486,7 @@ def _search_stage2_full_corpus(
         ranked_items.append((combined, hit, row))
 
     ranked_items.sort(key=lambda x: (-x[0], x[1].get("line") or 0))
-    hits = diversify_mechanism_hits(ranked_items, max(1, top_k), endpoint_sim)
+    hits = [hit for _score, hit, _row in ranked_items[: max(1, top_k)]]
     scanned = len(rows)
     for h in hits:
         h["scanned_rows"] = scanned

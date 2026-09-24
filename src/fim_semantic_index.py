@@ -14,7 +14,7 @@ from typing import Any
 from src.fim_semantic_schema import (
     EMBED_TEXT_KIND,
     EMBED_TIE_WEIGHT,
-    collect_relation_endpoints,
+    collect_semantic_embed_phrases,
     flatten_semantic_text_for_embedding,
     lexical_endpoint_sim,
     mechanism_signature,
@@ -25,7 +25,8 @@ from src.fim_semantic_schema import (
 
 _INDEX_CACHE: dict[str, Any] = {}
 _PHRASE_VEC_CACHE: dict[tuple[str, str], Any] = {}
-_PHRASE_CACHE_MAX = 20000
+_PHRASE_CACHE_MAX = 200000
+_PHRASE_DISK_LOADED: set[str] = set()
 
 
 def _env(name: str, default: str = "") -> str:
@@ -190,15 +191,16 @@ def _embed_texts_local(texts: list[str], *, model_dir: str, batch: int) -> list[
     return out
 
 
-def embed_texts(texts: list[str], *, model: str, batch: int = 32) -> list[list[float]]:
+def embed_texts(texts: list[str], *, model: str, batch: int = 20) -> list[list[float]]:
     if not texts:
         return []
     local_dir = _local_model_dir(model)
     if local_dir:
         return _embed_texts_local(texts, model_dir=local_dir, batch=batch)
+    # qwen3.7-text-embedding-flash rejects input.contents larger than 25.
     client = _build_embed_client()
     out: list[list[float] | None] = [None] * len(texts)
-    step = max(1, int(batch))
+    step = max(1, min(int(batch), 20))
     for start in range(0, len(texts), step):
         chunk = texts[start : start + step]
         resp = client.embeddings.create(model=model, input=chunk)
@@ -206,6 +208,74 @@ def embed_texts(texts: list[str], *, model: str, batch: int = 32) -> list[list[f
         for i in range(len(chunk)):
             out[start + i] = by_idx[i]
     return [v if v is not None else [] for v in out]
+
+
+def _endpoint_cache_path() -> Path | None:
+    """Persisted relation-endpoint vectors. Not the stage-1 document npz."""
+    raw = _env("EIF_LLM_SEMANTIC_ENDPOINT_EMBEDDINGS")
+    if raw:
+        return Path(raw).expanduser()
+    corpus = _env("EIF_LLM_SEMANTIC_CORPUS")
+    if not corpus:
+        return None
+    path = Path(corpus).expanduser()
+    return path.with_suffix(path.suffix + ".endpoint_embeddings.npz")
+
+
+def _load_phrase_disk(model: str) -> None:
+    if model in _PHRASE_DISK_LOADED:
+        return
+    _PHRASE_DISK_LOADED.add(model)
+    path = _endpoint_cache_path()
+    if path is None or not path.is_file():
+        return
+    meta_path = Path(str(path) + ".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if str(meta.get("model") or "") != model:
+        print(
+            f"[llm-semantic] endpoint cache model mismatch, ignore {path}",
+            flush=True,
+        )
+        return
+    import numpy as np
+
+    try:
+        blob = np.load(path, allow_pickle=True)
+        phrases = [str(p) for p in blob["phrases"].tolist()]
+        vectors = np.asarray(blob["vectors"], dtype="float32")
+    except Exception as exc:
+        print(f"[llm-semantic] endpoint cache unreadable ({exc})", flush=True)
+        return
+    n = min(len(phrases), int(vectors.shape[0]))
+    for phrase, vec in zip(phrases[:n], vectors[:n]):
+        if phrase:
+            _PHRASE_VEC_CACHE[(model, phrase)] = vec
+    print(f"[llm-semantic] loaded {n} endpoint vectors from {path}", flush=True)
+
+
+def _save_phrase_disk(model: str) -> None:
+    path = _endpoint_cache_path()
+    if path is None:
+        return
+    import numpy as np
+
+    phrases = [phrase for (cached_model, phrase) in _PHRASE_VEC_CACHE if cached_model == model]
+    if not phrases:
+        return
+    vectors = np.stack([np.asarray(_PHRASE_VEC_CACHE[(model, p)], dtype="float32") for p in phrases])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp.npz")
+    np.savez_compressed(tmp, phrases=np.array(phrases, dtype=object), vectors=vectors)
+    tmp.replace(path)
+    meta_path = Path(str(path) + ".meta.json")
+    meta_path.write_text(
+        json.dumps({"model": model, "n": len(phrases)}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"[llm-semantic] saved {len(phrases)} endpoint vectors to {path}", flush=True)
 
 
 def _remember_phrase_vec(model: str, phrase: str, vec: Any) -> None:
@@ -217,6 +287,7 @@ def _remember_phrase_vec(model: str, phrase: str, vec: Any) -> None:
 
 
 def embed_relation_phrases(phrases: list[str], model: str) -> dict[str, Any]:
+    _load_phrase_disk(model)
     table: dict[str, Any] = {}
     missing: list[str] = []
     for phrase in phrases:
@@ -227,12 +298,16 @@ def embed_relation_phrases(phrases: list[str], model: str) -> dict[str, Any]:
             missing.append(phrase)
     if missing:
         vecs = embed_texts(missing, model=model)
+        stored = 0
         for phrase, raw in zip(missing, vecs):
             if not raw:
                 continue
             arr = _l2_normalize(raw)
             _remember_phrase_vec(model, phrase, arr)
             table[phrase] = arr
+            stored += 1
+        if stored:
+            _save_phrase_disk(model)
     return table
 
 
@@ -480,9 +555,9 @@ def search_embed_then_rerank(
             continue
         raw_cands.append((rank, float(cos), row))
 
-    rel_mode = "endpoint_embed"
+    rel_mode = "relation_embed"
     try:
-        phrases = collect_relation_endpoints(q, *[row for _, _, row in raw_cands])
+        phrases = collect_semantic_embed_phrases(q, *[row for _, _, row in raw_cands])
         endpoint_sim = build_endpoint_sim(phrases, model)
     except Exception as exc:
         print(f"[llm-semantic] relation endpoint embed failed ({exc}); lexical fallback", flush=True)
@@ -510,7 +585,7 @@ def search_embed_then_rerank(
         ranked_items.append((combined, hit, row))
 
     ranked_items.sort(key=lambda x: (-x[0], x[1].get("line") or 0))
-    hits = diversify_mechanism_hits(ranked_items, max(1, top_k), endpoint_sim)
+    hits = [hit for _score, hit, _row in ranked_items[: max(1, top_k)]]
     scanned = len(rows)
     for h in hits:
         h["scanned_rows"] = scanned

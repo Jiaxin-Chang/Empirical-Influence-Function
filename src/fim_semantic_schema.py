@@ -310,19 +310,30 @@ def lexical_endpoint_sim(a: str, b: str) -> float:
     return float(jacc) if jacc >= 0.5 else 0.0
 
 
+def relation_phrase(rel: dict[str, str] | None) -> str:
+    """One relation as a single string, so release-vs-store stays in the same vector."""
+    if not isinstance(rel, dict):
+        return ""
+    src = _norm_term(rel.get("source") or "")
+    tgt = _norm_term(rel.get("target") or "")
+    if not src or not tgt:
+        return ""
+    return f"{src} -> {tgt}"
+
+
 def relation_pair_score(
     qr: dict[str, str],
     dr: dict[str, str],
     endpoint_sim: Any,
 ) -> float:
-    src = float(endpoint_sim(qr.get("source") or "", dr.get("source") or ""))
-    tgt = float(endpoint_sim(qr.get("target") or "", dr.get("target") or ""))
+    """Cosine of the whole ``source -> target`` string. Type adds a small fraction."""
+    left = relation_phrase(qr)
+    right = relation_phrase(dr)
+    if not left or not right:
+        return 0.0
+    cos = max(0.0, min(1.0, float(endpoint_sim(left, right))))
     typ = relation_type_soft_match(qr.get("type") or "", dr.get("type") or "")
-    src = max(0.0, min(1.0, src))
-    tgt = max(0.0, min(1.0, tgt))
-    # Both ends matter: one strong end cannot carry the pair. No hard cutoff.
-    ends = (src * tgt) ** 0.5
-    return ends * ((REL_SRC_W + REL_TGT_W) + REL_TYPE_W * typ)
+    return cos * (0.85 + 0.15 * typ)
 
 
 def relation_semantic_overlap(
@@ -343,6 +354,40 @@ def relation_semantic_overlap(
     return hits / max(len(query_rels), 1)
 
 
+def collect_semantic_embed_phrases(*sems: dict[str, Any] | None) -> list[str]:
+    """Phrases embedded once per corpus: each relation, each pattern, and the role."""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(phrase: str) -> None:
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+
+    for sem in sems:
+        s = normalize_semantic_repr(sem if isinstance(sem, dict) else {})
+        add(_norm_term(str(s.get("role") or "")))
+        for pattern in s.get("pattern") or []:
+            add(_norm_term(pattern))
+        for rel in s.get("relations") or []:
+            add(relation_phrase(rel))
+    return out
+
+
+def collect_relation_phrases(*sems: dict[str, Any] | None) -> list[str]:
+    """Unique ``source -> target`` strings. One cache entry per relation, not per endpoint."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for sem in sems:
+        s = normalize_semantic_repr(sem if isinstance(sem, dict) else {})
+        for rel in s.get("relations") or []:
+            phrase = relation_phrase(rel)
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                out.append(phrase)
+    return out
+
+
 def collect_relation_endpoints(*sems: dict[str, Any] | None) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -357,6 +402,27 @@ def collect_relation_endpoints(*sems: dict[str, Any] | None) -> list[str]:
     return out
 
 
+def _phrase_sim(a: str, b: str, sim: Any) -> float:
+    an, bn = _norm_term(a), _norm_term(b)
+    if not an or not bn:
+        return 0.0
+    return max(0.0, min(1.0, float(sim(an, bn))))
+
+
+def _list_embed_overlap(query: list[str], doc: list[str], sim: Any) -> float:
+    q_terms = [_norm_term(t) for t in query if _norm_term(t)]
+    d_terms = [_norm_term(t) for t in doc if _norm_term(t)]
+    if not q_terms or not d_terms:
+        return 0.0
+    hits = 0.0
+    for q in q_terms:
+        best = 0.0
+        for d in d_terms:
+            best = max(best, _phrase_sim(q, d, sim))
+        hits += best
+    return hits / max(len(q_terms), 1)
+
+
 def same_mechanism_cluster(
     a: dict[str, Any] | None,
     b: dict[str, Any] | None,
@@ -369,8 +435,8 @@ def same_mechanism_cluster(
     sa = normalize_semantic_repr(a if isinstance(a, dict) else {})
     sb = normalize_semantic_repr(b if isinstance(b, dict) else {})
     rel = relation_semantic_overlap(sa["relations"], sb["relations"], endpoint_sim)
-    pat = _list_overlap(sa["pattern"], sb["pattern"])
-    role = _role_overlap(str(sa.get("role") or ""), str(sb.get("role") or ""))
+    pat = _list_embed_overlap(sa["pattern"], sb["pattern"], endpoint_sim)
+    role = _phrase_sim(str(sa.get("role") or ""), str(sb.get("role") or ""), endpoint_sim)
     return rel >= rel_min and (pat >= pat_min or role >= 0.5)
 
 
@@ -484,8 +550,12 @@ def semantic_struct_components(
         rel = _relation_overlap(q["relations"], d["relations"])
     return {
         "relation": rel,
-        "pattern": _list_overlap(q["pattern"], d["pattern"]),
-        "role": _role_overlap(str(q.get("role") or ""), str(d.get("role") or "")),
+        "pattern": _list_embed_overlap(q["pattern"], d["pattern"], endpoint_sim)
+        if endpoint_sim is not None
+        else _list_overlap(q["pattern"], d["pattern"]),
+        "role": _phrase_sim(str(q.get("role") or ""), str(d.get("role") or ""), endpoint_sim)
+        if endpoint_sim is not None
+        else _role_overlap(str(q.get("role") or ""), str(d.get("role") or "")),
         "operations": _list_overlap(q["operations"], d["operations"]),
     }
 
