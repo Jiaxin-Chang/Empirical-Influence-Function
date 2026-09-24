@@ -29,11 +29,12 @@ _REL_BOTH = 3.2
 _REL_ONE = 0.9
 
 # Stage-2 rerank: four generation fields only. Sum = 0.90; embed is a 0.10 tie-break.
+# Relation is the missing link the model still needs, so it dominates retrieval.
 RERANK_WEIGHTS = {
-    "relation": 0.40,
-    "pattern": 0.22,
-    "role": 0.15,
-    "operations": 0.13,
+    "relation": 0.55,
+    "pattern": 0.12,
+    "role": 0.12,
+    "operations": 0.11,
 }
 EMBED_TIE_WEIGHT = 0.10
 EMBED_TEXT_KIND = "mechanism_v1"

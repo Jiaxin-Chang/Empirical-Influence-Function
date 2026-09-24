@@ -222,6 +222,9 @@ def build_valid_semantic_messages(
         "and the gold still requires. Do not describe behavior the prediction already got right.\n\n"
         "How to locate the residual:\n"
         "- Compare the prediction to the gold fill. Ignore pure whitespace and indentation.\n"
+        "- The same semantic act with different binding syntax counts as already done. "
+        "`var ccategory C.CString(category)` and `ccategory := C.CString(category)` "
+        "are the same allocation.\n"
         "- The residual is the gold content that is missing or wrong in the prediction, "
         "plus the link that content must have to the surrounding code "
         "(including code the prediction already wrote, and the suffix).\n"
@@ -237,10 +240,16 @@ def build_valid_semantic_messages(
         "This is the primary field.\n\n"
         "Relation rules (primary):\n"
         "- Anchor every relation on the residual, not on steps the prediction already got right.\n"
+        "- Do NOT emit a relation the prediction already realized. "
+        "If the prediction already converts a native string into a foreign string, "
+        "do not emit that transform, even when the binding syntax differs.\n"
         "- Emit 1-3 relations. Each one is a link the model failed to make.\n"
         "- Typical shape: what the missing piece consumes → what it produces, and "
         "what it produces → the later use the prediction skipped "
         "(the lookup, the suffix, or a binding the model wrote with the wrong input).\n"
+        "- A missing cleanup is a lifetime link: the already-created resource → "
+        "its release at function exit. Use semantic_dependency for that link. "
+        "Do not label it control.\n"
         "- source/target are semantic concepts, not raw identifiers or API spellings.\n"
         "- Keep the concept specific to the missing mechanism. "
         "If the gold case-folds a key, say normalized key / lowercased key, "
@@ -285,6 +294,23 @@ def build_valid_semantic_messages(
         '    {"source": "normalized key", "target": "map lookup key", "type": "dataflow"}\n'
         "  ]\n"
         "}\n\n"
+        "Worked example (prediction already did the first step; the residual is the later step):\n"
+        "Suffix still uses the foreign string in a later native call.\n"
+        "Prediction: var ccategory C.CString(category)\n"
+        "Gold: ccategory := C.CString(category), then defer freeing that foreign string "
+        "so it is released when the function returns.\n"
+        "The prediction already allocated the foreign string. "
+        "`var` versus `:=` is the same act. The missing link is scheduling its release.\n"
+        "{\n"
+        '  "role": "release the allocated foreign string when the function returns",\n'
+        '  "pattern": ["deferred release after foreign-string allocation"],\n'
+        '  "operations": ["schedule freeing the allocated foreign string"],\n'
+        '  "relations": [\n'
+        '    {"source": "allocated foreign string", "target": "release at function exit", '
+        '"type": "semantic_dependency"}\n'
+        "  ]\n"
+        "}\n"
+        "Do not also emit native string → foreign string. That transform is already in the prediction.\n\n"
         "Worked example (prediction shares no structure with the gold; describe the whole span):\n"
         "Prediction: return nil\n"
         "Gold: an error-driven early return that surfaces the open error before later use.\n"
@@ -300,6 +326,7 @@ def build_valid_semantic_messages(
         f"{pred}\n\n"
         "Describe the residual only. Relations are the links the model still needs to learn, "
         "anchored on what the gold has and the prediction lacks. "
+        "Do not include a link the prediction already realized, even if the binding syntax differs. "
         "If the prediction shares no real structure with the gold, describe the whole gold span instead.\n"
         "Return only the required JSON object."
     )
