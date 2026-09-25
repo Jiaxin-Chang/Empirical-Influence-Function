@@ -5771,6 +5771,7 @@ export function ReportPanel({
                                 }
                                 onToggleSaliencySelect={() => setModelSaliencySelected(v => !v)}
                                 headerExtra={(
+                                    <>
                                     <button
                                         type="button"
                                         aria-pressed={attrMode === 'manual'}
@@ -5806,6 +5807,7 @@ export function ReportPanel({
                                     >
                                         {sampleAttrBusy ? '整样本归因…' : '整样本归因'}
                                     </button>
+                                    </>
                                 )}
                             />
 
