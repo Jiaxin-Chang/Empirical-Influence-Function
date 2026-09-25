@@ -111,6 +111,9 @@ export default function App() {
   const [gsUseLlm, setGsUseLlm] = useState(true)
   const [gsBusy, setGsBusy] = useState(false)
   const [llmSemPreviewId, setLlmSemPreviewId] = useState<string | null>(null)
+  const [previewVerifyBusy, setPreviewVerifyBusy] = useState(false)
+  const [previewVerifyMsg, setPreviewVerifyMsg] = useState('')
+  const [previewCanUndo, setPreviewCanUndo] = useState(false)
   const [llmSemBusy, setLlmSemBusy] = useState(false)
   const llmSemAbortRef = useRef<AbortController | null>(null)
   const [queryMode, setQueryMode] = useState('manual')
@@ -728,6 +731,70 @@ export default function App() {
     }
   }
 
+  const activePreviewId = gsPreviewId || llmSemPreviewId
+
+  const pollPreviewJob = async (jobId: string) => {
+    for (;;) {
+      await new Promise(r => setTimeout(r, 2000))
+      const st = await api.previewVerifyStatus(jobId)
+      if (st.message) setPreviewVerifyMsg(st.message)
+      if (st.sample) setSample(st.sample)
+      if (st.stage === 'completed') return st
+      if (st.stage === 'error' || st.error) {
+        throw new Error(st.message || '预览验证失败')
+      }
+    }
+  }
+
+  const runPreviewOnestep = async () => {
+    if (corpusLine == null || !activePreviewId) return
+    setPreviewVerifyBusy(true)
+    setError('')
+    setPreviewVerifyMsg('一步续训排队…')
+    try {
+      const started = await api.previewOnestep(corpusLine, activePreviewId)
+      const st = await pollPreviewJob(started.jobId)
+      const before = st.loss_before
+      const after = st.loss_after
+      const dropped = before != null && after != null && after < before
+      setPreviewVerifyMsg(
+        before == null || after == null
+          ? '一步续训结束，但没有拿到 loss'
+          : `gold CE ${before} → ${after}（${dropped ? '下降' : '没有下降'}）。还没写入续训集。`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setPreviewVerifyMsg('')
+    } finally {
+      setPreviewVerifyBusy(false)
+    }
+  }
+
+  const runPreviewGrad = async (mode: 'filter' | 'undo') => {
+    if (corpusLine == null || !activePreviewId) return
+    setPreviewVerifyBusy(true)
+    setError('')
+    setPreviewVerifyMsg(mode === 'undo' ? '回退筛边…' : '梯度筛边排队…')
+    try {
+      const started = await api.previewGrad(corpusLine, activePreviewId, mode)
+      if (started.done) {
+        if (started.sample) setSample(started.sample)
+        setPreviewCanUndo(false)
+        setPreviewVerifyMsg(started.summary || '已回退筛边。还没写入续训集。')
+        return
+      }
+      if (!started.jobId) throw new Error('筛边没有返回 jobId')
+      const st = await pollPreviewJob(started.jobId)
+      setPreviewCanUndo(Boolean(st.can_undo))
+      setPreviewVerifyMsg(`${st.summary || st.message || '筛边结束'}。还没写入续训集。`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setPreviewVerifyMsg('')
+    } finally {
+      setPreviewVerifyBusy(false)
+    }
+  }
+
   const clearCorpusAnnotations = async () => {
     if (!corpusMode || corpusLine == null) return
     setBusy(true)
@@ -1183,6 +1250,44 @@ export default function App() {
                         </>
                       )}
                     </div>
+                  </div>
+                )}
+
+                {corpusMode && activePreviewId && (
+                  <div className="card" style={{ borderColor: '#93c5fd' }}>
+                    <h3>这条预览的一步续训</h3>
+                    <p className="hint" style={{ marginBottom: 8 }}>
+                      只对当前预览的这一条做一步 CE+saliency，看这道测试题的 gold CE 变不变。
+                      梯度筛边和回退也只改这条预览。点「接受」之后才会进续训集。
+                    </p>
+                    <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>
+                      <button
+                        type="button"
+                        disabled={previewVerifyBusy || gsBusy || llmSemBusy}
+                        onClick={() => void runPreviewOnestep()}
+                      >
+                        {previewVerifyBusy ? '…' : '一步续训'}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={previewVerifyBusy || gsBusy || llmSemBusy}
+                        onClick={() => void runPreviewGrad('filter')}
+                      >
+                        梯度筛边
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={previewVerifyBusy || gsBusy || llmSemBusy || !previewCanUndo}
+                        onClick={() => void runPreviewGrad('undo')}
+                      >
+                        回退筛边
+                      </button>
+                    </div>
+                    {previewVerifyMsg ? (
+                      <p className="hint" style={{ marginTop: 8 }}>{previewVerifyMsg}</p>
+                    ) : null}
                   </div>
                 )}
 

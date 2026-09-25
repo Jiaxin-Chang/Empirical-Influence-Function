@@ -256,6 +256,43 @@ export const api = {
       body: JSON.stringify({ copies }),
     }),
 
+  previewProbe: (line: number, body: { prompt: string; label: string; taskId?: string }) =>
+    jsonFetch<{ ok: boolean }>(`/api/corpus/sample/${line}/preview-probe`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  previewOnestep: (line: number, previewId: string) =>
+    jsonFetch<{ ok: boolean; jobId: string }>(`/api/corpus/sample/${line}/preview-onestep`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId }),
+    }),
+
+  previewGrad: (line: number, previewId: string, mode: 'filter' | 'undo') =>
+    jsonFetch<{
+      ok: boolean
+      jobId?: string
+      done?: boolean
+      sample?: SampleDetail
+      summary?: string
+    }>(`/api/corpus/sample/${line}/preview-grad`, {
+      method: 'POST',
+      body: JSON.stringify({ preview_id: previewId, mode }),
+    }),
+
+  previewVerifyStatus: (jobId: string) =>
+    jsonFetch<{
+      ok: boolean
+      stage: string
+      message?: string
+      error?: boolean
+      loss_before?: number | null
+      loss_after?: number | null
+      summary?: string
+      can_undo?: boolean
+      sample?: SampleDetail | null
+    }>(`/api/corpus/preview-verify-status?jobId=${encodeURIComponent(jobId)}`),
+
   graphsignalAnnotatePreview: (
     line: number,
     body?: { use_llm?: boolean; max_edges?: number },

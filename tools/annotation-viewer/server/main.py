@@ -2248,6 +2248,228 @@ def llm_semantic_annotate_reject(line: int, body: GraphsignalPreviewActionBody, 
     return {"ok": True, "preview_id": pid, "sample": sample}
 
 
+_preview_probe: dict[int, dict[str, str]] = {}
+_preview_jobs: dict[str, dict[str, Any]] = {}
+
+
+class PreviewProbeBody(BaseModel):
+    prompt: str = ""
+    label: str = ""
+    taskId: str = ""
+
+
+class PreviewVerifyBody(BaseModel):
+    preview_id: str = Field(..., min_length=8)
+    mode: str = "filter"
+
+
+def _eif_api_base() -> str:
+    return (os.environ.get("EIF_API_URL") or "http://127.0.0.1:8766").rstrip("/")
+
+
+def _preview_scratch_path(preview_id: str) -> Path:
+    d = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp") / "eif_preview_verify"
+    d.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in preview_id if c.isalnum())
+    return d / f"{safe}.jsonl"
+
+
+def _find_preview_entry(line: int, preview_id: str) -> dict[str, Any]:
+    pid = preview_id.strip()
+    entry = _gs_preview_cache.get(pid)
+    if isinstance(entry, dict) and int(entry.get("line", -1)) == int(line):
+        return entry
+    loaded = _load_llm_sem_preview(pid, line)
+    if isinstance(loaded, dict):
+        return loaded
+    raise HTTPException(404, "预览不存在或已过期，请重新标注后再验证。")
+
+
+def _write_preview_scratch(entry: dict[str, Any]) -> Path:
+    src = dict(entry.get("annotated_source") or {})
+    edges = []
+    for raw in entry.get("raw_edges") or src.get("attention_edges") or []:
+        if not isinstance(raw, dict) or "src" not in raw or "dst" not in raw:
+            continue
+        edge = dict(raw)
+        edge.setdefault("contrib", "llm_auto")
+        edge.setdefault("weight", 1.0)
+        edges.append(edge)
+    src["attention_edges"] = edges
+    src["uid"] = str(src.get("uid") or f"preview:{entry.get('preview_id')}")
+    path = _preview_scratch_path(str(entry.get("preview_id") or ""))
+    path.write_text(json.dumps(src, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _sync_scratch_edges(line: int, preview_id: str) -> dict[str, Any]:
+    path = _preview_scratch_path(preview_id)
+    if not path.is_file():
+        raise HTTPException(404, "没有这条预览的临时标注文件")
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+    edges = [e for e in (row.get("attention_edges") or []) if isinstance(e, dict)]
+    entry = _find_preview_entry(line, preview_id)
+    entry["raw_edges"] = edges
+    annotated = dict(entry.get("annotated_source") or {})
+    annotated["attention_edges"] = edges
+    entry["annotated_source"] = annotated
+    if preview_id in _llm_sem_preview_cache:
+        _save_llm_sem_preview(entry)
+    return _sample_detail_from_graphsignal_preview(
+        line,
+        annotated,
+        from_continue=False,
+        key=str(entry.get("preview_id") or preview_id),
+    )
+
+
+def _eif_json(method: str, path: str, body: dict[str, Any] | None = None, timeout: float = 60.0) -> dict[str, Any]:
+    import urllib.error
+    import urllib.request
+
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_eif_api_base()}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise HTTPException(exc.code, detail or f"EIF API HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(503, f"连不上续训服务 {_eif_api_base()}: {exc}") from exc
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, f"续训服务返回的不是 JSON: {raw[:200]}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(502, "续训服务返回格式不对")
+    return parsed
+
+
+@app.post("/api/corpus/sample/{line}/preview-probe")
+def preview_probe(line: int, body: PreviewProbeBody):
+    """Remember the valid prompt/gold for a later one-step check. Not written to continue data."""
+    prompt = body.prompt.strip()
+    label = body.label.strip()
+    if not prompt or not label:
+        raise HTTPException(400, "prompt 和 label 都不能空")
+    _preview_probe[int(line)] = {
+        "prompt": prompt,
+        "label": label,
+        "taskId": body.taskId.strip(),
+    }
+    return {"ok": True, "line": int(line)}
+
+
+@app.post("/api/corpus/sample/{line}/preview-onestep")
+def preview_onestep(line: int, body: PreviewVerifyBody):
+    """One SGD step on this preview row only. The continue JSONL is not touched."""
+    probe = _preview_probe.get(int(line))
+    if not probe:
+        raise HTTPException(
+            400,
+            "没有这道测试题的 prompt/gold。请从归因页重新打开标注页。",
+        )
+    with _state_lock:
+        entry = _find_preview_entry(line, body.preview_id)
+        scratch = _write_preview_scratch(entry)
+    started = _eif_json("POST", "/api/continue-train-eval", {
+        "mode": "train",
+        "trainData": str(scratch),
+        "maxSteps": 1,
+        "learningRate": 2e-5,
+        "lossMode": "ce_saliency",
+        "evalBefore": False,
+        "evalAfterFull": False,
+        "predictCurrent": False,
+        "adapterFamily": "ce",
+        "currentTest": {
+            "taskId": probe.get("taskId") or f"line_{line}",
+            "prompt": probe["prompt"],
+            "label": probe["label"],
+        },
+    })
+    job_id = str(started.get("jobId") or "")
+    if not job_id:
+        raise HTTPException(502, f"续训服务没有返回 jobId: {started}")
+    _preview_jobs[job_id] = {
+        "line": int(line),
+        "preview_id": body.preview_id.strip(),
+        "action": "onestep",
+    }
+    return {"ok": True, "jobId": job_id}
+
+
+@app.post("/api/corpus/sample/{line}/preview-grad")
+def preview_grad(line: int, body: PreviewVerifyBody):
+    """Filter or undo edges on the preview scratch file, then refresh the preview."""
+    mode = (body.mode or "filter").strip().lower()
+    probe = _preview_probe.get(int(line))
+    if mode != "undo" and not probe:
+        raise HTTPException(400, "没有这道测试题的 prompt/gold。请从归因页重新打开标注页。")
+    with _state_lock:
+        entry = _find_preview_entry(line, body.preview_id)
+        scratch = _write_preview_scratch(entry)
+    if mode == "undo":
+        parsed = _eif_json("POST", "/api/grad-align-undo", {"trainData": str(scratch)})
+        with _state_lock:
+            sample = _sync_scratch_edges(line, body.preview_id)
+        return {"ok": True, "done": True, "sample": sample, "summary": parsed.get("summary") or parsed.get("message")}
+    started = _eif_json("POST", "/api/grad-align-edges", {
+        "mode": "filter",
+        "trainData": str(scratch),
+        "adapterFamily": "ce",
+        "currentTest": {
+            "taskId": (probe or {}).get("taskId") or f"line_{line}",
+            "prompt": (probe or {})["prompt"],
+            "label": (probe or {})["label"],
+        },
+    })
+    job_id = str(started.get("jobId") or "")
+    if not job_id:
+        raise HTTPException(502, f"筛边服务没有返回 jobId: {started}")
+    _preview_jobs[job_id] = {
+        "line": int(line),
+        "preview_id": body.preview_id.strip(),
+        "action": "filter",
+    }
+    return {"ok": True, "jobId": job_id}
+
+
+@app.get("/api/corpus/preview-verify-status")
+def preview_verify_status(jobId: str):
+    job_id = jobId.strip()
+    parsed = _eif_json(
+        "GET",
+        f"/api/continue-train-eval-status?jobId={job_id}",
+        None,
+    )
+    stage = str(parsed.get("stage") or "")
+    meta = _preview_jobs.get(job_id) or {}
+    sample = None
+    if stage == "completed" and meta.get("action") == "filter":
+        with _state_lock:
+            sample = _sync_scratch_edges(int(meta["line"]), str(meta["preview_id"]))
+    result = parsed.get("result") if isinstance(parsed.get("result"), dict) else {}
+    current = result.get("currentTest") if isinstance(result.get("currentTest"), dict) else {}
+    return {
+        "ok": True,
+        "stage": stage,
+        "message": parsed.get("message") or "",
+        "error": bool(parsed.get("error")),
+        "loss_before": current.get("loss_before"),
+        "loss_after": current.get("loss_after"),
+        "summary": result.get("summary"),
+        "can_undo": bool(result.get("can_undo")),
+        "sample": sample,
+    }
+
+
 @app.get("/api/semantic-prompt/status")
 def semantic_prompt_status():
     from server.eval_semantic_prompt import prompt_status

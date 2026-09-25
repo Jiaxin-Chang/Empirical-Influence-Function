@@ -4724,9 +4724,21 @@ export function ReportPanel({
                 }
             }
 
+            if (continueCurrentTestPayload && hit.line != null) {
+                try {
+                    await fetch(`${base.replace(/\/$/, '')}/api/corpus/sample/${hit.line}/preview-probe`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(continueCurrentTestPayload),
+                    });
+                } catch (err) {
+                    console.warn('[preview-probe] failed', err);
+                }
+            }
             navigate(url.toString(), rewriteNote);
         })();
     }, [
+        continueCurrentTestPayload,
         llmTrainResult?.corpus_path,
         llmTrainResult?.analysis?.semantic,
         llmTrainResult?.semantic,
