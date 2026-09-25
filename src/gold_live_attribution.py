@@ -42,6 +42,7 @@ from src.intervention_experiment import (
     PRESCREEN_SKETCH_SEED,
     SALIENCY_TRAIN_BANK_CACHE_DIR,
     SEQUENCE_LENGTH_LIMIT,
+    _compute_bank_flat_grad_filtered,
     _load_or_build_saliency_train_bank,
     _project_flat_grad,
     _score_prescreen_sketch_cache,
@@ -1063,6 +1064,89 @@ def gold_retrieve_and_stage3(
         "trainSampleDetails": details,
         "filterTag": session["filter_tag"],
         "sampleIdHint": infer_sample_id_from_report(report),
+    }
+
+
+def attribute_sample_gradient(
+    report: dict[str, Any],
+    *,
+    top_k: int = 20,
+    full_tokens: list[str] | None = None,
+    full_token_ids: list[int] | None = None,
+    prompt_len_override: int | None = None,
+) -> dict[str, Any]:
+    """Cosine the valid sample's gold CE gradient against the train bank.
+
+    The query is the teacher-forced gold sequence (prompt labels masked).
+    Train rows are the existing saliency-bank sketches, one vector per sample.
+    """
+    from heapq import nlargest
+
+    session = _ensure_bank(report)
+    model = session["model"]
+    tokenizer = session["tokenizer"]
+    device = session["device"]
+    bank = session["bank"]
+    if bank is None:
+        raise RuntimeError("Saliency train bank is not available after _ensure_bank.")
+    ensure_peft_lora_dtype(model, torch.bfloat16)
+
+    baseline = report.get("test_sample_baseline") or {}
+    fallback_pl = int(baseline.get("prompt_len") or 0)
+    override = _predict_sequence_override(
+        full_tokens, full_token_ids, prompt_len_override, fallback_pl,
+    )
+    if override is not None:
+        _tokens, ids, prompt_len = override
+    else:
+        _tokens, ids, prompt_len = _gold_tokens_and_ids(report, tokenizer)
+    if not (0 < prompt_len < len(ids)):
+        raise ValueError(f"Invalid gold sequence prompt_len={prompt_len} len={len(ids)}")
+
+    batch = _batch_from_ids(ids, prompt_len, device)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    flat = _compute_bank_flat_grad_filtered(
+        model,
+        batch,
+        session["param_filter"],
+        device,
+        cfg=session.get("bank_cfg"),
+        edges=None,
+        special_ids=special_ids,
+    )
+    if flat is None:
+        raise RuntimeError("Valid-sample gold CE gradient was empty.")
+    sketch_dim = int(bank.get("sketch_dim") or PRESCREEN_SKETCH_DIM)
+    sketch_seed = int(bank.get("sketch_seed") or PRESCREEN_SKETCH_SEED)
+    sketch = _project_flat_grad(flat, sketch_dim, sketch_seed)
+    scored = _score_prescreen_sketch_cache(sketch, bank, device)
+    top = nlargest(max(1, int(top_k)), scored, key=lambda x: x[1])
+    train_samples = session.get("train_samples") or []
+    trains: list[dict[str, Any]] = []
+    for train_idx, cos in top:
+        meta: dict[str, Any] = {}
+        if 0 <= int(train_idx) < len(train_samples):
+            meta = train_samples[int(train_idx)]
+        trains.append({
+            "trainSampleId": int(train_idx),
+            "cos": round(float(cos), 6),
+            "taskId": str(meta.get("task_id") or ""),
+            "uid": str(meta.get("uid") or ""),
+        })
+    _release_cuda_memory(model, reason="sample_gradient")
+    bank_mode = ""
+    cfg = session.get("bank_cfg")
+    if cfg is not None:
+        bank_mode = str(getattr(cfg, "loss_mode", "") or "")
+    return {
+        "status": "success",
+        "retrieval": "sample_gradient",
+        "loss": "gold_ce",
+        "bankLossMode": bank_mode or str(bank.get("bank_loss_mode") or ""),
+        "promptLen": int(prompt_len),
+        "nTokens": len(ids),
+        "nTrain": int(bank["sample_ids"].numel()),
+        "trains": trains,
     }
 
 

@@ -30,6 +30,7 @@ from src.unlearn_pair_probe import (
 from src.gold_live_attribution import (
     _gold_tokens_and_ids,
     _hydrate_eif_env,
+    attribute_sample_gradient,
     gold_retrieve_and_stage3,
     gold_saliency_top_k,
 )
@@ -723,6 +724,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/gold-retrieve-stage3":
             self._handle_gold_retrieve_stage3()
+            return
+        if parsed.path == "/api/sample-attribution":
+            self._handle_sample_attribution()
             return
         if parsed.path == "/api/llm-train-retrieve":
             self._handle_llm_train_retrieve()
@@ -1530,6 +1534,81 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             flush=True,
         )
         self._send_json(200, result)
+
+    def _handle_sample_attribution(self):
+        """Whole-sample gradient (gold CE vs train bank) and AST structure."""
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+        if CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Sample attribution needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
+        report, err = self._load_report_from_req(req)
+        if err:
+            self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
+            return
+        try:
+            top_k = int(req.get("topK") or 20)
+        except (TypeError, ValueError):
+            top_k = 20
+        top_k = max(1, min(top_k, 100))
+        full_tokens = req.get("fullTokens")
+        full_token_ids = req.get("fullTokenIds")
+        prompt_len_override = req.get("promptLen")
+        which = str(req.get("which") or "both").strip().lower()
+        if which not in ("both", "gradient", "structural"):
+            which = "both"
+        print(f"[sample-attr] which={which} topK={top_k}", flush=True)
+
+        structural = None
+        gradient = None
+        try:
+            if which in ("both", "structural"):
+                from src.structural_pair_retrieval import retrieve_structural_samples
+
+                baseline = (report or {}).get("test_sample_baseline") or {}
+                tokens = full_tokens if isinstance(full_tokens, list) and full_tokens else (
+                    baseline.get("correct_full_tokens") or baseline.get("full_tokens") or []
+                )
+                prompt_len = prompt_len_override
+                if prompt_len is None:
+                    prompt_len = baseline.get("prompt_len")
+                structural = retrieve_structural_samples(
+                    query_tokens=[str(t) for t in tokens],
+                    query_prompt_len=int(prompt_len or 0),
+                    top_k=top_k,
+                )
+            if which in ("both", "gradient"):
+                with GOLD_LIVE_LOCK:
+                    gradient = attribute_sample_gradient(
+                        report,
+                        top_k=top_k,
+                        full_tokens=full_tokens if isinstance(full_tokens, list) else None,
+                        full_token_ids=full_token_ids if isinstance(full_token_ids, list) else None,
+                        prompt_len_override=int(prompt_len_override)
+                        if prompt_len_override is not None else None,
+                    )
+        except Exception as exc:
+            import traceback
+            print(f"[sample-attr] failed: {exc}", flush=True)
+            traceback.print_exc()
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, {
+            "status": "success",
+            "gradient": gradient,
+            "structural": structural,
+        })
 
     def _handle_unlearn_pair_probe(self):
         """One-step LoRA learn/unlearn on CE + single-edge contrastive."""

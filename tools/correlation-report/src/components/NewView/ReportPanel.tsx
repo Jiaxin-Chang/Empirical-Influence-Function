@@ -2797,6 +2797,10 @@ export function ReportPanel({
     const [structuralBusy, setStructuralBusy] = useState(false);
     const [structuralError, setStructuralError] = useState<string | null>(null);
     const [structuralMeta, setStructuralMeta] = useState<string | null>(null);
+    const [sampleAttrBusy, setSampleAttrBusy] = useState(false);
+    const [sampleAttrError, setSampleAttrError] = useState<string | null>(null);
+    const [sampleAttrGrad, setSampleAttrGrad] = useState<Array<{ trainSampleId: number; cos: number; taskId?: string }>>([]);
+    const [sampleAttrStruct, setSampleAttrStruct] = useState<Array<{ trainSampleId: number; score: number; typeCos?: number; edgeCos?: number; parseMode?: string }>>([]);
     const [llmTrainBusy, setLlmTrainBusy] = useState(false);
     const [llmTrainError, setLlmTrainError] = useState<string | null>(null);
     const [llmTrainResult, setLlmTrainResult] = useState<LlmTrainRetrieveResult | null>(null);
@@ -4409,6 +4413,49 @@ export function ReportPanel({
         fetchStructuralPairs(activeQueryEdge);
     }, [structuralAttributionEnabled, activeQueryEdge, fetchStructuralPairs]);
 
+    const runSampleAttribution = useCallback(() => {
+        if (importedReportActive) return;
+        setSampleAttrBusy(true);
+        setSampleAttrError(null);
+        setSampleAttrGrad([]);
+        setSampleAttrStruct([]);
+        void (async () => {
+            try {
+                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/sample-attribution'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reportFileName: selectedMeta.fileName,
+                        topK: 20,
+                        ...reportApiPayload,
+                    }),
+                });
+                const raw = await resp.text();
+                let parsed: Record<string, unknown> = {};
+                try {
+                    parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
+                } catch {
+                    throw new Error(`整样本归因 non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
+                }
+                if (!resp.ok || parsed.status !== 'success') {
+                    throw new Error(
+                        typeof parsed.message === 'string'
+                            ? parsed.message
+                            : `整样本归因 failed (HTTP ${resp.status})`,
+                    );
+                }
+                const grad = parsed.gradient as { trains?: Array<{ trainSampleId: number; cos: number; taskId?: string }> } | null;
+                const struct = parsed.structural as { trains?: Array<{ trainSampleId: number; score: number; typeCos?: number; edgeCos?: number; parseMode?: string }> } | null;
+                setSampleAttrGrad(Array.isArray(grad?.trains) ? grad.trains : []);
+                setSampleAttrStruct(Array.isArray(struct?.trains) ? struct.trains : []);
+            } catch (error) {
+                setSampleAttrError(error instanceof Error ? error.message : '整样本归因失败');
+            } finally {
+                setSampleAttrBusy(false);
+            }
+        })();
+    }, [importedReportActive, eifApiUrl, selectedMeta.fileName, reportApiPayload]);
+
     const fetchLlmTrainRetrieve = useCallback((opts?: {
         kind?: 'boolean' | 'semantic' | 'semantic-test';
         exprsOnly?: boolean;
@@ -5750,8 +5797,51 @@ export function ReportPanel({
                                     >
                                         {attrMode === 'manual' ? '指定 pair · 开' : '指定 pair'}
                                     </button>
+                                    <button
+                                        type="button"
+                                        disabled={importedReportActive || sampleAttrBusy || goldResponseTokens.length === 0}
+                                        title="整条 valid 的 gold CE 梯度对训练 bank，以及整段 AST 对训练集"
+                                        onClick={() => { void runSampleAttribution(); }}
+                                        className={styles.ghostBtn}
+                                    >
+                                        {sampleAttrBusy ? '整样本归因…' : '整样本归因'}
+                                    </button>
                                 )}
                             />
+
+                            {(sampleAttrBusy || sampleAttrError || sampleAttrGrad.length > 0 || sampleAttrStruct.length > 0) && (
+                                <div className={styles.correlationList}>
+                                    <div className={styles.correlationListTitle}>整样本归因</div>
+                                    {sampleAttrError && (
+                                        <div className={styles.manualPairHint} style={{ color: '#b91c1c' }}>{sampleAttrError}</div>
+                                    )}
+                                    {sampleAttrBusy && (
+                                        <div className={styles.manualPairHint}>正在算 gold CE 梯度，并比对训练集 AST…</div>
+                                    )}
+                                    {!sampleAttrBusy && (sampleAttrGrad.length > 0 || sampleAttrStruct.length > 0) && (
+                                        <div className={styles.manualPairBar} style={{ alignItems: 'flex-start', gap: 24 }}>
+                                            <div>
+                                                <div className={styles.toolRowLabel}>梯度 cos</div>
+                                                {sampleAttrGrad.map((row) => (
+                                                    <div key={`g${row.trainSampleId}`} className={styles.manualPairHint}>
+                                                        #{row.trainSampleId} {row.cos.toFixed(4)}
+                                                        {row.taskId ? ` · ${row.taskId}` : ''}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                            <div>
+                                                <div className={styles.toolRowLabel}>结构</div>
+                                                {sampleAttrStruct.map((row) => (
+                                                    <div key={`s${row.trainSampleId}`} className={styles.manualPairHint}>
+                                                        #{row.trainSampleId} {row.score.toFixed(4)}
+                                                        {row.parseMode ? ` · ${row.parseMode}` : ''}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
 
                             {attrMode === 'manual' && (
                                 <div className={styles.correlationList}>

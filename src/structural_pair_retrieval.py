@@ -998,3 +998,96 @@ def retrieve_structural_pairs(
         "pairs": top_rows,
         "trainSampleDetails": train_details,
     }
+
+
+def _type_hist(sample: SampleAstIndex) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for feat in sample.feats:
+        name = (feat.node_type or "").strip()
+        if not name:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _edge_hist(sample: SampleAstIndex) -> dict[str, int]:
+    """Parent-type → child-type counts over the parsed tree."""
+    counts: dict[str, int] = {}
+    types = sample.node_type_by_id
+    for child, parent in sample.parent.items():
+        ct = (types.get(child) or "").strip()
+        pt = (types.get(parent) or "").strip()
+        if not ct or not pt:
+            continue
+        key = f"{pt}->{ct}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _cosine_counts(a: dict[str, int], b: dict[str, int]) -> float:
+    if not a or not b:
+        return 0.0
+    dot = 0.0
+    for key, av in a.items():
+        bv = b.get(key)
+        if bv:
+            dot += float(av) * float(bv)
+    na = sum(float(v) * float(v) for v in a.values()) ** 0.5
+    nb = sum(float(v) * float(v) for v in b.values()) ** 0.5
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return float(dot / (na * nb))
+
+
+def retrieve_structural_samples(
+    *,
+    query_tokens: list[str],
+    query_prompt_len: int,
+    top_k: int = 20,
+    max_train_samples: int | None = None,
+) -> dict[str, Any]:
+    """Rank train samples by whole-sample AST similarity to the query.
+
+    Score is the mean of two cosines: node-type histogram, and parent→child
+    type edges. This is the sample, not one source→target pair.
+    """
+    if len(query_tokens) < 2:
+        raise ValueError("query tokens are required")
+    samples, train_path = build_or_load_train_ast_index(max_samples=max_train_samples)
+    q = index_query_tokens(query_tokens, int(query_prompt_len))
+    q_types = _type_hist(q)
+    q_edges = _edge_hist(q)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for sample in samples:
+        s_types = _cosine_counts(q_types, _type_hist(sample))
+        s_edges = _cosine_counts(q_edges, _edge_hist(sample))
+        if q_edges and _edge_hist(sample):
+            score = 0.5 * s_types + 0.5 * s_edges
+        else:
+            score = s_types
+        scored.append((score, {
+            "trainSampleId": int(sample.train_sample_id),
+            "score": round(float(score), 6),
+            "typeCos": round(float(s_types), 6),
+            "edgeCos": round(float(s_edges), 6),
+            "parseMode": sample.parse_mode,
+            "language": sample.language,
+            "nContext": len(sample.context_indices),
+            "nCompletion": len(sample.completion_indices),
+        }))
+    top = [row for _, row in nlargest(max(1, int(top_k)), scored, key=lambda x: x[0])]
+    return {
+        "status": "success",
+        "retrieval": "structural_sample",
+        "trainPath": train_path,
+        "nTrainSamples": len(samples),
+        "query": {
+            "language": q.language,
+            "parseMode": q.parse_mode,
+            "nNodeTypes": len(q_types),
+            "nEdgeTypes": len(q_edges),
+            "promptLen": int(query_prompt_len),
+            "nTokens": len(query_tokens),
+        },
+        "trains": top,
+    }
