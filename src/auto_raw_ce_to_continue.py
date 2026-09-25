@@ -330,7 +330,7 @@ def _try_annotate_hits(
     keep_original_if_unrewritten: bool = False,
     target_semantic: dict[str, Any] | None = None,
 ) -> bool:
-    """MID-prep + LLM/graphsignal annotate the first usable hit. True if written."""
+    """Annotate the first usable hit on the original corpus row. True if written."""
     for hit in hits:
         cline = hit.get("line")
         if cline is None:
@@ -340,43 +340,13 @@ def _try_annotate_hits(
             continue
         region = str(hit.get("match_region") or "")
         score = hit.get("semantic_score")
+        note = "keep original (MID rewrite disabled)"
         print(
             f"     try corpus line={cline} region={region} "
             f"sem={score} task={hit.get('task_id') or '-'}",
             flush=True,
         )
-        try:
-            prep = client.mid_rewrite_prep(
-                line=cline,
-                gold=gold,
-                expression=expression,
-                corpus_path=hit_corpus,
-            )
-        except Exception as exc:
-            print(f"       MID prep error → skip: {exc}", flush=True)
-            state.skipped.append({
-                "test_line": test_line,
-                "corpus_line": cline,
-                "reason": f"mid_prep_error: {exc}",
-            })
-            continue
-
-        ok, rewrite_id, note = _mid_decision(
-            prep,
-            region,
-            keep_original_if_unrewritten=keep_original_if_unrewritten,
-        )
-        if not ok:
-            print(f"       {note} → next hit", flush=True)
-            state.skipped.append({
-                "test_line": test_line,
-                "corpus_line": cline,
-                "reason": note,
-                "mid_reason": prep.get("reason"),
-                "detail": prep.get("detail"),
-            })
-            continue
-        print(f"       MID ok: {note}", flush=True)
+        print(f"       MID skipped: {note}", flush=True)
         if target_semantic:
             print(
                 "       annotate with test target_semantic "
@@ -385,11 +355,6 @@ def _try_annotate_hits(
             )
 
         try:
-            client.bind_rewrite(
-                line=cline,
-                rewrite_id=rewrite_id,
-                corpus_path=hit_corpus,
-            )
             accept = client.annotate_and_accept(
                 line=cline,
                 corpus_path=hit_corpus,
@@ -422,7 +387,7 @@ def _try_annotate_hits(
             "expression": expression,
             "expr_name": expr_name,
             "mid_note": note,
-            "rewrite_id": rewrite_id,
+            "rewrite_id": None,
             "n_continue_edges": accept.get("n_continue_edges"),
             "continue_path": accept.get("continue_path"),
             "continue_rows": continue_rows,

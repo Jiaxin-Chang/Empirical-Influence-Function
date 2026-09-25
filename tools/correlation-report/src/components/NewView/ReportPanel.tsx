@@ -4579,24 +4579,15 @@ export function ReportPanel({
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
         )?.trim() || 'http://127.0.0.1:5275';
         const corpusPath = llmTrainResult?.corpus_path?.trim();
-        const goldCompletion = (
-            report.test_sample_baseline.raw_label
-            || decodeTokens(goldResponseTokens).join('')
-        );
-        const region = String(hit.match_region || '');
-
-        // Open synchronously on the click gesture so the UI doesn't feel dead
-        // while mid-rewrite-prep waits (viewer may be busy with GraphSignal).
-        // Do NOT use noopener — we need to navigate this tab after prep.
+        // Open synchronously on the click gesture. The corpus row is shown
+        // as stored; MID rewrite is not applied.
         const popup = window.open('about:blank', '_blank');
         if (popup) {
             try {
                 popup.document.write(
-                    '<!doctype html><title>MID prep…</title>'
+                    '<!doctype html><title>打开标注页…</title>'
                     + '<body style="font:14px/1.4 system-ui;padding:24px;color:#334155">'
-                    + '<p>正在准备 MID 改写 / 打开标注页…</p>'
-                    + '<p style="color:#64748b;font-size:12px">若 annotation-viewer 正在跑 GraphSignal，'
-                    + '可能稍等几秒；请勿关闭此标签。</p></body>',
+                    + '<p>正在打开标注页…</p></body>',
                 );
                 popup.document.close();
             } catch {
@@ -4655,75 +4646,6 @@ export function ReportPanel({
                 url.searchParams.set('targetSem', JSON.stringify(targetSem));
             }
 
-            let rewriteNote = '';
-            if (goldCompletion.trim()) {
-                try {
-                    const prepResp = await fetch(`${base.replace(/\/$/, '')}/api/corpus/mid-rewrite-prep`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            line: hit.line,
-                            corpusPath: corpusPath || '',
-                            testGold: goldCompletion,
-                            expression: (expression || '').trim(),
-                        }),
-                    });
-                    const prepRaw = await prepResp.text();
-                    let prep: {
-                        rewrite_id?: string;
-                        applied?: boolean;
-                        mode?: string;
-                        reason?: string;
-                        detail?: string;
-                        dig_preview?: string;
-                        dig_locus?: string;
-                        message?: string;
-                    } = {};
-                    if (prepRaw.trim()) {
-                        try {
-                            prep = JSON.parse(prepRaw) as typeof prep;
-                        } catch {
-                            /* ignore */
-                        }
-                    }
-                    if (!prepResp.ok || !prep.rewrite_id) {
-                        rewriteNote =
-                            `MID改写准备失败 (HTTP ${prepResp.status}). `
-                            + '将打开原样本。请确认 annotation-viewer 后端已启动。';
-                        console.warn('[mid-rewrite-prep] failed', prepResp.status, prepRaw.slice(0, 240));
-                    } else if (prep.applied) {
-                        url.searchParams.set('rewriteId', prep.rewrite_id);
-                        rewriteNote =
-                            `已改写 MID (${prep.mode || ''}`
-                            + `${prep.dig_locus ? `@${prep.dig_locus}` : ''}): `
-                            + `${(prep.dig_preview || '').slice(0, 80)}`;
-                    } else if (
-                        prep.reason === 'train_mid_already_is_gold'
-                        || region === 'gold'
-                    ) {
-                        rewriteNote = '训练 MID 已是 gold 目标，保持原样本。';
-                    } else {
-                        const detail = prep.detail;
-                        const reason = prep.reason || prep.mode || 'unchanged';
-                        const hint =
-                            reason === 'section_rewrite_failed'
-                                ? '（已找到候选片段，但无法把它提升成合法 FIM 题面；常见：gold 只在 test 有、train 仅有 NotificationType 等符号命中 struct/函数声明）'
-                                : reason === 'no_dig_span'
-                                    ? (prep.detail || '（test gold / 表达式在 train 三个代码块中对不齐）')
-                                    : '';
-                        rewriteNote =
-                            `未能挖空改写 (${reason}${detail ? `: ${detail}` : ''})，打开原样本。`
-                            + hint;
-                        console.warn('[mid-rewrite-prep] not applied', prep);
-                    }
-                } catch (err) {
-                    const errMsg = err instanceof Error ? err.message : String(err);
-                    rewriteNote =
-                        `MID改写请求失败（连不上 ${base}/api，多半是 annotation-viewer 未在该端口启动）: ${errMsg}。打开原样本。`;
-                    console.warn('[mid-rewrite-prep] error', err);
-                }
-            }
-
             if (continueCurrentTestPayload && hit.line != null) {
                 try {
                     await fetch(`${base.replace(/\/$/, '')}/api/corpus/sample/${hit.line}/preview-probe`, {
@@ -4735,15 +4657,13 @@ export function ReportPanel({
                     console.warn('[preview-probe] failed', err);
                 }
             }
-            navigate(url.toString(), rewriteNote);
+            navigate(url.toString(), '');
         })();
     }, [
         continueCurrentTestPayload,
         llmTrainResult?.corpus_path,
         llmTrainResult?.analysis?.semantic,
         llmTrainResult?.semantic,
-        report.test_sample_baseline.raw_label,
-        goldResponseTokens,
     ]);
 
     const handlePairIntervene = useCallback((pair: CorrelationPair, direction: 'unlearn' | 'learn') => {

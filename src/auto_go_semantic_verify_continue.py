@@ -55,7 +55,6 @@ from src.auto_raw_ce_to_continue import (
     _http_json,
     _is_mismatch,
     _load_raw_rows,
-    _mid_decision,
     _row_language,
     _viewer_health,
 )
@@ -379,34 +378,13 @@ def _annotate_hit(
         return None, "hit missing corpus line"
     cline = int(cline)
     region = str(hit.get("match_region") or "")
-    try:
-        prep = client.mid_rewrite_prep(
-            line=cline,
-            gold=gold,
-            expression=expression,
-            corpus_path=hit_corpus,
-        )
-    except Exception as exc:
-        return None, f"mid_prep_error: {exc}"
-
-    ok, rewrite_id, note = _mid_decision(
-        prep,
-        region,
-        keep_original_if_unrewritten=True,
-    )
-    if not ok:
-        return None, note
-    print(f"       MID ok: {note}", flush=True)
+    note = "keep original (MID rewrite disabled)"
+    print(f"       MID skipped: {note}", flush=True)
 
     if client.dry_run:
         return {"dry_run": True, "corpus_line": cline}, f"dry_run ({note})"
 
     try:
-        client.bind_rewrite(
-            line=cline,
-            rewrite_id=rewrite_id,
-            corpus_path=hit_corpus,
-        )
         accept = client.annotate_and_accept(
             line=cline,
             corpus_path=hit_corpus,
@@ -428,7 +406,7 @@ def _annotate_hit(
         return None, f"annotate produced 0 continue edges (line={cline})"
     row["_verify_meta"] = {
         "corpus_line": cline,
-        "rewrite_id": rewrite_id,
+        "rewrite_id": None,
         "mid_note": note,
         "n_continue_edges": _n_continue_edges(row),
         "accept_edges": n_edges,

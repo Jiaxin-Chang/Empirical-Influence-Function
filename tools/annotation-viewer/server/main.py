@@ -748,14 +748,9 @@ def _raw_row_with_bound_mid_rewrite(
     *,
     corpus_path: str | None = None,
 ) -> dict[str, Any]:
-    """Overlay rewritten prompt/response onto a corpus raw row when bound."""
-    bound = _get_bound_corpus_mid_rewrite(line, corpus_path=corpus_path)
-    if not bound or not bound.get("mode") or bound.get("mode") == "unchanged":
-        return raw_row
-    out = dict(raw_row)
-    out["prompt"] = str(bound.get("prompt") or "")
-    out["response"] = str(bound.get("response") or "")
-    return out
+    """MID rewrite is disabled. The corpus row is shown as stored."""
+    del line, corpus_path
+    return raw_row
 
 
 def _encode_corpus_row(
@@ -770,20 +765,6 @@ def _encode_corpus_row(
     if not prompt.strip():
         raise HTTPException(400, f"corpus line {line} missing prompt/input text")
     rewrite_meta: dict[str, Any] | None = None
-    bound = _get_bound_corpus_mid_rewrite(line, corpus_path=corpus_path)
-    if bound and bound.get("mode") and bound.get("mode") != "unchanged":
-        prompt = str(bound.get("prompt") or prompt)
-        response = str(bound.get("response") or response)
-        rewrite_meta = {
-            "mid_rewrite": True,
-            "mid_rewrite_mode": bound.get("mode"),
-            "mid_rewrite_locus": bound.get("dig_locus"),
-            "mid_rewrite_geometry": bound.get("fim_geometry"),
-            "mid_rewrite_reason": bound.get("reason"),
-            "mid_rewrite_dig_preview": (str(bound.get("dig_text") or "")[:160]),
-            "mid_rewrite_old_mid_preview": (str(bound.get("old_mid") or "")[:120]),
-            "mid_rewrite_hash": bound.get("dig_hash"),
-        }
     input_ids, labels = encode_prompt_response(_get_tokenizer(), prompt, response)
     task_id = str(raw_row.get("task_id") or f"line_{line}")
     uid = f"corpus:{task_id}"
@@ -1324,24 +1305,8 @@ def get_corpus_sample(
     rewriteId: str = "",
 ):
     override = corpusPath.strip() or None
-    rid = (rewriteId or "").strip()
+    del rewriteId
     with _state_lock:
-        if rid:
-            prep = _corpus_mid_rewrite_prep.get(rid)
-            if not prep:
-                raise HTTPException(404, "mid-rewrite prep not found or expired")
-            if int(prep.get("line", -1)) != int(line):
-                raise HTTPException(400, "rewriteId line mismatch")
-            prep_path = str(prep.get("corpus_path") or "").strip()
-            if override and prep_path and prep_path != override:
-                raise HTTPException(400, "rewriteId corpus path mismatch")
-            if not override and prep_path:
-                override = prep_path
-            _bind_corpus_mid_rewrite(
-                line,
-                prep["rewrite"],
-                corpus_path=override,
-            )
         obj, from_continue, key = _effective_corpus_sample(line, corpus_path=override)
     return _sample_detail_from_obj(line, obj, from_continue=from_continue, key=key)
 
@@ -1355,51 +1320,19 @@ class CorpusMidRewritePrepBody(BaseModel):
 
 @app.post("/api/corpus/mid-rewrite-prep")
 def corpus_mid_rewrite_prep(body: CorpusMidRewritePrepBody):
-    """Precompute context→MID re-hollow for a corpus line (cross-origin open)."""
-    override = (body.corpusPath or "").strip() or None
-    test_gold = body.testGold or ""
-    expression = (body.expression or "").strip()
-    if not test_gold.strip() and not expression:
-        raise HTTPException(400, "testGold or expression required")
-    # Read under lock; heavy rewrite outside so GraphSignal / other APIs aren't blocked.
-    with _state_lock:
-        raw_row = _read_corpus_raw_row(int(body.line), corpus_path=override)
-        corpus_path_snap = override or (str(_corpus_path) if _corpus_path else "")
-    from server.corpus_encode import extract_prompt_response
-
-    prompt, response = extract_prompt_response(raw_row)
-    rewrite = _compute_corpus_mid_rewrite(
-        prompt,
-        response,
-        test_gold=test_gold,
-        expression=expression,
-    )
-    rewrite_id = uuid.uuid4().hex
-    with _state_lock:
-        while len(_corpus_mid_rewrite_prep) >= _CORPUS_MID_REWRITE_PREP_MAX:
-            _corpus_mid_rewrite_prep.pop(next(iter(_corpus_mid_rewrite_prep)))
-        _corpus_mid_rewrite_prep[rewrite_id] = {
-            "rewrite_id": rewrite_id,
-            "line": int(body.line),
-            "corpus_path": corpus_path_snap,
-            "rewrite": rewrite,
-            "created_at": time.time(),
-        }
-        # Bind immediately so a subsequent open without rewriteId still works
-        # if the same viewer process loads the line.
-        if rewrite.get("mode") and rewrite.get("mode") != "unchanged":
-            _bind_corpus_mid_rewrite(int(body.line), rewrite, corpus_path=override)
+    """MID rewrite is disabled. The corpus row is opened as stored."""
+    del body
     return {
         "ok": True,
-        "rewrite_id": rewrite_id,
-        "mode": rewrite.get("mode"),
-        "reason": rewrite.get("reason"),
-        "dig_locus": rewrite.get("dig_locus"),
-        "fim_geometry": rewrite.get("fim_geometry"),
-        "dig_preview": (str(rewrite.get("dig_text") or "")[:200]),
-        "old_mid_preview": (str(rewrite.get("old_mid") or "")[:120]),
-        "detail": rewrite.get("detail") or "",
-        "applied": bool(rewrite.get("mode") and rewrite.get("mode") != "unchanged"),
+        "rewrite_id": "",
+        "mode": "unchanged",
+        "reason": "mid_rewrite_disabled",
+        "dig_locus": "",
+        "fim_geometry": "",
+        "dig_preview": "",
+        "old_mid_preview": "",
+        "detail": "",
+        "applied": False,
     }
 
 
