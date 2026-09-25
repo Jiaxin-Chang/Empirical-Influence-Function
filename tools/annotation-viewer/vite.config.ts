@@ -1,9 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 
-/** Defaults: UI 5275 → API 8765. Override with ANNOTATION_VIEWER_PORT / ANNOTATION_API_PORT. */
-const ANNOTATION_VIEWER_PORT = Number(process.env.ANNOTATION_VIEWER_PORT || 5275)
-const ANNOTATION_API_PORT = Number(process.env.ANNOTATION_API_PORT || 8765)
+/** Fixed: annotation UI 5275, annotation API 8765. Do not bump to the next free port. */
+const ANNOTATION_VIEWER_PORT = 5275
+const ANNOTATION_API_PORT = 8765
 
 export default defineConfig({
   plugins: [react()],

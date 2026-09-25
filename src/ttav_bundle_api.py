@@ -2413,7 +2413,7 @@ def _warn_if_loopback_stolen(port: int) -> None:
 def main():
     parser = argparse.ArgumentParser(description="EIF API for preparing and uploading TTAV bundles.")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
 
     httpd = ThreadingHTTPServer((args.host, args.port), TTAVBundleRequestHandler)

@@ -16,7 +16,7 @@ const RAW_FAMILY_DIRS: Record<string, 'ce' | 'saliency'> = {
   raw_sa: 'saliency',
 }
 const ALL_RAW_DIRS = ['raw_ce', 'raw_sal', 'raw_sa', 'raw'] as const
-const EIF_API_PORT = Number(process.env.EIF_API_PORT || 8766)
+const EIF_API_PORT = 8766
 const JSONL_CHUNK = 1024 * 1024
 const JSONL_LINE_CAP = 64 * 1024 * 1024
 
@@ -733,7 +733,7 @@ function experimentDataPlugin(): Plugin {
 
 // Reverse-proxy remaining /api/* to the EIF bundle API (tokenize / prepare).
 // 127.0.0.1:8766 is often a VS Code forward to a remote uvicorn — probe first.
-const EIF_REPORT_PORT = Number(process.env.EIF_REPORT_PORT || 5273)
+const EIF_REPORT_PORT = 5273
 
 export default defineConfig(async () => {
   const eifApiTarget = await resolveEifApiProxyTarget()

@@ -616,11 +616,18 @@ def _write_continue_payload(
     viz_edges: list[dict[str, Any]],
     continue_edges: list[dict[str, Any]],
     corpus_line: int | None = None,
+    always_insert: bool = False,
 ) -> dict[str, Any]:
-    """Persist continue row: attention_edges = continue-only; viz_* = display."""
-    force_insert = False
+    """Persist continue row: attention_edges = continue-only; viz_* = display.
+
+    ``always_insert`` appends even when the same corpus line is already in the
+    continue file. Repeated hits keep their own edges and raise that sample's weight.
+    """
+    force_insert = bool(always_insert)
     uid_override = None
-    if corpus_line is not None and int(corpus_line) in _corpus_skip_overlay:
+    if corpus_line is not None and (
+        force_insert or int(corpus_line) in _corpus_skip_overlay
+    ):
         force_insert = True
         base_uid = str(source.get("uid") or source.get("task_id") or f"corpus_line_{corpus_line}")
         uid_override = f"{base_uid}::new{uuid.uuid4().hex[:8]}"
@@ -841,6 +848,7 @@ def _write_continue_corpus_payload(
     *,
     viz_edges: list[dict[str, Any]],
     continue_edges: list[dict[str, Any]],
+    always_insert: bool = False,
 ) -> dict[str, Any]:
     return _write_continue_payload(
         -1,
@@ -848,6 +856,7 @@ def _write_continue_corpus_payload(
         viz_edges=viz_edges,
         continue_edges=continue_edges,
         corpus_line=line,
+        always_insert=always_insert,
     )
 
 
@@ -1865,6 +1874,7 @@ def graphsignal_annotate_accept(line: int, body: GraphsignalPreviewActionBody, c
             merged_source,
             viz_edges=viz_out,
             continue_edges=cont_out,
+            always_insert=True,
         )
         _gs_preview_cache.pop(pid, None)
         _, cont_idx = _lookup_continue(-1, merged_source)
@@ -2201,6 +2211,7 @@ def llm_semantic_annotate_accept(line: int, body: GraphsignalPreviewActionBody, 
             merged_source,
             viz_edges=viz_out,
             continue_edges=cont_out,
+            always_insert=True,
         )
         _drop_llm_sem_preview(pid)
         _, cont_idx = _lookup_continue(-1, merged_source)
