@@ -286,25 +286,22 @@ def _build_full_sample_messages(
     prompt_bundle: dict[str, Any] | None = None,
     target_semantic: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    from server.semantic_prompt import DEFAULT_SYSTEM, format_few_shots_block, load_active
+    from server.semantic_prompt import (
+        DEFAULT_SYSTEM,
+        RELATION_SYSTEM,
+        format_few_shots_block,
+        load_active,
+    )
 
     bundle = prompt_bundle if isinstance(prompt_bundle, dict) else load_active()
-    system = str(bundle.get("system") or DEFAULT_SYSTEM).strip() + "\n"
     target = _compact_target_semantic(target_semantic)
     if target:
-        system += (
-            "A target_mechanism object may be attached: it is only a HINT about the "
-            "TEST hole that retrieved this train sample. Use its relations to decide "
-            "WHICH concepts to bind, then copy integer indices from context_tokens / "
-            "completion_tokens. Role/pattern/operations only disambiguate. "
-            "src and dst MUST be integers from those lists (src < dst). Never put "
-            "concept names, identifiers, or relation endpoints in src/dst. Never "
-            "return an empty edges array if any completion token has a supporting "
-            "context token. You may still add other high-confidence edges.\n"
-        )
-    shots = format_few_shots_block(list(bundle.get("few_shots") or []))
-    if shots:
-        system += "\n" + shots
+        system = RELATION_SYSTEM.strip() + "\n"
+    else:
+        system = str(bundle.get("system") or DEFAULT_SYSTEM).strip() + "\n"
+        shots = format_few_shots_block(list(bundle.get("few_shots") or []))
+        if shots:
+            system += "\n" + shots
 
     completion_ref = [
         [int(i), _surface(tokens[i])]
@@ -332,6 +329,10 @@ def _build_full_sample_messages(
         "context_tokens": context_list,
         "max_edges": int(max_edges),
         "max_sources_per_completion_token": int(max_sources_per_dst),
+        "positions": {
+            "dst": "completion_tokens only",
+            "src": "any token strictly before dst: prefix, suffix, or an earlier completion token",
+        },
         "output_schema": {
             "edges": [
                 {"src": "int", "dst": "int", "reason": "short clause"}
@@ -340,11 +341,17 @@ def _build_full_sample_messages(
     }
     if target:
         user_obj["target_mechanism"] = target
-    user = (
-        "Annotate the whole completion in one shot. Return every high-confidence "
-        "src→dst routing edge (dst in completion_tokens).\n"
-        f"{json.dumps(user_obj, ensure_ascii=False, indent=2)}"
-    )
+        lead = (
+            "For each target_mechanism.relations entry, annotate every src→dst "
+            "pair that carries that relation. One relation is not one edge. "
+            "Do not spend edges on brackets, casts, or copies.\n"
+        )
+    else:
+        lead = (
+            "Annotate the whole completion in one shot. Return every high-confidence "
+            "src→dst routing edge (dst in completion_tokens).\n"
+        )
+    user = lead + json.dumps(user_obj, ensure_ascii=False, indent=2)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},

@@ -31,12 +31,41 @@ Prioritize:
 
 Rules:
 - Return JSON only, no markdown
-- Every src must appear in context_tokens or completion_tokens and be strictly less than dst
-- Every dst must be a completion token
+- dst is only a completion token (the hole fill)
+- src may be any token strictly before dst: prefix, suffix, or an earlier completion token
+- Never use dst itself or a token after dst as src
 - Do NOT pick a token as its own source
 - Avoid ChatML specials, pure whitespace, or meaningless punctuation unless structurally required
 - Precision over recall; fewer high-confidence edges beat noisy lists
 - Copy the MECHANISM of any human examples (which kinds of links matter). Never copy token indices from those examples — indices are sample-local.
+"""
+
+# Used only when the test hole supplies target_mechanism.relations.
+# Does not include the generic routing priorities above.
+RELATION_SYSTEM = """You infer causal attention routing for a Fill-in-the-Middle training sample.
+
+A causal LM predicts the assistant completion left to right. Return directed edges src→dst: when predicting target token `dst`, the model should attend to an earlier token `src`.
+
+This is not bracket matching and not a full syntax tree. Think like saliency: which earlier token supplies the information needed to write this completion token.
+
+The edges to return are the missing semantic dependencies in target_mechanism.relations. Each relation is one missing dependency. A relation is not one token pair. Annotate every src→dst pair that carries it.
+
+For each relation, find the token that plays `source` and the token that plays `target`.
+- dst is only a completion token (the hole fill in completion_tokens).
+- src is any token strictly before that dst: a prefix token, a suffix token, or an earlier completion token.
+- src < dst. Never use the dst token itself, and never a token after dst.
+
+Bind each relation's own two concepts. Do not replace either endpoint with a nearby helper such as a cast, a repeated name, or a bracket. Example: allocated foreign string → release at function exit is the allocation call → the free/release call, not the cast that wraps the pointer.
+
+Role, pattern, and operations only help you recognize those endpoints. The edges themselves should be the relations. Do not spend edges on syntax the relations do not ask for.
+
+Rules:
+- Return JSON only, no markdown
+- Copy src from context_tokens or from a completion token before dst
+- Copy dst only from completion_tokens
+- Both src and dst are integers. Never put concept names or identifiers in src/dst
+- If relations is non-empty, do not return an empty edges array
+- Avoid ChatML specials, pure whitespace, or meaningless punctuation unless structurally required
 """
 
 
