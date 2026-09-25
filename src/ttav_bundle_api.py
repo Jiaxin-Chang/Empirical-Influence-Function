@@ -1547,12 +1547,6 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(req, dict):
             self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
             return
-        if CACHE_ONLY_MODE:
-            self._send_json(503, {
-                "status": "error",
-                "message": "Sample attribution needs a live model (EIF_CACHE_ONLY=1).",
-            })
-            return
         report, err = self._load_report_from_req(req)
         if err:
             self._send_json(400 if "required" in err else 404, {"status": "error", "message": err})
@@ -1566,26 +1560,41 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         full_token_ids = req.get("fullTokenIds")
         prompt_len_override = req.get("promptLen")
         which = str(req.get("which") or "both").strip().lower()
-        if which not in ("both", "gradient", "structural"):
+        if which not in ("both", "gradient", "structural", "text"):
             which = "both"
+        if which in ("both", "gradient") and CACHE_ONLY_MODE:
+            self._send_json(503, {
+                "status": "error",
+                "message": "Gradient sample attribution needs a live model (EIF_CACHE_ONLY=1).",
+            })
+            return
         print(f"[sample-attr] which={which} topK={top_k}", flush=True)
 
         structural = None
+        text = None
         gradient = None
+        baseline = (report or {}).get("test_sample_baseline") or {}
+        tokens = full_tokens if isinstance(full_tokens, list) and full_tokens else (
+            baseline.get("correct_full_tokens") or baseline.get("full_tokens") or []
+        )
+        query_tokens = [str(t) for t in tokens]
+        prompt_len = prompt_len_override
+        if prompt_len is None:
+            prompt_len = baseline.get("prompt_len")
         try:
             if which in ("both", "structural"):
                 from src.structural_pair_retrieval import retrieve_structural_samples
 
-                baseline = (report or {}).get("test_sample_baseline") or {}
-                tokens = full_tokens if isinstance(full_tokens, list) and full_tokens else (
-                    baseline.get("correct_full_tokens") or baseline.get("full_tokens") or []
-                )
-                prompt_len = prompt_len_override
-                if prompt_len is None:
-                    prompt_len = baseline.get("prompt_len")
                 structural = retrieve_structural_samples(
-                    query_tokens=[str(t) for t in tokens],
+                    query_tokens=query_tokens,
                     query_prompt_len=int(prompt_len or 0),
+                    top_k=top_k,
+                )
+            if which in ("both", "text"):
+                from src.structural_pair_retrieval import retrieve_text_samples
+
+                text = retrieve_text_samples(
+                    query_tokens=query_tokens,
                     top_k=top_k,
                 )
             if which in ("both", "gradient"):
@@ -1608,6 +1617,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
             "status": "success",
             "gradient": gradient,
             "structural": structural,
+            "text": text,
         })
 
     def _handle_unlearn_pair_probe(self):

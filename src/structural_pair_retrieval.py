@@ -1091,3 +1091,78 @@ def retrieve_structural_samples(
         },
         "trains": top,
     }
+
+
+_TEXT_SKIP = {
+    "",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<pre>",
+    "<suf>",
+    "<mid>",
+    "<fim>",
+}
+
+
+def _text_hist(tokens: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for tok in tokens:
+        surface = normalize_surface(tok)
+        if not surface or surface in _TEXT_SKIP:
+            continue
+        counts[surface] = counts.get(surface, 0) + 1
+    return counts
+
+
+def retrieve_text_samples(
+    *,
+    query_tokens: list[str],
+    top_k: int = 1,
+    max_train_samples: int | None = None,
+) -> dict[str, Any]:
+    """Rank train samples by whole-sample token-text cosine. No model, no AST."""
+    if len(query_tokens) < 2:
+        raise ValueError("query tokens are required")
+    path = _train_jsonl_path()
+    if path is None:
+        raise FileNotFoundError(
+            "No train JSONL. Set EIF_TRAIN_DATA / ANNOTATION_TRAIN_DATA."
+        )
+    q_hist = _text_hist(query_tokens)
+    if not q_hist:
+        raise ValueError("query has no text tokens")
+    tokenizer = _get_tokenizer()
+    scored: list[tuple[float, dict[str, Any]]] = []
+    n_seen = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for idx, line in enumerate(handle):
+            if max_train_samples is not None and n_seen >= max_train_samples:
+                break
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            tokens = _tokens_from_train_obj(obj, tokenizer)
+            if len(tokens) < 2:
+                continue
+            n_seen += 1
+            score = _cosine_counts(q_hist, _text_hist(tokens))
+            scored.append((score, {
+                "trainSampleId": int(idx),
+                "score": round(float(score), 6),
+                "taskId": str(obj.get("task_id") or obj.get("uid") or ""),
+                "uid": str(obj.get("uid") or ""),
+            }))
+    top = [row for _, row in nlargest(max(1, int(top_k)), scored, key=lambda x: x[0])]
+    return {
+        "status": "success",
+        "retrieval": "text_sample",
+        "trainPath": str(path),
+        "nTrainSamples": n_seen,
+        "nQueryTokens": len(q_hist),
+        "trains": top,
+    }
