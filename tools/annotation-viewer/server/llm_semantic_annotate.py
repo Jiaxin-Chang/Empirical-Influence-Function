@@ -344,7 +344,8 @@ def _build_full_sample_messages(
         lead = (
             "For each target_mechanism.relations entry, annotate every src→dst "
             "pair that carries that relation. One relation is not one edge. "
-            "Do not spend edges on brackets, casts, or copies.\n"
+            "If a word is split into several tokens, connect every piece. "
+            "Do not spend edges on brackets, casts, or timing keywords.\n"
         )
     else:
         lead = (

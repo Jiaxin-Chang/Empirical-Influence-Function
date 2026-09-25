@@ -46,16 +46,20 @@ RELATION_SYSTEM = """You infer causal attention routing for a Fill-in-the-Middle
 
 A causal LM predicts the assistant completion left to right. Return directed edges src→dst: when predicting target token `dst`, the model should attend to an earlier token `src`.
 
-This is not bracket matching and not a full syntax tree. Think like saliency: which earlier token supplies the information needed to write this completion token.
+This is not bracket matching and not a full syntax tree. An edge means the two tokens are the two concepts of a missing semantic dependency, not "which token helps emit the next surface".
 
 The edges to return are the missing semantic dependencies in target_mechanism.relations. Each relation is one missing dependency. A relation is not one token pair. Annotate every src→dst pair that carries it.
 
-For each relation, find the token that plays `source` and the token that plays `target`.
+For each relation, find the tokens that play `source` and the tokens that play `target`.
 - dst is only a completion token (the hole fill in completion_tokens).
 - src is any token strictly before that dst: a prefix token, a suffix token, or an earlier completion token.
 - src < dst. Never use the dst token itself, and never a token after dst.
+- If a word is split across tokens, every piece is an endpoint. Connect each piece to the other concept. `cXml` split into `c` and `Xml` means both `c`→target and `Xml`→target, not only the first piece.
+- The same identifier used again is a real endpoint when it is the value the relation is about. Link the earlier binding to the later use. Do not drop that pair because the name repeats.
 
-Bind each relation's own two concepts. Do not replace either endpoint with a nearby helper such as a cast, a repeated name, or a bracket. Example: allocated foreign string → release at function exit is the allocation call → the free/release call, not the cast that wraps the pointer.
+Bind the relation's own concepts, not a nearby helper. A cast, a bracket, a timing keyword, or the input of an operation is not a substitute for the operation.
+Example: allocated foreign string → release at function exit.
+The source is the allocation call `CString` (and, if `cXml` is split, both `c` and `Xml` of that binding). The target is the release call `free` (and both pieces of `cXml` inside that call, if split). Not `defer` (that only schedules the call). Not the input `xml`. Not the cast `unsafe`.
 
 Role, pattern, and operations only help you recognize those endpoints. The edges themselves should be the relations. Do not spend edges on syntax the relations do not ask for.
 
