@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""100 条错测：8767 语义召回 Top-10 → 文本相似度重排 → 标注 Top-1 → 每条复制成 10 份。
+"""100 条错测：8766 语义召回 Top-10 → 文本相似度重排 → 标注 Top-1 → 每条复制成 10 份。
 
 100 条成功则续训文件里是 1000 行。再取
 ``csn_go_train_fim_10k_ids.jsonl`` 的前 10000 行，接上这 1000 行，
@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--train-repo", default=DEFAULT_TRAIN_REPO)
     p.add_argument("--base-model", default=_env("EIF_BASE_MODEL_PATH") or DEFAULT_BASE_MODEL)
     p.add_argument("--state", default=str(DEFAULT_STATE))
-    p.add_argument("--eif-url", default="http://127.0.0.1:8767")
+    p.add_argument("--eif-url", default="http://127.0.0.1:8766")
     p.add_argument("--viewer-url", default="http://127.0.0.1:8765")
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--copies", type=int, default=10, help="rows per successful top-1, including the accepted row")
