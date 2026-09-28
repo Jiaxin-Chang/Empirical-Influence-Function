@@ -167,6 +167,12 @@ def _surfaces_for_ids(tokenizer, ids: list[int]) -> list[str]:
 
 
 def _encode_prompt_once(tokenizer, prompt: str) -> tuple[list[str], list[int]]:
+    """Same ChatML prefix as ``eval_go_fim_line_hit.py``.
+
+    Qwen3 with thinking off still appends an empty ``<think></think>`` before
+    the answer. That block is part of the string ``generate`` conditions on,
+    so the report keeps it.
+    """
     from src.continue_train_eval import _render_eval_prompt
 
     rendered = _render_eval_prompt(tokenizer, prompt)

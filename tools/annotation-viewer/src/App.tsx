@@ -754,13 +754,13 @@ export default function App() {
     try {
       const started = await api.previewOnestep(corpusLine, activePreviewId)
       const st = await pollPreviewJob(started.jobId)
-      const before = st.loss_before
-      const after = st.loss_after
-      const dropped = before != null && after != null && after < before
+      const before = st.margin_before
+      const after = st.margin_after
+      const rose = before != null && after != null && after > before
       setPreviewVerifyMsg(
         before == null || after == null
-          ? '一步续训结束，但没有拿到 loss'
-          : `gold CE ${before} → ${after}（${dropped ? '下降' : '没有下降'}）。还没写入续训集。`,
+          ? '一步续训结束，但没有拿到分叉 margin'
+          : `分叉 margin ${before} → ${after}（${rose ? '上升，向好' : '没有上升'}）。还没写入续训集。`,
       )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1257,7 +1257,7 @@ export default function App() {
                   <div className="card" style={{ borderColor: '#93c5fd' }}>
                     <h3>这条预览的一步续训</h3>
                     <p className="hint" style={{ marginBottom: 8 }}>
-                      只对当前预览的这一条做一步 CE+saliency，看这道测试题的 gold CE 变不变。
+                      只对当前预览的这一条做一步 CE+saliency，看这道测试题的分叉 margin 升不升。
                       梯度筛边和回退也只改这条预览。点「接受」之后才会进续训集。
                     </p>
                     <div className="addRow" style={{ flexWrap: 'wrap', gap: 8 }}>

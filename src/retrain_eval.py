@@ -424,7 +424,8 @@ def run_retrain_and_eval(cfg: RetrainConfig, progress_cb=None) -> dict[str, Any]
         print(
             f"[retrain] current test task_id={cur_row.get('task_id')!r} "
             f"pre={pre:.4f} rec={rec:.4f} "
-            f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
+            f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')} "
+            f"fork margin {loss_before.get('margin') if loss_before else None} → {loss_after.get('margin')}",
             flush=True,
         )
         print(f"[retrain] predict:\n{gen['predict'][:2000]}", flush=True)

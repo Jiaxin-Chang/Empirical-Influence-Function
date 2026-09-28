@@ -734,6 +734,9 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/llm-semantic-retrieve":
             self._handle_llm_semantic_retrieve()
             return
+        if parsed.path == "/api/code-embed-retrieve":
+            self._handle_code_embed_retrieve()
+            return
         if parsed.path == "/api/llm-corpus-search":
             self._handle_llm_corpus_search()
             return
@@ -1445,6 +1448,14 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         top_k = req.get("topK")
         mode = str(req.get("mode", "gold") or "gold").strip().lower()
         source_index = req.get("sourceIndex")
+        raw_source_indices = req.get("sourceIndices")
+        source_indices = None
+        if isinstance(raw_source_indices, list):
+            try:
+                source_indices = [int(item) for item in raw_source_indices]
+            except (TypeError, ValueError):
+                self._send_json(400, {"status": "error", "message": "sourceIndices must be integers"})
+                return
         full_tokens = req.get("fullTokens")
         full_token_ids = req.get("fullTokenIds")
         prompt_len_override = req.get("promptLen")
@@ -1461,6 +1472,7 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
                     top_k=int(top_k) if top_k is not None else None,
                     mode=mode,
                     source_index=int(source_index) if source_index is not None else None,
+                    source_indices=source_indices,
                     full_tokens=full_tokens if isinstance(full_tokens, list) else None,
                     full_token_ids=full_token_ids if isinstance(full_token_ids, list) else None,
                     prompt_len_override=int(prompt_len_override)
@@ -2118,6 +2130,61 @@ class TTAVBundleRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             print(f"[llm-semantic] failed: {exc}", flush=True)
             self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _handle_code_embed_retrieve(self):
+        """Cosine of prefix+middle+suffix against the raw-code train embedding cache."""
+        _hydrate_eif_env()
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"status": "error", "message": "Invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"status": "error", "message": "JSON body must be an object"})
+            return
+
+        fim_prompt = str(req.get("fimPrompt") or req.get("promptText") or "")
+        gold = str(req.get("goldCompletion") or req.get("goldText") or "")
+        if not fim_prompt.strip() or not gold.strip():
+            self._send_json(400, {
+                "status": "error",
+                "message": "fimPrompt and goldCompletion are required",
+            })
+            return
+        try:
+            top_k = int(req.get("topK", 10) or 10)
+        except (TypeError, ValueError):
+            top_k = 10
+        try:
+            hole_weight = float(req.get("holeWeight", 0.4))
+        except (TypeError, ValueError):
+            hole_weight = 0.4
+        restart = bool(req.get("restart"))
+        print(
+            f"[code-embed] prompt_chars={len(fim_prompt)} gold_chars={len(gold)} "
+            f"top_k={top_k} hole_weight={hole_weight} restart={restart}",
+            flush=True,
+        )
+        try:
+            from src.code_embed_retrieval import retrieve_code_embeddings
+
+            result = retrieve_code_embeddings(
+                fim_prompt,
+                gold,
+                top_k=top_k,
+                hole_weight=hole_weight,
+                restart=restart,
+            )
+        except Exception as exc:
+            print(f"[code-embed] failed: {exc}", flush=True)
+            self._send_json(500, {"status": "error", "message": str(exc)})
+            return
+        if result.get("status") == "error":
+            self._send_json(500, result)
             return
         self._send_json(200, result)
 

@@ -122,10 +122,32 @@ def _thinking_enabled() -> bool:
 
 
 def _semantic_max_tokens() -> int:
+    """Edge JSON is short. Do not inherit ANNOTATE_MAX_TOKENS (often 4096)."""
     override = _optional_env_int("ANNOTATE_SEMANTIC_MAX_TOKENS")
     if override is not None:
-        return max(256, override)
-    return max(256, _env_int("ANNOTATE_MAX_TOKENS", 4096))
+        return max(128, override)
+    return 1024
+
+
+def _context_limit() -> int:
+    return max(1024, _env_int("ANNOTATE_CONTEXT_LIMIT", 8192))
+
+
+def _fit_output_tokens(messages: list[dict[str, str]], requested: int) -> int:
+    """Keep input estimate + output request inside the model context."""
+    limit = _context_limit()
+    chars = sum(len(str(m.get("content") or "")) for m in messages)
+    est_in = max(1, (chars + 1) // 2)
+    room = limit - est_in - 64
+    fitted = min(int(requested), room) if room > 0 else 128
+    fitted = max(128, fitted) if room >= 128 else max(1, room)
+    if fitted < requested:
+        print(
+            f"[llm-semantic] max_tokens {requested} -> {fitted} "
+            f"(est_in={est_in} limit={limit})",
+            flush=True,
+        )
+    return fitted
 
 
 def resolve_max_edges(
@@ -313,16 +335,21 @@ def _build_full_sample_messages(
         for i in context_indices
         if not _is_junk_surface(_surface(tokens[i]))
     ]
-    user_prompt = str(fim.get("full_user_prompt") or "")
-    if len(user_prompt) > 6000:
-        user_prompt = user_prompt[:3000] + "\n…\n" + user_prompt[-2500:]
+    def _clip(text: str, limit: int = 4000) -> str:
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        head = limit // 2
+        return text[:head] + "\n…\n" + text[-(limit - head - 3):]
+
+    user_prompt = _clip(str(fim.get("full_user_prompt") or ""), 6000)
 
     user_obj = {
         "language": language,
         "fim": {
             "user_prompt": user_prompt,
-            "prefix_before_mid": fim.get("prefix", ""),
-            "suffix_after_mid": fim.get("suffix", ""),
+            "prefix_before_mid": _clip(fim.get("prefix", "")),
+            "suffix_after_mid": _clip(fim.get("suffix", "")),
             "correct_completion_text": fim.get("correct_mid", ""),
         },
         "completion_tokens": completion_ref,
@@ -507,7 +534,7 @@ def _call_llm_full_sample(
         or _env("OPENAI_MODEL")
         or default_model
     )
-    max_tokens = _semantic_max_tokens()
+    max_tokens = _fit_output_tokens(messages, _semantic_max_tokens())
     thinking = _thinking_enabled()
     client = _build_client()
     kwargs: dict[str, Any] = {

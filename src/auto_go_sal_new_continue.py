@@ -101,25 +101,6 @@ def _rerank_text(
     return [row for _text, _sem, row in ranked]
 
 
-def _append_copies(row: dict[str, Any], dest: Path, extra: int) -> int:
-    """The accept path already wrote one row. Append ``extra`` uid-distinct copies."""
-    if extra <= 0:
-        return 0
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    base_uid = str(row.get("uid") or row.get("task_id") or row.get("raw_id") or "sample")
-    n = 0
-    with dest.open("a", encoding="utf-8") as handle:
-        for i in range(extra):
-            obj = json.loads(json.dumps(row, ensure_ascii=False))
-            obj.pop("_verify_meta", None)
-            obj["uid"] = f"{base_uid}::c{i:02d}_{uuid.uuid4().hex[:8]}"
-            obj["raw_id"] = obj["uid"]
-            obj["duplicate_of"] = base_uid
-            handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            n += 1
-    return n
-
-
 def _head_lines(path: Path, n: int) -> list[str]:
     out: list[str] = []
     with path.open(encoding="utf-8") as handle:
@@ -132,6 +113,29 @@ def _head_lines(path: Path, n: int) -> list[str]:
     return out
 
 
+def _repeat_row(raw: str, copies: int) -> list[str]:
+    """One accepted continue row, then uid-distinct copies. File itself is not touched."""
+    text = raw if raw.endswith("\n") else raw + "\n"
+    if copies <= 1:
+        return [text]
+    try:
+        base = json.loads(text)
+    except json.JSONDecodeError:
+        return [text] * copies
+    if not isinstance(base, dict):
+        return [text] * copies
+    base_uid = str(base.get("uid") or base.get("task_id") or base.get("raw_id") or "sample")
+    out = [text]
+    for i in range(copies - 1):
+        obj = json.loads(json.dumps(base, ensure_ascii=False))
+        obj.pop("_verify_meta", None)
+        obj["uid"] = f"{base_uid}::c{i:02d}_{uuid.uuid4().hex[:8]}"
+        obj["raw_id"] = obj["uid"]
+        obj["duplicate_of"] = base_uid
+        out.append(json.dumps(obj, ensure_ascii=False) + "\n")
+    return out
+
+
 def _write_mixed(
     train_ids: Path,
     continue_path: Path,
@@ -139,19 +143,23 @@ def _write_mixed(
     *,
     head_n: int,
     start_lines: int,
+    copies: int,
 ) -> tuple[int, int]:
     head = _head_lines(train_ids, head_n)
     fresh = _read_lines(continue_path)[start_lines:]
+    repeated: list[str] = []
+    for raw in fresh:
+        repeated.extend(_repeat_row(raw, copies))
     mixed_path.parent.mkdir(parents=True, exist_ok=True)
     with mixed_path.open("w", encoding="utf-8") as handle:
         handle.writelines(head)
-        handle.writelines(fresh)
+        handle.writelines(repeated)
     print(
         f"[data] mixed {len(head)} train head + {len(fresh)} annotated "
-        f"→ {mixed_path}",
+        f"× {copies} = {len(repeated)} → {mixed_path}",
         flush=True,
     )
-    return len(head), len(fresh)
+    return len(head), len(repeated)
 
 
 def _launch_train(train_repo: Path, base_model: str, data_path: Path) -> None:
@@ -263,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         eif_url=args.eif_url,
         viewer_url=args.viewer_url,
         corpus_path=args.train_corpus or None,
-        annotate="llm",
+        annotate="llm-semantic",
         top_k=args.top_k,
         max_scan=None,
         graphsignal_use_llm=None,
@@ -341,9 +349,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    [skip] {note}", flush=True)
             rec["reason"] = note
         else:
-            extra = _append_copies(row_ann, continue_path, copies - 1)
-            rec["copies"] = 1 + extra
-            print(f"    annotated + {extra} copies → {1 + extra} rows", flush=True)
+            meta = row_ann.get("_verify_meta") if isinstance(row_ann.get("_verify_meta"), dict) else {}
+            n_edges = int(meta.get("n_continue_edges") or 0)
+            rec["n_edges"] = n_edges
+            rec["top"]["n_edges"] = n_edges
+            print(
+                f"    annotated edges={n_edges} (copies ×{copies} at the end, not written to the continue file yet)",
+                flush=True,
+            )
         state["results"].append(rec)
         state["processed_lines"].append(int(test_line))
         _save_state(state_path, state)
@@ -365,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         mixed_path,
         head_n=int(args.head_n),
         start_lines=int(state.get("continue_start_lines") or 0),
+        copies=copies,
     )
     state["finalized"] = True
     state["mixed_out"] = str(mixed_path)

@@ -785,6 +785,186 @@ def generate_one(tokenizer, model, prompt: str, max_new_tokens: int) -> dict[str
     return row
 
 
+def _token_piece(tokenizer, token_id: int) -> str:
+    piece = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    shown = piece.replace("\n", "\\n")[:40]
+    if piece and not piece[0].isalnum():
+        shown = f"U+{ord(piece[0]):04X}:{shown}"
+    return shown
+
+
+def _as_id_list(tokenizer, text: str) -> list[int]:
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if not isinstance(ids, list):
+        ids = [int(x) for x in ids]
+    return [int(x) for x in ids]
+
+
+def _split_prompt_gold_ids(tokenizer, prefix: str, gold: str) -> tuple[list[int], list[int]]:
+    """Token ids of ``prefix + gold`` cut at the gold boundary.
+
+    Encoding the gold alone turns ``ccategory`` into ``cc``, while the same
+    letters after the prompt are often the one piece `` cc``. The forward has
+    to use the in-context pieces, or the margin reports a fork that still
+    spells the gold.
+    """
+    full = prefix + gold
+    try:
+        enc = tokenizer(full, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = enc["offset_mapping"]
+        ids = enc["input_ids"]
+    except (TypeError, ValueError, KeyError):
+        offsets, ids = None, None
+    if offsets is not None and ids is not None:
+        if not isinstance(ids, list):
+            ids = [int(x) for x in ids]
+        boundary = len(prefix)
+        pre: list[int] = []
+        gol: list[int] = []
+        for tid, span in zip(ids, offsets):
+            start, end = int(span[0]), int(span[1])
+            if end <= boundary:
+                pre.append(int(tid))
+            else:
+                gol.append(int(tid))
+        if pre and gol:
+            return pre, gol
+    pre = _as_id_list(tokenizer, prefix)
+    full_ids = _as_id_list(tokenizer, full)
+    if full_ids[: len(pre)] == pre and len(full_ids) > len(pre):
+        return pre, full_ids[len(pre) :]
+    return pre, _as_id_list(tokenizer, gold)
+
+
+_BOUNDARY_CHARS = frozenset(" \t\u00a0\u0120\u2581\u2009\u202f\ufeff")
+
+
+def _strip_boundary(text: str) -> str:
+    """Drop one leading BPE marker: ASCII space, Ġ, ▁, or another space separator."""
+    import unicodedata
+
+    if text and (text[0] in _BOUNDARY_CHARS or unicodedata.category(text[0]) == "Zs"):
+        return text[1:]
+    return text
+
+
+def _piece_forms(tokenizer, token_id: int) -> set[str]:
+    forms: set[str] = set()
+    raw = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    forms.add(raw)
+    forms.add(_strip_boundary(raw))
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if callable(convert):
+        token = convert(int(token_id))
+        if isinstance(token, str):
+            forms.add(token)
+            forms.add(_strip_boundary(token))
+    forms.discard("")
+    return forms
+
+
+def _same_boundary_piece(tokenizer, gold_id: int, other_id: int) -> bool:
+    """True when two ids spell the same letters aside from one BPE boundary mark.
+
+    Qwen's in-context piece of ``ccategory`` decodes as `` cc`` or ``Ġcc``.
+    The isolated piece decodes as ``cc``. Those are the same step.
+    """
+    if int(gold_id) == int(other_id):
+        return True
+    return bool(_piece_forms(tokenizer, gold_id) & _piece_forms(tokenizer, other_id))
+
+
+def _step_on_gold_string(
+    tokenizer,
+    context_ids: list[int],
+    token_id: int,
+    full_text: str,
+) -> bool:
+    """True when this token still spells the gold, even if the id differs.
+
+    A leading BPE space (``cc`` vs `` cc``) is the same step when the decoded
+    text stays on the gold string.
+    """
+    produced = tokenizer.decode(list(context_ids) + [int(token_id)], skip_special_tokens=False)
+    if full_text.startswith(produced):
+        return True
+    ctx = tokenizer.decode(list(context_ids), skip_special_tokens=False)
+    if not produced.startswith(ctx) or not full_text.startswith(ctx):
+        return False
+    added = produced[len(ctx) :]
+    rest = full_text[len(ctx) :]
+    if added.startswith(" "):
+        added = added[1:]
+    return bool(added) and rest.startswith(added)
+
+
+def _fork_margin_from_logits(
+    logits,
+    prefix_ids: list[int],
+    gold_ids: list[int],
+    tokenizer,
+    full_text: str,
+) -> dict[str, Any]:
+    """Min margin along the gold. A step that still decodes as gold counts as 0.
+
+    margin = log p(gold piece) − log p(argmax). Negative means greedy would
+    leave the gold text here.
+    """
+    n_tok = len(gold_ids)
+    start = len(prefix_ids) - 1
+    if start < 0 or n_tok <= 0:
+        return {"margin": None, "fork_index": None}
+    pred = logits[0, start : start + n_tok, :].float()
+    logp = torch.log_softmax(pred, dim=-1)
+    gold_index = torch.tensor(gold_ids, device=logp.device, dtype=torch.long)
+    gold_lp = logp.gather(-1, gold_index.unsqueeze(-1)).squeeze(-1)
+    max_lp, max_id = logp.max(dim=-1)
+    margin = gold_lp - max_lp
+    raw_margin = [float(margin[i].item()) for i in range(n_tok)]
+    for i in range(n_tok):
+        chosen = int(max_id[i].item())
+        if chosen == int(gold_ids[i]) or _same_boundary_piece(tokenizer, gold_ids[i], chosen):
+            raw_margin[i] = 0.0
+            continue
+        ctx = prefix_ids + gold_ids[:i]
+        if _step_on_gold_string(tokenizer, ctx, chosen, full_text):
+            raw_margin[i] = 0.0
+    fork = min(range(n_tok), key=raw_margin.__getitem__)
+    chosen = int(max_id[fork].item())
+    return {
+        "margin": round(raw_margin[fork], 6),
+        "fork_index": fork,
+        "fork_gold_token": _token_piece(tokenizer, gold_ids[fork]),
+        "fork_argmax_token": _token_piece(tokenizer, chosen),
+        "fork_text_match": bool(raw_margin[fork] >= -1e-6),
+    }
+
+
+def _attach_fork_margin(
+    dest: dict[str, Any],
+    *,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+) -> None:
+    def _copy(src: dict[str, Any] | None, suffix: str) -> float | None:
+        if not src or src.get("margin") is None:
+            return None
+        dest[f"margin_{suffix}"] = src.get("margin")
+        dest[f"fork_index_{suffix}"] = src.get("fork_index")
+        dest[f"fork_gold_token_{suffix}"] = src.get("fork_gold_token")
+        dest[f"fork_argmax_token_{suffix}"] = src.get("fork_argmax_token")
+        dest[f"fork_text_match_{suffix}"] = bool(src.get("fork_text_match"))
+        try:
+            return float(src["margin"])
+        except (TypeError, ValueError):
+            return None
+
+    b = _copy(before, "before")
+    a = _copy(after, "after")
+    if b is not None and a is not None:
+        dest["margin_delta"] = round(a - b, 6)
+
+
 @torch.no_grad()
 def gold_teacher_forced_ce(
     model,
@@ -800,12 +980,7 @@ def gold_teacher_forced_ce(
     model.eval()
     try:
         prefix = _render_eval_prompt(tokenizer, prompt or "")
-        prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
-        gold_ids = tokenizer(gold, add_special_tokens=False)["input_ids"]
-        if not isinstance(prefix_ids, list):
-            prefix_ids = [int(x) for x in prefix_ids]
-        if not isinstance(gold_ids, list):
-            gold_ids = [int(x) for x in gold_ids]
+        prefix_ids, gold_ids = _split_prompt_gold_ids(tokenizer, prefix, gold)
         if not gold_ids:
             return {"loss": None, "nll": None, "n_tokens": 0}
         device = _device_of(model)
@@ -818,10 +993,14 @@ def gold_teacher_forced_ce(
         out = model(input_ids=input_ids, labels=labels)
         loss = float(out.loss.detach().float().cpu())
         n_tok = int(len(gold_ids))
+        fork = _fork_margin_from_logits(
+            out.logits, prefix_ids, gold_ids, tokenizer, prefix + gold,
+        )
         return {
             "loss": round(loss, 6),
             "nll": round(loss * n_tok, 6),
             "n_tokens": n_tok,
+            **fork,
         }
     finally:
         if was_training:
@@ -847,6 +1026,7 @@ def _attach_gold_ce(
     a = None if not after else after.get("loss")
     if isinstance(b, (int, float)) and isinstance(a, (int, float)):
         dest["loss_delta"] = round(float(a) - float(b), 6)
+    _attach_fork_margin(dest, before=before, after=after)
 
 
 def evaluate_line_hit(
@@ -1451,7 +1631,11 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             )
             print(
                 f"[continue-eval] current test gold CE before="
-                f"{loss_before.get('loss')} n_tokens={loss_before.get('n_tokens')}",
+                f"{loss_before.get('loss')} n_tokens={loss_before.get('n_tokens')} "
+                f"fork margin={loss_before.get('margin')} "
+                f"at={loss_before.get('fork_index')} "
+                f"gold={loss_before.get('fork_gold_token')!r} "
+                f"argmax={loss_before.get('fork_argmax_token')!r}",
                 flush=True,
             )
             model.zero_grad(set_to_none=True)
@@ -1500,7 +1684,8 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             print(
                 f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
                 f"pre={pre:.4f} rec={rec_hit:.4f} "
-                f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')}",
+                f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')} "
+                f"fork margin {loss_before.get('margin') if loss_before else None} → {loss_after.get('margin')}",
                 flush=True,
             )
             print(
@@ -1512,6 +1697,7 @@ def run_continue_train_and_eval(cfg: ContinueTrainConfig, progress_cb=None) -> d
             print(
                 f"[continue-eval] current test task_id={cur_row.get('task_id')!r} "
                 f"gold CE {loss_before.get('loss') if loss_before else None} → {loss_after.get('loss')} "
+                f"fork margin {loss_before.get('margin') if loss_before else None} → {loss_after.get('margin')} "
                 f"(skip predict)",
                 flush=True,
             )

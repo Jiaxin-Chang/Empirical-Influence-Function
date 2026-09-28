@@ -623,6 +623,42 @@
 .codeBlockCompact {
     max-height: 480px; /* was 280; Model+Gold split — raise Model viewport */
 }
+.codeBlockFrame {
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+}
+.codeResizeHandle {
+    height: 28px;
+    cursor: ns-resize;
+    background: #f5f5f4;
+    border-top: 1px solid #d6d3d1;
+    border-bottom: 1px solid #d6d3d1;
+    flex-shrink: 0;
+    touch-action: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: #57534e;
+    user-select: none;
+}
+.codeResizeHandle::before {
+    content: '';
+    width: 18px;
+    height: 2px;
+    border-radius: 1px;
+    background: #78716c;
+    box-shadow: 0 -4px 0 #78716c, 0 4px 0 #78716c;
+}
+.codeResizeHandle:hover,
+.codeResizeHandle:active {
+    background: #e7e5e4;
+    color: #1c1917;
+}
 
 /* ── Token states ── */
 .token { border-radius: 3px; transition: background 0.1s; }

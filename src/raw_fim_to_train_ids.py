@@ -82,10 +82,13 @@ def encode_prompt_response(
 def _prompt_response(row: dict[str, Any]) -> tuple[str, str]:
     prompt = str(row.get("prompt") or row.get("input") or "").strip()
     response = ""
-    for key in ("response", "label", "gold", "target"):
+    for key in ("response", "label", "gold", "target", "middle"):
         v = row.get(key)
         if isinstance(v, str) and v.strip():
-            response = v.strip()
+            # Keep leading indent and the trailing newline. strip() would
+            # drop the hole's own whitespace, so the supervised line no
+            # longer matches the surrounding prefix/suffix.
+            response = v
             break
     return prompt, response
 

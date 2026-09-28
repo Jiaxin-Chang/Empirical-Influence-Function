@@ -288,6 +288,9 @@ export const api = {
       error?: boolean
       loss_before?: number | null
       loss_after?: number | null
+      margin_before?: number | null
+      margin_after?: number | null
+      margin_delta?: number | null
       summary?: string
       can_undo?: boolean
       sample?: SampleDetail | null

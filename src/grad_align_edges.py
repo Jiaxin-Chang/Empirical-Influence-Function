@@ -1,18 +1,20 @@
-"""One-step gradient check: does this annotation help the current test gold CE?
+"""One-step gradient check: does this annotation raise the current test fork margin?
 
-Saliency loss is **not** a sum over edges. Edges that share a query compete in
-one softmax (and negatives are subsampled when ``neg_sample_k`` > 0), so an
-edge score is the leave-one-out change in
+The test scalar is the negative fork margin (log p(gold) − log p(argmax) at the
+worst gold token, competitor id frozen). Saliency loss is not a sum over edges,
+so an edge score is the leave-one-out change in
 
     ∇L_test · ∇L_saliency
 
-Predicted gold-CE change of one SGD step on the train objective is
+Predicted change of one SGD step is
 
     ΔL_test ≈ −η ∇L_test · ∇L_train
 
-so a positive dot means the step would lower test gold CE.
+L_test = −margin, so a positive dot means the step would raise the fork margin.
+Deleting an edge and remeasuring margin on the same weights does nothing:
+margin depends on the weights, and the edge only matters inside the train gradient.
 
-    dot(∇test, ∇(CE + λ Sal)) > 0     CE+saliency helps
+    dot(∇test, ∇(CE + λ Sal)) > 0     one step raises margin
     dot(∇test, ∇Sal) > 0               that help beats CE-only
     dot_full − dot_without(e) < 0      edge e hurts; drop it
 """
@@ -35,6 +37,9 @@ from src.continue_train_eval import (
     _pick_continue_attn_implementation,
     _render_eval_prompt,
     _resolve_path,
+    _same_boundary_piece,
+    _split_prompt_gold_ids,
+    _step_on_gold_string,
     resolve_continue_start_adapter,
 )
 from src.eif_adapter_env import base_model_path_from_env
@@ -133,28 +138,39 @@ def _dot(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a[:n], b[:n]).item())
 
 
-def _gold_ce_loss(model, tokenizer, prompt: str, label: str) -> torch.Tensor:
+def _fork_margin_loss(model, tokenizer, prompt: str, label: str) -> torch.Tensor:
+    """−margin at the worst gold token. Decreasing this raises the fork margin."""
     prefix = _render_eval_prompt(tokenizer, prompt or "")
-    prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
-    gold_ids = tokenizer(label or "", add_special_tokens=False)["input_ids"]
-    if not isinstance(prefix_ids, list):
-        prefix_ids = [int(x) for x in prefix_ids]
-    if not isinstance(gold_ids, list):
-        gold_ids = [int(x) for x in gold_ids]
+    gold = str(label or "")
+    prefix_ids, gold_ids = _split_prompt_gold_ids(tokenizer, prefix, gold)
     if not gold_ids:
         raise ValueError("current test gold is empty after tokenization")
+    if not prefix_ids:
+        raise ValueError("current test prompt is empty after tokenization")
     device = _device_of(model)
     input_ids = torch.tensor([prefix_ids + gold_ids], dtype=torch.long, device=device)
-    labels = torch.tensor(
-        [[-100] * len(prefix_ids) + gold_ids],
-        dtype=torch.long,
-        device=device,
-    )
-    out = model(input_ids=input_ids, labels=labels, use_cache=False)
-    loss = out.loss
-    if loss is None:
-        raise RuntimeError("gold CE forward returned no loss")
-    return loss.mean() if loss.dim() > 0 else loss
+    out = model(input_ids=input_ids, use_cache=False)
+    start = len(prefix_ids) - 1
+    logp = torch.log_softmax(out.logits[0, start : start + len(gold_ids), :].float(), dim=-1)
+    gold_index = torch.tensor(gold_ids, device=logp.device, dtype=torch.long)
+    gold_lp = logp.gather(-1, gold_index.unsqueeze(-1)).squeeze(-1)
+    comp_id = logp.detach().argmax(dim=-1)
+    comp_lp = logp.gather(-1, comp_id.unsqueeze(-1)).squeeze(-1)
+    margin = gold_lp - comp_lp
+    full_text = prefix + gold
+    aligned = torch.zeros(len(gold_ids), device=margin.device, dtype=torch.bool)
+    for i, gid in enumerate(gold_ids):
+        chosen = int(comp_id[i].item())
+        if chosen == int(gid) or _same_boundary_piece(tokenizer, gid, chosen):
+            aligned[i] = True
+            continue
+        if _step_on_gold_string(tokenizer, prefix_ids + gold_ids[:i], chosen, full_text):
+            aligned[i] = True
+    scored = torch.where(aligned, torch.zeros_like(margin), margin)
+    fork = int(scored.detach().argmin().item())
+    if float(scored[fork].detach().item()) >= -1e-6:
+        return logp.sum() * 0
+    return -scored[fork]
 
 
 def _bank_cfg_for_probe(adapter_path: str, lam: float) -> BankLossConfig:
@@ -228,9 +244,9 @@ def _score_pair(
     batch = _compact_batch(train_row, device)
     model.eval()
 
-    progress("test_grad", "测试 gold CE 梯度…")
+    progress("test_grad", "测试分叉 margin 梯度…")
     _clear(model)
-    g_test = _flat_grad(_gold_ce_loss(model, tokenizer, prompt, label), params)
+    g_test = _flat_grad(_fork_margin_loss(model, tokenizer, prompt, label), params)
     _clear(model)
 
     progress("train_ce", "训练 CE 梯度…")
@@ -274,7 +290,7 @@ def _score_pair(
     dropped: list[dict[str, Any]] = []
     keep_idx: list[int] = []
     for i, edge in enumerate(edges):
-        progress("loo", f"去掉第 {i + 1}/{len(edges)} 条边再算点积…")
+        progress("loo", f"去掉第 {i + 1}/{len(edges)} 条边，再算它对分叉 margin 的点积…")
         rest = [e for j, e in enumerate(edges) if j != i]
         if not rest:
             # Single edge: without it saliency grad is 0, so its contribution is dot_sal.
@@ -516,14 +532,14 @@ def run_grad_align(
     both = bool(scored.get("both_positive"))
     if filtering:
         summary = (
-            f"{key} 删边 {len(banned)}，写回 {written} 行。"
+            f"{key} 按分叉 margin 删边 {len(banned)}，写回 {written} 行。"
             "请再点验证看两个点积。"
         )
     else:
         summary = (
-            f"{key} ∇(CE+λSal)={scored.get('dot_ce_saliency')} "
+            f"{key} 分叉 margin ∇(CE+λSal)={scored.get('dot_ce_saliency')} "
             f"∇Sal={scored.get('dot_saliency')} "
-            + ("都 > 0" if both else "未都 > 0")
+            + ("都 > 0，一步会抬高 margin" if both else "未都 > 0")
         )
     print(f"[grad-align] {summary}", flush=True)
     return {

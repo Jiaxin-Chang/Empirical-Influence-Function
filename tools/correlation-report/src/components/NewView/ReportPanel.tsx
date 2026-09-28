@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import styles from './NewView.module.css';
 import { InlineVisualizer } from './InlineVisualizer';
 import {
@@ -108,7 +108,7 @@ interface UnlearnPairResult {
 
 /** Default normalized LoRA step size for Learn/Unlearn (||Δθ||₂ = η). */
 const DEFAULT_PAIR_INTERVENE_LR = 0.05;
-const LIVE_SALIENCY_TOP_K = 6;
+const LIVE_SALIENCY_TOP_K = 4;
 
 function asIntArray(value: unknown): number[] | undefined {
     if (!Array.isArray(value)) return undefined;
@@ -264,6 +264,31 @@ interface LlmTrainRetrieveResult {
     semantic?: LlmSemanticRepr;
     semantic_flat_text?: string;
     llm?: { model?: string; raw?: string };
+    message?: string;
+}
+
+interface CodeEmbedHit extends LlmTrainSearchHit {
+    context_score?: number;
+    full_score?: number;
+    gold_score?: number;
+}
+
+interface CodeEmbedResult {
+    status?: string;
+    embed_chars?: number;
+    hole_side?: number;
+    hole_weight?: number;
+    context_chars?: number;
+    gold_chars?: number;
+    phase?: string;
+    done?: number;
+    total?: number;
+    model?: string;
+    cache_path?: string;
+    gold_cache_path?: string;
+    context_cache_path?: string;
+    corpus_path?: string;
+    hits?: CodeEmbedHit[];
     message?: string;
 }
 
@@ -461,6 +486,17 @@ type ContinueCurrentTestState = {
     loss_after?: number;
     loss_delta?: number;
     loss_tokens?: number;
+    margin_before?: number;
+    margin_after?: number;
+    margin_delta?: number;
+    fork_index_before?: number;
+    fork_index_after?: number;
+    fork_gold_token_before?: string;
+    fork_argmax_token_before?: string;
+    fork_gold_token_after?: string;
+    fork_argmax_token_after?: string;
+    fork_text_match_before?: boolean;
+    fork_text_match_after?: boolean;
 };
 
 function parseContinueCurrentTest(cur: Record<string, unknown>): ContinueCurrentTestState | null {
@@ -482,6 +518,17 @@ function parseContinueCurrentTest(cur: Record<string, unknown>): ContinueCurrent
         loss_after: numOrUndef(cur.loss_after),
         loss_delta: numOrUndef(cur.loss_delta),
         loss_tokens: numOrUndef(cur.loss_tokens),
+        margin_before: numOrUndef(cur.margin_before),
+        margin_after: numOrUndef(cur.margin_after),
+        margin_delta: numOrUndef(cur.margin_delta),
+        fork_index_before: numOrUndef(cur.fork_index_before),
+        fork_index_after: numOrUndef(cur.fork_index_after),
+        fork_gold_token_before: typeof cur.fork_gold_token_before === 'string' ? cur.fork_gold_token_before : undefined,
+        fork_argmax_token_before: typeof cur.fork_argmax_token_before === 'string' ? cur.fork_argmax_token_before : undefined,
+        fork_gold_token_after: typeof cur.fork_gold_token_after === 'string' ? cur.fork_gold_token_after : undefined,
+        fork_argmax_token_after: typeof cur.fork_argmax_token_after === 'string' ? cur.fork_argmax_token_after : undefined,
+        fork_text_match_before: cur.fork_text_match_before === true,
+        fork_text_match_after: cur.fork_text_match_after === true,
     };
 }
 
@@ -491,7 +538,13 @@ function formatContinueDoneSummary(kind: string, cur: Record<string, unknown>): 
     const fmt4 = (v: unknown) =>
         typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : '—';
     let s = `${kind} · 当前 test line_hit_pre=${fmt2(cur.line_hit_pre)} rec=${fmt2(cur.line_hit_rec)}`;
-    if (typeof cur.loss_before === 'number' && typeof cur.loss_after === 'number') {
+    if (typeof cur.margin_before === 'number' && typeof cur.margin_after === 'number') {
+        const d = typeof cur.margin_delta === 'number'
+            ? cur.margin_delta
+            : cur.margin_after - cur.margin_before;
+        const sign = d > 0 ? '+' : '';
+        s += ` · 分叉 margin ${fmt4(cur.margin_before)} → ${fmt4(cur.margin_after)} (Δ ${sign}${d.toFixed(4)})`;
+    } else if (typeof cur.loss_before === 'number' && typeof cur.loss_after === 'number') {
         const d = typeof cur.loss_delta === 'number'
             ? cur.loss_delta
             : cur.loss_after - cur.loss_before;
@@ -1450,8 +1503,8 @@ function TokenSpan({
     const decoded = decodeToken(token);
     const blank = !decoded.trim();
     const showBlankMark = blank && (state === 'source-highlight' || state === 'selected');
-    const display = (token === '\n' || decoded === '\n')
-        ? '↵\n'
+    const display = (token === '\n' || decoded === '\n' || decoded === '\r\n')
+        ? '\n'
         : token === '  '
             ? '→'
             : showBlankMark
@@ -1512,6 +1565,7 @@ function CodeTokenStream({
     linkedTokenIndex,
     onTokenHover,
     compact = false,
+    boxHeight,
 }: {
     tokens: string[];
     promptLen: number;
@@ -1524,10 +1578,15 @@ function CodeTokenStream({
     linkedTokenIndex?: number | null;
     onTokenHover?: (idx: number | null) => void;
     compact?: boolean;
+    /** When set, replaces the fixed max-height so the block can be dragged taller. */
+    boxHeight?: number;
 }) {
     const responseState = resolveResponseState(responseTone);
     return (
-        <pre className={`${styles.codeBlock}${compact ? ` ${styles.codeBlockCompact}` : ''}`}>
+        <pre
+            className={`${styles.codeBlock}${compact ? ` ${styles.codeBlockCompact}` : ''}`}
+            style={boxHeight != null ? { height: boxHeight, maxHeight: 'none' } : undefined}
+        >
             <code>
                 {tokens.map((tok, i) => {
                     const isResponse = i >= promptLen;
@@ -1566,6 +1625,45 @@ function CodeTokenStream({
                 })}
             </code>
         </pre>
+    );
+}
+
+function ResizableCode({
+    defaultHeight,
+    children,
+}: {
+    defaultHeight: number;
+    children: (height: number) => ReactNode;
+}) {
+    const [height, setHeight] = useState(defaultHeight);
+    const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        const handle = event.currentTarget;
+        const startY = event.clientY;
+        const startH = height;
+        handle.setPointerCapture(event.pointerId);
+        const move = (ev: PointerEvent) => {
+            setHeight(Math.max(120, startH + ev.clientY - startY));
+        };
+        const up = () => {
+            handle.removeEventListener('pointermove', move);
+            handle.removeEventListener('pointerup', up);
+        };
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', up);
+    };
+    return (
+        <div className={styles.codeBlockFrame}>
+            {children(height)}
+            <div
+                className={styles.codeResizeHandle}
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="拖动调整代码高度"
+                title="拖动调整高度"
+                onPointerDown={onPointerDown}
+            />
+        </div>
     );
 }
 
@@ -1657,19 +1755,24 @@ function OutputComparePanel({
                             </span>
                         )}
                     </div>
-                    <CodeTokenStream
-                        tokens={modelTokens}
-                        promptLen={promptLen}
-                        responseTone="model"
-                        highlightSourceIndices={highlightSourceIndices}
-                        selectedTargetIndex={selectedTargetIndex}
-                        analyzedIndices={analyzedIndices}
-                        onTokenClick={onTokenClick}
-                        clickScope={modelClickScope}
-                        linkedTokenIndex={linkedTokenIndex}
-                        onTokenHover={onTokenHover}
-                        compact={hasGold}
-                    />
+                    <ResizableCode defaultHeight={hasGold ? 480 : 560}>
+                        {boxHeight => (
+                            <CodeTokenStream
+                                tokens={modelTokens}
+                                promptLen={promptLen}
+                                responseTone="model"
+                                highlightSourceIndices={highlightSourceIndices}
+                                selectedTargetIndex={selectedTargetIndex}
+                                analyzedIndices={analyzedIndices}
+                                onTokenClick={onTokenClick}
+                                clickScope={modelClickScope}
+                                linkedTokenIndex={linkedTokenIndex}
+                                onTokenHover={onTokenHover}
+                                compact={hasGold}
+                                boxHeight={boxHeight}
+                            />
+                        )}
+                    </ResizableCode>
                 </div>
                 {hasGold && (
                     <div className={styles.outputSection}>
@@ -1677,9 +1780,11 @@ function OutputComparePanel({
                             <span className={`${styles.outputSectionTitle} ${styles.outputSectionTitleGold}`}>
                                 Gold
                             </span>
-                            <span className={styles.outputSectionHint}>
-                                {goldHint ?? '点击 → 现场 teacher-force 归因'}
-                            </span>
+                            {goldHint ? (
+                                <span className={styles.outputSectionHint}>
+                                    {goldHint}
+                                </span>
+                            ) : null}
                         </div>
                         <CodeTokenStream
                             tokens={goldResponseTokens}
@@ -2783,6 +2888,11 @@ export function ReportPanel({
     /** After continue-train: live predict top-k overlay (null = use report JSON). */
     const [predictLiveTop, setPredictLiveTop] = useState<TestCorrelation[] | null>(null);
     const [predictLiveBusy, setPredictLiveBusy] = useState(false);
+    /** Temporary: pin the clicked target and hand-pick up to 4 source tokens. */
+    const [cheatPickOn, setCheatPickOn] = useState(false);
+    const [cheatSourceIdxs, setCheatSourceIdxs] = useState<number[]>([]);
+    const [cheatRows, setCheatRows] = useState<TestCorrelation[] | null>(null);
+    const [cheatBusy, setCheatBusy] = useState(false);
     const [predictPairs, setPredictPairs] = useState<CorrelationPair[]>([]);
     const [predictTrainDetails, setPredictTrainDetails] = useState<Record<string, TrainSampleDetail>>({});
     const [predictStage3Busy, setPredictStage3Busy] = useState(false);
@@ -2797,22 +2907,18 @@ export function ReportPanel({
     const [structuralBusy, setStructuralBusy] = useState(false);
     const [structuralError, setStructuralError] = useState<string | null>(null);
     const [structuralMeta, setStructuralMeta] = useState<string | null>(null);
-    type SampleHit = { trainSampleId: number; score: number; taskId?: string; extra?: string };
-    const [sampleGradBusy, setSampleGradBusy] = useState(false);
-    const [sampleStructBusy, setSampleStructBusy] = useState(false);
-    const [sampleTextBusy, setSampleTextBusy] = useState(false);
-    const [sampleGradError, setSampleGradError] = useState<string | null>(null);
-    const [sampleStructError, setSampleStructError] = useState<string | null>(null);
-    const [sampleTextError, setSampleTextError] = useState<string | null>(null);
-    const [sampleGradHit, setSampleGradHit] = useState<SampleHit | null>(null);
-    const [sampleStructHit, setSampleStructHit] = useState<SampleHit | null>(null);
-    const [sampleTextHit, setSampleTextHit] = useState<SampleHit | null>(null);
     const [llmTrainBusy, setLlmTrainBusy] = useState(false);
     const [llmTrainError, setLlmTrainError] = useState<string | null>(null);
     const [llmTrainResult, setLlmTrainResult] = useState<LlmTrainRetrieveResult | null>(null);
     const [llmTrainPanelOpen, setLlmTrainPanelOpen] = useState(false);
     const [llmTrainExprsOnly, setLlmTrainExprsOnly] = useState(false);
     const [llmTrainMode, setLlmTrainMode] = useState<'boolean' | 'semantic' | 'semantic-test'>('boolean');
+    const [codeEmbedBusy, setCodeEmbedBusy] = useState(false);
+    const [codeEmbedError, setCodeEmbedError] = useState<string | null>(null);
+    const [codeEmbedResult, setCodeEmbedResult] = useState<CodeEmbedResult | null>(null);
+    const [codeEmbedOpen, setCodeEmbedOpen] = useState(false);
+    const [codeEmbedHoleWeight, setCodeEmbedHoleWeight] = useState('0.4');
+    const codeEmbedPollGen = useRef(0);
     const [llmTrainActiveExprIdx, setLlmTrainActiveExprIdx] = useState<number | null>(null);
     const [llmTrainExprHits, setLlmTrainExprHits] = useState<Record<number, LlmTrainSearchHit[]>>({});
     const [llmTrainExprSearchBusy, setLlmTrainExprSearchBusy] = useState(false);
@@ -2895,6 +3001,9 @@ export function ReportPanel({
         setPredictPairs([]);
         setPredictTrainDetails({});
         setPredictStage3Busy(false);
+        setCheatPickOn(false);
+        setCheatSourceIdxs([]);
+        setCheatRows(null);
     }, [selectedTokIdx]);
 
     useEffect(() => {
@@ -4038,6 +4147,7 @@ export function ReportPanel({
         targetIndex: number;
         sourceIndex?: number | null;
         topK?: number;
+        sourceIndices?: number[];
     }): Promise<Record<string, unknown>> => {
         if (!selectedMeta) throw new Error('No report selected');
         const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/gold-saliency'), {
@@ -4049,6 +4159,9 @@ export function ReportPanel({
                 targetIndex: opts.targetIndex,
                 topK: opts.topK ?? LIVE_SALIENCY_TOP_K,
                 ...(opts.sourceIndex != null ? { sourceIndex: opts.sourceIndex } : {}),
+                ...(opts.sourceIndices && opts.sourceIndices.length > 0
+                    ? { sourceIndices: opts.sourceIndices }
+                    : {}),
                 ...reportApiPayload,
                 ...(opts.mode === 'predict' && livePredictOverride ? {
                     fullTokens: livePredictOverride.tokens,
@@ -4073,6 +4186,56 @@ export function ReportPanel({
         }
         return parsed;
     }, [eifApiUrl, selectedMeta, livePredictOverride, promptLen, reportApiPayload]);
+
+    useEffect(() => {
+        if (!cheatPickOn || selectedTokIdx == null || cheatSourceIdxs.length === 0) {
+            setCheatRows(null);
+            setCheatBusy(false);
+            return;
+        }
+        if (importedReportActive || !selectedMeta) return;
+        let cancelled = false;
+        setCheatBusy(true);
+        void (async () => {
+            try {
+                const parsed = await fetchLiveSaliency({
+                    mode: 'predict',
+                    targetIndex: selectedTokIdx,
+                    sourceIndices: cheatSourceIdxs,
+                    topK: 1,
+                });
+                if (cancelled) return;
+                const raw = Array.isArray(parsed.pickedCorrelations) ? parsed.pickedCorrelations : [];
+                const byIdx = new Map<number, number>();
+                for (const item of raw) {
+                    if (!item || typeof item !== 'object') continue;
+                    const rec = item as Record<string, unknown>;
+                    const idx = Number(rec.source_token_index);
+                    const score = Number(rec.saliency_score);
+                    if (!Number.isFinite(idx) || !Number.isFinite(score)) continue;
+                    byIdx.set(Math.trunc(idx), score);
+                }
+                setCheatRows(cheatSourceIdxs.map(idx => ({
+                    source_token: modelTokens[idx] ?? '',
+                    source_token_index: idx,
+                    source_display_index: idx,
+                    target_token: modelTokens[selectedTokIdx] ?? '',
+                    target_token_index: selectedTokIdx,
+                    saliency_score: byIdx.get(idx) ?? 0,
+                })));
+            } catch (error) {
+                if (cancelled) return;
+                const msg = error instanceof Error ? error.message : '手动 saliency 失败';
+                setTtavLaunchError(msg);
+            } finally {
+                if (!cancelled) setCheatBusy(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [
+        cheatPickOn, cheatSourceIdxs, selectedTokIdx, importedReportActive, selectedMeta,
+        fetchLiveSaliency, modelTokens,
+    ]);
 
     /** Refresh predict/gold top-k and 指定-pair edge saliency after continue / recover. */
     const refreshSaliencyPanels = useCallback(async (opts?: {
@@ -4419,65 +4582,6 @@ export function ReportPanel({
         fetchStructuralPairs(activeQueryEdge);
     }, [structuralAttributionEnabled, activeQueryEdge, fetchStructuralPairs]);
 
-    const runSampleKind = useCallback((kind: 'gradient' | 'structural' | 'text') => {
-        if (importedReportActive) return;
-        const setBusy = kind === 'gradient' ? setSampleGradBusy : kind === 'structural' ? setSampleStructBusy : setSampleTextBusy;
-        const setErr = kind === 'gradient' ? setSampleGradError : kind === 'structural' ? setSampleStructError : setSampleTextError;
-        const setHit = kind === 'gradient' ? setSampleGradHit : kind === 'structural' ? setSampleStructHit : setSampleTextHit;
-        setBusy(true);
-        setErr(null);
-        setHit(null);
-        void (async () => {
-            try {
-                const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/sample-attribution'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        reportFileName: selectedMeta.fileName,
-                        topK: 1,
-                        which: kind,
-                        ...reportApiPayload,
-                    }),
-                });
-                const raw = await resp.text();
-                let parsed: Record<string, unknown> = {};
-                try {
-                    parsed = raw.trim() ? JSON.parse(raw) as Record<string, unknown> : {};
-                } catch {
-                    throw new Error(`non-JSON (HTTP ${resp.status}): ${raw.slice(0, 200)}`);
-                }
-                if (!resp.ok || parsed.status !== 'success') {
-                    throw new Error(
-                        typeof parsed.message === 'string'
-                            ? parsed.message
-                            : `failed (HTTP ${resp.status})`,
-                    );
-                }
-                const bucket = parsed[kind] as { trains?: Array<Record<string, unknown>> } | null;
-                const row = Array.isArray(bucket?.trains) ? bucket.trains[0] : undefined;
-                if (!row) {
-                    setHit(null);
-                    return;
-                }
-                const score = Number(kind === 'gradient' ? row.cos : row.score);
-                const taskId = typeof row.taskId === 'string' ? row.taskId : '';
-                const extra = kind === 'structural'
-                    ? `type ${Number(row.typeCos || 0).toFixed(3)} · edge ${Number(row.edgeCos || 0).toFixed(3)}`
-                    : '';
-                setHit({
-                    trainSampleId: Number(row.trainSampleId),
-                    score: Number.isFinite(score) ? score : 0,
-                    taskId,
-                    extra,
-                });
-            } catch (error) {
-                setErr(error instanceof Error ? error.message : '归因失败');
-            } finally {
-                setBusy(false);
-            }
-        })();
-    }, [importedReportActive, eifApiUrl, selectedMeta.fileName, reportApiPayload]);
-
     const fetchLlmTrainRetrieve = useCallback((opts?: {
         kind?: 'boolean' | 'semantic' | 'semantic-test';
         exprsOnly?: boolean;
@@ -4577,6 +4681,85 @@ export function ReportPanel({
         eifApiUrl,
     ]);
 
+    const fetchCodeEmbedRetrieve = useCallback(() => {
+        if (importedReportActive) return;
+        const fimPrompt = (
+            report.test_sample_baseline.raw_prompt
+            || decodeTokens(correctTokens.slice(0, promptLen)).join('')
+        );
+        const goldCompletion = (
+            report.test_sample_baseline.raw_label
+            || decodeTokens(goldResponseTokens).join('')
+        );
+        if (!fimPrompt.trim() || !goldCompletion.trim()) {
+            setCodeEmbedError('缺少 FIM prompt 或 gold completion');
+            setCodeEmbedOpen(true);
+            return;
+        }
+        const parsedWeight = Number(codeEmbedHoleWeight);
+        const holeWeight = Number.isFinite(parsedWeight)
+            ? Math.min(1, Math.max(0, parsedWeight))
+            : 0.4;
+        setCodeEmbedBusy(true);
+        setCodeEmbedError(null);
+        setCodeEmbedOpen(true);
+        const gen = codeEmbedPollGen.current + 1;
+        codeEmbedPollGen.current = gen;
+        const run = (restart: boolean) => {
+            if (codeEmbedPollGen.current !== gen) return;
+            void (async () => {
+                try {
+                    const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/code-embed-retrieve'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            fimPrompt,
+                            goldCompletion,
+                            topK: 10,
+                            holeWeight,
+                            restart,
+                        }),
+                    });
+                    const raw = await resp.text();
+                    let parsed: CodeEmbedResult = {};
+                    if (raw.trim()) {
+                        parsed = JSON.parse(raw) as CodeEmbedResult;
+                    }
+                    if (codeEmbedPollGen.current !== gen) return;
+                    if (resp.ok && parsed.status === 'building') {
+                        setCodeEmbedResult(parsed);
+                        window.setTimeout(() => run(false), 3000);
+                        return;
+                    }
+                    if (!resp.ok || parsed.status !== 'success') {
+                        throw new Error(
+                            typeof parsed.message === 'string'
+                                ? parsed.message
+                                : `Code embed retrieve failed (HTTP ${resp.status})`,
+                        );
+                    }
+                    setCodeEmbedResult(parsed);
+                    setCodeEmbedBusy(false);
+                } catch (error) {
+                    if (codeEmbedPollGen.current !== gen) return;
+                    setCodeEmbedResult(null);
+                    setCodeEmbedError(error instanceof Error ? error.message : 'Code embed retrieve failed');
+                    setCodeEmbedBusy(false);
+                }
+            })();
+        };
+        run(true);
+    }, [
+        importedReportActive,
+        report.test_sample_baseline.raw_prompt,
+        report.test_sample_baseline.raw_label,
+        correctTokens,
+        promptLen,
+        goldResponseTokens,
+        eifApiUrl,
+        codeEmbedHoleWeight,
+    ]);
+
     const fetchLlmCorpusSearch = useCallback((exprIdx: number, item: LlmTrainExprItem) => {
         const expression = item.expression || '';
         if (importedReportActive || !expression.trim()) return;
@@ -4642,12 +4825,13 @@ export function ReportPanel({
         hit: LlmTrainSearchHit,
         expression?: string,
         queryName?: string,
+        corpusPathOverride?: string,
     ) => {
         if (hit.line == null || hit.line < 0) return;
         const base = (
             import.meta.env.VITE_ANNOTATION_VIEWER_URL as string | undefined
         )?.trim() || 'http://127.0.0.1:5275';
-        const corpusPath = llmTrainResult?.corpus_path?.trim();
+        const corpusPath = (corpusPathOverride || llmTrainResult?.corpus_path || '').trim();
         // Open synchronously on the click gesture. The corpus row is shown
         // as stored; MID rewrite is not applied.
         const popup = window.open('about:blank', '_blank');
@@ -4703,9 +4887,11 @@ export function ReportPanel({
             if (qe) url.searchParams.set('queryExpr', qe);
             const qn = (queryName || '').trim();
             if (qn) url.searchParams.set('queryName', qn);
-            const targetSem = semanticExportView(
-                llmTrainResult?.analysis?.semantic || llmTrainResult?.semantic || {},
-            );
+            const targetSem = queryName === 'code-embed'
+                ? { role: '', pattern: [] as string[], operations: [] as string[], relations: [] as LlmSemanticRelation[] }
+                : semanticExportView(
+                    llmTrainResult?.analysis?.semantic || llmTrainResult?.semantic || {},
+                );
             if (
                 targetSem.role
                 || targetSem.pattern.length
@@ -5121,8 +5307,8 @@ export function ReportPanel({
         setContinueBusy(true);
         setTtavLaunchError(null);
         setTtavLaunchStatus(mode === 'filter'
-            ? '梯度筛边：逐条边算 marginal，小于 0 的删掉…'
-            : '验证：最近一条标注的两个点积…');
+            ? '梯度筛边：逐条边看对分叉 margin 的贡献，小于 0 的删掉…'
+            : '验证：最近一条标注走一步会不会抬高分叉 margin…');
         void (async () => {
             try {
                 const resp = await fetch(buildEifApiUrl(eifApiUrl, '/api/grad-align-edges'), {
@@ -5742,7 +5928,9 @@ export function ReportPanel({
                                 goldResponseTokens={goldResponseTokens}
                                 promptLen={promptLen}
                                 highlightSourceIndices={
-                                    attrMode === 'manual'
+                                    cheatPickOn
+                                        ? new Set(cheatSourceIdxs)
+                                        : attrMode === 'manual'
                                         ? (manualSourceIdx != null ? new Set([manualSourceIdx]) : undefined)
                                         : attrMode === 'predict'
                                             ? sourceHighlightIndices
@@ -5753,11 +5941,22 @@ export function ReportPanel({
                                 selectedTargetIndex={attrMode === 'predict' ? (selectedTokIdx ?? undefined) : undefined}
                                 analyzedIndices={analyzedIndices}
                                 modelClickScope={
-                                    attrMode === 'manual'
+                                    cheatPickOn
+                                        ? 'all'
+                                        : attrMode === 'manual'
                                         ? 'prompt'
                                         : (rawEvalActive ? 'response' : 'analyzed')
                                 }
                                 onTokenClick={idx => {
+                                    if (cheatPickOn && selectedTokIdx != null) {
+                                        if (idx === selectedTokIdx || idx >= selectedTokIdx) return;
+                                        setCheatSourceIdxs(prev => {
+                                            if (prev.includes(idx)) return prev.filter(item => item !== idx);
+                                            if (prev.length >= 4) return prev;
+                                            return [...prev, idx];
+                                        });
+                                        return;
+                                    }
                                     if (attrMode === 'manual') {
                                         handleManualSourceClick(idx);
                                         return;
@@ -5796,6 +5995,33 @@ export function ReportPanel({
                                     <>
                                     <button
                                         type="button"
+                                        aria-pressed={cheatPickOn}
+                                        disabled={importedReportActive || selectedTokIdx == null || attrMode === 'manual'}
+                                        title={
+                                            selectedTokIdx == null
+                                                ? '先点一个 token'
+                                                : (cheatPickOn
+                                                    ? '退出手动选择，恢复自动 saliency'
+                                                    : '保持当前 token，手选最多 4 个它前面的 token 作为 saliency source')
+                                        }
+                                        onClick={() => {
+                                            if (cheatPickOn) {
+                                                setCheatPickOn(false);
+                                                setCheatSourceIdxs([]);
+                                                setCheatRows(null);
+                                                return;
+                                            }
+                                            setCheatPickOn(true);
+                                            setCheatSourceIdxs([]);
+                                            setCheatRows(null);
+                                            setSelectedTestCorrIdx(null);
+                                        }}
+                                        className={`${styles.ghostBtn}${cheatPickOn ? ` ${styles.ghostBtnOn}` : ''}`}
+                                    >
+                                        {cheatPickOn ? `手动 ${cheatSourceIdxs.length}/4` : '手动选'}
+                                    </button>
+                                    <button
+                                        type="button"
                                         aria-pressed={attrMode === 'manual'}
                                         disabled={importedReportActive || goldResponseTokens.length === 0}
                                         title={
@@ -5808,6 +6034,9 @@ export function ReportPanel({
                                                         : '手动选上下文 source + Gold target，结构归因检索后 Learn 提升该 token 概率')
                                         }
                                         onClick={() => {
+                                            setCheatPickOn(false);
+                                            setCheatSourceIdxs([]);
+                                            setCheatRows(null);
                                             if (attrMode === 'manual') exitManualPairMode();
                                             else enterManualPairMode();
                                         }}
@@ -5820,60 +6049,9 @@ export function ReportPanel({
                                     >
                                         {attrMode === 'manual' ? '指定 pair · 开' : '指定 pair'}
                                     </button>
-                                    <button
-                                        type="button"
-                                        disabled={importedReportActive || sampleGradBusy || goldResponseTokens.length === 0}
-                                        title="整条 valid 的 gold CE 梯度对训练 bank，只出 top 1"
-                                        onClick={() => runSampleKind('gradient')}
-                                        className={styles.ghostBtn}
-                                    >
-                                        {sampleGradBusy ? '梯度…' : '梯度 top1'}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        disabled={importedReportActive || sampleTextBusy || goldResponseTokens.length === 0}
-                                        title="整段 token 文本余弦，只出 top 1，不跑模型"
-                                        onClick={() => runSampleKind('text')}
-                                        className={styles.ghostBtn}
-                                    >
-                                        {sampleTextBusy ? '文本…' : '文本 top1'}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        disabled={importedReportActive || sampleStructBusy || goldResponseTokens.length === 0}
-                                        title="整段 AST 结构余弦，只出 top 1，不跑模型"
-                                        onClick={() => runSampleKind('structural')}
-                                        className={styles.ghostBtn}
-                                    >
-                                        {sampleStructBusy ? '结构…' : '结构 top1'}
-                                    </button>
                                     </>
                                 )}
                             />
-
-                            <div className={styles.manualPairBar} style={{ alignItems: 'flex-start', gap: 16 }}>
-                                {([
-                                    ['梯度', sampleGradBusy, sampleGradError, sampleGradHit],
-                                    ['文本', sampleTextBusy, sampleTextError, sampleTextHit],
-                                    ['结构', sampleStructBusy, sampleStructError, sampleStructHit],
-                                ] as const).map(([label, busy, err, hit]) => (
-                                    <div key={label} className={styles.correlationList} style={{ flex: 1, minWidth: 0 }}>
-                                        <div className={styles.correlationListTitle}>{label} top 1</div>
-                                        {busy && <div className={styles.manualPairHint}>计算中…</div>}
-                                        {err && <div className={styles.manualPairHint} style={{ color: '#b91c1c' }}>{err}</div>}
-                                        {!busy && !err && hit && (
-                                            <div className={styles.manualPairHint}>
-                                                #{hit.trainSampleId} · {hit.score.toFixed(4)}
-                                                {hit.taskId ? ` · ${hit.taskId}` : ''}
-                                                {hit.extra ? ` · ${hit.extra}` : ''}
-                                            </div>
-                                        )}
-                                        {!busy && !err && !hit && (
-                                            <div className={styles.manualPairHint}>尚未计算</div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
 
                             {attrMode === 'manual' && (
                                 <div className={styles.correlationList}>
@@ -5943,15 +6121,6 @@ export function ReportPanel({
 
                             {attrMode === 'gold' && goldLocalIdx !== null && (
                                 <div className={styles.correlationList}>
-                                    <div className={styles.correlationListTitle}>
-                                        Gold 特征归因 · 点击边做数据归因 · "
-                                        {decodeToken(goldResponseTokens[goldLocalIdx] ?? '').trim()}"
-                                        {' '}@ idx {promptLen + goldLocalIdx}
-                                        {goldBusy ? ' …' : ''}
-                                        {continueAdapterActive
-                                            ? (liveAdapterKind === 'retrain' ? ' · 重训 adapter' : ' · 续训 adapter')
-                                            : ''}
-                                    </div>
                                     <div className={styles.correlationListItems}>
                                         {goldTopCorrelations.map(c => (
                                             <button
@@ -5979,27 +6148,20 @@ export function ReportPanel({
                                 </div>
                             )}
 
-                            {attrMode === 'predict' && selectedTokIdx != null && (selectedResult || livePredictOverride || rawEvalActive) && (
+                            {attrMode === 'predict' && selectedTokIdx != null && (cheatPickOn || selectedResult || livePredictOverride || rawEvalActive) && (
                                 <div className={styles.correlationList}>
-                                    <div className={styles.correlationListTitle}>
-                                        特征归因 · 点击边做数据归因 · "{decodeToken(
-                                            selectedResult?.target_token
-                                            ?? modelTokens[selectedTokIdx]
-                                            ?? ''
-                                        ).trim()}" @ idx {selectedTokIdx}
-                                        {predictLiveBusy || predictStage3Busy ? ' …' : ''}
-                                        {predictLiveTop
-                                            ? (rawEvalActive
-                                                ? ' · live(raw)'
-                                                : (continueAdapterActive
-                                                    ? (liveAdapterKind === 'retrain' ? ' · live(重训)' : ' · live(续训)')
-                                                    : ' · live'))
-                                            : (livePredictOverride
-                                                ? (liveAdapterKind === 'retrain' ? ' · live(重训输出)' : ' · live(续训输出)')
-                                                : ' · report')}
-                                    </div>
+                                    {cheatPickOn && (
+                                        <div className={styles.correlationListHint}>
+                                            {cheatBusy
+                                                ? '正在计算手选 saliency…'
+                                                : `已选 ${cheatSourceIdxs.length}/4，点当前 token 前面的 token`}
+                                        </div>
+                                    )}
                                     <div className={styles.correlationListItems}>
-                                        {(predictLiveTop ?? selectedResult?.top_correlations ?? []).slice(0, LIVE_SALIENCY_TOP_K).map(c => (
+                                        {(cheatPickOn
+                                            ? (cheatRows ?? [])
+                                            : (predictLiveTop ?? selectedResult?.top_correlations ?? []).slice(0, LIVE_SALIENCY_TOP_K)
+                                        ).map(c => (
                                             <button
                                                 key={c.source_token_index}
                                                 type="button"
@@ -6136,6 +6298,32 @@ export function ReportPanel({
                                         >
                                             {llmTrainBusy && llmTrainMode === 'semantic' ? 'Semantic 归因中…' : 'Semantic 归因'}
                                         </button>
+                                        <label
+                                            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                                            title="洞附近权重 w。综合分 = 全文余弦^(1-w) × 洞附近余弦^w。0 只看全文，1 只看洞附近。"
+                                        >
+                                            洞附近
+                                            <input
+                                                type="number"
+                                                min={0}
+                                                max={1}
+                                                step={0.05}
+                                                value={codeEmbedHoleWeight}
+                                                disabled={codeEmbedBusy || importedReportActive}
+                                                onChange={(e) => setCodeEmbedHoleWeight(e.target.value)}
+                                                className={styles.toolInput}
+                                                style={{ width: 56 }}
+                                            />
+                                        </label>
+                                        <button
+                                            type="button"
+                                            disabled={codeEmbedBusy || importedReportActive}
+                                            onClick={() => fetchCodeEmbedRetrieve()}
+                                            title="全文（prefix+middle+suffix 前 4000 字）和洞附近（上一行 + middle + 下一行）分别嵌入，按洞附近权重做乘积"
+                                            className={`${styles.ghostBtn}${codeEmbedBusy ? ` ${styles.ghostBtnWait}` : ''}`}
+                                        >
+                                            {codeEmbedBusy ? 'Embedding 归因中…' : 'Embedding 归因'}
+                                        </button>
                                         <button
                                             type="button"
                                             disabled={llmTrainBusy || importedReportActive}
@@ -6252,7 +6440,7 @@ export function ReportPanel({
                                             type="button"
                                             disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
                                             onClick={() => handleGradAlign('verify')}
-                                            title="不改边。对续训小集最后一条标注算 ∇(CE+λSaliency) 和 ∇Saliency，看是否都大于 0"
+                                            title="不改边。点积大于 0 表示走一步会抬高当前 test 的分叉 margin"
                                             className={`${styles.ghostBtn}${continueBusy ? ` ${styles.ghostBtnWait}` : ''}`}
                                         >
                                             {continueBusy ? '…' : '验证'}
@@ -6261,7 +6449,7 @@ export function ReportPanel({
                                             type="button"
                                             disabled={continueBusy || Boolean(interveningPairId) || recoverBusy || continueRecoverBusy}
                                             onClick={() => handleGradAlign('filter')}
-                                            title="逐条边算 marginal，小于 0 就从续训小集删掉。删完再点验证看两个点积"
+                                            title="逐条边看对分叉 margin 的边际贡献，小于 0 就从续训小集删掉"
                                             className={`${styles.ghostBtn}${continueBusy ? ` ${styles.ghostBtnWait}` : ''}`}
                                         >
                                             {continueBusy ? '…' : '梯度筛边'}
@@ -6342,7 +6530,53 @@ export function ReportPanel({
                                                         : ''}
                                                     {livePredictViewActive ? ' · 已接到 test 页' : ' · 点击 token 查看 saliency'}
                                                 </summary>
-                                                {(continueCurrentTestOutput.loss_before != null
+                                                {(continueCurrentTestOutput.margin_before != null
+                                                    || continueCurrentTestOutput.margin_after != null) ? (
+                                                    <div style={{
+                                                        marginTop: 6,
+                                                        fontSize: 11,
+                                                        lineHeight: 1.45,
+                                                        color: '#334155',
+                                                    }}>
+                                                        分叉 margin（沿 gold 最弱的一步
+                                                        {continueCurrentTestOutput.fork_index_before != null
+                                                            || continueCurrentTestOutput.fork_index_after != null
+                                                            ? ` · 第 ${continueCurrentTestOutput.fork_index_before ?? '—'} → ${continueCurrentTestOutput.fork_index_after ?? '—'} 个 token`
+                                                            : ''}
+                                                        ）：
+                                                        {continueCurrentTestOutput.margin_before != null
+                                                            ? continueCurrentTestOutput.margin_before.toFixed(4)
+                                                            : '—'}
+                                                        {' → '}
+                                                        {continueCurrentTestOutput.margin_after != null
+                                                            ? continueCurrentTestOutput.margin_after.toFixed(4)
+                                                            : '—'}
+                                                        {continueCurrentTestOutput.margin_delta != null && (
+                                                            <span style={{
+                                                                marginLeft: 6,
+                                                                fontWeight: 700,
+                                                                color: continueCurrentTestOutput.margin_delta > 0
+                                                                    ? '#166534'
+                                                                    : continueCurrentTestOutput.margin_delta < 0
+                                                                        ? '#b91c1c'
+                                                                        : '#64748b',
+                                                            }}>
+                                                                Δ {continueCurrentTestOutput.margin_delta > 0 ? '+' : ''}
+                                                                {continueCurrentTestOutput.margin_delta.toFixed(4)}
+                                                            </span>
+                                                        )}
+                                                        {(continueCurrentTestOutput.fork_gold_token_after
+                                                            || continueCurrentTestOutput.fork_argmax_token_after) && (
+                                                            <div style={{ color: '#64748b' }}>
+                                                                续训后这一步 gold「{continueCurrentTestOutput.fork_gold_token_after ?? ''}」
+                                                                / argmax「{continueCurrentTestOutput.fork_argmax_token_after ?? ''}」
+                                                                {continueCurrentTestOutput.fork_text_match_after
+                                                                    ? ' · 解码后仍是 gold'
+                                                                    : ''}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : (continueCurrentTestOutput.loss_before != null
                                                     || continueCurrentTestOutput.loss_after != null) && (
                                                     <div style={{
                                                         marginTop: 6,
@@ -7017,6 +7251,102 @@ export function ReportPanel({
                                                     </div>
                                                 )}
                                             </>
+                                        )}
+                                    </div>
+                                )}
+
+                                {(codeEmbedOpen || codeEmbedBusy || codeEmbedError) && (
+                                    <div style={{
+                                        margin: '8px 12px',
+                                        padding: '10px 12px',
+                                        borderRadius: 8,
+                                        border: '1px solid #fcd34d',
+                                        background: '#fffbeb',
+                                        fontSize: 12,
+                                        color: '#78350f',
+                                        maxHeight: 480,
+                                        overflow: 'auto',
+                                    }}>
+                                        <div style={{ fontWeight: 800, marginBottom: 6, color: '#92400e' }}>
+                                            Embedding 归因 → 全文^(1-w) × 洞附近^w
+                                            {codeEmbedResult?.hole_weight != null
+                                                ? ` · w=${codeEmbedResult.hole_weight}`
+                                                : ''}
+                                        </div>
+                                        <div style={{ fontSize: 11, color: '#a16207', marginBottom: 6 }}>
+                                            全文是 prefix+middle+suffix 前 {codeEmbedResult?.embed_chars ?? 4000} 字。
+                                            洞附近是洞的上一行 + middle + 洞的下一行。
+                                            改上面的洞附近权重后再点一次。
+                                        </div>
+                                        {codeEmbedBusy && codeEmbedResult?.status === 'building' && (
+                                            <div style={{ color: '#b45309' }}>
+                                                {codeEmbedResult.message
+                                                    || `正在写入训练集 ${codeEmbedResult.phase === 'full' ? '全文' : '洞附近'} embedding`}
+                                                {codeEmbedResult.total
+                                                    ? ` ${codeEmbedResult.done ?? 0}/${codeEmbedResult.total}`
+                                                    : ''}
+                                            </div>
+                                        )}
+                                        {codeEmbedBusy && codeEmbedResult?.status !== 'building' && (
+                                            <div style={{ color: '#b45309' }}>正在计算当前样本的全文和洞附近 embedding…</div>
+                                        )}
+                                        {codeEmbedError && (
+                                            <div style={{ color: '#b91c1c' }}>{codeEmbedError}</div>
+                                        )}
+                                        {(codeEmbedResult?.hits ?? []).map(h => (
+                                            <div
+                                                key={`emb-${h.line}-${h.task_id}`}
+                                                role="button"
+                                                tabIndex={0}
+                                                onClick={() => handleOpenCorpusAnnotationViewer(
+                                                    h,
+                                                    undefined,
+                                                    'code-embed',
+                                                    codeEmbedResult?.corpus_path,
+                                                )}
+                                                onKeyDown={ev => {
+                                                    if (ev.key === 'Enter' || ev.key === ' ') {
+                                                        ev.preventDefault();
+                                                        handleOpenCorpusAnnotationViewer(
+                                                            h,
+                                                            undefined,
+                                                            'code-embed',
+                                                            codeEmbedResult?.corpus_path,
+                                                        );
+                                                    }
+                                                }}
+                                                style={{
+                                                    marginTop: 4,
+                                                    padding: '4px 6px',
+                                                    borderRadius: 4,
+                                                    cursor: 'pointer',
+                                                    background: '#fff',
+                                                    border: '1px solid #fde68a',
+                                                    fontSize: 11,
+                                                }}
+                                            >
+                                                L{h.line}
+                                                {h.task_id ? ` · ${h.task_id}` : ''}
+                                                {h.embed_score != null ? ` · 综合 ${h.embed_score}` : ''}
+                                                {(h.full_score ?? h.context_score) != null ? ` · 全文 ${h.full_score ?? h.context_score}` : ''}
+                                                {h.gold_score != null ? ` · 洞 ${h.gold_score}` : ''}
+                                                {h.preview ? ` · ${h.preview.slice(0, 100)}` : ''}
+                                            </div>
+                                        ))}
+                                        {codeEmbedResult?.model && (
+                                            <div style={{ marginTop: 8, fontSize: 10, color: '#a8a29e' }}>
+                                                model: {codeEmbedResult.model}
+                                            </div>
+                                        )}
+                                        {codeEmbedResult?.gold_cache_path && (
+                                            <div style={{ marginTop: 2, fontSize: 10, color: '#a8a29e' }}>
+                                                gold: {codeEmbedResult.gold_cache_path}
+                                            </div>
+                                        )}
+                                        {codeEmbedResult?.corpus_path && (
+                                            <div style={{ marginTop: 2, fontSize: 10, color: '#a8a29e' }}>
+                                                corpus: {codeEmbedResult.corpus_path}
+                                            </div>
                                         )}
                                     </div>
                                 )}

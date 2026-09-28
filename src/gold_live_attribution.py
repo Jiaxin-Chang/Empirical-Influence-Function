@@ -653,6 +653,7 @@ def gold_saliency_top_k(
     top_k: int | None = None,
     mode: str = "gold",
     source_index: int | None = None,
+    source_indices: list[int] | None = None,
     full_tokens: list[str] | None = None,
     full_token_ids: list[int] | None = None,
     prompt_len_override: int | None = None,
@@ -660,7 +661,8 @@ def gold_saliency_top_k(
     """Stage 1: top-k saliency sources for one target (gold or predict completion).
 
     Optional ``source_index`` adds ``edgeSaliency`` for that specific edge
-    (used by 指定 pair panel).
+    (used by 指定 pair panel). ``source_indices`` scores those positions from
+    the same vector and returns them as ``pickedCorrelations``.
     """
     mode_norm = (mode or "gold").strip().lower()
     if mode_norm not in ("gold", "predict"):
@@ -769,6 +771,24 @@ def gold_saliency_top_k(
         out["sourceTokenIndex"] = int(source_index)
         out["sourceToken"] = edge_src_tok
         out["edgeSaliency"] = edge_sal
+    if source_indices:
+        picked: list[dict[str, Any]] = []
+        for raw_si in source_indices:
+            si = int(raw_si)
+            if not (0 <= si < len(sal_vec)):
+                continue
+            surf = display[si] if si < len(display) else tokens[si]
+            if not _surface_visible(surf):
+                surf = tokens[si] if si < len(tokens) else surf
+            picked.append({
+                "source_token_index": si,
+                "source_display_index": si,
+                "source_token": surf,
+                "target_token_index": int(target_index),
+                "target_token": target_tok,
+                "saliency_score": float(sal_vec[si]),
+            })
+        out["pickedCorrelations"] = picked
     return out
 
 
